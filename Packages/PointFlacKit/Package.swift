@@ -12,6 +12,8 @@ let package = Package(
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
         .library(name: "PFSearch", targets: ["PFSearch"]),
         .library(name: "PFFind", targets: ["PFFind"]),
+        // Optional module: only the Soulseek build variant links this product (spec §5.6 "Build flag").
+        .library(name: "PFSoulseek", targets: ["PFSoulseek"]),
     ],
     targets: [
         .target(
@@ -75,6 +77,15 @@ let package = Package(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFSoulseek",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFSoulseekTests",
+            dependencies: ["PFSoulseek"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

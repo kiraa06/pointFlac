@@ -45,3 +45,12 @@ Apple's SDK terms; nothing is vendored.
 - **Cover Art Archive** (`https://coverartarchive.org/`): album thumbnails, opt-in only (spec §5.8). Images belong
   to their rights holders; pointFlac only displays and caches them.
 - Neither is contacted when the person turns registry lookups off; typeahead then shows library rows only.
+
+## Soulseek module (`PFSoulseek`): no third-party code
+
+- `PFSoulseek` is pointFlac's own MIT code. It links only Apple system frameworks (Foundation, Network, Compression,
+  CryptoKit, Synchronization, os).
+- SeeleseekCore (MIT, `github.com/bretth18/seeleseek`) was evaluated as the first-choice core and not adopted; no code
+  was copied from it. The reasons are in `docs/spikes/S4-soulseek-core.md`. The soulseek-rs fallback was not needed.
+- No code from GPL/AGPL Soulseek clients (Nicotine+, Soulseek.NET, slskd, Seeker) is used. Protocol behaviour follows
+  the live probe of 2026-10-21 and the publicly documented protocol, which is reading material only (§3.3).
