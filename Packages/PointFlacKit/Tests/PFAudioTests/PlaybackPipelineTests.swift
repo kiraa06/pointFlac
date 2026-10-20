@@ -489,8 +489,12 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(!rig.log.contains(.trackEnded(0)))
         // The boundary rendered, and nothing more pulled: the event follows promptly, the next track's end does not.
         #expect(await rig.pull(upTo: 4096))
-        #expect(await wait(upTo: .milliseconds(50)) { rig.log.contains(.trackEnded(0)) })
-        #expect(rig.log.contains(.trackStarted(1)) && !rig.log.contains(.trackEnded(1)))
+        // trackEnded(0) and trackStarted(1) share frame 4096 and reach the log one at a time, so wait for both.
+        #expect(
+            await wait(upTo: .milliseconds(50)) {
+                rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1))
+            })
+        #expect(!rig.log.contains(.trackEnded(1)))
     }
 
     /// 44.1 → 48 kHz has no integer ratio, so the join's output frame is predicted (4096 · 48000/44100 ≈ 4458), and
