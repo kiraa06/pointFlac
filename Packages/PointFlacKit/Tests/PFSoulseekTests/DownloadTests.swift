@@ -233,6 +233,22 @@ struct DownloadTests {
         #expect(await events(stream).last == .failed(.timeout))
     }
 
+    @Test("A second download of the same file is refused; logout cancels a queued download")
+    func duplicateAndLogout() async throws {
+        let (client, server, _) = try await loggedInClient()
+        let peer = try await MockListener.start()
+        let staging = try temporaryStaging()
+        let first = Task { await events(client.download(Self.result(), into: staging)) }
+        try await answerPeerAddress(server, port: peer.port)
+        let control = try await peer.accept()
+        _ = try await control.nextFrame(codeWidth: .u8)
+        _ = try await control.expect(code: 43)
+        #expect(await events(client.download(Self.result(), into: staging)) == [.failed(.alreadyInProgress)])
+        await client.logout()
+        #expect(await first.value.last == .failed(.cancelled))
+        #expect(await client.state == .disconnected)
+    }
+
     @Test("Non-FLAC names are refused before any network traffic")
     func flacOnly() async throws {
         let (client, _, _) = try await loggedInClient()

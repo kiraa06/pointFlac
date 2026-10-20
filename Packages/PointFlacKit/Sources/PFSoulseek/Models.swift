@@ -151,6 +151,8 @@ public enum SoulseekTransferFailure: Error, Sendable, Equatable {
     case timeout
     case incomplete(received: Int64, expected: Int64)
     case cancelled
+    /// The same peer and path is already downloading.
+    case alreadyInProgress
     case io(String)
     case protocolViolation(String)
 }

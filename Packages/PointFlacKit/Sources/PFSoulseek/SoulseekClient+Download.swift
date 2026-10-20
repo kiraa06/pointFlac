@@ -25,6 +25,8 @@ struct TransferEntry {
     let expectedSize: Int64
     let signals: AsyncStream<TransferSignal>.Continuation
     var phase: Phase = .waitingForRequest
+    /// The F connection once the body is flowing, so logout can stop it.
+    var fileLink: FramedLink?
 
     var isAwaitingFile: Bool {
         if case .awaitingFile = phase { return true }
@@ -75,8 +77,12 @@ extension SoulseekClient {
         }
 
         let (signals, signalContinuation) = AsyncStream.makeStream(of: TransferSignal.self)
-        let id = await client.registerTransfer(
-            TransferEntry(peer: file.peer, path: file.path, expectedSize: file.sizeBytes, signals: signalContinuation))
+        // One transfer per peer and path: two would write the same .part file.
+        guard
+            let id = await client.registerTransfer(
+                TransferEntry(
+                    peer: file.peer, path: file.path, expectedSize: file.sizeBytes, signals: signalContinuation))
+        else { return .failed(.alreadyInProgress) }
         var controlLink: FramedLink?
         defer { controlLink?.close() }
 
@@ -231,7 +237,7 @@ extension SoulseekClient {
             await client.notePeerConnectFailure()
             return
         }
-        guard let claim = await client.claimFileConnection(peer: request.username, token: token) else {
+        guard let claim = await client.claimFileConnection(peer: request.username, token: token, link: framed) else {
             framed.close()
             return
         }
@@ -240,7 +246,8 @@ extension SoulseekClient {
 
     // MARK: - Actor-side routing
 
-    func registerTransfer(_ entry: TransferEntry) -> UUID {
+    func registerTransfer(_ entry: TransferEntry) -> UUID? {
+        guard !transfers.values.contains(where: { $0.peer == entry.peer && $0.path == entry.path }) else { return nil }
         let id = UUID()
         transfers[id] = entry
         return id
@@ -304,12 +311,13 @@ extension SoulseekClient {
         }
     }
 
-    func claimFileConnection(peer: String, token: UInt32) -> (
+    func claimFileConnection(peer: String, token: UInt32, link: FramedLink) -> (
         signals: AsyncStream<TransferSignal>.Continuation, size: Int64
     )? {
         for (id, entry) in transfers where entry.peer == peer {
             if case .awaitingFile(let expectedToken, let size) = entry.phase, expectedToken == token {
                 transfers[id]?.phase = .receiving
+                transfers[id]?.fileLink = link
                 return (entry.signals, size)
             }
         }

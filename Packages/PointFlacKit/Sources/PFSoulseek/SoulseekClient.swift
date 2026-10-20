@@ -28,6 +28,8 @@ public actor SoulseekClient {
     let logger = Logger(subsystem: "app.pointflac", category: "soulseek")
 
     private var credentials: (username: String, password: String)?
+    /// Bumped by login, logout and Relogged, so a connect that was in flight when one of them happened is discarded.
+    private var sessionEpoch = 0
     private var server: FramedLink?
     private var serverGeneration = 0
     private var serverTasks: [Task<Void, Never>] = []
@@ -88,6 +90,7 @@ public actor SoulseekClient {
         guard !username.isEmpty, !password.isEmpty else { throw .invalidUsername }
         reconnectTask?.cancel()
         reconnectTask = nil
+        sessionEpoch += 1
         credentials = (username, password)
         setState(.connecting)
         do {
@@ -101,13 +104,24 @@ public actor SoulseekClient {
 
     /// Closes everything. Downloads in progress fail with `cancelled`; their `.part` files stay for a later resume.
     public func logout() {
+        sessionEpoch += 1
         credentials = nil
         reconnectTask?.cancel()
         reconnectTask = nil
         tearDownServer()
         finishAllSearches(error: nil)
-        for entry in transfers.values { entry.signals.yield(.cancelled) }
+        cancelTransfers(includingReceiving: true)
         setState(.disconnected)
+    }
+
+    private func cancelTransfers(includingReceiving: Bool) {
+        for entry in transfers.values {
+            if entry.phase == .receiving {
+                if includingReceiving { entry.fileLink?.close() }
+            } else {
+                entry.signals.yield(.cancelled)
+            }
+        }
     }
 
     private func tearDownServer() {
@@ -120,6 +134,7 @@ public actor SoulseekClient {
 
     private func establishSession() async throws(SoulseekError) {
         guard let credentials else { throw .notLoggedIn }
+        let epoch = sessionEpoch
         tearDownServer()
         let config = configuration
         let link: TCPLink
@@ -128,6 +143,10 @@ public actor SoulseekClient {
                 host: config.serverHost, port: config.serverPort, timeout: config.connectTimeout)
         } catch {
             throw .serverUnavailable
+        }
+        guard epoch == sessionEpoch else {
+            link.close()
+            throw .connectionLost
         }
         let framed = FramedLink(link, maxFrame: FrameCaps.server)
         serverGeneration += 1
@@ -150,7 +169,10 @@ public actor SoulseekClient {
             server = nil
             throw .serverUnavailable
         }
-        guard generation == serverGeneration else { throw .connectionLost }
+        guard generation == serverGeneration, epoch == sessionEpoch else {
+            framed.close()
+            throw .connectionLost
+        }
 
         if case .loginFailed(let reason) = reply {
             framed.close()
@@ -284,11 +306,15 @@ public actor SoulseekClient {
             excludedPhrases = phrases.map { $0.lowercased() }.filter { !$0.isEmpty }
         case .relogged:
             // Another client signed in with this account. Reconnecting would just kick that client in turn.
+            sessionEpoch += 1
             credentials = nil
             reconnectTask?.cancel()
             setState(.kicked)
             tearDownServer()
             finishAllSearches(error: .kicked)
+            // Transfers still waiting need the server for their indirect connections; a body already flowing can
+            // finish, since it no longer depends on the server.
+            cancelTransfers(includingReceiving: false)
         case .peerAddress(let username, let ip, let port):
             resolveAddress(username: username, address: PeerAddress(ip: ip, port: port))
         case .loginSucceeded, .loginFailed, .cantConnectToPeer, .other:
