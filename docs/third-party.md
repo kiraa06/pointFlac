@@ -22,3 +22,12 @@
 - Notice: `App/ThirdPartyNotices.txt` (the libFLAC BSD-3 notice with the Xiph copyright, and pointFlac's MIT licence)
   ships in the app bundle in every configuration, Release included. The debug UI shows it under "Licences".
   `scripts/make-ipa.sh` fails if a Release app lacks it.
+
+## Soulseek module (`PFSoulseek`): no third-party code
+
+- `PFSoulseek` is pointFlac's own MIT code. It links only Apple system frameworks (Foundation, Network, Compression,
+  CryptoKit, Synchronization, os).
+- SeeleseekCore (MIT, `github.com/bretth18/seeleseek`) was evaluated as the first-choice core and not adopted; no code
+  was copied from it. The reasons are in `docs/spikes/S4-soulseek-core.md`. The soulseek-rs fallback was not needed.
+- GPL/AGPL Soulseek clients (Nicotine+, Soulseek.NET, slskd, Seeker) were not used, even as reading material, tonight;
+  the protocol facts come from a live probe and the public protocol description.

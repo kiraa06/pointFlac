@@ -281,3 +281,39 @@ struct FuzzTests {
         }
     }
 }
+
+@Suite("Presentation helpers")
+struct PresentationTests {
+    @Test("Results group by peer and folder; free slots, fuller folders and faster peers first")
+    func grouping() {
+        let slow = (1...3).map {
+            SearchResultFile(
+                peer: "slow", path: "M\\Artist\\Album\\0\($0) T.flac", sizeBytes: 10, bitsPerSample: 16,
+                freeSlot: true, uploadSpeed: 10)
+        }
+        let fast = (1...2).map {
+            SearchResultFile(
+                peer: "fast", path: "M\\Artist\\Album\\0\($0) T.flac", sizeBytes: 10, bitsPerSample: 24,
+                sampleRate: 96_000, freeSlot: true, uploadSpeed: 1000)
+        }
+        let busy = [SearchResultFile(peer: "busy", path: "x\\y\\1.flac", sizeBytes: 5, freeSlot: false)]
+        let groups = SearchResultFolder.group(busy + fast + slow)
+        #expect(groups.map(\.peer) == ["slow", "fast", "busy"])
+        #expect(groups[0].name == "Album" && groups[0].totalBytes == 30)
+        #expect(groups[1].bestBitsPerSample == 24 && groups[1].bestSampleRate == 96_000)
+        #expect(groups[0].files.map(\.fileName) == ["01 T.flac", "02 T.flac", "03 T.flac"])
+    }
+
+    @Test("Adapter conveniences for contract 1")
+    func adapterFields() {
+        let file = SearchResultFile(
+            peer: "bob", path: "Music\\Artist\\Album\\01 Song.flac", sizeBytes: 9, freeSlot: false, uploadSpeed: 5,
+            queueLength: 2)
+        #expect(file.displayTitle == "01 Song")
+        #expect(file.albumGuess == "Album" && file.artistGuess == "Artist")
+        #expect(file.detail["peer"] == "bob" && file.detail["queue"] == "2" && file.detail["freeSlot"] == "0")
+        #expect(SoulseekTransferEvent.progress(received: 1, size: 4).fraction == 0.25)
+        #expect(SoulseekTransferEvent.requested.fraction == nil)
+        #expect(SoulseekTransferFailure.denied("Banned").reason.contains("Banned"))
+    }
+}
