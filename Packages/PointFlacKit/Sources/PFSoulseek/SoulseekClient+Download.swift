@@ -251,10 +251,6 @@ extension SoulseekClient {
         transfers[id] = nil
     }
 
-    func hasTransfer(with peer: String) -> Bool {
-        transfers.values.contains { $0.peer == peer }
-    }
-
     /// The reply to a TransferRequest, plus the signal to deliver once the reply is on the wire. Sending first matters:
     /// a refused download closes its connections at once, and the peer should still hear why.
     struct TransferReply: Sendable {

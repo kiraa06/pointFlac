@@ -261,3 +261,64 @@ struct DownloadTests {
         #expect(try reader2.bool() == false)
     }
 }
+
+@Suite("Folder browse", .timeLimit(.minutes(1)))
+struct BrowseTests {
+    static func listing(token: UInt32, folder: String) -> [UInt8] {
+        var body = WireWriter()
+        body.u32(token)
+        body.string(folder)
+        body.u32(1)
+        body.string(folder)
+        let entries: [(String, UInt64, [(UInt32, UInt32)])] = [
+            ("02 Southwood Plantation Road.flac", 26_000_000, [(4, 96_000), (5, 24)]),
+            ("01 First Few Desperate Hours.flac", 25_000_000, [(4, 44_100), (5, 16)]),
+            ("cover.jpg", 300_000, []),
+        ]
+        body.u32(UInt32(entries.count))
+        for (name, size, attributes) in entries {
+            body.u8(1)
+            body.string(name)
+            body.u64(size)
+            body.string("")
+            body.u32(UInt32(attributes.count))
+            for (key, value) in attributes {
+                body.u32(key)
+                body.u32(value)
+            }
+        }
+        return Mock.frame(code: 37) { $0.raw(Mock.zlib(body.bytes)) }
+    }
+
+    @Test("A folder listing returns its FLAC files with full remote paths, in track order")
+    func browse() async throws {
+        let (client, server, _) = try await loggedInClient()
+        let peer = try await MockListener.start()
+        let folder = "Music\\Goats\\Tallahassee"
+        async let files = client.browseFolder(folder, of: "bob")
+        try await answerPeerAddress(server, port: peer.port)
+        let link = try await peer.accept()
+        _ = try await link.nextFrame(codeWidth: .u8)
+        let request = try await link.expect(code: 36)
+        var reader = WireReader(request.payload)
+        let token = try reader.u32()
+        #expect(try reader.string() == folder)
+        try await link.send(Self.listing(token: token, folder: folder))
+        let result = try await files
+        #expect(result.map(\.fileName) == ["01 First Few Desperate Hours.flac", "02 Southwood Plantation Road.flac"])
+        #expect(result[0].path == folder + "\\01 First Few Desperate Hours.flac")
+        #expect(result[1].bitsPerSample == 24 && result[1].sampleRate == 96_000)
+    }
+
+    @Test("A peer that never lists the folder times out")
+    func browseTimeout() async throws {
+        let (client, server, _) = try await loggedInClient { $0.browseTimeout = .milliseconds(300) }
+        let peer = try await MockListener.start()
+        let browse = Task { () async throws(SoulseekTransferFailure) -> [SearchResultFile] in
+            try await client.browseFolder("x", of: "bob")
+        }
+        try await answerPeerAddress(server, port: peer.port)
+        _ = try await peer.accept()
+        await #expect(throws: SoulseekTransferFailure.timeout) { try await browse.value }
+    }
+}

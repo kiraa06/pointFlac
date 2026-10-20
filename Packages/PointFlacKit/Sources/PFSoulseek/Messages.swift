@@ -28,6 +28,8 @@ enum PeerCode {
     static let uploadFailed: UInt32 = 46
     static let uploadDenied: UInt32 = 50
     static let placeInQueueRequest: UInt32 = 51
+    static let folderContentsRequest: UInt32 = 36
+    static let folderContentsResponse: UInt32 = 37
 }
 
 enum PeerInitCode {
@@ -114,6 +116,13 @@ enum Outgoing {
 
     static func queueUpload(path: String) -> [UInt8] {
         WireWriter.message(code: PeerCode.queueUpload) { $0.string(path) }
+    }
+
+    static func folderContentsRequest(token: UInt32, folder: String) -> [UInt8] {
+        WireWriter.message(code: PeerCode.folderContentsRequest) {
+            $0.u32(token)
+            $0.string(folder)
+        }
     }
 
     static func placeInQueueRequest(path: String) -> [UInt8] {
@@ -205,6 +214,7 @@ enum PeerMessage: Sendable, Equatable {
     case placeInQueue(path: String, place: Int)
     case uploadFailed(path: String)
     case uploadDenied(path: String, reason: String)
+    case folderContents(FolderListing)
     case other(code: UInt32)
 
     static func parse(_ frame: Frame) throws(WireError) -> PeerMessage {
@@ -232,9 +242,52 @@ enum PeerMessage: Sendable, Equatable {
         case PeerCode.uploadDenied:
             let path = try reader.string()
             return .uploadDenied(path: path, reason: try reader.string())
+        case PeerCode.folderContentsResponse:
+            let inflated = try Inflate.zlib(frame.payload, limit: Inflate.folderListingLimit)
+            return .folderContents(try FolderListing.parse(inflated))
         default:
             return .other(code: frame.code)
         }
+    }
+}
+
+/// A decoded FolderContentsResponse (peer code 37). Entries carry base names; `files` holds full remote paths.
+struct FolderListing: Sendable, Equatable {
+    /// More entries than any real album folder tree; the 32 MiB inflate cap bounds the work long before this.
+    static let maxFiles = 50_000
+
+    var token: UInt32
+    var folder: String
+    var files: [SearchResponse.File]
+
+    static func parse(_ bytes: [UInt8]) throws(WireError) -> FolderListing {
+        var reader = WireReader(bytes)
+        let token = try reader.u32()
+        let folder = try reader.string()
+        let folderCount = try reader.count()
+        var files: [SearchResponse.File] = []
+        for _ in 0..<folderCount {
+            let directory = try reader.string()
+            let fileCount = try reader.count()
+            guard files.count + fileCount <= maxFiles else { throw .countTooLarge(files.count + fileCount) }
+            for _ in 0..<fileCount {
+                _ = try reader.u8()
+                let name = try reader.string()
+                let rawSize = try reader.u64()
+                _ = try reader.string()
+                let attributeCount = try reader.count()
+                guard attributeCount <= 64 else { throw .countTooLarge(attributeCount) }
+                var attributes: [UInt32: UInt32] = [:]
+                for _ in 0..<attributeCount {
+                    let key = try reader.u32()
+                    attributes[key] = try reader.u32()
+                }
+                guard rawSize <= UInt64(Int64.max) else { throw .malformed("file size") }
+                files.append(
+                    SearchResponse.File(path: directory + "\\" + name, size: Int64(rawSize), attributes: attributes))
+            }
+        }
+        return FolderListing(token: token, folder: folder, files: files)
     }
 }
 

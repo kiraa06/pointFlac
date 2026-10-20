@@ -40,6 +40,7 @@ public actor SoulseekClient {
     var activePeerConnections = 0
 
     var transfers: [UUID: TransferEntry] = [:]
+    var folderWaiters: [UInt32: (peer: String, continuation: CheckedContinuation<[SearchResultFile]?, Never>)] = [:]
     var addressWaiters: [UUID: (username: String, continuation: CheckedContinuation<PeerAddress?, Never>)] = [:]
 
     public init(configuration: SoulseekConfiguration = SoulseekConfiguration()) {
@@ -304,7 +305,7 @@ public actor SoulseekClient {
         diagnostics.connectRequests += 1
         switch request.type {
         case "P":
-            let wanted = transfers.values.contains { $0.peer == request.username }
+            let wanted = hasBusiness(with: request.username)
             if !wanted {
                 guard searchesAcceptingPeers() else { return }
                 guard activePeerConnections < configuration.maxConcurrentPeerConnections else {
@@ -385,7 +386,9 @@ public actor SoulseekClient {
             switch message {
             case .searchResponse(let response):
                 await client.receiveSearchResponse(response, peer: peer)
-                if await !client.hasTransfer(with: peer) { return }
+                if await !client.hasBusiness(with: peer) { return }
+            case .folderContents(let listing):
+                await client.receiveFolderListing(listing, peer: peer)
             case .transferRequest(let direction, let token, let path, let size):
                 let reply = await client.handleTransferRequest(
                     peer: peer, direction: direction, token: token, path: path, size: size)

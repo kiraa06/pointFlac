@@ -102,6 +102,8 @@ public struct SoulseekConfiguration: Sendable {
     public var peerAddressTimeout: Duration = .seconds(10)
     /// How long a download may wait for the peer's TransferRequest (in its upload queue) before it fails.
     public var transferRequestTimeout: Duration = .seconds(600)
+    /// How long a folder listing (album preview) may take to arrive.
+    public var browseTimeout: Duration = .seconds(30)
     /// How long the F connection may take to appear after we accepted a TransferRequest.
     public var fileConnectionTimeout: Duration = .seconds(60)
     /// A transfer that receives no bytes for this long fails (and can resume later).
