@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 DEST='platform=iOS Simulator,name=iPhone 17 Pro'
 
 echo "== 1/4 swift format lint =="
-swift format lint --strict --recursive App Packages
+swift format lint --strict --recursive App AppUITests Packages
 
 echo "== 2/4 swift test (host) =="
 swift test --package-path Packages/PointFlacKit
