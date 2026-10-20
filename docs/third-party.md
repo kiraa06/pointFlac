@@ -35,3 +35,13 @@
 
 `CryptoKit` (content identity), `ImageIO` and `UniformTypeIdentifiers` (cover downsampling) are OS frameworks under
 Apple's SDK terms; nothing is vendored.
+
+## Online services used by `PFFind` (no code linked)
+
+- **MusicBrainz web service** (`https://musicbrainz.org/ws/2/`): artist, album and track names for typeahead and
+  for planning searches. Core data is CC0 (public domain). Rules followed: a meaningful User-Agent
+  (`pointFlac/0.2 ( https://github.com/kiraa06/pointFlac )`) and at most one request per second, process-wide.
+  The test fixtures in `Packages/PointFlacKit/Tests/PFFindTests/Fixtures/` are recorded MusicBrainz responses (CC0).
+- **Cover Art Archive** (`https://coverartarchive.org/`): album thumbnails, opt-in only (spec §5.8). Images belong
+  to their rights holders; pointFlac only displays and caches them.
+- Neither is contacted when the person turns registry lookups off; typeahead then shows library rows only.
