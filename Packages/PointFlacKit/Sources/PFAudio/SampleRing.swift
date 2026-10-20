@@ -31,8 +31,9 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
 
     /// Creates a ring holding at least `capacity` elements; the size is rounded up to a power of two.
     public init(capacity requested: Int) {
+        precondition(requested > 0 && requested <= 1 << 62, "SampleRing capacity out of range")
         var size = 1
-        while size < max(requested, 1) { size <<= 1 }
+        while size < requested { size <<= 1 }
         capacity = size
         mask = size - 1
         storage = UnsafeMutablePointer<Element>.allocate(capacity: size)
@@ -43,14 +44,28 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         storage.deallocate()
     }
 
-    /// Elements currently readable.
+    /// Elements currently readable, clamped to `0...capacity`.
+    ///
+    /// Only meaningful when called by the producer or the consumer thread; from any other thread (or
+    /// across a `reset()`) the two index loads are not a consistent snapshot.
     public var availableToRead: Int {
-        head.load(ordering: .acquiring) - tail.load(ordering: .acquiring)
+        used(head: head.load(ordering: .acquiring), tail: tail.load(ordering: .acquiring))
     }
 
-    /// Free slots currently writable.
+    /// Free slots currently writable, clamped to `0...capacity`. Same caller restriction as ``availableToRead``.
     public var availableToWrite: Int {
         capacity - availableToRead
+    }
+
+    @inline(__always)
+    private func used(head h: Int, tail t: Int) -> Int {
+        min(max(h - t, 0), capacity)
+    }
+
+    /// Test hook: forces raw index values to simulate a `reset()` that raced the consumer. Never call in production.
+    internal func _setIndicesForTesting(head h: Int, tail t: Int) {
+        head.store(h, ordering: .releasing)
+        tail.store(t, ordering: .releasing)
     }
 
     /// Producer only. Copies as many of `src` as fit and returns the count written.
@@ -58,7 +73,8 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         guard let base = src.baseAddress, !src.isEmpty else { return 0 }
         let h = head.load(ordering: .acquiring)
         let t = tail.load(ordering: .acquiring)
-        let count = min(src.count, capacity - (h - t))
+        // Clamp so a stale tail (reset racing the consumer) can never make us write past the allocation.
+        let count = min(src.count, capacity - used(head: h, tail: t))
         guard count > 0 else { return 0 }
         let start = h & mask
         let first = min(count, capacity - start)
@@ -75,7 +91,8 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         guard let base = dst.baseAddress, !dst.isEmpty else { return 0 }
         let t = tail.load(ordering: .acquiring)
         let h = head.load(ordering: .acquiring)
-        let count = min(dst.count, h - t)
+        assert(h - t >= 0 && h - t <= capacity, "SampleRing index invariant violated")
+        let count = min(dst.count, max(h - t, 0))
         guard count > 0 else { return 0 }
         let start = t & mask
         let first = min(count, capacity - start)
@@ -85,6 +102,13 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         }
         tail.store(t + count, ordering: .releasing)
         return count
+    }
+
+    /// Consumer only; real-time safe. Drops everything currently readable by advancing `tail` to `head`.
+    /// Unlike ``reset()`` this is safe while the producer is writing.
+    public func discardReadable() {
+        let h = head.load(ordering: .acquiring)
+        tail.store(h, ordering: .releasing)
     }
 
     /// Empties the ring. Valid only while both the producer and the consumer are stopped.

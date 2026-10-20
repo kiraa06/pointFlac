@@ -32,6 +32,68 @@ private func read(_ ring: SampleRing<Int32>, count: Int) -> [Int32] {
     return Array(out.prefix(n))
 }
 
+private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin: Bool) {
+    let ring = SampleRing<Int32>(capacity: capacity)
+    let abort = Atomic<Bool>(false)
+    let producerDone = DispatchSemaphore(value: 0)
+    let consumerDone = DispatchSemaphore(value: 0)
+    let mismatches = Atomic<Int>(0)
+    let consumed = Atomic<Int>(0)
+
+    let producer = Thread {
+        var rng = SplitMix64(state: 0xA11CE)
+        let source = (0..<total).map { Int32($0) }
+        var next = 0
+        source.withUnsafeBufferPointer { src in
+            while next < total, !abort.load(ordering: .relaxed) {
+                let chunk = min(rng.next(in: chunks), total - next)
+                let written = ring.write(UnsafeBufferPointer(rebasing: src[next..<(next + chunk)]))
+                next += written
+                if written == 0 && !spin { sched_yield() }
+            }
+        }
+        producerDone.signal()
+    }
+
+    let consumer = Thread {
+        var rng = SplitMix64(state: 0xB0B)
+        var scratch = [Int32](repeating: 0, count: chunks.upperBound)
+        var expected: Int32 = 0
+        var got = 0
+        scratch.withUnsafeMutableBufferPointer { buf in
+            while got < total, !abort.load(ordering: .relaxed) {
+                let chunk = rng.next(in: chunks)
+                let n = ring.read(into: UnsafeMutableBufferPointer(rebasing: buf[0..<chunk]))
+                if n == 0 {
+                    if !spin { sched_yield() }
+                    continue
+                }
+                for i in 0..<n {
+                    if buf[i] != expected { mismatches.add(1, ordering: .relaxed) }
+                    expected &+= 1
+                }
+                got += n
+                consumed.store(got, ordering: .relaxed)
+            }
+        }
+        consumerDone.signal()
+    }
+
+    let start = ContinuousClock.now
+    producer.start()
+    consumer.start()
+    let deadline = DispatchTime.now() + .seconds(spin ? 20 : 5)
+    let producerFinished = producerDone.wait(timeout: deadline) == .success
+    let consumerFinished = consumerDone.wait(timeout: deadline) == .success
+    abort.store(true, ordering: .relaxed)  // timeout guard: unblock a stuck thread so CI never hangs
+    let elapsed = ContinuousClock.now - start
+
+    #expect(producerFinished && consumerFinished, "producer/consumer did not finish within the deadline")
+    #expect(mismatches.load(ordering: .relaxed) == 0)
+    #expect(consumed.load(ordering: .relaxed) == total)
+    #expect(elapsed < .seconds(spin ? 20 : 5), "took \(elapsed)")
+}
+
 @Suite struct SampleRingTests {
     @Test func wrapsAroundPreservingOrder() {
         let ring = SampleRing<Int32>(capacity: 8)
@@ -67,65 +129,16 @@ private func read(_ ring: SampleRing<Int32>, count: Int) -> [Int32] {
     }
 
     @Test func concurrentProducerConsumerIsExact() {
-        let total = 2_000_000
-        let ring = SampleRing<Int32>(capacity: 16_384)
-        let abort = Atomic<Bool>(false)
-        let producerDone = DispatchSemaphore(value: 0)
-        let consumerDone = DispatchSemaphore(value: 0)
-        let mismatches = Atomic<Int>(0)
-        let consumed = Atomic<Int>(0)
+        runStress(total: 2_000_000, capacity: 16_384, chunks: 1...4096, spin: false)
+    }
+}
 
-        let producer = Thread {
-            var rng = SplitMix64(state: 0xA11CE)
-            let source = (0..<total).map { Int32($0) }
-            var next = 0
-            source.withUnsafeBufferPointer { src in
-                while next < total, !abort.load(ordering: .relaxed) {
-                    let chunk = min(rng.next(in: 1...4096), total - next)
-                    let written = ring.write(UnsafeBufferPointer(rebasing: src[next..<(next + chunk)]))
-                    next += written
-                    if written == 0 { sched_yield() }
-                }
-            }
-            producerDone.signal()
-        }
-
-        let consumer = Thread {
-            var rng = SplitMix64(state: 0xB0B)
-            var scratch = [Int32](repeating: 0, count: 4096)
-            var expected: Int32 = 0
-            var got = 0
-            scratch.withUnsafeMutableBufferPointer { buf in
-                while got < total, !abort.load(ordering: .relaxed) {
-                    let chunk = rng.next(in: 1...4096)
-                    let n = ring.read(into: UnsafeMutableBufferPointer(rebasing: buf[0..<chunk]))
-                    if n == 0 {
-                        sched_yield()
-                        continue
-                    }
-                    for i in 0..<n {
-                        if buf[i] != expected { mismatches.add(1, ordering: .relaxed) }
-                        expected &+= 1
-                    }
-                    got += n
-                    consumed.store(got, ordering: .relaxed)
-                }
-            }
-            consumerDone.signal()
-        }
-
-        let start = ContinuousClock.now
-        producer.start()
-        consumer.start()
-        let deadline = DispatchTime.now() + .seconds(5)
-        let producerFinished = producerDone.wait(timeout: deadline) == .success
-        let consumerFinished = consumerDone.wait(timeout: deadline) == .success
-        abort.store(true, ordering: .relaxed)  // timeout guard: unblock a stuck thread so CI never hangs
-        let elapsed = ContinuousClock.now - start
-
-        #expect(producerFinished && consumerFinished, "producer/consumer did not finish within 5 s")
-        #expect(mismatches.load(ordering: .relaxed) == 0)
-        #expect(consumed.load(ordering: .relaxed) == total)
-        #expect(elapsed < .seconds(5), "took \(elapsed)")
+/// Regression test for a missing release on the `head` publish (or acquire on its load). A tiny ring with tiny
+/// chunks and pure spinning maximises the chance that the consumer observes a new `head` before the data.
+/// Only reliable in an optimized build, so it skips itself in debug; `scripts/test.sh` runs it with `-c release`.
+@Suite struct SampleRingOrderingTests {
+    @Test(.enabled(if: !_isDebugAssertConfiguration(), "needs an optimized build"))
+    func smallRingOrderingStress() {
+        runStress(total: 10_000_000, capacity: 16, chunks: 1...4, spin: true)
     }
 }
