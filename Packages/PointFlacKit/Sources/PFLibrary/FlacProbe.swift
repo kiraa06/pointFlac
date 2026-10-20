@@ -43,24 +43,39 @@ enum FlacProbe {
                 album: TagText.clean(metadata.album) ?? "", compilation: compilation ?? false,
                 discNumber: metadata.discNumber.flatMap(plausible),
                 trackNumber: metadata.trackNumber.flatMap(plausible),
-                year: metadata.year, format: metadata.streamInfo.format, totalFrames: metadata.streamInfo.totalFrames,
+                year: metadata.year.flatMap(plausibleYear), format: metadata.streamInfo.format,
+                totalFrames: metadata.streamInfo.totalFrames,
                 cover: cover(fileAt: url)))
     }
+
+    /// A DATE of "0000" or "9999" is a placeholder, not a year.
+    private static func plausibleYear(_ year: Int) -> Int? { (1000...2100).contains(year) ? year : nil }
 
     /// Disc and track numbers from tags are free text; anything outside 0…9999 is noise, not an order.
     private static func plausible(_ n: Int) -> Int? { (0...9999).contains(n) ? n : nil }
 
     /// The front cover's image data, or the first picture's when there is no front cover.
     static func cover(fileAt url: URL) -> Data? {
+        var bytesRead = 0
+        return cover(fileAt: url, bytesRead: &bytesRead)
+    }
+
+    /// As `cover(fileAt:)`, counting the bytes read, for the bound test. Each PICTURE block's 4-byte type is read
+    /// first; its body is read only for the first front cover, or as the fallback while there is none yet. Every
+    /// other picture is skipped by seeking, so a file with a thousand 16 MiB back covers costs at most two bodies.
+    static func cover(fileAt url: URL, bytesRead: inout Int) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        func read(_ count: Int) -> [UInt8]? {
-            guard let data = try? handle.read(upToCount: count), data.count == count else { return nil }
+        var count = 0
+        defer { bytesRead = count }
+        func read(_ n: Int) -> [UInt8]? {
+            guard let data = try? handle.read(upToCount: n), data.count == n else { return nil }
+            count += n
             return [UInt8](data)
         }
-        func skip(_ count: Int) -> Bool {
+        func skip(_ n: Int) -> Bool {
             guard let offset = try? handle.offset() else { return false }
-            return (try? handle.seek(toOffset: offset + UInt64(count))) != nil
+            return (try? handle.seek(toOffset: offset + UInt64(n))) != nil
         }
         guard var magic = read(4) else { return nil }
         if magic[0] == 0x49, magic[1] == 0x44, magic[2] == 0x33 {
@@ -77,10 +92,19 @@ enum FlacProbe {
             guard let header = read(4) else { break }
             let length = Int(header[1]) << 16 | Int(header[2]) << 8 | Int(header[3])
             let isLast = header[0] & 0x80 != 0
-            if header[0] & 0x7F == 6, length <= ArtworkStore.maxSourceBytes + 1024, let body = read(length) {
-                if let picture = parsePicture(body) {
-                    if picture.type == 3 { return picture.data }
-                    if fallback == nil { fallback = picture.data }
+            if header[0] & 0x7F == 6, length >= 4, length <= ArtworkStore.maxSourceBytes + 1024,
+                let typeBytes = read(4)
+            {
+                let type =
+                    Int(typeBytes[0]) << 24 | Int(typeBytes[1]) << 16 | Int(typeBytes[2]) << 8 | Int(typeBytes[3])
+                if type == 3 || fallback == nil {
+                    guard let rest = read(length - 4) else { break }
+                    if let picture = parsePicture(typeBytes + rest) {
+                        if picture.type == 3 { return picture.data }
+                        fallback = picture.data
+                    }
+                } else if !skip(length - 4) {
+                    break
                 }
             } else if !skip(length) {
                 break

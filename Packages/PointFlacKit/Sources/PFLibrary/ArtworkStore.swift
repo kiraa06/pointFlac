@@ -19,7 +19,8 @@ import UniformTypeIdentifiers
 final class ArtworkStore: @unchecked Sendable {
     static let sleevePixels = 600
     static let maxSourceBytes = 16 * 1024 * 1024
-    static let maxSourcePixels = 64_000_000
+    /// About 36 Mpx (a 6000 × 6000 scan): above any real cover, and a bound on what ImageIO is asked to decode.
+    static let maxSourcePixels = 36_000_000
 
     let folder: URL
     /// Decoded-file bytes for the UI, bounded by bytes, not count (spec §5.4: Runout's out-of-memory risk).
@@ -30,7 +31,8 @@ final class ArtworkStore: @unchecked Sendable {
         cache.totalCostLimit = cacheBytes
     }
 
-    /// Stores `image` (JPEG, PNG or anything ImageIO reads) and returns its ID; nil when it is refused.
+    /// Stores `image` (JPEG, PNG or anything ImageIO reads) and returns its ID; nil when it is refused. Storing an
+    /// image whose file has gone writes it again.
     func store(_ image: Data) -> String? {
         guard !image.isEmpty, image.count <= Self.maxSourceBytes else { return nil }
         let id = SHA256.hash(data: image).prefix(16).map { String(format: "%02x", $0) }.joined()
@@ -55,6 +57,11 @@ final class ArtworkStore: @unchecked Sendable {
         return data
     }
 
+    /// Whether the stored file for `id` is there.
+    func exists(_ id: String) -> Bool {
+        Self.isValidID(id) && FileManager.default.fileExists(atPath: url(for: id).path)
+    }
+
     func url(for id: String) -> URL {
         folder.appending(path: "\(id).jpg")
     }
@@ -71,12 +78,14 @@ final class ArtworkStore: @unchecked Sendable {
         }
     }
 
+    func isValid(_ id: String) -> Bool { Self.isValidID(id) }
+
     /// An ID is 32 lowercase hex digits; anything else never reaches the file system.
     private static func isValidID(_ id: String) -> Bool {
         id.utf8.count == 32 && id.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
     }
 
-    private static func downsample(_ image: Data) -> Data? {
+    static func downsample(_ image: Data) -> Data? {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(image as CFData, sourceOptions),
             CGImageSourceGetCount(source) > 0,
