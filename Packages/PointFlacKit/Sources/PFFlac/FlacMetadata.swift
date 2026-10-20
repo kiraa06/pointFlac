@@ -53,10 +53,13 @@ public struct FlacMetadata: Sendable {
         return Int(digits)
     }
 
+    /// A ReplayGain value in dB, with or without its "dB" unit. `Double` also parses "nan" and "inf"; a gain that is
+    /// not finite is treated as absent, like a missing tag, so playback can never scale audio by it (ledger T5).
     private static func gain(_ s: String) -> Double? {
         var t = s.trimmingCharacters(in: .whitespaces)
         if t.lowercased().hasSuffix("db") { t = String(t.dropLast(2)).trimmingCharacters(in: .whitespaces) }
-        return Double(t)
+        guard let value = Double(t), value.isFinite else { return nil }
+        return value
     }
 }
 

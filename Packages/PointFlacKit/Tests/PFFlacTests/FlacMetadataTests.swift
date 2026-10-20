@@ -49,3 +49,24 @@ import Testing
     #expect(m.trackNumber == 2 && m.discNumber == 1 && m.year == 1999)
     #expect(m.albumGainDb == 3.5 && m.trackGainDb == nil)
 }
+
+/// Ledger T5: a gain that is not a finite number is treated as absent, like a missing tag, so ReplayGain (Plan 4) can
+/// never scale audio by NaN or infinity. Finite values, with or without "dB", still parse.
+@Test func nonFiniteGainsAreAbsent() {
+    let streamInfo = FlacStreamInfo(
+        minBlockSize: 16, maxBlockSize: 16, minFrameSize: 0, maxFrameSize: 0, sampleRate: 44_100, channels: 2,
+        bitsPerSample: 16, totalFrames: 0, md5: [])
+    func gains(_ raw: String) -> (track: Double?, album: Double?) {
+        let m = FlacMetadata(
+            streamInfo: streamInfo, tags: ["REPLAYGAIN_TRACK_GAIN": [raw], "REPLAYGAIN_ALBUM_GAIN": [raw]],
+            pictures: [])
+        return (m.trackGainDb, m.albumGainDb)
+    }
+    for raw in ["nan", "NaN", "-nan", "inf", "-inf", "+inf", "infinity", "-Infinity", "inf dB", "nan dB", " NAN DB "] {
+        let (track, album) = gains(raw)
+        #expect(track == nil && album == nil, "\"\(raw)\" read as \(String(describing: track))")
+    }
+    #expect(gains("-7.5 dB").track == -7.5)
+    #expect(gains("+0.00 dB").album == 0)
+    #expect(gains("12").track == 12)
+}
