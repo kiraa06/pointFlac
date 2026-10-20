@@ -38,7 +38,13 @@ public struct OutputCapabilities: Sendable {
         self.int32Passthrough = int32Passthrough
     }
 
-    /// Placeholder until spike S1 (Task 12) sets this from measured device results.
+    /// What pointFlac assumes the output path carries: no Int32 passthrough. 32-bit sources are TPDF-dithered to 24
+    /// bits on a Float32 client, and the signal strip says so; spec §5.2 accepts this as a disclosed limit.
+    ///
+    /// Spike S1 (ruling R13) keeps this false whatever the simulator shows. Its capture proves what pointFlac hands the
+    /// RemoteIO unit, not what iOS passes to the DAC, and the simulator runs on the Mac's CoreAudio, not iPhone
+    /// hardware. It flips to true only on device evidence with a 32-bit-capable USB DAC; the steps that would justify
+    /// it are in `docs/spikes/S1-output-path.md`.
     public static let current = OutputCapabilities(int32Passthrough: false)
 }
 

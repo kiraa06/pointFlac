@@ -1,3 +1,4 @@
+import Darwin
 import PFCore
 
 /// Where rendered audio goes: a RemoteIO unit on device, `FakeOutput` in host tests.
@@ -15,4 +16,14 @@ public protocol AudioOutput: AnyObject {
     func start() throws
     func stop()
     var source: RenderSource? { get set }
+}
+
+/// Why an output could not be set up or started. Each case carries the `OSStatus` the system returned.
+public enum AudioOutputError: Error, Equatable {
+    /// The output unit could not be created or given its render callback.
+    case unitUnavailable(OSStatus)
+    /// The unit refused the client format: setting it, or initialising with it.
+    case formatRejected(OSStatus)
+    /// The unit would not start.
+    case startFailed(OSStatus)
 }
