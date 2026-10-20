@@ -123,3 +123,25 @@ enum SyntheticLibrary {
     #expect(p95 < LatencyBudget.scaled(budget), "search p95 \(p95), \(LatencyBudget.describe(budget))")
     #expect(suggestP95 < LatencyBudget.scaled(budget), "suggest p95 \(suggestP95), \(LatencyBudget.describe(budget))")
 }
+
+/// Spec §8 states the budget at 100k tracks. Measured here on the host with the same keystrokes; spike S5 still owes
+/// the on-device figure.
+@Test func searchMeetsTheFrameBudgetAt100kTracks() {
+    let catalog = SyntheticLibrary.catalog(albums: 10_000, tracksPerAlbum: 10, seed: 99)
+    let buildStart = ContinuousClock.now
+    let index = SearchIndex(catalog)
+    let buildTime = ContinuousClock.now - buildStart
+    let queries = SyntheticLibrary.keystrokes(from: catalog, count: 300)
+    for query in queries.prefix(10) { _ = index.search(query) }
+    var times: [Duration] = []
+    for query in queries {
+        let start = ContinuousClock.now
+        _ = index.search(query, filter: .all, limit: 50)
+        times.append(ContinuousClock.now - start)
+    }
+    times.sort()
+    let p95 = times[times.count * 95 / 100]
+    print("Search 100k: build \(buildTime), p50 \(times[times.count / 2]), p95 \(p95), max \(times.last!)")
+    let budget = Duration.milliseconds(8)
+    #expect(p95 < LatencyBudget.scaled(budget), "search p95 \(p95) at 100k, \(LatencyBudget.describe(budget))")
+}
