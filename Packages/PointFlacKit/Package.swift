@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "PFDSP", targets: ["PFDSP"]),
         .library(name: "PFAudio", targets: ["PFAudio"]),
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
+        .library(name: "PFFind", targets: ["PFFind"]),
     ],
     targets: [
         .target(
@@ -55,6 +56,10 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "PFFind",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
@@ -83,6 +88,12 @@ let package = Package(
         .testTarget(
             name: "PFLibraryTests",
             dependencies: ["PFLibrary", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFFindTests",
+            dependencies: ["PFFind"],
+            resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
