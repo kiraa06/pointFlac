@@ -94,7 +94,8 @@ let package = Package(
         ),
         .testTarget(
             name: "PFLibraryTests",
-            dependencies: ["PFLibrary", "PFTestSupport"],
+            // PFSearch and PFAudio only for the end-to-end test of the path the app adapter takes.
+            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

@@ -60,6 +60,9 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
 
     /// The artist to show: the track's own, else the album artist.
     public var displayArtist: String { artist.isEmpty ? albumArtist : artist }
+
+    /// For track rows: "FLAC 24/96", like the album's label.
+    public var formatLabel: String { LibraryAlbum.formatLabel(format) }
 }
 
 /// An album derived from its tracks' tags. Albums are not stored: they are regrouped from the tracks whenever the
