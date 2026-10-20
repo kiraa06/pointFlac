@@ -223,6 +223,7 @@ func testConfiguration(serverPort: UInt16) -> SoulseekConfiguration {
     config.fileConnectionTimeout = .seconds(5)
     config.transferIdleTimeout = .seconds(2)
     config.excludedPhrasesWait = .zero
+    config.allowPrivatePeerAddresses = true  // the mock peers live on 127.0.0.1
     return config
 }
 

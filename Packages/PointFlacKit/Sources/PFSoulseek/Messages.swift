@@ -41,7 +41,10 @@ enum PeerInitCode {
 /// user lists. Peer frames carry compressed search responses, which are far smaller than their inflated form.
 enum FrameCaps {
     static let server = 4 * 1024 * 1024
+    /// Connections we asked for (downloads, folder listings).
     static let peer = 4 * 1024 * 1024
+    /// Connections that only bring a search response. 1 MiB of compressed response is thousands of files.
+    static let searchPeer = 1024 * 1024
     static let peerInit = 4 * 1024
 }
 
@@ -76,7 +79,9 @@ enum Outgoing {
         }
     }
 
-    /// We are a leaf of the distributed network and never ask for a parent to relay searches to us.
+    /// Tells the server we have no distributed-network parent. pointFlac never connects to the parents it is offered
+    /// and ignores type "D" connections, so it stays outside the distributed network; its search results arrive only
+    /// through server-forwarded ConnectToPeer.
     static func haveNoParent() -> [UInt8] {
         WireWriter.message(code: ServerCode.haveNoParent) { $0.bool(true) }
     }
@@ -289,6 +294,18 @@ struct FolderListing: Sendable, Equatable {
         }
         return FolderListing(token: token, folder: folder, files: files)
     }
+
+    /// The listing as results in track order, filtered and sorted in the per-peer task rather than on the actor.
+    func results(peer: String, filter: ResultFilter) -> [SearchResultFile] {
+        files.filter { filter.admits(path: $0.path, size: $0.size) }
+            .map { file in
+                SearchResultFile(
+                    peer: peer, path: file.path, sizeBytes: file.size, bitsPerSample: file.attributes[5].map(Int.init),
+                    sampleRate: file.attributes[4].map(Int.init), bitrate: file.attributes[0].map(Int.init),
+                    durationSeconds: file.attributes[1].map(Int.init))
+            }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
 }
 
 /// A decoded FileSearchResponse (peer code 9), before it is turned into `SearchResultFile`s.
@@ -306,18 +323,34 @@ struct SearchResponse: Sendable, Equatable {
     var uploadSpeed: UInt32
     var queueLength: UInt32
 
+    /// Files kept from one response. A peer may list more (they are skipped, not stored), so one response can never
+    /// make the client hold more than this many entries.
+    static let maxFilesKept = 2_000
+
+    /// Reads just the token from the first inflated bytes (username, then token), so a response for a search that is
+    /// no longer running is dropped without inflating the rest.
+    static func token(fromPrefix bytes: [UInt8]) throws(WireError) -> UInt32 {
+        var reader = WireReader(bytes, limits: WireLimits(maxString: 512))
+        try reader.skipString()
+        return try reader.u32()
+    }
+
     static func parse(_ bytes: [UInt8]) throws(WireError) -> SearchResponse {
         var reader = WireReader(bytes)
         let username = try reader.string()
         let token = try reader.u32()
         let count = try reader.count()
         var files: [File] = []
-        files.reserveCapacity(min(count, 4096))
-        for _ in 0..<count {
+        files.reserveCapacity(min(count, maxFilesKept))
+        for index in 0..<count {
+            guard index < maxFilesKept else {
+                try skipFile(&reader)
+                continue
+            }
             _ = try reader.u8()
             let path = try reader.string()
             let rawSize = try reader.u64()
-            _ = try reader.string()  // extension; unreliable, the path is used instead
+            try reader.skipString()  // extension; unreliable, the path is used instead
             let attributeCount = try reader.count()
             guard attributeCount <= 64 else { throw .countTooLarge(attributeCount) }
             var attributes: [UInt32: UInt32] = [:]
@@ -339,14 +372,46 @@ struct SearchResponse: Sendable, Equatable {
             username: username, token: token, files: files, freeSlot: freeSlot, uploadSpeed: speed, queueLength: queue)
     }
 
-    /// The files as public results, attributed to the server-authenticated `peer`.
-    func results(peer: String) -> [SearchResultFile] {
-        files.map { file in
-            SearchResultFile(
-                peer: peer, path: file.path, sizeBytes: file.size,
-                bitsPerSample: file.attributes[5].map(Int.init), sampleRate: file.attributes[4].map(Int.init),
-                bitrate: file.attributes[0].map(Int.init), durationSeconds: file.attributes[1].map(Int.init),
-                freeSlot: freeSlot, uploadSpeed: Int(uploadSpeed), queueLength: Int(queueLength))
-        }
+    private static func skipFile(_ reader: inout WireReader) throws(WireError) {
+        try reader.skip(1)
+        try reader.skipString()
+        try reader.skip(8)
+        try reader.skipString()
+        let attributeCount = try reader.count()
+        guard attributeCount <= 64 else { throw .countTooLarge(attributeCount) }
+        try reader.skip(attributeCount * 8)
+    }
+
+    /// The files as public results, attributed to the server-authenticated `peer`, after the cheap checks on the raw
+    /// path (FLAC suffix, excluded phrases, empty files) so that only survivors pay for sanitising and hashing. Runs
+    /// in the per-peer task, never on the actor.
+    func results(peer: String, filter: ResultFilter = ResultFilter()) -> [SearchResultFile] {
+        Array(
+            files.lazy
+                .filter { filter.admits(path: $0.path, size: $0.size) }
+                .prefix(filter.limit)
+                .map { file in
+                    SearchResultFile(
+                        peer: peer, path: file.path, sizeBytes: file.size,
+                        bitsPerSample: file.attributes[5].map(Int.init), sampleRate: file.attributes[4].map(Int.init),
+                        bitrate: file.attributes[0].map(Int.init), durationSeconds: file.attributes[1].map(Int.init),
+                        freeSlot: freeSlot, uploadSpeed: Int(uploadSpeed), queueLength: Int(queueLength))
+                })
+    }
+}
+
+/// The checks a result must pass before it reaches the actor: a snapshot of the search's options and the excluded
+/// phrases, so the per-peer task can filter without touching actor state.
+struct ResultFilter: Sendable {
+    var flacOnly = true
+    /// Lower-cased.
+    var excludedPhrases: [String] = []
+    var limit = SearchResponse.maxFilesKept
+
+    func admits(path: String, size: Int64) -> Bool {
+        guard size > 0 else { return false }
+        let lowered = path.lowercased()
+        if flacOnly && !lowered.hasSuffix(".flac") { return false }
+        return !excludedPhrases.contains { lowered.contains($0) }
     }
 }

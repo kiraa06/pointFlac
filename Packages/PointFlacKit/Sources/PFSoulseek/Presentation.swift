@@ -91,6 +91,8 @@ extension SoulseekTransferFailure {
         case .incomplete: "The transfer stopped early; it will resume from where it stopped"
         case .cancelled: "Cancelled"
         case .alreadyInProgress: "Already downloading"
+        case .fileTooLarge: "The file is too large"
+        case .insufficientStorage: "Not enough free space"
         case .io(let what): "Could not save the file (\(what))"
         case .protocolViolation: "The peer broke the protocol"
         }

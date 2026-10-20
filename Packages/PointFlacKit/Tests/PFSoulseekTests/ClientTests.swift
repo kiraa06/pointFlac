@@ -257,7 +257,13 @@ struct SearchTests {
         let bombTask = Task {
             let l = try await bomb.accept()
             _ = try await l.nextFrame(codeWidth: .u8)
-            try await l.send(Mock.searchResponse(compressed: Mock.zlib([UInt8](repeating: 0, count: 20 * 1024 * 1024))))
+            // A valid header for the running search, then 20 MiB of zeros: it passes the token check and must stop at
+            // the 16 MiB inflate cap.
+            var head = WireWriter()
+            head.string("bomb")
+            head.u32(await tokenBox.value)
+            let bombBody = head.bytes + [UInt8](repeating: 0, count: 20 * 1024 * 1024)
+            try await l.send(Mock.searchResponse(compressed: Mock.zlib(bombBody)))
         }
         let garbageTask = Task {
             let l = try await garbage.accept()

@@ -13,13 +13,24 @@ enum Inflate {
     /// Cap for a folder listing (peer code 37).
     static let folderListingLimit = 32 * 1024 * 1024
 
-    static func zlib(_ input: [UInt8], limit: Int) throws(WireError) -> [UInt8] {
+    /// The first `count` inflated bytes (or fewer if the stream is shorter), without the checksum. Used to read a
+    /// search response's token before deciding whether the whole response is worth inflating.
+    static func zlibPrefix(_ input: [UInt8], count: Int) throws(WireError) -> [UInt8] {
+        try checkHeader(input)
+        return try rawDeflate(Array(input[2..<(input.count - 4)]), limit: Int.max, stopAfter: count)
+    }
+
+    private static func checkHeader(_ input: [UInt8]) throws(WireError) {
         guard input.count >= 6 else { throw .inflateFailed }
         let cmf = input[0]
         let flg = input[1]
         guard cmf & 0x0F == 8, (UInt16(cmf) << 8 | UInt16(flg)) % 31 == 0, flg & 0x20 == 0 else {
             throw .inflateFailed
         }
+    }
+
+    static func zlib(_ input: [UInt8], limit: Int) throws(WireError) -> [UInt8] {
+        try checkHeader(input)
         let deflate = Array(input[2..<(input.count - 4)])
         let output = try rawDeflate(deflate, limit: limit)
         let trailer = input.suffix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
@@ -27,7 +38,7 @@ enum Inflate {
         return output
     }
 
-    private static func rawDeflate(_ input: [UInt8], limit: Int) throws(WireError) -> [UInt8] {
+    private static func rawDeflate(_ input: [UInt8], limit: Int, stopAfter: Int? = nil) throws(WireError) -> [UInt8] {
         let chunk = 64 * 1024
         let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { destination.deallocate() }
@@ -40,6 +51,7 @@ enum Inflate {
 
         enum Outcome {
             case finished(compression_status)
+            case prefix
             case tooLarge
             case noInput
         }
@@ -55,6 +67,7 @@ enum Inflate {
                 let produced = chunk - streamPointer.pointee.dst_size
                 if output.count + produced > limit { return .tooLarge }
                 output.append(contentsOf: UnsafeBufferPointer(start: destination, count: produced))
+                if let stopAfter, output.count >= stopAfter { return .prefix }
                 switch status {
                 case COMPRESSION_STATUS_OK:
                     // With FINALIZE set, OK and no output means the decoder wants input that is not there: the stream
@@ -68,9 +81,11 @@ enum Inflate {
         }
         switch outcome {
         case .tooLarge: throw .inflatedTooLarge(limit)
+        case .prefix: return Array(output.prefix(stopAfter ?? output.count))
         case .noInput: throw .inflateFailed
         case .finished(let status):
             guard status == COMPRESSION_STATUS_END else { throw .inflateFailed }
+            if let stopAfter { return Array(output.prefix(stopAfter)) }
             return output
         }
     }

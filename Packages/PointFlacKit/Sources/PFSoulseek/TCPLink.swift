@@ -15,6 +15,8 @@ private final class OnceContinuation<T: Sendable>: Sendable {
 
     init(_ continuation: CheckedContinuation<T, any Error>) { self.continuation = Mutex(continuation) }
 
+    var isResumed: Bool { continuation.withLock { $0 == nil } }
+
     @discardableResult
     func resume(with result: Result<T, any Error>) -> Bool {
         guard
@@ -26,6 +28,20 @@ private final class OnceContinuation<T: Sendable>: Sendable {
         continuation.resume(with: result)
         return true
     }
+}
+
+/// A one-shot timer on a dispatch queue that can be cancelled, so a completed receive or send does not leave a pending
+/// block behind. `DispatchWorkItem.cancel()` is thread-safe; the class only adds the Sendable wrapper.
+private final class CancellableTimer: @unchecked Sendable {
+    private let item: DispatchWorkItem
+
+    init(_ action: @escaping @Sendable () -> Void) { item = DispatchWorkItem(block: action) }
+
+    func schedule(on queue: DispatchQueue, after duration: Duration) {
+        queue.asyncAfter(deadline: .now() + duration.dispatchInterval, execute: item)
+    }
+
+    func cancel() { item.cancel() }
 }
 
 extension Duration {
@@ -72,7 +88,11 @@ final class TCPLink: Sendable {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 let once = OnceContinuation(continuation)
+                let timer = CancellableTimer {
+                    if once.resume(with: .failure(LinkError.timeout)) { connection.cancel() }
+                }
                 connection.stateUpdateHandler = { state in
+                    defer { if once.isResumed { timer.cancel() } }
                     switch state {
                     case .ready:
                         once.resume(with: .success(()))
@@ -88,27 +108,33 @@ final class TCPLink: Sendable {
                     }
                 }
                 connection.start(queue: queue)
-                queue.asyncAfter(deadline: .now() + timeout.dispatchInterval) {
-                    if once.resume(with: .failure(LinkError.timeout)) { connection.cancel() }
-                }
+                timer.schedule(on: queue, after: timeout)
             }
         } onCancel: {
             connection.cancel()
         }
     }
 
-    func send(_ bytes: [UInt8]) async throws {
+    /// Sends `bytes`. A peer that stops reading cannot hold the connection forever: after `timeout` the connection
+    /// is closed and `LinkError.timeout` thrown.
+    func send(_ bytes: [UInt8], timeout: Duration = .seconds(30)) async throws {
         let connection = self.connection
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            let once = OnceContinuation(continuation)
+            let timer = CancellableTimer {
+                if once.resume(with: .failure(LinkError.timeout)) { connection.cancel() }
+            }
             connection.send(
                 content: Data(bytes),
                 completion: .contentProcessed { error in
+                    timer.cancel()
                     if let error {
-                        continuation.resume(throwing: LinkError.failed("\(error)"))
+                        once.resume(with: .failure(LinkError.failed("\(error)")))
                     } else {
-                        continuation.resume()
+                        once.resume(with: .success(()))
                     }
                 })
+            timer.schedule(on: queue, after: timeout)
         }
     }
 
@@ -119,7 +145,12 @@ final class TCPLink: Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[UInt8], any Error>) in
                 let once = OnceContinuation(continuation)
+                // A cancellable timer: thousands of receives per transfer must not leave thousands of pending blocks.
+                let timer = CancellableTimer {
+                    if once.resume(with: .failure(LinkError.timeout)) { connection.cancel() }
+                }
                 connection.receive(minimumIncompleteLength: 1, maximumLength: maximum) { data, _, isComplete, error in
+                    timer.cancel()
                     if let data, !data.isEmpty {
                         once.resume(with: .success([UInt8](data)))
                     } else if let error {
@@ -130,9 +161,7 @@ final class TCPLink: Sendable {
                     }
                 }
                 if let timeout {
-                    queue.asyncAfter(deadline: .now() + timeout.dispatchInterval) {
-                        if once.resume(with: .failure(LinkError.timeout)) { connection.cancel() }
-                    }
+                    timer.schedule(on: queue, after: timeout)
                 }
             }
         } onCancel: {
@@ -156,10 +185,23 @@ final class FramedLink: @unchecked Sendable {
         self.buffer = FrameBuffer(maxFrame: maxFrame)
     }
 
-    func nextFrame(codeWidth: FrameBuffer.CodeWidth = .u32, timeout: Duration? = nil) async throws -> Frame {
+    /// The next frame. `timeout` bounds each receive (a silent peer); `deadline` bounds the whole call, so a peer
+    /// trickling one byte just inside every timeout (slowloris) still loses its connection when the deadline passes.
+    func nextFrame(
+        codeWidth: FrameBuffer.CodeWidth = .u32, timeout: Duration? = nil, deadline: ContinuousClock.Instant? = nil
+    ) async throws -> Frame {
         while true {
             if let frame = try buffer.next(codeWidth: codeWidth) { return frame }
-            buffer.append(try await link.receive(timeout: timeout))
+            var wait = timeout
+            if let deadline {
+                let remaining = deadline - ContinuousClock.now
+                guard remaining > .zero else {
+                    close()
+                    throw LinkError.timeout
+                }
+                wait = min(wait ?? remaining, remaining)
+            }
+            buffer.append(try await link.receive(timeout: wait))
         }
     }
 
@@ -173,7 +215,14 @@ final class FramedLink: @unchecked Sendable {
     /// Bytes buffered beyond the last frame read (the start of file data on an F connection).
     func drain() -> [UInt8] { buffer.drain() }
 
-    func send(_ bytes: [UInt8]) async throws { try await link.send(bytes) }
+    func send(_ bytes: [UInt8]) async throws {
+        do {
+            try await link.send(bytes)
+        } catch {
+            link.close()
+            throw error
+        }
+    }
 
     func close() { link.close() }
 }

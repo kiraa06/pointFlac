@@ -106,20 +106,29 @@ extension SoulseekClient {
         return searches.values.contains { !$0.reachedCap && now < $0.acceptPeersUntil }
     }
 
-    func receiveSearchResponse(_ response: SearchResponse, peer: String) {
+    /// The filter a per-peer task applies before handing results over, or `nil` when no search with this token is
+    /// collecting (the response is then dropped without being inflated).
+    func resultFilter(forSearch token: UInt32) -> ResultFilter? {
+        guard let session = searches[token], !session.reachedCap else { return nil }
+        let room = session.options.maxFiles - session.delivered - session.pending.count
+        guard room > 0 else { return nil }
+        return ResultFilter(
+            flacOnly: session.options.flacOnly, excludedPhrases: excludedPhrases,
+            limit: min(room, SearchResponse.maxFilesKept))
+    }
+
+    /// Takes one peer's already filtered, capped batch. Only de-duplication and the early-stop cap happen here.
+    func receiveSearchBatch(_ files: [SearchResultFile], token: UInt32) {
         diagnostics.searchResponses += 1
-        guard var session = searches[response.token], !session.reachedCap else { return }
-        for file in response.results(peer: peer) {
-            if session.options.flacOnly && !file.isFLAC { continue }
-            if matchesExcludedPhrase(file.path) { continue }
-            guard file.sizeBytes > 0, session.seen.insert(file.id).inserted else { continue }
+        guard var session = searches[token], !session.reachedCap else { return }
+        for file in files where session.seen.insert(file.id).inserted {
             session.pending.append(file)
             if session.delivered + session.pending.count >= session.options.maxFiles {
                 session.reachedCap = true
                 break
             }
         }
-        searches[response.token] = session
+        searches[token] = session
     }
 
     func finishAllSearches(error: SoulseekError?) {

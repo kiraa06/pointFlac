@@ -130,6 +130,15 @@ struct WireReader {
         return "\(slice[3]).\(slice[2]).\(slice[1]).\(slice[0])"
     }
 
+    /// Skips a string without decoding or copying it (entries past a response's file cap).
+    mutating func skipString() throws(WireError) {
+        let length = Int(try u32())
+        guard length <= limits.maxString else { throw .stringTooLong(length) }
+        _ = try take(length)
+    }
+
+    mutating func skip(_ count: Int) throws(WireError) { _ = try take(count) }
+
     mutating func rest() -> [UInt8] {
         defer { offset = bytes.count }
         return Array(bytes[min(offset, bytes.count)...])

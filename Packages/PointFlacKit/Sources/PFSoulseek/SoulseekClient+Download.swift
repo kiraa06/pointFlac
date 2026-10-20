@@ -25,8 +25,9 @@ struct TransferEntry {
     let expectedSize: Int64
     let signals: AsyncStream<TransferSignal>.Continuation
     var phase: Phase = .waitingForRequest
-    /// The F connection once the body is flowing, so logout can stop it.
+    /// The F connection once the body is flowing, so logout and unregistering can stop it, and its slot.
     var fileLink: FramedLink?
+    var fileSlot: UUID?
 
     var isAwaitingFile: Bool {
         if case .awaitingFile = phase { return true }
@@ -64,12 +65,15 @@ extension SoulseekClient {
         events: AsyncStream<SoulseekTransferEvent>.Continuation
     ) async -> SoulseekTransferEvent {
         guard file.isFLAC else { return .failed(.notFLAC) }
+        guard file.sizeBytes > 0, file.sizeBytes <= config.maxFileSize else { return .failed(.fileTooLarge) }
         guard await client.isLoggedIn, let me = await client.username else { return .failed(.notLoggedIn) }
 
+        // The local name is derived again here from the remote path, never taken from the caller's value.
+        let localName = PathSanitizer.localFileName(forRemotePath: file.path)
         let folder = staging.appending(
             path: PathSanitizer.transferFolderName(peer: file.peer, path: file.path), directoryHint: .isDirectory)
-        let destination = folder.appending(path: file.fileName, directoryHint: .notDirectory)
-        let part = folder.appending(path: file.fileName + ".part", directoryHint: .notDirectory)
+        let destination = folder.appending(path: localName, directoryHint: .notDirectory)
+        let part = folder.appending(path: localName + ".part", directoryHint: .notDirectory)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
@@ -83,36 +87,39 @@ extension SoulseekClient {
                 TransferEntry(
                     peer: file.peer, path: file.path, expectedSize: file.sizeBytes, signals: signalContinuation))
         else { return .failed(.alreadyInProgress) }
-        var controlLink: FramedLink?
-        defer { controlLink?.close() }
 
         let outcome: SoulseekTransferEvent = await {
             guard let address = await client.resolvePeerAddress(file.peer, timeout: config.peerAddressTimeout),
                 let port = UInt16(exactly: address.port)
             else { return .failed(.peerOffline) }
+            guard let slot = await client.reservePeerSlot(for: file.peer, bypassGlobalCap: true) else {
+                return .failed(.peerUnreachable)
+            }
             let framed: FramedLink
             do {
                 let link = try await TCPLink.connect(host: address.ip, port: port, timeout: config.peerConnectTimeout)
                 framed = FramedLink(link, maxFrame: FrameCaps.peer)
+                await client.attach(framed, to: slot)
+                // A failed send closes the link (FramedLink.send), so nothing is left half-open.
                 try await framed.send(Outgoing.peerInit(username: me, type: "P"))
                 try await framed.send(Outgoing.queueUpload(path: file.path))
             } catch {
+                await client.releasePeerSlot(slot)
                 return .failed(.peerUnreachable)
             }
-            controlLink = framed
-            await client.beginPeerConnection()
             Task {
                 await servePeer(framed, peer: file.peer, client: client, readTimeout: config.transferRequestTimeout)
-                await client.endPeerConnection()
+                await client.releasePeerSlot(slot)
             }
             events.yield(.requested)
             return await waitAndReceive(
                 signals: signals, signalContinuation: signalContinuation, file: file, part: part,
                 destination: destination, config: config, events: events)
         }()
+        // Unregistering closes the control link and any forwarded links to this peer that are now idle.
         await client.unregisterTransfer(id)
         if case .failed(let failure) = outcome {
-            client.logger.info("Soulseek: download failed (\(failure.reason, privacy: .public))")
+            client.logger.info("Soulseek: download failed (\(failure.reason, privacy: .private))")
         }
         return outcome
     }
@@ -168,6 +175,10 @@ extension SoulseekClient {
         let manager = FileManager.default
         var offset = Int64((try? manager.attributesOfItem(atPath: part.path)[.size] as? NSNumber)?.int64Value ?? 0)
         if offset > size { offset = 0 }
+        // Check the space for the rest of the file before writing a byte of it.
+        if let available = config.availableCapacity(part.deletingLastPathComponent()), available < size - offset {
+            return .failed(.insufficientStorage)
+        }
         if !manager.fileExists(atPath: part.path) || offset == 0 {
             guard manager.createFile(atPath: part.path, contents: nil) else { return .failed(.io("cannot create")) }
         }
@@ -224,27 +235,36 @@ extension SoulseekClient {
 
     @concurrent
     nonisolated static func runPiercedFile(
-        _ request: ConnectRequest, client: SoulseekClient, config: SoulseekConfiguration
+        _ request: ConnectRequest, client: SoulseekClient, config: SoulseekConfiguration, slot: UUID
     ) async {
         let framed: FramedLink
         let token: UInt32
         do {
-            let link = try await TCPLink.connect(
-                host: request.ip, port: request.port, timeout: config.peerConnectTimeout)
-            try await link.send(Outgoing.pierceFireWall(token: request.token))
-            framed = FramedLink(link, maxFrame: FrameCaps.peerInit)
+            framed = FramedLink(
+                try await TCPLink.connect(host: request.ip, port: request.port, timeout: config.peerConnectTimeout),
+                maxFrame: FrameCaps.peerInit)
+            await client.attach(framed, to: slot)
+            try await framed.send(Outgoing.pierceFireWall(token: request.token))
             // FileTransferInit: the uploader names the transfer by the token from its TransferRequest.
             let raw = try await framed.readRaw(4, timeout: config.peerReadTimeout)
             token = UInt32(raw[0]) | UInt32(raw[1]) << 8 | UInt32(raw[2]) << 16 | UInt32(raw[3]) << 24
         } catch {
             await client.notePeerConnectFailure()
+            await client.releasePeerSlot(slot)
             return
         }
-        guard let claim = await client.claimFileConnection(peer: request.username, token: token, link: framed) else {
+        guard
+            let claim = await client.claimFileConnection(
+                peer: request.username, token: token, link: framed, slot: slot)
+        else {
             framed.close()
+            await client.releasePeerSlot(slot)
             return
         }
-        claim.signals.yield(.fileConnection(framed, size: claim.size))
+        // The download may have ended (timeout, cancel) in the meantime; then nobody will read this link.
+        if case .terminated = claim.signals.yield(.fileConnection(framed, size: claim.size)) {
+            framed.close()
+        }
     }
 
     // MARK: - Actor-side routing
@@ -257,8 +277,11 @@ extension SoulseekClient {
     }
 
     func unregisterTransfer(_ id: UUID) {
-        transfers[id]?.signals.finish()
-        transfers[id] = nil
+        guard let entry = transfers.removeValue(forKey: id) else { return }
+        entry.signals.finish()
+        entry.fileLink?.close()
+        if let slot = entry.fileSlot { releasePeerSlot(slot) }
+        closeIdleLinks(for: entry.peer)
     }
 
     /// The reply to a TransferRequest, plus the signal to deliver once the reply is on the wire. Sending first matters:
@@ -271,8 +294,8 @@ extension SoulseekClient {
         func deliver() { if let signal { signals?.yield(signal) } }
     }
 
-    /// Answers a peer's TransferRequest. Only uploads *to* us for a file we queued, at a size no larger than the
-    /// search result, are accepted; pointFlac never uploads (§2).
+    /// Answers a peer's TransferRequest. Only uploads *to* us for a file we queued, at exactly the size from the search
+    /// result, are accepted; pointFlac never uploads (§2).
     func handleTransferRequest(peer: String, direction: UInt32, token: UInt32, path: String, size: Int64?)
         -> TransferReply
     {
@@ -287,7 +310,8 @@ extension SoulseekClient {
         else {
             return TransferReply(bytes: Outgoing.transferResponse(token: token, allowed: false, reason: "Cancelled"))
         }
-        guard let size, size > 0, size <= entry.expectedSize else {
+        // Exactly the size from search: larger is hostile (§5.6), smaller would end as a truncated "finished" file.
+        guard let size, size > 0, size == entry.expectedSize, size <= configuration.maxFileSize else {
             return TransferReply(
                 bytes: Outgoing.transferResponse(token: token, allowed: false, reason: "Cancelled"),
                 signal: .sizeMismatch(expected: entry.expectedSize, announced: size ?? 0), signals: entry.signals)
@@ -314,13 +338,14 @@ extension SoulseekClient {
         }
     }
 
-    func claimFileConnection(peer: String, token: UInt32, link: FramedLink) -> (
+    func claimFileConnection(peer: String, token: UInt32, link: FramedLink, slot: UUID) -> (
         signals: AsyncStream<TransferSignal>.Continuation, size: Int64
     )? {
         for (id, entry) in transfers where entry.peer == peer {
             if case .awaitingFile(let expectedToken, let size) = entry.phase, expectedToken == token {
                 transfers[id]?.phase = .receiving
                 transfers[id]?.fileLink = link
+                transfers[id]?.fileSlot = slot
                 return (entry.signals, size)
             }
         }
@@ -346,7 +371,8 @@ extension SoulseekClient {
     }
 
     func resolveAddress(username: String, address: PeerAddress) {
-        let usable = address.port > 0 && address.ip != "0.0.0.0" ? address : nil
+        let routable = configuration.allowPrivatePeerAddresses || AddressPolicy.isPublic(address.ip)
+        let usable = address.port > 0 && address.ip != "0.0.0.0" && routable ? address : nil
         for (id, waiter) in addressWaiters where waiter.username == username {
             addressWaiters[id] = nil
             waiter.continuation.resume(returning: usable)
