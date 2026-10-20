@@ -19,11 +19,18 @@
     /// retain/release traffic.
     ///
     /// ## Stopping, and swapping what the callback reads
-    /// Each callback holds the context's in-flight count up for its whole run. `stop()` calls `AudioOutputUnitStop`
-    /// and then waits, bounded and with short sleeps, for the count to reach zero. So it returns only once no render
-    /// call is in flight, without relying on `AudioOutputUnitStop` being synchronous (it is not documented to be).
-    /// Setting `source` publishes the new pointer and waits the same way before releasing the old source, so a callback
-    /// is never left holding a freed one.
+    /// Each callback raises the context's in-flight count for its whole run, then checks the context's `enabled` flag
+    /// before touching anything else. `stop()` clears that flag, calls `AudioOutputUnitStop`, and waits, bounded and
+    /// with short sleeps, for the in-flight count to reach zero. When it returns:
+    /// - no render call is in flight;
+    /// - any callback that starts later outputs flagged silence and touches neither the source, the capture nor the
+    ///   latency timestamps. That covers a callback the unit delivers after `AudioOutputUnitStop` returns, which is not
+    ///   documented either way.
+    ///
+    /// So while stopped the pipeline may flush, replace or drop the source, and `start()` may reset its timestamps,
+    /// without racing the render thread. Neither guarantee relies on `AudioOutputUnitStop` being synchronous. Setting
+    /// `source` publishes the new pointer and waits the same way before releasing the old source, so a callback is
+    /// never left holding a freed one. The waits are bounded at 2 s; past that, see `retire`.
     ///
     /// The owner serialises `configure`, `start`, `stop` and `source` (and, in DEBUG, `installCapture`), as the
     /// `AudioOutput` contract says. `firstRenderLatency` and, in DEBUG, `capturedBytes` read atomics, so they may be
@@ -33,6 +40,11 @@
         let unit: AudioUnit
         private let context: RenderContext
         private var running = false
+        /// The sample rate on the unit's hardware side (output scope, bus 0), read at the end of the last successful
+        /// `configure`. On a device it should equal the plan's client rate; when it does not, iOS resamples after the
+        /// unit, which pointFlac must never allow silently. On the simulator it is the Mac output device's rate,
+        /// whatever the session reports (spike S1). Nil before a successful `configure`, or if the unit does not say.
+        public private(set) var hardwareSideSampleRate: Int?
         /// The strong reference behind the context's unretained `source`.
         private var renderSource: RenderSource?
         #if DEBUG
@@ -42,8 +54,8 @@
 
         /// Creates the RemoteIO unit and installs the render callback. The unit is initialised by `configure`.
         ///
-        /// - Throws: `AudioOutputError.unitUnavailable` with the system's status, or `kAudio_UnimplementedError` if
-        ///   there is no RemoteIO component at all.
+        /// - Throws: `AudioOutputError.unitUnavailable` with the system's status, or with `kAudio_UnimplementedError`
+        ///   if there is no RemoteIO component at all.
         public init() throws {
             var description = AudioComponentDescription(
                 componentType: kAudioUnitType_Output, componentSubType: kAudioUnitSubType_RemoteIO,
@@ -69,10 +81,20 @@
         }
 
         deinit {
+            context.enabled.store(false, ordering: .sequentiallyConsistent)
             AudioOutputUnitStop(unit)
-            // Like `retire`: should a render call still be in flight, leak the context rather than free it under it.
+            // Like `retire`: should a render call still be in flight, leak everything it can read unretained (the
+            // context, the source and the capture) rather than free it under it.
             if !waitForRenderCalls() {
                 _ = Unmanaged.passRetained(context)
+                if let renderSource {
+                    _ = Unmanaged.passRetained(renderSource)
+                }
+                #if DEBUG
+                    if let captureBuffer {
+                        _ = Unmanaged.passRetained(captureBuffer)
+                    }
+                #endif
             }
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
@@ -83,6 +105,7 @@
         public var source: RenderSource? {
             get { renderSource }
             set {
+                assert(!running, "RemoteIOOutput.source set while started")
                 let old = renderSource
                 renderSource = newValue
                 context.source.store(newValue.map { .passUnretained($0) }, ordering: .sequentiallyConsistent)
@@ -101,6 +124,7 @@
         public func configure(_ plan: OutputPlan, channels: Int) throws {
             precondition(channels > 0, "RemoteIOOutput needs at least one channel")
             stop()
+            hardwareSideSampleRate = nil
             // Harmless before the first `configure`. The stream format can only change on an uninitialised unit.
             AudioUnitUninitialize(unit)
             let bytesPerFrame = UInt32(channels * MemoryLayout<UInt32>.size)
@@ -116,6 +140,13 @@
             guard set == noErr else { throw AudioOutputError.formatRejected(set) }
             let initialised = AudioUnitInitialize(unit)
             guard initialised == noErr else { throw AudioOutputError.formatRejected(initialised) }
+            var hardware = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            let read = AudioUnitGetProperty(
+                unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &hardware, &size)
+            if read == noErr, hardware.mSampleRate > 0 {
+                hardwareSideSampleRate = Int(hardware.mSampleRate.rounded())
+            }
         }
 
         /// Starts the unit. `firstRenderLatency` is measured afresh from here.
@@ -123,15 +154,22 @@
         /// - Throws: `AudioOutputError.startFailed` with the unit's status.
         public func start() throws {
             guard !running else { return }
+            // Rendering is disabled until the store below, so no callback writes these meanwhile.
             context.firstRealAt.store(0, ordering: .relaxed)
-            context.startedAt.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ordering: .releasing)
+            context.startedAt.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ordering: .relaxed)
+            context.enabled.store(true, ordering: .sequentiallyConsistent)
             let status = AudioOutputUnitStart(unit)
-            guard status == noErr else { throw AudioOutputError.startFailed(status) }
+            guard status == noErr else {
+                stop()
+                throw AudioOutputError.startFailed(status)
+            }
             running = true
         }
 
-        /// Stops the unit and returns only once no render call is in flight.
+        /// Stops the unit. Returns only once no render call is in flight, and from then on any callback outputs flagged
+        /// silence without touching the source (see the class notes).
         public func stop() {
+            context.enabled.store(false, ordering: .sequentiallyConsistent)
             if running {
                 AudioOutputUnitStop(unit)
                 running = false
@@ -159,6 +197,13 @@
             Unmanaged.passUnretained(context).toOpaque()
         }
 
+        /// Whether the callback renders: `start()` sets it and `stop()` clears it. Internal so tests can call the
+        /// callback directly on a stopped unit, both ways.
+        var renderingEnabled: Bool {
+            get { context.enabled.load(ordering: .sequentiallyConsistent) }
+            set { context.enabled.store(newValue, ordering: .sequentiallyConsistent) }
+        }
+
         #if DEBUG
             /// Debug and tests only. From now on the render callback copies the real frames it renders into a buffer
             /// of `byteCapacity` bytes allocated here, and drops what no longer fits. Only the real-frame prefix that
@@ -170,6 +215,7 @@
             /// speakers. Verification is unaffected: the copy is taken before the unit, of exactly what pointFlac
             /// handed it.
             func installCapture(byteCapacity: Int) {
+                assert(!running, "RemoteIOOutput.installCapture while started")
                 let buffer = CaptureBuffer(byteCapacity: byteCapacity)
                 let old = captureBuffer
                 captureBuffer = buffer
@@ -194,9 +240,10 @@
         /// Waits, with short sleeps, until no render call is in flight. Returns false if one is still running after
         /// two seconds; a render call takes well under a millisecond, so that means something is badly wrong.
         ///
-        /// Why a callback that has not started yet cannot be missed: the count and the published pointers are
-        /// sequentially consistent. A callback that read the old pointer raised the count before reading it, so
-        /// once the new pointer is stored, the count stays above zero until that callback has returned.
+        /// Why a callback cannot slip past: the count, `enabled` and the published pointers are all sequentially
+        /// consistent, and a callback raises the count before it reads any of them. So once `enabled` is cleared or a
+        /// new pointer is stored, a callback that saw the old value is still counted until it returns. A callback that
+        /// starts after that sees the new value.
         @discardableResult
         private func waitForRenderCalls() -> Bool {
             let deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 2_000_000_000
@@ -218,12 +265,15 @@
     private final class RenderContext {
         /// Render calls running right now: raised on entry, lowered on return.
         let inFlight = Atomic<Int>(0)
+        /// Set by `start()`, cleared by `stop()`. While clear, a callback outputs flagged silence and touches nothing
+        /// else.
+        let enabled = Atomic<Bool>(false)
         /// The source to render from, unretained (`RemoteIOOutput.source` holds it). Nil plays silence.
         let source = Atomic<Unmanaged<RenderSource>?>(nil)
         /// `CLOCK_UPTIME_RAW` nanoseconds at the latest `start()`.
         let startedAt = Atomic<UInt64>(0)
         /// The same clock at the first callback since then that delivered real frames; 0 until one has. Written only
-        /// by the callback, and by `start()` while stopped.
+        /// by the callback, and by `start()` while rendering is disabled.
         let firstRealAt = Atomic<UInt64>(0)
         #if DEBUG
             /// The capture, unretained (`RemoteIOOutput` holds it). Nil: no capture, and the audio reaches the unit.
@@ -240,15 +290,20 @@
             guard let ioData else { return }
             let buffers = Self.buffers(of: ioData)
             let bufferCount = Int(ioData.pointee.mNumberBuffers)
+            // Stopped (or stopping): silence, without reading the source, the capture or the timestamps.
+            guard enabled.load(ordering: .sequentiallyConsistent) else {
+                Self.silence(buffers, count: bufferCount, flags)
+                return
+            }
             // The client format is interleaved, so there is exactly one buffer.
             guard bufferCount == 1, let data = buffers[0].mData,
-                let source = source.load(ordering: .sequentiallyConsistent)
+                let current = source.load(ordering: .sequentiallyConsistent)
             else {
                 Self.silence(buffers, count: bufferCount, flags)
                 return
             }
             let byteSize = Int(buffers[0].mDataByteSize)
-            let realBytes = source._withUnsafeGuaranteedRef { rendering in
+            let realBytes = current._withUnsafeGuaranteedRef { rendering in
                 let bytesPerFrame = rendering.channels * MemoryLayout<UInt32>.size
                 let fit = min(frames, byteSize / bytesPerFrame)
                 let real = rendering.render(into: data, frames: fit)
@@ -263,8 +318,8 @@
                 firstRealAt.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ordering: .releasing)
             }
             #if DEBUG
-                if let capture = capture.load(ordering: .sequentiallyConsistent) {
-                    capture._withUnsafeGuaranteedRef { $0.append(data, byteCount: realBytes) }
+                if let activeCapture = capture.load(ordering: .sequentiallyConsistent) {
+                    activeCapture._withUnsafeGuaranteedRef { $0.append(data, byteCount: realBytes) }
                     // Muted: the capture already holds what pointFlac handed the unit.
                     Self.silence(buffers, count: bufferCount, flags)
                     return

@@ -14,7 +14,9 @@
                 #expect(actual > 0)
                 #expect(actual == Int(AVAudioSession.sharedInstance().sampleRate))
                 #if targetEnvironment(simulator)
-                    // The simulator honours every rate (the S3 finding). Not expected on a device.
+                    // The simulator honours every rate (the S3 finding), but only in what AVAudioSession reports:
+                    // the unit's hardware side stays at the Mac device's rate and the simulator resamples after
+                    // the unit (see S1). Not expected on a device.
                     #expect(actual == requested)
                 #endif
                 print("S3: requested=\(requested) actual=\(actual) port=\(session.currentPort)")

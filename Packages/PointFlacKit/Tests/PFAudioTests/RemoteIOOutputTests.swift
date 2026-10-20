@@ -1,6 +1,7 @@
 #if os(iOS)
     import AVFoundation
     import AudioToolbox
+    import CoreAudio
     import Foundation
     import PFCore
     import PFDSP
@@ -157,21 +158,44 @@
         return String(format: "%.1f ms", Double(seconds) * 1_000 + Double(attoseconds) / 1e15)
     }
 
-    /// One call of the real render callback on a buffer pre-filled with 0xAA, so untouched bytes would show. Returns
-    /// the bytes the unit would get and whether the call flagged them as silence.
-    private func renderOnce(_ output: RemoteIOOutput, frames: Int) -> (bytes: [UInt8], silent: Bool) {
+    /// One call of the real render callback on `bufferCount` stereo buffers of `frames` frames, pre-filled with 0xAA
+    /// so untouched bytes would show, or with no data pointers at all. Returns every buffer's bytes, concatenated,
+    /// and whether the call flagged them as silence.
+    private func renderOnce(
+        _ output: RemoteIOOutput, frames: Int, bufferCount: Int = 1, withData: Bool = true
+    ) -> (bytes: [UInt8], silent: Bool) {
         let byteSize = frames * 2 * 4
-        let data = UnsafeMutableRawPointer.allocate(byteCount: byteSize, alignment: 16)
-        defer { data.deallocate() }
-        data.initializeMemory(as: UInt8.self, repeating: 0xAA, count: byteSize)
-        var list = AudioBufferList(
-            mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(byteSize), mData: data))
+        let list = AudioBufferList.allocate(maximumBuffers: bufferCount)
+        defer { free(list.unsafeMutablePointer) }
+        var storage: [UnsafeMutableRawPointer] = []
+        defer {
+            for bytes in storage { bytes.deallocate() }
+        }
+        for i in 0..<bufferCount {
+            var data: UnsafeMutableRawPointer?
+            if withData {
+                let bytes = UnsafeMutableRawPointer.allocate(byteCount: byteSize, alignment: 16)
+                bytes.initializeMemory(as: UInt8.self, repeating: 0xAA, count: byteSize)
+                storage.append(bytes)
+                data = bytes
+            }
+            list[i] = AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(byteSize), mData: data)
+        }
         var flags = AudioUnitRenderActionFlags()
         var timeStamp = AudioTimeStamp()
-        let status = remoteIORender(output.renderRefCon, &flags, &timeStamp, 0, UInt32(frames), &list)
+        let status = remoteIORender(
+            output.renderRefCon, &flags, &timeStamp, 0, UInt32(frames), list.unsafeMutablePointer)
         #expect(status == noErr)
-        let bytes = [UInt8](UnsafeRawBufferPointer(start: data, count: byteSize))
+        let bytes = storage.flatMap { [UInt8](UnsafeRawBufferPointer(start: $0, count: byteSize)) }
         return (bytes, flags.contains(.unitRenderAction_OutputIsSilence))
+    }
+
+    /// A source holding `frames` stereo frames of distinct, non-zero words.
+    private func filledSource(frames: Int) -> (source: RenderSource, bytes: [UInt8]) {
+        let words = (0..<(frames * 2)).map { UInt32(0x0101_0101) &* UInt32($0 + 1) }
+        let source = RenderSource(channels: 2, capacityFrames: 64, renderedFrames: 0, inheritingHoldsFrom: nil)
+        #expect(words.withUnsafeBufferPointer { source.write($0) } == words.count)
+        return (source, words.withUnsafeBytes { [UInt8]($0) })
     }
 
     // MARK: - Tests
@@ -188,12 +212,11 @@
             let client = streamFormat(output, kAudioUnitScope_Input)
             let hardware = streamFormat(output, kAudioUnitScope_Output)
             #expect(isClientFormat(client, .float32, rate: rate, channels: 2), "client side: \(describe(client))")
-            #if targetEnvironment(simulator)
-                // The simulator's hardware side is the Mac's output device (48 kHz Float32 here) whatever rate the
-                // session reports, so it resamples anything else itself (an S1 finding, in the spike doc).
-            #else
-                // Client rate == hardware rate, so RemoteIO has nothing to resample.
-                #expect(hardware?.mSampleRate == Double(rate), "hardware side: \(describe(hardware))")
+            #expect(output.hardwareSideSampleRate == hardware.map { Int($0.mSampleRate) })
+            #if !targetEnvironment(simulator)
+                // Client rate == hardware rate, so RemoteIO has nothing to resample. The simulator's hardware side
+                // stays at the Mac device's rate instead (`reportsHardwareSideRate`).
+                #expect(output.hardwareSideSampleRate == rate, "hardware side: \(describe(hardware))")
             #endif
             print("S1: float32 accepted; client \(describe(client)); hardware \(describe(hardware))")
         }
@@ -209,6 +232,23 @@
                 print("S1: int32 accepted; client \(describe(client)); hardware \(describe(hardware))")
             } catch AudioOutputError.formatRejected(let status) {
                 print("S1: int32 rejected(\(status))")
+            }
+        }
+
+        /// The rate on the unit's hardware side for each client rate the session gives. On a device the two must match:
+        /// iOS never resamples silently. The simulator's hardware side stays at the Mac output device's rate whatever
+        /// the session reports, so there the lines are the record of that S1 finding.
+        @Test func reportsHardwareSideRate() async throws {
+            let (session, _) = try await activeSession()
+            for requested in [44_100, 96_000, 48_000] {
+                let rate = await session.requestSampleRate(requested)
+                let output = try RemoteIOOutput()
+                try output.configure(clientPlan(.float32, rate), channels: 2)
+                let hardware = try #require(output.hardwareSideSampleRate, "requested \(requested)")
+                print("S1: hw-side \(hardware) for client \(rate)")
+                #if !targetEnvironment(simulator)
+                    #expect(hardware == rate, "requested \(requested): iOS resamples after the unit")
+                #endif
             }
         }
 
@@ -232,14 +272,18 @@
             let wanted = OutputFormatPolicy.plan(source: format, hardwareRate: f.sampleRate, capabilities: capabilities)
             #expect(plan == wanted, "\(name): the hardware did not take \(f.sampleRate) Hz")
             #expect(plan.client == .float32 && plan.reduceTo24 == (f.bits > 24))
+            #if !targetEnvironment(simulator)
+                #expect(output.hardwareSideSampleRate == plan.clientSampleRate, "\(name): iOS resamples after the unit")
+            #endif
 
             let captured = output.capturedBytes
             let expected = expectedBytes(Fixtures.rawSamples(f), bits: f.bits, plan: plan)
             #expect(expected.count == byteCount)
             #expect(mismatch(captured, expected) == nil, "\(name)")
+            let hardwareSide = output.hardwareSideSampleRate.map(String.init) ?? "nil"
             print(
                 "S1: capture \(name) client=\(plan.client) reduceTo24=\(plan.reduceTo24) bytes=\(captured.count) "
-                    + "exact=\(captured == expected)")
+                    + "exact=\(captured == expected) hw-side=\(hardwareSide)")
         }
 
         /// Ruling 2: the Int32 client, when RemoteIO takes it, carries 32-bit samples exactly (b = 32, shift 0).
@@ -265,6 +309,9 @@
                 "\(name): no queueEnded")
             let plan = try #require(firstPlan(events), "\(name): no planChanged in \(events)")
             #expect(plan == clientPlan(.int32, f.sampleRate), "\(name): plan \(plan)")
+            #if !targetEnvironment(simulator)
+                #expect(output.hardwareSideSampleRate == plan.clientSampleRate, "\(name): iOS resamples after the unit")
+            #endif
 
             let raw = Fixtures.rawSamples(f)
             let captured = output.capturedBytes
@@ -296,25 +343,19 @@
             #expect(endToEnd < .milliseconds(150))
         }
 
-        /// Rulings 3, 5 and 6 at the callback itself, called directly while the unit is stopped: with no source it
-        /// plays flagged silence; without a capture the rendered audio reaches the unit; with one, only the real-frame
-        /// prefix is captured, within its capacity, and the unit gets flagged silence.
+        /// Rulings 3, 5 and 6 at the callback itself, called directly on a stopped unit with rendering switched on by
+        /// hand: with no source it plays flagged silence; without a capture the rendered audio reaches the unit; with
+        /// one, only the real-frame prefix is captured, within its capacity, and the unit gets flagged silence.
         @Test func renderCallbackCapturesRealPrefixAndMutes() throws {
             let frames = 16
-            let realFrames = 10
-            let words = (0..<(realFrames * 2)).map { UInt32(0x0101_0101) &* UInt32($0 + 1) }
-            let wordBytes = words.withUnsafeBytes { [UInt8]($0) }
             let zeros = [UInt8](repeating: 0, count: frames * 2 * 4)
-            func filledSource() -> RenderSource {
-                let source = RenderSource(channels: 2, capacityFrames: 64, renderedFrames: 0, inheritingHoldsFrom: nil)
-                #expect(words.withUnsafeBufferPointer { source.write($0) } == words.count)
-                return source
-            }
 
             let plain = try RemoteIOOutput()
+            plain.renderingEnabled = true
             let idle = renderOnce(plain, frames: frames)
             #expect(idle.bytes == zeros && idle.silent, "no source")
-            plain.source = filledSource()
+            let (first, wordBytes) = filledSource(frames: 10)
+            plain.source = first
             let playing = renderOnce(plain, frames: frames)
             #expect(playing.bytes == wordBytes + zeros.dropFirst(wordBytes.count) && !playing.silent, "no capture")
             let underrun = renderOnce(plain, frames: frames)
@@ -322,19 +363,55 @@
 
             let capturing = try RemoteIOOutput()
             capturing.installCapture(byteCapacity: 4096)
-            let source = filledSource()
+            capturing.renderingEnabled = true
+            let (source, _) = filledSource(frames: 10)
             capturing.source = source
             let muted = renderOnce(capturing, frames: frames)
             #expect(muted.bytes == zeros && muted.silent, "capture mode reaches the unit as silence")
             #expect(renderOnce(capturing, frames: frames).silent)
             #expect([UInt8](capturing.capturedBytes) == wordBytes, "real frames only, no underrun silence")
-            #expect(source.renderedFrames == Int64(realFrames))
+            #expect(source.renderedFrames == 10)
 
             let small = try RemoteIOOutput()
             small.installCapture(byteCapacity: 12)
-            small.source = filledSource()
+            small.renderingEnabled = true
+            small.source = filledSource(frames: 10).source
             _ = renderOnce(small, frames: frames)
             #expect([UInt8](small.capturedBytes) == Array(wordBytes.prefix(12)), "bounded by its capacity")
+        }
+
+        /// Every path on which the callback cannot or must not render: flagged silence in every buffer it was given,
+        /// and the source and the capture left untouched.
+        @Test func renderCallbackIsSilentWhenItCannotRender() throws {
+            let frames = 16
+            let zeros = [UInt8](repeating: 0, count: frames * 2 * 4)
+            let output = try RemoteIOOutput()
+            output.installCapture(byteCapacity: 4096)
+
+            // Capture installed but no source: nothing to capture.
+            output.renderingEnabled = true
+            let sourceless = renderOnce(output, frames: frames)
+            #expect(sourceless.bytes == zeros && sourceless.silent, "capture without a source")
+
+            let (source, wordBytes) = filledSource(frames: 10)
+            output.renderingEnabled = false
+            output.source = source
+            // Stopped: as a stopped unit's late callback would see it. A fresh unit starts disabled.
+            let disabled = renderOnce(output, frames: frames)
+            #expect(disabled.bytes == zeros && disabled.silent, "rendering disabled")
+            #expect(try RemoteIOOutput().renderingEnabled == false)
+
+            output.renderingEnabled = true
+            let twoBuffers = renderOnce(output, frames: frames, bufferCount: 2)
+            #expect(twoBuffers.bytes == zeros + zeros && twoBuffers.silent, "mNumberBuffers != 1")
+            let noData = renderOnce(output, frames: frames, withData: false)
+            #expect(noData.bytes.isEmpty && noData.silent, "nil mData")
+            #expect(source.renderedFrames == 0, "the source was rendered from")
+            #expect(output.capturedBytes.isEmpty, "something was captured")
+
+            // The same source still renders once the callback can.
+            #expect(renderOnce(output, frames: frames).silent)
+            #expect([UInt8](output.capturedBytes) == wordBytes)
         }
     }
 #endif

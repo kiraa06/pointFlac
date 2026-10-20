@@ -27,9 +27,16 @@ atomics. A Release build was disassembled to check this. The callback calls only
 resilient overlay, so using it meant runtime metadata calls and a dynamically sized stack slot on the real-time
 thread.
 
-`stop()` returns only once no render call is in flight. It does not rely on `AudioOutputUnitStop` being synchronous.
-Instead it waits, with a 2 s bound and short sleeps, on an atomic in-flight count that the callback raises on entry and
-lowers on return.
+`stop()` does not rely on `AudioOutputUnitStop` being synchronous. Each callback raises an atomic in-flight count on
+entry and lowers it on return, and checks an atomic `enabled` flag first. `stop()` works in three steps:
+
+1. It clears the flag.
+2. It calls `AudioOutputUnitStop`.
+3. It waits, with a 2 s bound and short sleeps, for the in-flight count to reach zero.
+
+When `stop()` returns, no render call is in flight. Any callback that starts later outputs flagged silence and touches
+neither the source, the capture nor the latency timestamps. That covers a callback the unit delivers after
+`AudioOutputUnitStop` returns.
 
 ## How the capture works
 
@@ -53,11 +60,14 @@ iPhone 17 Pro simulator, iOS 26.5 runtime, Xcode 26.6, built-in output (2026-10-
 ```
 S1: float32 accepted; client 48000 Hz 32-bit float 2 ch interleaved; hardware 48000 Hz 32-bit float 2 ch non-interleaved
 S1: int32 accepted; client 48000 Hz 32-bit sint 2 ch interleaved; hardware 48000 Hz 32-bit float 2 ch non-interleaved
-S1: capture s16-48000 client=float32 reduceTo24=false bytes=32768 exact=true
-S1: capture s24-48000 client=float32 reduceTo24=false bytes=32768 exact=true
-S1: capture s32-48000 client=float32 reduceTo24=true bytes=32768 exact=true
+S1: hw-side 48000 for client 44100
+S1: hw-side 48000 for client 96000
+S1: hw-side 48000 for client 48000
+S1: capture s16-48000 client=float32 reduceTo24=false bytes=32768 exact=true hw-side=48000
+S1: capture s24-48000 client=float32 reduceTo24=false bytes=32768 exact=true hw-side=48000
+S1: capture s32-48000 client=float32 reduceTo24=true bytes=32768 exact=true hw-side=48000
 S1: int32 passthrough s32-48000 bytes=32768 exact=true
-S1: firstRenderLatency=22.4 ms endToEnd=23.6 ms
+S1: firstRenderLatency=16.9 ms endToEnd=18.1 ms
 ```
 
 A run forced onto the 44.1 kHz fixtures was also exact for all four captures (`s16-44100`, `s24-44100`, `s32-44100`
@@ -82,12 +92,14 @@ and the `s32-44100` Int32 passthrough). That run's end-to-end figure included a 
 
 The unit's hardware side (output scope, bus 0) reads 48 kHz Float32 non-interleaved: the Mac's output device. It reads
 the same with the session at 44.1, 48 or 96 kHz, even though `AVAudioSession` reports the requested rate (spike S3).
-So:
+`reportsHardwareSideRate` reproduces this on every run: it requests 44.1, 96 and 48 kHz, configures at each rate the
+session gives, and prints the `S1: hw-side` lines above, read from `RemoteIOOutput.hardwareSideSampleRate`. So:
 
 - The simulator converts an Int32 client to Float32 inside the unit. "Int32 accepted" says only that RemoteIO takes the
   format, not that 32 bits reach any output.
-- At session rates other than the Mac's, the simulator resamples internally. `acceptsFloat32Client` therefore checks
-  hardware rate == client rate only on a device.
+- At session rates other than the Mac's, the simulator resamples after the unit. So the check that the hardware-side
+  rate equals the client rate (iOS never resamples silently) runs only on a device. It is in `acceptsFloat32Client`,
+  `reportsHardwareSideRate` and both capture tests.
 
 ## Ruling R13: `OutputCapabilities.current` stays `int32Passthrough: false`
 
@@ -97,7 +109,7 @@ Plan 1 keeps `current` at `false` despite the simulator accepting Int32:
 - The simulator runs on the Mac's CoreAudio, not on iPhone hardware, and its hardware side is Float32 anyway.
 
 So 32-bit sources are TPDF-dithered to 24 bits on the Float32 client, and the signal strip says so. Spec §5.2 accepts
-this as a disclosed limit: 24 significant bits is far below any DAC's noise floor.
+this as a disclosed limit: the 24-bit TPDF quantisation noise (about −144 dBFS) is below any DAC's noise floor.
 
 If this is wrong, the cost is that 32-bit files get 24-bit TPDF on hardware that might take 32-bit. That is inaudible,
 honestly disclosed, and fixed later by flipping one line. `current` flips only on the device evidence below.
@@ -120,6 +132,9 @@ The device run needs an Xcode build that supports the iPhone 17 Pro's iOS 27.2 b
 3. Record every `S1:` line here. Expected results:
    - Float32 accepted, with the hardware rate equal to the client rate. The device-only expectation in
      `acceptsFloat32Client` checks this.
+   - The `S1: hw-side <rate> for client <rate>` lines from `reportsHardwareSideRate`, **especially at 44.1 kHz**. The
+     hardware side must read 44100 for client 44100. If it reads 48000, iOS resamples after the unit on that route,
+     so 44.1 kHz files are not untouched there. The device-only expectation fails, and the finding goes here.
    - Exact captures at 48 kHz, or at 44.1 kHz if the route runs there. The tests pick the matching fixtures.
    - `firstRenderUnder150ms` passing.
    - Whether Int32 is accepted on a device. Also record the hardware-side format line, which shows whether the unit

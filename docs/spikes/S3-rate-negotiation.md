@@ -14,7 +14,9 @@ S3: requested=48000 actual=48000 port=builtIn
 S3: requested=96000 actual=96000 port=builtIn
 ```
 
-The simulator follows the request exactly. It says nothing about real hardware, which may refuse.
+The simulator follows the request exactly, but only in what `AVAudioSession` reports. The RemoteIO unit's hardware
+side stays at the Mac output device's rate (48 kHz here), and the simulator resamples after the unit; see
+`S1-output-path.md`. It says nothing about real hardware, which may refuse.
 
 ## iPhone 17 Pro + EarPods
 
