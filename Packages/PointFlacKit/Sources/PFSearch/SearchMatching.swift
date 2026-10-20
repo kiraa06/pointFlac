@@ -1,8 +1,11 @@
-/// The one-edit typo rule (spec §4.6, §5.5): tokens of four or more letters may be one substitution, insertion,
+/// The one-edit typo rule (spec §4.6, §5.5): tokens of five or more letters may be one substitution, insertion,
 /// deletion or adjacent transposition away from a word, or from the start of one, since the user is still typing.
 enum SearchMatching {
-    /// Typo tolerance starts at this many letters; shorter tokens have too many neighbours to be useful.
-    static let minimumTypoLength = 4
+    /// Typo tolerance starts at this many letters. At four, "beat" found "Bear" and "Bertrand" and "wish" found
+    /// "With": short words have too many neighbours one edit away for a typo match to mean anything.
+    static let minimumTypoLength = 5
+    /// Matching inside words (spec §5.5 tier 3, "love" in "Glove", "ヒカル" in "宇多田ヒカル") starts at three letters.
+    static let minimumSubstringLength = 3
 
     /// Whether `query` is within one edit of `word` or of a prefix of `word`, but not an exact prefix of it (that is a
     /// prefix match, ranked above a typo).

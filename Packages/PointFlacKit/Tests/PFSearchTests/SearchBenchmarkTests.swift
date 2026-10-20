@@ -86,7 +86,7 @@ enum SyntheticLibrary {
 }
 
 /// Spec §8: keystroke → local results in < 8 ms of work (one 120 Hz frame). Asserted at 10k tracks on the host, with
-/// the CI tolerance (`LatencyBudget`); 100k is measured and printed, not gated, until spike S5 runs on the device.
+/// the CI tolerance (`LatencyBudget`); the 100k test below holds the same budget. Both need an unsanitized build.
 @Test func searchMeetsTheFrameBudgetAt10kTracks() {
     let catalog = SyntheticLibrary.catalog()
     #expect(catalog.tracks.count == 10_000)

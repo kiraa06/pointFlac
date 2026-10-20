@@ -9,9 +9,11 @@ public struct LibraryHit: Sendable, Hashable, Identifiable {
         case track
     }
 
-    /// How the hit matched, worst token first: one typo makes the whole hit fuzzy.
+    /// How the hit matched, worst token first: one typo makes the whole hit fuzzy, one word found only inside another
+    /// makes it a substring hit.
     public enum Match: Int, Sendable, Hashable, Comparable {
         case fuzzy
+        case substring
         case prefix
         case exact
 
@@ -52,12 +54,12 @@ public struct LibrarySearchResults: Sendable {
 /// - Documents are albums (title, artist), artists (name) and tracks (title, artist, album).
 /// - The vocabulary is every distinct folded token (`TextFolding`), sorted, flat. Each token has postings: document,
 ///   field, word position, and whether it is a piece of a punctuated word.
-/// - Each query token matches vocabulary words exactly, as a prefix, or with one typo (tokens of 4+ letters).
-///   Documents must match every query token (AND).
+/// - Each query token matches vocabulary words exactly, as a prefix, inside the word (3+ letters: "ove" in "Love",
+///   "ヒカル" in "宇多田ヒカル"), or with one typo (5+ letters). Documents must match every query token (AND).
 /// - Ranking, highest first: no typo at all; the query is the whole title; the title starts with the query; the sum
-///   of match quality (exact 100, prefix 60, typo 25) × field weight (title 4, artist 2, album 2); albums, then
-///   artists, then tracks; shorter titles; library order. That is the spec's order: exact title, title word, title
-///   start, artist or album word, typo.
+///   of match quality (exact 100, prefix 60, substring 40, typo 25) × field weight (title 4, artist 2, album 2);
+///   albums, then artists, then tracks; shorter titles; library order. That is the spec's order: exact title, title
+///   word, title start, title substring, artist or album word, typo.
 public final class SearchIndex: Sendable {
     public typealias Token = TextFolding.Token
 
@@ -70,6 +72,7 @@ public final class SearchIndex: Sendable {
     private static let fieldWeights: [Int32] = [4, 2, 2]
     private static let exactQuality: Int32 = 100
     private static let prefixQuality: Int32 = 60
+    private static let substringQuality: Int32 = 40
     private static let typoQuality: Int32 = 25
 
     // Documents, in library order: albums, then artists, then tracks album by album.
@@ -280,6 +283,8 @@ public final class SearchIndex: Sendable {
         var quality: Int32
         var exact: Bool
         var typo: Bool
+        /// Found inside the word, not at its start (spec §5.5 tier 3).
+        var substring: Bool
     }
 
     /// Every document that matches all `tokens`, with its ranking key.
@@ -294,6 +299,7 @@ public final class SearchIndex: Sendable {
         var titleRun = [UInt8](repeating: 0, count: count)
         var exactTitleRun = [UInt8](repeating: 0, count: count)
         var exactWords = [UInt8](repeating: 0, count: count)
+        var substringsOnly = [UInt8](repeating: 0, count: count)
         var typos = [UInt8](repeating: 0, count: count)
         var touched: [Int32] = []
 
@@ -327,7 +333,9 @@ public final class SearchIndex: Sendable {
                             var flag = flags[document]
                             if !match.typo { flag |= 4 }
                             if match.exact { flag |= 8 }
-                            if field == 0, Int(posting & 0x7F) == index {
+                            if !match.typo, !match.substring { flag |= 16 }
+                            // A match inside a word never makes the title "start with" the query.
+                            if field == 0, Int(posting & 0x7F) == index, !match.substring {
                                 flag |= 1
                                 if match.exact, posting & 0x80 == 0 { flag |= 2 }
                             }
@@ -340,7 +348,11 @@ public final class SearchIndex: Sendable {
                         let flag = flags[d]
                         if flag & 1 != 0 { titleRun[d] += 1 }
                         if flag & 2 != 0 { exactTitleRun[d] += 1 }
-                        if flag & 4 == 0 { typos[d] += 1 }
+                        if flag & 4 == 0 {
+                            typos[d] += 1
+                        } else if flag & 16 == 0 {
+                            substringsOnly[d] += 1
+                        }
                         if flag & 8 != 0 { exactWords[d] += 1 }
                     }
                     touched = next
@@ -368,7 +380,8 @@ public final class SearchIndex: Sendable {
                 typoFree << 50 | exactTitle << 49 | titleStart << 48 | Int64(min(score[d], 1 << 30)) << 8
                 | kindRank << 4 | shortness
             let match: LibraryHit.Match =
-                typos[d] > 0 ? .fuzzy : exactWords[d] == tokenCount ? .exact : .prefix
+                typos[d] > 0
+                ? .fuzzy : substringsOnly[d] > 0 ? .substring : exactWords[d] == tokenCount ? .exact : .prefix
             entries.append((key, document, match))
         }
         return entries
@@ -399,26 +412,54 @@ public final class SearchIndex: Sendable {
                         result.append(
                             WordMatch(
                                 word: k, quality: exact ? Self.exactQuality : Self.prefixQuality, exact: exact,
-                                typo: false))
+                                typo: false, substring: false))
                         k += 1
                     }
-                    guard query.count >= SearchMatching.minimumTypoLength, let base = words.baseAddress else { return }
-                    // One pass over the vocabulary. Within one edit, the first two letters line up somehow: the
-                    // four-comparison test below rejects nearly every word before any call is made.
+                    let m = query.count
+                    let typos = m >= SearchMatching.minimumTypoLength
+                    let substrings = m >= SearchMatching.minimumSubstringLength
+                    guard typos || substrings, let base = words.baseAddress else { return }
+                    // One pass over the vocabulary for both. A typo lines its first two letters up somehow, so a
+                    // four-comparison test rejects nearly every word before any call; a substring needs the word to
+                    // be longer than the token and to hold its first letter after the start.
                     let q0 = query[0]
                     let q1 = query[1]
-                    let minimumLength = query.count - 1
                     var start = Int(starts[0])
                     for k in 0..<wordCount {
                         let end = Int(starts[k + 1])
                         defer { start = end }
-                        guard end - start >= minimumLength else { continue }
+                        let n = end - start
+                        if substrings, n > m {
+                            var offset = 1
+                            var found = false
+                            while offset <= n - m {
+                                if base[start + offset] == q0 {
+                                    var i = 1
+                                    while i < m, base[start + offset + i] == query[i] { i += 1 }
+                                    if i == m {
+                                        found = true
+                                        break
+                                    }
+                                }
+                                offset += 1
+                            }
+                            if found {
+                                result.append(
+                                    WordMatch(
+                                        word: k, quality: Self.substringQuality, exact: false, typo: false,
+                                        substring: true))
+                                continue
+                            }
+                        }
+                        guard typos, n >= m - 1 else { continue }
                         let w0 = base[start]
                         let w1 = base[start + 1]
                         guard w0 == q0 || w1 == q1 || w1 == q0 || w0 == q1 else { continue }
-                        let candidate = UnsafeBufferPointer(start: base + start, count: end - start)
+                        let candidate = UnsafeBufferPointer(start: base + start, count: n)
                         if SearchMatching.prefixWithinOneEdit(query, candidate) {
-                            result.append(WordMatch(word: k, quality: Self.typoQuality, exact: false, typo: true))
+                            result.append(
+                                WordMatch(
+                                    word: k, quality: Self.typoQuality, exact: false, typo: true, substring: false))
                         }
                     }
                 }
