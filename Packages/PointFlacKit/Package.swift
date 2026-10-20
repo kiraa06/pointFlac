@@ -5,7 +5,8 @@ let package = Package(
     name: "PointFlacKit",
     platforms: [.iOS("26.0"), .macOS("26.0")],
     products: [
-        .library(name: "PFCore", targets: ["PFCore"])
+        .library(name: "PFCore", targets: ["PFCore"]),
+        .library(name: "PFFlac", targets: ["PFFlac"]),
     ],
     targets: [
         .target(
@@ -28,6 +29,11 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "PFFlac",
+            dependencies: ["PFCore", "CFLAC"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
             name: "PFTestSupport",
             resources: [.copy("Resources/Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -35,6 +41,11 @@ let package = Package(
         .testTarget(
             name: "CFLACTests",
             dependencies: ["CFLAC", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFFlacTests",
+            dependencies: ["PFFlac", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
