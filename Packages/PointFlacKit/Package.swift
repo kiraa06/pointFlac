@@ -9,12 +9,32 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CFLAC",
+            exclude: [
+                "COPYING.Xiph",
+                // Code fragments #included by other libFLAC sources; not standalone translation units.
+                "libFLAC/deduplication",
+            ],
+            cSettings: [
+                .define("HAVE_CONFIG_H"),
+                .headerSearchPath("."),
+                .headerSearchPath("include"),
+                .headerSearchPath("libFLAC/include"),
+                .unsafeFlags(["-w"]),
+            ]
+        ),
+        .target(
             name: "PFCore",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
             name: "PFTestSupport",
             resources: [.copy("Resources/Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "CFLACTests",
+            dependencies: ["CFLAC", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
