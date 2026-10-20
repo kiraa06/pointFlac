@@ -146,6 +146,26 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 10)
     }
 
+    /// The crate's flick, measured: UIKit's scroll-deceleration hitch ratio while the coverflow decelerates. No
+    /// baseline is set; the numbers land in the log. The simulator's figures only hint at the device's (spec §8
+    /// wants < 1 ms/s at 120 Hz on the iPhone itself).
+    @MainActor
+    func testCrateFlickHitchRatio() {
+        let app = launch()
+        openShelf(app)
+        let front = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(front.waitForExistence(timeout: 3))
+        let y = front.frame.midY / app.frame.height
+        let right = app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: y))
+        let left = app.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: y))
+        let options = XCTMeasureOptions()
+        options.iterationCount = 3
+        measure(metrics: [XCTOSSignpostMetric.scrollDecelerationMetric], options: options) {
+            right.press(forDuration: 0.01, thenDragTo: left, withVelocity: .fast, thenHoldForDuration: 0)
+            left.press(forDuration: 0.01, thenDragTo: right, withVelocity: .fast, thenHoldForDuration: 0)
+        }
+    }
+
     // MARK: Helpers
 
     @MainActor

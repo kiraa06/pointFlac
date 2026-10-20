@@ -2,6 +2,7 @@ import PFAudio
 import PFCore
 import PFDesign
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Which stage the player shows (spec §4.2): the glass turntable or the editorial cover.
 enum PlayerStage: String, CaseIterable {
@@ -19,6 +20,7 @@ struct PlayerScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shelfOpen = false
     @State private var upNextOpen = false
+    @State private var importing = false
     @State private var handoff = HandoffDirector()
     @Namespace private var discSpace
 
@@ -38,7 +40,8 @@ struct PlayerScreen: View {
                         .frame(height: stageHeight(proxy.size))
                     SharedControls(
                         playback: playback, theme: theme, upNextOpen: $upNextOpen,
-                        hidden: handoff.hidesTitle)
+                        hidden: handoff.hidesTitle, libraryEmpty: model.library.albums.isEmpty,
+                        addFromFiles: { importing = true }, getMusic: { tab = .getMusic })
                     Spacer(minLength: 0)
                     shelfPeek
                 }
@@ -67,6 +70,14 @@ struct PlayerScreen: View {
                     stage = start
                 }
             #endif
+        }
+        .fileImporter(
+            isPresented: $importing, allowedContentTypes: [UTType(filenameExtension: "flac") ?? .audio],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                Task { _ = await model.library.importFiles(urls) }
+            }
         }
         .sheet(isPresented: $upNextOpen) {
             UpNextSheet(playback: playback)

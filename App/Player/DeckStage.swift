@@ -104,6 +104,12 @@ struct DeckStage: View {
                     let now = context.date.timeIntervalSinceReferenceDate
                     ZStack(alignment: .topLeading) {
                         record(layout, angle: recordAngle(now))
+                            // A record Up Next pulls in arrives with a short settle (the hand-off's short form).
+                            // Not during the hand-off, whose own record lands exactly where this one appears.
+                            .transition(
+                                handoff.isRunning ? .identity : .scale(scale: 0.7).combined(with: .opacity)
+                            )
+                            .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
                         tonearm(layout, angle: armAngle(layout, at: context.date))
                     }
                 }
@@ -240,6 +246,7 @@ struct DeckStage: View {
             .accessibilityIdentifier("deckRecord")
             .accessibilityAction(named: "Back 5 seconds") { jogBy(-5) }
             .accessibilityAction(named: "Forward 5 seconds") { jogBy(5) }
+            .id(album.id)
         }
     }
 

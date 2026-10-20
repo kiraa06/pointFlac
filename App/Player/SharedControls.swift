@@ -10,6 +10,10 @@ struct SharedControls: View {
     let theme: Theme
     @Binding var upNextOpen: Bool
     let hidden: Bool
+    /// The shelf is empty: the first run, when getting music must be the obvious next step (spec §4.1).
+    var libraryEmpty = false
+    var addFromFiles: () -> Void = {}
+    var getMusic: () -> Void = {}
 
     private var player: Player { playback.player }
 
@@ -34,9 +38,24 @@ struct SharedControls: View {
                 Text("pointFlac")
                     .font(Typeface.display(30))
                     .tracking(-0.6)
-                Text("Swipe up for the shelf, or get music to fill it.")
-                    .font(Typeface.artist)
-                    .foregroundStyle(theme.inkSecondary)
+                if libraryEmpty {
+                    Text("Your shelf is empty. Bring in a record to start.")
+                        .font(Typeface.artist)
+                        .foregroundStyle(theme.inkSecondary)
+                    HStack(spacing: 10) {
+                        Button("Add music from Files", systemImage: "folder", action: addFromFiles)
+                            .buttonStyle(.glassProminent)
+                            .accessibilityIdentifier("emptyAddFiles")
+                        Button("Browse online", systemImage: "globe", action: getMusic)
+                            .buttonStyle(.glass)
+                            .accessibilityIdentifier("emptyGetMusic")
+                    }
+                    .padding(.top, 6)
+                } else {
+                    Text("Swipe up for the shelf and pick a record.")
+                        .font(Typeface.artist)
+                        .foregroundStyle(theme.inkSecondary)
+                }
             } else {
                 Text(title)
                     .font(Typeface.display(30))
