@@ -82,7 +82,9 @@ public enum ResultRanker {
         for key in order {
             guard let group = groups[key] else { continue }
             let folderParts = components(group.folder)
-            let albumMatch = folderParts.suffix(3).map { phraseScore(albumTitle, in: $0) }.max() ?? 0
+            // For an artist, any of their album folders will do: only the artist has to match.
+            let albumMatch =
+                entity.kind == .artist ? 1 : folderParts.suffix(3).map { phraseScore(albumTitle, in: $0) }.max() ?? 0
             let artistMatch = bestArtistMatch(artistNames, in: folderParts + group.files.map { fileName($0.path) })
             guard albumMatch >= minimumMatch, artistMatch >= minimumMatch else { continue }
             let match = albumMatch * 0.55 + artistMatch * 0.45

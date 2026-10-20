@@ -118,10 +118,30 @@ public final class MusicBrainzRegistry: SuggestionRegistry {
     static func suggestions(from response: MB.SearchResponse, entity: MB.Entity) -> [Suggestion] {
         switch entity {
         case .artist: (response.artists ?? []).map(suggestion(artist:))
-        case .releaseGroup: (response.releaseGroups ?? []).map(suggestion(releaseGroup:))
+        case .releaseGroup: releaseGroupSuggestions(response.releaseGroups ?? [])
         case .recording: dedupedRecordings(response.recordings ?? []).map(suggestion(recording:))
         case .release: []
         }
+    }
+
+    /// Album rows, plus one artist row per credited artist. The album request goes first, so this puts artist rows
+    /// on screen a second before the artist request can; the artist request's rows later merge with them (same id).
+    static func releaseGroupSuggestions(_ groups: [MB.ReleaseGroup]) -> [Suggestion] {
+        var rows = groups.map(suggestion(releaseGroup:))
+        var seen = Set<String>()
+        for group in groups {
+            guard let artist = group.artistCredit?.first?.artist, seen.insert(artist.id).inserted else { continue }
+            let entity = ResolvedEntity(
+                kind: .artist, artist: artist.name, artistCredit: artist.name, artistSortName: artist.sortName,
+                artistAliases: aliasNames(artist.aliases), musicBrainzID: artist.id, artistMusicBrainzID: artist.id)
+            let subtitle = ["Artist", artist.disambiguation].compactMap { $0 }.filter { !$0.isEmpty }
+            rows.append(
+                Suggestion(
+                    id: "mb:artist:\(artist.id)", kind: .artist, title: artist.name,
+                    subtitle: subtitle.joined(separator: " · "), source: Suggestion.Source.musicBrainz, entity: entity,
+                    relevance: Double(group.score ?? 0) / 100 * 0.9))
+        }
+        return rows
     }
 
     static func suggestion(artist: MB.Artist) -> Suggestion {

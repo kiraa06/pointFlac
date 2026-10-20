@@ -16,7 +16,7 @@ public struct SearchPlanRunner: Sendable {
     public let preference: FormatPreference
 
     public init(
-        bucket: TokenBucket = TokenBucket(interval: .seconds(5)), enoughComplete: Int = 3, enoughCandidates: Int = 8,
+        bucket: TokenBucket = .soulseekSearch, enoughComplete: Int = 3, enoughCandidates: Int = 8,
         preference: FormatPreference = .highest
     ) {
         self.bucket = bucket

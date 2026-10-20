@@ -41,6 +41,16 @@ public actor TokenBucket {
         }
     }
 
+    /// The one MusicBrainz limiter for the whole process: every ``MusicBrainzClient`` uses it unless told otherwise,
+    /// so two clients created by mistake still share one request per second.
+    public static let musicBrainz = TokenBucket(interval: .seconds(1), burst: 1)
+
+    /// The Cover Art Archive limiter: no published limit, so a gentle four per second with a small burst.
+    public static let coverArtArchive = TokenBucket(interval: .milliseconds(250), burst: 4)
+
+    /// Soulseek searches, process-wide (spec §4.6: at least a few seconds apart, or the account is throttled).
+    public static let soulseekSearch = TokenBucket(interval: .seconds(5), burst: 1)
+
     /// Holds every request back for at least `delay`, after the server said it is busy (503 or 429, `Retry-After`).
     public func penalize(for delay: Duration) {
         // With a burst allowance the next slot is `arrival - interval * (burst - 1)`; offset so it lands at `until`.

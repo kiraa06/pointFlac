@@ -38,7 +38,7 @@ public actor CoverArtArchive {
 
     public init(
         configuration: Configuration = Configuration(), session: URLSession = MusicBrainzClient.makeSession(),
-        bucket: TokenBucket = TokenBucket(interval: .milliseconds(250), burst: 4),
+        bucket: TokenBucket = .coverArtArchive,
         disk: DiskCache? = DiskCache(
             directory: DiskCache.defaultDirectory().deletingLastPathComponent().appending(path: "CoverArt"),
             timeToLive: 30 * 24 * 3600, maxEntries: 1_000)

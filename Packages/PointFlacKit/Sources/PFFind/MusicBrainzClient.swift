@@ -62,7 +62,7 @@ public actor MusicBrainzClient {
     public init(
         configuration: Configuration = Configuration(),
         session: URLSession = MusicBrainzClient.makeSession(),
-        bucket: TokenBucket = TokenBucket(interval: .seconds(1), burst: 1),
+        bucket: TokenBucket = .musicBrainz,
         memory: LRUCache<String, Data> = LRUCache(capacity: 256),
         disk: DiskCache? = DiskCache(directory: DiskCache.defaultDirectory())
     ) {
