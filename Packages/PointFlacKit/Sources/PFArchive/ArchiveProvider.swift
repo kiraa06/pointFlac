@@ -166,15 +166,20 @@ struct ArchiveDownload {
 
         if have < expectedSize {
             let headers = have > 0 ? ["Range": "bytes=\(have)-"] : [:]
-            let (body, response) = try await client.open(client.request(url, headers: headers))
+            let (transfer, response) = try await client.open(client.request(url, headers: headers))
+            // Every early exit below stops the transfer instead of letting the body keep arriving.
+            defer { transfer.cancel() }
             var offset: Int64
             switch response.statusCode {
             case 200:
                 offset = 0
-            case 206 where Self.rangeStart(response) == have:
+            case 206
+            where Self.contentRange(response).map({ $0.start == have && ($0.total ?? expectedSize) == expectedSize })
+                == true:
                 offset = have
             case 206:
-                // A range we did not ask for: start again rather than splice mismatched bytes.
+                // A range we did not ask for, or of a file whose total size is not the listed one: start again
+                // rather than splice mismatched bytes.
                 try? fileManager.removeItem(at: part)
                 throw ArchiveError.truncated  // transient: the next attempt starts from zero
             case 416:
@@ -191,7 +196,7 @@ struct ArchiveDownload {
             if response.expectedContentLength > 0, offset + response.expectedContentLength > expectedSize {
                 throw ArchiveError.tooLarge
             }
-            try await write(body, to: part, from: offset, expectedSize: expectedSize, progress: progress)
+            try await write(transfer, to: part, from: offset, expectedSize: expectedSize, progress: progress)
             have = (try? fileManager.attributesOfItem(atPath: part.path)[.size] as? NSNumber)?.int64Value ?? 0
         }
 
@@ -208,7 +213,7 @@ struct ArchiveDownload {
     }
 
     private func write(
-        _ body: ResponseBody, to part: URL, from offset: Int64, expectedSize: Int64,
+        _ transfer: StreamingTransfer, to part: URL, from offset: Int64, expectedSize: Int64,
         progress: @Sendable (Double) -> Void
     ) async throws {
         let fileManager = FileManager.default
@@ -224,7 +229,8 @@ struct ArchiveDownload {
         var written = offset
         var lastReported = -1
         do {
-            for try await chunk in body {
+            for try await chunk in transfer.body {
+                transfer.consumed(chunk.count)
                 // Never accept more than the listing promised (spec §5.8: every untrusted input is bounded).
                 guard written + Int64(chunk.count) <= expectedSize else {
                     try? handle.close()
@@ -245,13 +251,19 @@ struct ArchiveDownload {
         }
     }
 
-    static func rangeStart(_ response: HTTPURLResponse) -> Int64? {
-        // "bytes 1000-1999/2000"
+    /// Parses "bytes 1000-1999/2000" (the total may be "*", meaning unknown).
+    static func contentRange(_ response: HTTPURLResponse) -> (start: Int64, total: Int64?)? {
         guard let header = response.value(forHTTPHeaderField: "Content-Range")?.lowercased(),
-            header.hasPrefix("bytes "),
-            let dash = header.firstIndex(of: "-")
+            header.hasPrefix("bytes ")
         else { return nil }
-        return Int64(header[header.index(header.startIndex, offsetBy: 6)..<dash].trimmingCharacters(in: .whitespaces))
+        let spec = header.dropFirst(6).trimmingCharacters(in: .whitespaces)
+        let halves = spec.split(separator: "/", maxSplits: 1).map(String.init)
+        guard let range = halves.first, let dash = range.firstIndex(of: "-"),
+            let start = Int64(range[..<dash].trimmingCharacters(in: .whitespaces))
+        else { return nil }
+        let total = halves.count == 2 ? Int64(halves[1].trimmingCharacters(in: .whitespaces)) : nil
+        if halves.count == 2, halves[1] != "*", total == nil { return nil }
+        return (start, total)
     }
 
     static func md5(of url: URL) throws -> String {

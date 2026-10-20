@@ -11,6 +11,8 @@ struct StubReply: Sendable {
     var body = Data()
     /// Delivered after the body instead of a clean finish, to simulate a dropped connection.
     var failure: URLError?
+    /// Keeps the connection open after the body, like a server still sending; only a cancel ends it.
+    var hang = false
 
     static func json(_ data: Data) -> StubReply {
         StubReply(headers: ["Content-Type": "application/json"], body: data)
@@ -54,6 +56,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             if !reply.body.isEmpty { client?.urlProtocol(self, didLoad: reply.body) }
+            if reply.hang { return }
             if let failure = reply.failure {
                 // A real connection drops after the bytes before it were read; failing at once would let the session
                 // discard them unread.

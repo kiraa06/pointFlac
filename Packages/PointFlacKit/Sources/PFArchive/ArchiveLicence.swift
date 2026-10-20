@@ -11,6 +11,13 @@ public struct ArchiveLicence: Sendable, Hashable {
     /// The licence deed, for a "view licence" link.
     public var url: String
 
+    /// The Creative Commons licence codes that exist. NC and ND are open licences in the spec's sense and stay
+    /// admitted; the UI labels them. Anything else under `/licenses/` is not a licence pointFlac recognises.
+    static let creativeCommonsCodes: Set<String> = [
+        "by", "by-sa", "by-nd", "by-nc", "by-nc-sa", "by-nc-nd", "sampling", "sampling+", "nc-sampling+",
+        "devnations", "publicdomain",
+    ]
+
     static let etree = ArchiveLicence(
         name: "Live Music Archive (trading permitted)", url: "https://archive.org/details/etree")
 
@@ -45,7 +52,7 @@ public struct ArchiveLicence: Sendable, Hashable {
             guard parts.count >= 2 else { return nil }
             let code = parts[1]
             if code == "publicdomain" { return ArchiveLicence(name: "Public domain", url: canonical) }
-            guard code.first?.isLetter == true else { return nil }
+            guard creativeCommonsCodes.contains(code) else { return nil }
             let name = (["CC", code.uppercased()] + parts.dropFirst(2).prefix(2).map { $0.uppercased() })
                 .joined(separator: " ")
             return ArchiveLicence(name: name, url: canonical)

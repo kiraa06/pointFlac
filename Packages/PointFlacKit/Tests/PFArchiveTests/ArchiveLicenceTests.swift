@@ -15,6 +15,9 @@ struct ArchiveLicenceTests {
             ("https://creativecommons.org/publicdomain/zero/1.0/", "CC0 1.0"),
             ("http://creativecommons.org/publicdomain/mark/1.0/", "Public Domain Mark 1.0"),
             ("http://creativecommons.org/licenses/publicdomain/", "Public domain"),
+            ("http://creativecommons.org/licenses/sampling+/1.0/", "CC SAMPLING+ 1.0"),
+            ("http://creativecommons.org/licenses/nc-sampling+/1.0/", "CC NC-SAMPLING+ 1.0"),
+            ("http://creativecommons.org/licenses/by-nd/2.0/", "CC BY-ND 2.0"),
         ])
     func recognises(url: String, name: String) {
         #expect(ArchiveLicence.classify(licenseURL: url, collections: [])?.name == name)
@@ -26,6 +29,8 @@ struct ArchiveLicenceTests {
             "http://rightsstatements.org/vocab/InC/1.0/", "https://creativecommons.org.evil.example/licenses/by/4.0/",
             "ftp://creativecommons.org/licenses/by/4.0/", "https://creativecommons.org/", "All rights reserved", "",
             "https://creativecommons.org/licenses/<script>/1.0/",
+            "https://creativecommons.org/licenses/all-rights-reserved/1.0/",
+            "https://creativecommons.org/licenses/by-commercial/4.0/",
         ])
     func refuses(url: String) {
         #expect(ArchiveLicence.classify(licenseURL: url, collections: ["opensource_audio"]) == nil)
@@ -89,5 +94,17 @@ struct ArchiveLicenceTests {
         #expect(ArchiveFileSelector.isSafePath("a\\\u{301}b.flac") == false)
         let encoded = ArchiveQuery.downloadURL(base: base, identifier: "ok", path: "d/\u{301}x.flac")?.absoluteString
         #expect(encoded == "https://archive.org/download/ok/d/%CC%81x.flac")
+    }
+
+    @Test(
+        "redirects are allowed only to HTTPS Archive hosts, not look-alikes",
+        arguments: [
+            ("https://ia800.us.archive.org/7/items/x.flac", true), ("https://archive.org/download/x", true),
+            ("http://ia800.us.archive.org/x.flac", false), ("https://evilarchive.org/x.flac", false),
+            ("https://archive.org.evil.com/x.flac", false), ("https://archive.org@evil.com/x.flac", false),
+            ("ftp://archive.org/x.flac", false),
+        ])
+    func redirectHosts(url: String, allowed: Bool) {
+        #expect(StreamingTransfer(allowedHost: "archive.org").isAllowed(URL(string: url)) == allowed)
     }
 }
