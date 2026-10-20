@@ -406,12 +406,13 @@ public final class Player {
             engine?.negotiated = SignalPath(
                 plan: plan, hardwareRate: arbiter.hardwareSideSampleRate ?? plan.clientSampleRate,
                 hardwareChannels: arbiter.hardwareSideChannels)
-        case .trackStarted(let index, let format):
+        case .trackStarted(let index, let format, let totalFrames):
             guard queue.indices.contains(index) else { return }
             anyItemStarted = true
-            // The decoder's format is authoritative (the file may have changed since import). The queue entry takes
-            // it, so the strip, positions and seeks all follow what plays.
+            // The decoder's format and length are authoritative (the file may have changed since import). The queue
+            // entry takes them, so the strip, positions, seeks and the track's duration all follow what plays.
             if queue[index].format != format { queue[index].format = format }
+            if queue[index].totalFrames != totalFrames { queue[index].totalFrames = totalFrames }
             signal.source = format
             // A gapless join keeps the running plan: it has no `planChanged` of its own.
             if let path = engine?.negotiated {

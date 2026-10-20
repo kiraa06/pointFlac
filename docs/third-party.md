@@ -22,3 +22,16 @@
 - Notice: `App/ThirdPartyNotices.txt` (the libFLAC BSD-3 notice with the Xiph copyright, and pointFlac's MIT licence)
   ships in the app bundle in every configuration, Release included. The debug UI shows it under "Licences".
   `scripts/make-ipa.sh` fails if a Release app lacks it.
+
+## SQLite (system library, not vendored)
+
+- Used by: `PFLibrary` (`SQLiteDatabase.swift`), through the SDK's `SQLite3` module, linked as `libsqlite3`.
+- Source: ships with iOS and macOS; nothing is copied into this repository or the app bundle.
+- Licence: public domain (https://sqlite.org/copyright.html). No notice is required.
+- Why not GRDB (MIT): see `docs/superpowers/plans/2026-10-21-plan-2-library-search.md`. Moving to GRDB later changes
+  one file; it would then need an entry here and its MIT notice in `App/ThirdPartyNotices.txt`.
+
+## Apple system frameworks used by the library
+
+`CryptoKit` (content identity), `ImageIO` and `UniformTypeIdentifiers` (cover downsampling) are OS frameworks under
+Apple's SDK terms; nothing is vendored.

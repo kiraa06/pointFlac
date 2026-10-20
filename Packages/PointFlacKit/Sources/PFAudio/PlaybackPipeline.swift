@@ -24,10 +24,10 @@ public struct PlaybackItem: Sendable, Hashable, Identifiable {
 public enum PipelineEvent: Sendable, Equatable {
     /// The output was configured for a new plan: for the first item, and at each boundary where the plan changes.
     case planChanged(OutputPlan)
-    /// Item `index` started rendering, in the format its decoder reports. That format is authoritative: the
-    /// import-time `PlaybackItem.format` may be stale (the file replaced since), and the strip and positions must
-    /// follow what plays.
-    case trackStarted(Int, AudioFormat)
+    /// Item `index` started rendering, in the format and with the length its decoder reports. Both are
+    /// authoritative: the import-time `PlaybackItem.format` and `totalFrames` may be stale (the file replaced since),
+    /// and the strip, positions and the scrubber's length must follow what plays (Plan 1 ledger M5).
+    case trackStarted(Int, AudioFormat, totalFrames: Int64)
     case trackEnded(Int)
     /// The item could not be opened, positioned, decoded or output. Playback moves on to the next item, and the failed
     /// item gets no `trackEnded`. Audio decoded before a mid-track failure still plays; the event fires after it.
