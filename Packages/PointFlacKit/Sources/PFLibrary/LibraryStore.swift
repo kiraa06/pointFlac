@@ -200,18 +200,45 @@ final class LibraryStore {
     }
 
     /// Scans every folder whose location is known. Folders that cannot be found this launch are left as they are.
+    ///
+    /// Tracks whose file is gone are removed only after every folder has been scanned, so a file moved from one
+    /// folder into another is found as a move, and keeps its ID, whichever folder is scanned first.
     func scanAll() throws -> ScanReport {
         var report = ScanReport()
+        var gone: [String: KnownTrack] = [:]
         for id in roots.keys.sorted() {
-            try scan(folder: id, into: &report)
+            try scan(folder: id, into: &report, gone: &gone)
         }
+        try removeGone(gone, into: &report)
         return report
     }
 
-    /// Re-reads only what changed in `folder`: new files and files whose size or modification date differ. A file
-    /// found under a new path with the identity of a track whose file is gone is that track moved, and keeps its ID.
-    /// Tracks whose file is gone are removed.
+    /// Scans one folder (`scanAll` explains moves and removals).
     func scan(folder: Int64, into report: inout ScanReport) throws {
+        var gone: [String: KnownTrack] = [:]
+        try scan(folder: folder, into: &report, gone: &gone)
+        try removeGone(gone, into: &report)
+    }
+
+    /// Removes the tracks whose file is gone, then every cover no track uses any more (gone, refused or re-tagged).
+    private func removeGone(_ gone: [String: KnownTrack], into report: inout ScanReport) throws {
+        try database.transaction {
+            for id in gone.keys.sorted() {
+                try delete(id)
+                report.removed.append(id)
+            }
+            try database.query(
+                "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+        }
+        let keep = Set(try database.query("SELECT id FROM artwork").compactMap { $0[0].string })
+        artwork.removeAll(except: keep)
+    }
+
+    /// Re-reads only what changed in `folder`: new files and files whose size or modification date differ. A file
+    /// found under a new path with the identity of a track whose file is gone (here, or in a folder scanned before in
+    /// this pass, `gone`) is that track moved, and keeps its ID. Tracks whose file is gone from this folder are added
+    /// to `gone`. A track whose file is now refused (replaced by something that is not FLAC) is removed at once.
+    private func scan(folder: Int64, into report: inout ScanReport, gone: inout [String: KnownTrack]) throws {
         guard let root = roots[folder] else { return }
         let (disk, pending) = enumerate(root: root, external: folder != Self.libraryFolderID)
         report.pendingDownloads += pending
@@ -220,10 +247,9 @@ final class LibraryStore {
         let here = Dictionary(known.filter { $0.folderID == folder }.map { ($0.relativePath, $0) }) { a, _ in a }
         let skipped = try skippedFiles(in: folder)
         let onDisk = Set(disk.map(\.relativePath))
-        // Gone from this folder: candidates for a move, else removed at the end.
-        var missing = Dictionary(
-            here.values.filter { !onDisk.contains($0.relativePath) }.map { ($0.id, $0) }
-        ) { a, _ in a }
+        // Gone from this folder: candidates for a move, else removed at the end of the pass.
+        var missing = gone
+        for track in here.values where !onDisk.contains(track.relativePath) { missing[track.id] = track }
         var byContent: [String: [KnownTrack]] = [:]
         for track in known { byContent[track.contentID, default: []].append(track) }
 
@@ -239,16 +265,28 @@ final class LibraryStore {
                     report.unchanged += 1
                     continue
                 }
-                guard file.size <= maxFileBytes else {
-                    try skip(file, in: folder, reason: "Too large to add", report: &report)
-                    continue
+                let refusal: String?
+                var probed: ProbedTrack?
+                if file.size > maxFileBytes {
+                    refusal = "Too large to add"
+                } else {
+                    probes += 1
+                    switch probe(file.url, external: folder != Self.libraryFolderID) {
+                    case .success(let value):
+                        probed = value
+                        refusal = nil
+                    case .failure(let rejection):
+                        refusal = Self.describe(rejection)
+                    }
                 }
-                probes += 1
-                let probed: ProbedTrack
-                switch probe(file.url, external: folder != Self.libraryFolderID) {
-                case .success(let value): probed = value
-                case .failure(let rejection):
-                    try skip(file, in: folder, reason: Self.describe(rejection), report: &report)
+                guard let probed else {
+                    try skip(file, in: folder, reason: refusal ?? "Could not be read", report: &report)
+                    if let previous = here[file.relativePath] {
+                        // It was music and is not any more: the track goes, never pointing at a refused file.
+                        try delete(previous.id)
+                        report.removed.append(previous.id)
+                        byContent[previous.contentID]?.removeAll { $0.id == previous.id }
+                    }
                     continue
                 }
                 try database.query(
@@ -289,18 +327,11 @@ final class LibraryStore {
                         modified: file.modified, contentID: probed.contentID))
                 report.added.append(id)
             }
-            for id in missing.keys.sorted() {
-                try delete(id)
-                report.removed.append(id)
-            }
             try database.query(
                 "DELETE FROM skipped WHERE folder_id = ? AND rel_path NOT IN (SELECT value FROM json_each(?))",
                 [.integer(folder), .text(Self.jsonArray(onDisk))])
-            try database.query(
-                "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
         }
-        let keep = Set(try database.query("SELECT id FROM artwork").compactMap { $0[0].string })
-        artwork.removeAll(except: keep)
+        gone = missing
     }
 
     /// Whether a known track's file is still where the database says.

@@ -398,3 +398,42 @@ private func tags(
     #expect(FlacProbe.parsePicture([0, 0, 0, 3, 0xFF, 0xFF, 0xFF, 0xFF]) == nil)
     #expect(FlacProbe.parsePicture([]) == nil)
 }
+
+/// A file moved out of the library folder into a folder added in place is a move, whichever folder scans first.
+@Test func movesBetweenFoldersKeepTheID() async throws {
+    let temp = try TemporaryLibraryRoot()
+    let library = try temp.open()
+    let external = temp.root.appending(path: "Elsewhere", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+    let inLibrary = temp.libraryFolder.appending(path: "song.flac")
+    try TaggedFlac.write("s24-96000", to: inLibrary, tags: [("TITLE", "Traveller")])
+    _ = try await library.addFolder(external)
+    await library.rescan()
+    let id = try #require(library.current.tracks.keys.first)
+
+    try FileManager.default.moveItem(at: inLibrary, to: external.appending(path: "song.flac"))
+    let report = await library.rescan()
+
+    #expect(report.moved == [id] && report.removed.isEmpty)
+    #expect(library.current.tracks[id]?.url.deletingLastPathComponent().lastPathComponent == "Elsewhere")
+}
+
+/// A track whose file is replaced by something that is not FLAC leaves the library at once.
+@Test func aFileThatStopsBeingFlacLeaves() async throws {
+    let temp = try TemporaryLibraryRoot()
+    let library = try temp.open()
+    let url = temp.libraryFolder.appending(path: "song.flac")
+    try TaggedFlac.write("s16-44100", to: url, tags: [("TITLE", "Real")], picture: TaggedFlac.png())
+    await library.rescan()
+    let id = try #require(library.current.tracks.keys.first)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: temp.artwork.path).count == 1)
+
+    try FileManager.default.removeItem(at: url)
+    try FileManager.default.copyItem(at: Fixtures.url(Fixtures.named("renamed-mp3")), to: url)
+    let report = await library.rescan()
+
+    #expect(report.removed == [id])
+    #expect(report.rejected == ["song.flac": "Not a FLAC file"])
+    #expect(library.current.tracks.isEmpty)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: temp.artwork.path).isEmpty)
+}
