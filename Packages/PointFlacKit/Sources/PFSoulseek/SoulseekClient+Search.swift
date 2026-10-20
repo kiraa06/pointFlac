@@ -45,6 +45,12 @@ extension SoulseekClient {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return continuation.finish(throwing: SoulseekError.emptyQuery) }
         guard isLoggedIn else { return continuation.finish(throwing: SoulseekError.notLoggedIn) }
+        let phrasesDeadline = ContinuousClock.now + configuration.excludedPhrasesWait
+        while !excludedPhrasesReceived, ContinuousClock.now < phrasesDeadline, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        // Wait once per session at most: a server that never sends the list must not slow every search.
+        excludedPhrasesReceived = true
         guard !matchesExcludedPhrase(trimmed) else {
             return continuation.finish(throwing: SoulseekError.excludedPhrase)
         }

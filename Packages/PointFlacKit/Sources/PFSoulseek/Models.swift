@@ -88,6 +88,9 @@ public struct SoulseekConfiguration: Sendable {
     /// Reconnect after an unexpected drop. Never after being kicked (Relogged).
     public var autoReconnect = true
     public var reconnectDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(15), .seconds(30), .seconds(60)]
+    /// The server sends ExcludedSearchPhrases shortly after login. A search started before it arrives waits up to this
+    /// long, so a forbidden phrase is never sent just because the user typed fast.
+    public var excludedPhrasesWait: Duration = .seconds(3)
     /// Minimum gap between two searches (§4.6: "rate-limited, with at least a few seconds between them").
     public var searchMinimumInterval: Duration = .seconds(5)
     /// Peer connections in flight at once (connecting or reading). The probe saw ~23,000 requests in 30 s.

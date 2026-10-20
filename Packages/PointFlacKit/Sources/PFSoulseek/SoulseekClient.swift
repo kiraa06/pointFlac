@@ -13,6 +13,8 @@ public actor SoulseekClient {
     public private(set) var state: SoulseekConnectionState = .disconnected
     /// Lower-cased phrases from the server's ExcludedSearchPhrases (160). Never searched for, never shown.
     public private(set) var excludedPhrases: [String] = []
+    /// Whether the server has sent its list yet this session. Searches wait briefly for it (see `runSearch`).
+    var excludedPhrasesReceived = false
     public internal(set) var diagnostics = Diagnostics()
 
     /// Counters for tests and the debug screen.
@@ -308,6 +310,7 @@ public actor SoulseekClient {
             handleConnectRequest(request)
         case .excludedPhrases(let phrases):
             excludedPhrases = phrases.map { $0.lowercased() }.filter { !$0.isEmpty }
+            excludedPhrasesReceived = true
         case .relogged:
             // Another client signed in with this account. Reconnecting would just kick that client in turn.
             sessionEpoch += 1

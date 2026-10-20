@@ -222,6 +222,7 @@ func testConfiguration(serverPort: UInt16) -> SoulseekConfiguration {
     config.transferRequestTimeout = .seconds(5)
     config.fileConnectionTimeout = .seconds(5)
     config.transferIdleTimeout = .seconds(2)
+    config.excludedPhrasesWait = .zero
     return config
 }
 

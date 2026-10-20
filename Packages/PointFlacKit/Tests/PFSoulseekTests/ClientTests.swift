@@ -203,6 +203,16 @@ struct SearchTests {
         #expect(!results.contains { $0.path.contains("Forbidden") })
     }
 
+    @Test("A search right after login waits for the excluded phrases before sending anything")
+    func waitsForPhrases() async throws {
+        let (client, link, _) = try await loggedInClient { $0.excludedPhrasesWait = .seconds(3) }
+        let stream = client.search("forbidden band", options: SoulseekSearchOptions(window: .milliseconds(200)))
+        try await Task.sleep(for: .milliseconds(200))
+        try await link.send(Mock.excludedPhrases(["forbidden band"]))
+        let (_, error) = await collect(stream)
+        #expect(error as? SoulseekError == .excludedPhrase)
+    }
+
     @Test("Searches are spaced by the minimum interval")
     func rateLimit() async throws {
         let (client, link, _) = try await loggedInClient { $0.searchMinimumInterval = .milliseconds(400) }
