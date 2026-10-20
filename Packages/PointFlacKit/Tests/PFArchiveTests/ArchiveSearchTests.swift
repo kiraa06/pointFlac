@@ -137,18 +137,33 @@ struct ArchiveSearchTests {
         #expect(calls.value == 2)
     }
 
-    @Test("requests are spaced by the minimum interval")
+    @Test("the pacer never lets requests start closer together than the interval")
+    func pacer() async throws {
+        let pacer = RequestPacer(interval: .milliseconds(40))
+        let started = ContinuousClock.now
+        for _ in 0..<5 { try await pacer.waitTurn() }
+        // Sleeps never end early, so four intervals is a hard lower bound.
+        #expect(ContinuousClock.now - started >= .milliseconds(160))
+    }
+
+    @Test("a search's requests are paced end to end")
     func pacing() async throws {
         let network = stubbedArchive()
         let stamps = TimeStamps()
-        network.route("/metadata/") { _ in
+        network.route("/") { _ in
             stamps.record()
             return .success(.json(loadFixture("metadata-missing.json")))
         }
+        network.route("/advancedsearch.php") { _ in
+            stamps.record()
+            return .success(.json(loadFixture("advancedsearch-search.json")))
+        }
         _ = try await collect(network.provider(interval: .milliseconds(60)), "x")
         let gaps = stamps.gaps()
-        #expect(gaps.count >= 3)
-        #expect(gaps.allSatisfy { $0 >= .milliseconds(50) }, "gaps: \(gaps)")
+        // One search page and five metadata requests. Delivery to the stub jitters a little, so the total span is
+        // checked against the pacing with a small allowance rather than each gap.
+        #expect(gaps.count == 5)
+        #expect(gaps.reduce(.zero, +) >= .milliseconds(5 * 60 - 30), "gaps: \(gaps)")
     }
 
     @Test("JSON larger than the cap is refused without being decoded")

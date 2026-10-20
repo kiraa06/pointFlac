@@ -86,9 +86,14 @@ enum Admission {
 
 /// Free space on the volume that holds a folder.
 public enum DiskSpace {
-    /// Bytes available for user-initiated downloads, or `nil` when the volume does not say.
+    /// Bytes available for user-initiated downloads, or `nil` when the volume does not say. A folder that does not
+    /// exist yet is measured at its nearest existing parent, which is on the same volume.
     public static func available(at url: URL) -> Int64? {
-        let values = try? url.resourceValues(forKeys: [
+        var probe = url.standardizedFileURL
+        while !FileManager.default.fileExists(atPath: probe.path), probe.pathComponents.count > 1 {
+            probe.deleteLastPathComponent()
+        }
+        let values = try? probe.resourceValues(forKeys: [
             .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey,
         ])
         if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { return important }

@@ -55,3 +55,26 @@ public protocol DownloadProvider: Sendable {
     /// Downloads into `staging` (a directory); the last event is .finished(fileURL) or .failed.
     func download(_ track: RemoteTrack, into staging: URL) -> AsyncThrowingStream<DownloadEvent, Error>
 }
+
+extension RemoteTrack {
+    /// What a result row shows as the format, using only what the provider actually stated: "FLAC 24/96",
+    /// "FLAC 24-bit", or plain "FLAC" when the depth is unknown. Nothing is guessed.
+    public var formatLabel: String {
+        switch (bitsPerSample, sampleRate) {
+        case (let bits?, let rate?):
+            let kilohertz = Double(rate) / 1000
+            let rateText =
+                kilohertz == kilohertz.rounded() ? String(Int(kilohertz)) : String(format: "%.1f", kilohertz)
+            return "FLAC \(bits)/\(rateText)"
+        case (let bits?, nil): return "FLAC \(bits)-bit"
+        case (nil, let rate?): return "FLAC \(String(format: "%g", Double(rate) / 1000)) kHz"
+        case (nil, nil): return "FLAC"
+        }
+    }
+
+    /// The listed size for a result row, e.g. "3.6 MB", or empty when the provider did not say.
+    public var sizeLabel: String {
+        guard let sizeBytes else { return "" }
+        return ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+}

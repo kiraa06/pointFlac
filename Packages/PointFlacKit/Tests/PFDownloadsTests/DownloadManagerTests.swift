@@ -344,11 +344,64 @@ struct DownloadManagerTests {
         await first.cancel(doneID)
     }
 
+    @Test("a job that was saving when the app died, whose file already left staging, is not downloaded again")
+    func interruptedWhileSaving() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let stateFile = folder.url.appending(path: "queue.json")
+        var item = DownloadItem(id: "job-1", track: fixtureTrack("s16-44100"), state: .saving, attempts: 1)
+        item.stagedFileName = "Song.flac"
+        var waiting = DownloadItem(id: "job-2", track: fixtureTrack("s16-44100", id: "t2"), state: .saving)
+        waiting.stagedFileName = "Song.flac"
+        try DownloadQueueStore(url: stateFile).save([item, waiting])
+        // job-2's validated file is still in staging, so it is checked again and published.
+        let staging2 = folder.sub("Staging").appending(path: "job-2")
+        try FileManager.default.createDirectory(at: staging2, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: Fixtures.url(Fixtures.named("s16-44100")), to: staging2.appending(path: "Song.flac"))
+
+        let provider = ScriptedProvider { _, _, _, _ in Issue.record("nothing should be downloaded") }
+        let manager = makeManager(folder, provider: provider, library: library, stateFile: stateFile)
+        await manager.restore()
+        let items = try await waitFor(manager, allFinal)
+        #expect(failureMessage(items[0].state)?.contains("check the library") == true)
+        #expect(items[1].state == .published)
+        #expect(library.names == ["Song.flac"])
+    }
+
+    @Test("free space is measured even before the staging folder exists")
+    func diskSpaceOfMissingFolder() throws {
+        let folder = try TempFolder()
+        #expect(DiskSpace.available(at: folder.url.appending(path: "not/yet/here")) != nil)
+    }
+
     @Test("a damaged queue file is ignored rather than crashing")
     func damagedQueueFile() throws {
         let folder = try TempFolder()
         let file = folder.url.appending(path: "queue.json")
         try Data("{not json".utf8).write(to: file)
         #expect(DownloadQueueStore(url: file).load().isEmpty)
+    }
+}
+
+@Suite("DownloadsObserver")
+@MainActor
+struct DownloadsObserverTests {
+    @Test("the main-actor mirror follows the manager to the published state")
+    func mirrors() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let provider = ScriptedProvider { track, staging, _, events in
+            events.yield(.finished(try deliverFixture(track, staging)))
+        }
+        let manager = makeManager(folder, provider: provider, library: library)
+        let observer = DownloadsObserver(manager: manager)
+        await manager.enqueue(fixtureTrack("s16-44100"))
+        for _ in 0..<1000 where observer.items.first?.state != .published {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(observer.items.first?.state == .published)
+        #expect(observer.items.first?.state.label == "Done")
+        #expect(observer.items.first?.state.progress == 1)
     }
 }

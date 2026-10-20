@@ -90,9 +90,18 @@ public actor DownloadManager {
         let saved = store.load()
         let known = Set(queue.map(\.id))
         for var item in saved where !known.contains(item.id) {
-            // A job interrupted mid-flight starts again from the queue; a provider resumes from the staged part
-            // file and a validated file is re-checked, never trusted from the last run.
-            if !item.state.isFinal { item.state = .queued }
+            if item.state == .saving, let staged = item.stagedFileName,
+                !FileManager.default.fileExists(atPath: stagingFolder(item.id).appending(path: staged).path)
+            {
+                // The app stopped while the library was taking the file, and the file has left staging: the
+                // library probably has it. Downloading again could duplicate it, so the user decides.
+                item.state = .failed("the app closed while saving; check the library before retrying")
+                item.stagedFileName = nil
+            } else if !item.state.isFinal {
+                // A job interrupted mid-flight starts again from the queue; a provider resumes from the staged
+                // part file and a validated file is re-checked, never trusted from the last run.
+                item.state = .queued
+            }
             queue.append(item)
         }
         changed(persist: true)

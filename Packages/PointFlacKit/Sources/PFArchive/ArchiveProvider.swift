@@ -178,7 +178,7 @@ struct ArchiveDownload {
             case 206:
                 // A range we did not ask for: start again rather than splice mismatched bytes.
                 try? fileManager.removeItem(at: part)
-                throw ArchiveError.badResponse("unexpected range")
+                throw ArchiveError.truncated  // transient: the next attempt starts from zero
             case 416:
                 try? fileManager.removeItem(at: part)
                 throw ArchiveError.truncated  // transient: the next attempt starts from zero
