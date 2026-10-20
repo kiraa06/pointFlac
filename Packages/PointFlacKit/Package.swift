@@ -12,9 +12,14 @@ let package = Package(
             name: "PFCore",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "PFTestSupport",
+            resources: [.copy("Resources/Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .testTarget(
             name: "PFCoreTests",
-            dependencies: ["PFCore"],
+            dependencies: ["PFCore", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
