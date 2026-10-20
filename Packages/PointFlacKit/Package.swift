@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "PFDSP", targets: ["PFDSP"]),
         .library(name: "PFAudio", targets: ["PFAudio"]),
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
+        .library(name: "PFSearch", targets: ["PFSearch"]),
     ],
     targets: [
         .target(
@@ -55,6 +56,17 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "PFSearch",
+            dependencies: ["PFCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                // Search runs on every keystroke inside one 120 Hz frame (spec §8), so it is optimised in Debug builds
+                // too: an unoptimised index loop is several times slower, and a Debug app or a `swift test` run would
+                // then misstate the budget. Release builds are optimised anyway.
+                .unsafeFlags(["-O"], .when(configuration: .debug)),
+            ]
+        ),
+        .target(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
@@ -83,6 +95,11 @@ let package = Package(
         .testTarget(
             name: "PFLibraryTests",
             dependencies: ["PFLibrary", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFSearchTests",
+            dependencies: ["PFSearch", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
