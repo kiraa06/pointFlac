@@ -1,12 +1,15 @@
 #!/bin/bash
-# Builds the Debug app signed with the team in Config/Signing.local.xcconfig, installs it on the first connected
-# iPhone or iPad, and launches it (ruling R19).
+# Builds the app signed with the team in Config/Signing.local.xcconfig, installs it on the first connected iPhone or
+# iPad, and launches it (ruling R19). It builds Release by default: optimised, as the audio path is meant to run, and
+# without the debug fixtures.
 #
-# Usage: scripts/install-device.sh [--build-only | --unsigned] [-- <app launch arguments>]
+# Usage: scripts/install-device.sh [--debug] [--build-only | --unsigned] [-- <app launch arguments>]
+#   --debug       build Debug instead (-Onone). The DEBUG launch flags need it: -PFPreloadFixtures, which imports the
+#                 bundled fixtures, and -PFMuteOutput. A Release build ignores them.
 #   --build-only  build and sign, then stop: no device is needed.
 #   --unsigned    build without signing (CODE_SIGNING_ALLOWED=NO), then stop. This checks the build on a machine with no
 #                 team; an unsigned app cannot be installed.
-#   -- <args>     passed to the app at launch, for example `-- -PFPreloadFixtures` to import the bundled fixtures.
+#   -- <args>     passed to the app at launch, for example `--debug -- -PFPreloadFixtures` to import the fixtures.
 #
 # One-time setup: copy Config/Signing.local.xcconfig.example to Config/Signing.local.xcconfig (git-ignored) and set
 # DEVELOPMENT_TEAM in it. A free Personal Team works. The device needs Developer Mode on, and on the first install the
@@ -73,9 +76,11 @@ main() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
     local mode=install
+    local configuration=Release
     local app_arguments=()
     while [ $# -gt 0 ]; do
         case "$1" in
+            --debug) configuration=Debug ;;
             --build-only) mode=build-only ;;
             --unsigned) mode=unsigned ;;
             --)
@@ -83,10 +88,17 @@ main() {
                 app_arguments=("$@")
                 break
                 ;;
-            *) fail "unknown option $1. Usage: scripts/install-device.sh [--build-only | --unsigned] [-- <app args>]" ;;
+            *)
+                fail "unknown option $1. Usage: scripts/install-device.sh [--debug] [--build-only | --unsigned] \
+[-- <app args>]"
+                ;;
         esac
         shift
     done
+    if [ "$configuration" = Release ] && [ ${#app_arguments[@]} -gt 0 ]; then
+        echo "install-device: note: a Release build ignores the DEBUG launch flags (-PFPreloadFixtures, -PFMuteOutput);" \
+            "pass --debug for them." >&2
+    fi
 
     local signing=(-allowProvisioningUpdates)
     if [ "$mode" = unsigned ]; then
@@ -101,14 +113,14 @@ main() {
     fi
 
     scripts/bootstrap.sh
-    local app="$DERIVED/Build/Products/Debug-iphoneos/PointFlac.app"
+    local app="$DERIVED/Build/Products/$configuration-iphoneos/PointFlac.app"
     rm -rf "$app"
-    xcodebuild build -project PointFlac.xcodeproj -scheme PointFlac -configuration Debug \
+    xcodebuild build -project PointFlac.xcodeproj -scheme PointFlac -configuration "$configuration" \
         -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED" "${signing[@]}" \
-        || fail "the Debug build failed; see the xcodebuild output above."
+        || fail "the $configuration build failed; see the xcodebuild output above."
     [ -x "$app/PointFlac" ] || fail "no app at $app after the build."
     if [ "$mode" != install ]; then
-        echo "install-device: built $app ($mode); not installing."
+        echo "install-device: built $app ($configuration, $mode); not installing."
         return
     fi
 
@@ -118,7 +130,7 @@ main() {
         ${app_arguments[@]+"${app_arguments[@]}"} \
         || fail "launching on $DEVICE_NAME failed. If the device says the developer is not trusted, trust it in \
 Settings > General > VPN & Device Management, then run this again."
-    echo "install-device: installed and launched on $DEVICE_NAME."
+    echo "install-device: installed and launched the $configuration build on $DEVICE_NAME."
 }
 
 # Sourcing the script defines the functions without running it, so the device picker can be checked on its own.

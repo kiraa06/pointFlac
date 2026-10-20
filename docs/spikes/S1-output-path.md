@@ -127,8 +127,8 @@ These exact strings were verified at 48 kHz, and the tests assert them whenever 
 Mac whose output device runs at another rate, 44.1 kHz say, the hardware side reads that rate and iOS resamples after
 the unit. The strip then honestly reads "● Resampled 48→44.1" for both fixtures: resampling outranks the depth
 reduction in `SignalState.indicator`. The tests accept that, and on any Mac they still check the source-derived
-part: the `FLAC · 24-bit · ` or `FLAC · 32-bit · ` prefix, the "●" indicator, and no "bit-perfect". On a machine with
-no usable audio output (a headless CI runner), the two playback tests skip.
+part: the `FLAC · 24-bit · ` or `FLAC · 32-bit · ` prefix, the "●" indicator, and no claim stronger than "● Pure".
+On a machine with no usable audio output (a headless CI runner), the two playback tests skip.
 
 ## Ruling R13: `OutputCapabilities.current` stays `int32Passthrough: false`
 
@@ -210,8 +210,9 @@ DAC:
    - **Loopback:** a DAC or interface with a digital output (S/PDIF or AES) feeding a recorder that captures 32-bit
      integer, such as a Mac with a digital input. Compare the recording with the source after aligning the start. All
      32 bits must match, with no dither in the low byte.
-   - **DAC bit test:** a DAC with a built-in bit-perfect or bit-depth check, such as a signature-pattern test or an
-     input-depth display. It must report 32-bit and pass the test file unchanged.
+   - **DAC bit test:** a DAC with a built-in check that its input is identical to the source, or a bit-depth check,
+     such as a signature-pattern test or an input-depth display. It must report 32-bit and pass the test file
+     unaltered.
 4. Only if all 32 bits arrive intact, on that route and at unity volume, flip `OutputCapabilities.current` to
    `int32Passthrough: true`. Record the DAC, the route, the iOS version and the method here, and update the
    strip copy. If the low byte arrives truncated, dithered or rescaled, `current` stays `false`, and the disclosed

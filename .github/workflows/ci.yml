@@ -10,9 +10,10 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request replaces its running check; runs on main always finish, so every main commit is tested.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -22,12 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select the newest Xcode 26.x
+      - name: Select the newest released Xcode 26.x
         run: |
           set -euo pipefail
-          latest="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          # Released versions only: runner images also carry betas (Xcode_26.2_beta_3.app) and release candidates
+          # (Xcode_26.1.1_Release_Candidate.app, Xcode_26.3_RC.app), which sort above the release they precede.
+          latest="$(ls -d /Applications/Xcode_26*.app 2>/dev/null \
+            | grep -viE 'beta|release_candidate|_rc([_.0-9]|\.app)' | sort -V | tail -n 1 || true)"
           if [ -z "$latest" ]; then
-            echo "::error::No /Applications/Xcode_26*.app on this runner image"
+            echo "::error::No released /Applications/Xcode_26*.app on this runner image"
             exit 1
           fi
           echo "Using $latest"
