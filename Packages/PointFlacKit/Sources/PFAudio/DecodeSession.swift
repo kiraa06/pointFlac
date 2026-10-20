@@ -66,13 +66,19 @@ final class DecodeSession: @unchecked Sendable {
     private var samples = UnsafeMutableBufferPointer<Int32>(start: nil, count: 0)
     private var words = UnsafeMutableBufferPointer<UInt32>(start: nil, count: 0)
     private var resampled: [Float] = []
+    /// Signpost intervals waiting for the first real frame rendered past `mark`: the start's, and the latest seek's.
+    private var firstFrames: [(interval: FirstFrameInterval, mark: Int64)]
 
-    init(core: PipelineCore, items: [PlaybackItem], startIndex: Int, startFrame: Int64) {
+    init(
+        core: PipelineCore, items: [PlaybackItem], startIndex: Int, startFrame: Int64, firstFrame: FirstFrameInterval
+    ) {
         self.core = core
         self.items = items
         self.startIndex = startIndex
         self.startFrame = startFrame
         dither = TPDFDither(seed: core.ditherSeed)
+        // A fresh session renders from frame 0, so any real frame ends the start's interval.
+        firstFrames = [(firstFrame, 0)]
     }
 
     deinit {
@@ -110,7 +116,10 @@ final class DecodeSession: @unchecked Sendable {
             case .finishQueue: step = finishQueue()
             case .ended: step = waitAfterEnd()
             case .seek: step = performSeek()
-            case .stop: return
+            case .stop:
+                for watch in firstFrames { watch.interval.end(.abandoned) }
+                firstFrames.removeAll()
+                return
             }
         }
     }
@@ -487,16 +496,25 @@ final class DecodeSession: @unchecked Sendable {
             written = source.renderedFrames
         }
         // Read together under the lock `seek(toFrame:)` holds, so the ticket covers exactly the requests taken.
-        let taken = core.withShared(for: self) { s -> (target: Int64, ticket: UInt64)? in
+        let taken = core.withShared(for: self) { s -> SeekRequest? in
             guard let target = s.requestedSeek else { return nil }
             s.requestedSeek = nil
-            return (target, s.source?.seekHoldTicket ?? 0)
+            return SeekRequest(target: target, ticket: s.source?.seekHoldTicket ?? 0, interval: s.seekInterval.take())
         }
         guard let taken else { return .stop }
-        guard let (target, ticket) = taken else {
+        guard let request = taken else {
             assertionFailure("only the decode thread takes seek requests")
             return .play
         }
+        let (target, ticket) = (request.target, request.ticket)
+        // Nothing renders from the ring now until the new position's audio, so the next real frame past `written` is
+        // the first one at the target. An earlier seek still waiting for its frame is superseded.
+        firstFrames.removeAll { watch in
+            guard watch.interval.kind == .seek else { return false }
+            watch.interval.end(.abandoned)
+            return true
+        }
+        if let interval = request.interval { firstFrames.append((interval, written)) }
         source?.releaseSeekHolds(through: ticket)
         emitDueMarkers()
         markers.removeAll()
@@ -512,12 +530,23 @@ final class DecodeSession: @unchecked Sendable {
     }
 
     private func emitDueMarkers() {
-        guard let first = markers.first else { return }
         let rendered = source?.renderedFrames ?? 0
-        guard first.at <= rendered else { return }
+        endFirstFrameIntervals(rendered: rendered)
+        guard let first = markers.first, first.at <= rendered else { return }
         let due = markers.prefix { $0.at <= rendered }.map(\.event)
         markers.removeFirst(due.count)
         core.emit(due, for: self)
+    }
+
+    /// Ends every first-frame interval whose mark `rendered` has passed. Here on the decode thread, never in the render
+    /// callback, which must not signpost (see `Telemetry`).
+    private func endFirstFrameIntervals(rendered: Int64) {
+        guard !firstFrames.isEmpty else { return }
+        firstFrames.removeAll { watch in
+            guard rendered > watch.mark else { return false }
+            watch.interval.end(.rendered)
+            return true
+        }
     }
 
     /// Sleeps until about `frames` more frames have been rendered or the next marker is due, within 1…8 ms. A seek or
@@ -531,6 +560,13 @@ final class DecodeSession: @unchecked Sendable {
         let microseconds = min(max(Double(frames) / rate * 1_000_000, 1_000), 8_000)
         _ = wakeup.wait(timeout: .now() + .microseconds(Int(microseconds)))
     }
+}
+
+/// A seek request as the decode thread takes it, with the hold ticket read under the same lock.
+private struct SeekRequest: Sendable {
+    var target: Int64
+    var ticket: UInt64
+    var interval: FirstFrameInterval?
 }
 
 /// An item the pipeline refuses to play. Its description is the `.itemFailed` message, word for word.

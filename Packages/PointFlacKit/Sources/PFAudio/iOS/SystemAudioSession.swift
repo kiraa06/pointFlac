@@ -6,12 +6,13 @@
 
     /// The real `AVAudioSession`, configured for long-form playback.
     ///
-    /// Checked `Sendable`: the only mutable state is the observer tokens, behind a `Mutex`. `AVAudioSession` itself
-    /// is a process-wide singleton read on demand, never stored.
+    /// Checked `Sendable`: the mutable state is the observer tokens, behind a `Mutex`, and `SessionActivity`'s
+    /// atomics. `AVAudioSession` itself is a process-wide singleton read on demand, never stored.
     public final class SystemAudioSession: AudioSessionControlling {
         /// Single consumer (the player). Created once; finished in `deinit`.
         public let events: AsyncStream<SessionEvent>
         private let continuation: AsyncStream<SessionEvent>.Continuation
+        private let activity = SessionActivity()
 
         /// Observer tokens and the KVO handle, held in a `Mutex`, touched only in `init` and `deinit`.
         /// `@unchecked Sendable` is forced: without it the iOS build fails with "'inout sending' parameter '$0'
@@ -30,6 +31,7 @@
 
             let center = NotificationCenter.default
             let session = AVAudioSession.sharedInstance()
+            let activity = activity
             var tokens: [any NSObjectProtocol] = []
 
             tokens.append(
@@ -47,6 +49,8 @@
                     let event = SessionEvent.interruption(
                         typeRawValue: info?[AVAudioSessionInterruptionTypeKey] as? UInt,
                         optionsRawValue: info?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                    // The system has deactivated the session for the interruption.
+                    if event == .interruptionBegan { activity.isActive.store(false, ordering: .releasing) }
                     if let event { continuation.yield(event) }
                 })
 
@@ -55,6 +59,7 @@
                 center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil)
                 {
                     @Sendable _ in
+                    activity.isActive.store(false, ordering: .releasing)
                     continuation.yield(.mediaServicesReset)
                 })
 
@@ -74,13 +79,23 @@
             continuation.finish()
         }
 
-        public func activate() async throws {
+        /// Sets the category and, when given, the preferred rate, then activates. Setting the rate before activation is
+        /// what lets a first play come up at the file's rate without a deactivate and reactivate cycle afterwards. A
+        /// refused preferred rate is not fatal: the session activates at whatever rate the hardware picks, and the
+        /// pipeline's read-back sees it.
+        public func activate(preferredRate: Int?) async throws {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+            if let preferredRate {
+                try? session.setPreferredSampleRate(Double(preferredRate))
+            }
             try session.setActive(true)
+            activity.isActive.store(true, ordering: .releasing)
         }
 
-        /// Deactivates, sets the preferred rate, reactivates, then reads the hardware rate back.
+        /// Reads the hardware rate back and returns it, after deactivating, setting the preferred rate and
+        /// reactivating, unless the active session already runs at `hz`. Then nothing is touched: a cycle would cost
+        /// tens of milliseconds and post route changes for no change (final review I6).
         ///
         /// The read-back rate is returned on every path, including when a step throws: it is whatever the hardware
         /// runs at, and the pipeline resamples to it. Returning `hz` instead would claim a rate the hardware may not
@@ -92,8 +107,12 @@
         /// error and the rate does not change, though the read-back keeps the result correct.
         public func requestSampleRate(_ hz: Int) async -> Int {
             let session = AVAudioSession.sharedInstance()
+            let running = Int(session.sampleRate)
+            if running == hz, activity.isActive.load(ordering: .acquiring) { return running }
             do {
                 try session.setActive(false)
+                activity.isActive.store(false, ordering: .releasing)
+                activity.deactivations.add(1, ordering: .relaxed)
             } catch {
                 // Still active (busy output): the preferred rate cannot take effect. Read back what is running.
                 return Int(session.sampleRate)
@@ -108,11 +127,19 @@
             }
             do {
                 try session.setActive(true)
+                activity.isActive.store(true, ordering: .releasing)
             } catch {
                 // Nothing more to do; the read-back below reports what the session has.
             }
             return Int(session.sampleRate)
         }
+
+        /// Whether this object last left the session active: a successful activation sets it; a deactivation, an
+        /// interruption (the system deactivates the session) and a media-services reset clear it. Internal for tests.
+        var isActive: Bool { activity.isActive.load(ordering: .acquiring) }
+
+        /// Deactivations `requestSampleRate` has made so far. Internal for tests, which prove it short-circuits.
+        var deactivations: Int { activity.deactivations.load(ordering: .relaxed) }
 
         public var currentPort: OutputPort { Self.readCurrentPort() }
         public var outputVolume: Float { AVAudioSession.sharedInstance().outputVolume }
@@ -122,5 +149,12 @@
             guard let port = AVAudioSession.sharedInstance().currentRoute.outputs.first else { return .other("") }
             return OutputPort(portType: port.portType.rawValue, name: port.portName)
         }
+    }
+
+    /// What `SystemAudioSession` knows of the session's activity, shared with its notification observers. AVAudioSession
+    /// has no public "is active" query, so the session object tracks what it did and what the system told it.
+    private final class SessionActivity: Sendable {
+        let isActive = Atomic<Bool>(false)
+        let deactivations = Atomic<Int>(0)
     }
 #endif

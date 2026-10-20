@@ -15,7 +15,7 @@ final class SessionGate: Sendable {
     private struct State {
         var busy = false
         var waiting: [CheckedContinuation<Void, Never>] = []
-        /// What the last negotiation that reached the session read back.
+        /// What the last negotiation or activation that reached the session left the hardware at.
         var negotiated: Int?
     }
 
@@ -41,17 +41,27 @@ final class SessionGate: Sendable {
         }
     }
 
-    /// Configures and activates the session, in turn with the negotiations.
-    func activate() async throws {
-        try await withTurn { try await session.activate() }
+    /// Configures and activates the session, in turn with the negotiations, and records the rate it comes up at.
+    ///
+    /// Recording it matters (ledger T13): an activation can move the hardware rate (a preferred rate, or a route that
+    /// changed while the session was down) and posts same-port route changes. Were the settled rate still the previous
+    /// negotiation's, such a notification, handled before the start's own negotiation takes the turn, would look like
+    /// the hardware moving and restart the start for nothing. An inactive session's 0 is not recorded.
+    func activate(preferredRate: Int?) async throws {
+        try await withTurn {
+            try await session.activate(preferredRate: preferredRate)
+            let rate = session.sampleRate
+            if rate > 0 { state.withLock { $0.negotiated = rate } }
+        }
     }
 
-    /// The rate the last negotiation read back, once nothing is using the session. Nil while a call holds the turn,
-    /// whose answer is not in yet, and before the first negotiation.
+    /// The rate the last negotiation read back, or the last activation came up at, once nothing is using the session.
+    /// Nil while a call holds the turn, whose answer is not in yet, and before the first negotiation or activation.
     ///
     /// The player compares it with the session's live rate on a route change. A route notification that a negotiation
-    /// itself causes is handled either while that negotiation holds the turn (nil: ignored) or after it, when its
-    /// read-back equals the live rate. Either way it cannot set off another negotiation, so reacting cannot loop.
+    /// or an activation itself causes is handled either while that call holds the turn (nil: ignored) or after it,
+    /// when the rate it recorded equals the live rate. Either way it cannot set off another negotiation, so reacting
+    /// cannot loop.
     var settledRate: Int? {
         state.withLock { $0.busy ? nil : $0.negotiated }
     }

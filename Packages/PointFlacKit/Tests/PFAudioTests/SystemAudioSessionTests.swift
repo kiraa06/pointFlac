@@ -5,7 +5,8 @@
 
     @testable import PFAudio
 
-    @Suite(.audioOutputAvailable, .audioHardware) struct SystemAudioSessionTests {
+    /// Serialized: several tests set the one process-wide session's rate and activity.
+    @Suite(.serialized, .audioOutputAvailable, .audioHardware) struct SystemAudioSessionTests {
         @Test func requestedRateIsReadBack() async throws {
             let session = SystemAudioSession()
             try await session.activate()
@@ -21,6 +22,42 @@
                     #expect(actual == requested)
                 #endif
                 print("S3: requested=\(requested) actual=\(actual) port=\(session.currentPort)")
+            }
+        }
+
+        /// Final review I6: asking an active session for the rate it already runs at only reads it back; no
+        /// deactivate and reactivate. Another rate still goes through the full cycle.
+        @Test func requestingTheRunningRateLeavesTheSessionAlone() async throws {
+            let session = SystemAudioSession()
+            try await session.activate()
+            let running = session.sampleRate
+            #expect(running > 0 && session.isActive)
+            let before = session.deactivations
+            #expect(await session.requestSampleRate(running) == running)
+            #expect(session.deactivations == before, "the session was cycled for the rate it already had")
+            let other = running == 44_100 ? 48_000 : 44_100
+            _ = await session.requestSampleRate(other)
+            #expect(session.deactivations == before + 1)
+            #expect(session.isActive)
+        }
+
+        /// The preferred rate is set before the first activation, so a first play can come up at the file's rate.
+        @Test func activationSetsThePreferredRateFirst() async throws {
+            try AVAudioSession.sharedInstance().setActive(false)
+            let session = SystemAudioSession()
+            for preferred in [44_100, 96_000] {
+                try AVAudioSession.sharedInstance().setActive(false)
+                try await session.activate(preferredRate: preferred)
+                #expect(session.isActive)
+                #expect(session.sampleRate > 0)
+                #if targetEnvironment(simulator)
+                    // The simulator honours every rate (S3); a device may pick another one.
+                    #expect(session.sampleRate == preferred)
+                #endif
+                let before = session.deactivations
+                #expect(await session.requestSampleRate(session.sampleRate) == session.sampleRate)
+                #expect(session.deactivations == before)
+                print("S3: activated with preferred=\(preferred) actual=\(session.sampleRate)")
             }
         }
 

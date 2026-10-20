@@ -148,7 +148,7 @@ public final class Player {
             nowPlaying.clear()
             return
         }
-        await launch(at: min(max(index, 0), items.count - 1), frame: 0).value
+        await launch(at: min(max(index, 0), items.count - 1), frame: 0, for: .play).value
     }
 
     /// Stops playback where it is (ruling R15). No effect unless playing or preparing.
@@ -181,17 +181,19 @@ public final class Player {
         switch status {
         case .playing, .preparing:
             guard let engine else { return }
+            // From the request, through the main actor's queue on the engine, to the first frame at the target.
+            let interval = FirstFrameInterval(.seek)
             cue = Cue(index: index, frame: frame)
             position = item.duration(ofFrames: frame)
             nowPlaying.show(item, elapsed: position, playing: true)
             engine.seeksInFlight += 1
-            await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame) }.value
+            await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame, firstFrame: interval) }.value
             engine.seeksInFlight -= 1
         case .paused:
             cue = Cue(index: index, frame: frame)
             showCue(playing: false)
         case .ended:
-            await launch(at: index, frame: frame).value
+            await launch(at: index, frame: frame, for: .play).value
         case .idle, .failed:
             break
         }
@@ -234,7 +236,7 @@ public final class Player {
     private func go(to index: Int) async {
         switch status {
         case .playing, .preparing, .ended:
-            await launch(at: index, frame: 0).value
+            await launch(at: index, frame: 0, for: .play).value
         case .paused:
             cue = Cue(index: index, frame: 0)
             showPending(for: index)
@@ -246,8 +248,12 @@ public final class Player {
 
     /// Retires whatever plays and starts a new engine at `frame` of `queue[index]`. The state changes happen now; the
     /// returned task finishes once the pipeline has the queue, or the start was abandoned.
+    ///
+    /// `kind` names the signpost interval that runs from here, before the session activation, to the first real
+    /// frame; an abandoned start ends it as abandoned.
     @discardableResult
-    private func launch(at index: Int, frame: Int64) -> Task<Void, Never> {
+    private func launch(at index: Int, frame: Int64, for kind: FirstFrameInterval.Kind) -> Task<Void, Never> {
+        let interval = FirstFrameInterval(kind)
         retireEngine()
         cue = Cue(index: index, frame: frame)
         currentIndex = index
@@ -265,18 +271,20 @@ public final class Player {
         self.engine = engine
         let items = queue.map(\.playbackItem)
         let needsActivation = !sessionActive
+        // The item's rate as imported: the negotiation that follows asks for the decoder's, normally the same.
+        let preferredRate = queue[index].format.sampleRate
         return engine.enqueue { [weak self] pipeline in
             if needsActivation {
                 guard let self else { return }
                 do {
-                    try await activateSession()
+                    try await activateSession(preferredRate: preferredRate)
                 } catch {
                     if self.engine === engine { fail("Audio session unavailable: \(error)") }
                     return
                 }
             }
             guard !engine.isRetired else { return }
-            await pipeline.start(items, at: index, fromFrame: frame)
+            await pipeline.start(items, at: index, fromFrame: frame, firstFrame: interval)
             engine.hasStarted = true
         }
     }
@@ -313,10 +321,11 @@ public final class Player {
     }
 
     /// Configures and activates the session, in turn with the negotiations, then reads the route again: the port and
-    /// volume read before activation may be stale.
-    private func activateSession() async throws {
+    /// volume read before activation may be stale. With `preferredRate`, the session comes up at that rate if the
+    /// hardware takes it, so the start's own negotiation finds nothing to change (final review I6).
+    private func activateSession(preferredRate: Int?) async throws {
         let losses = sessionLosses
-        try await gate.activate()
+        try await gate.activate(preferredRate: preferredRate)
         // If the session was lost again meanwhile (an interruption), the next start activates it again.
         if sessionLosses == losses { sessionActive = true }
         signal.port = session.currentPort
@@ -349,7 +358,7 @@ public final class Player {
     private func resumeNow() {
         guard status == .paused || status == .ended, queue.indices.contains(cue.index) else { return }
         // Now Playing switches to playing once the new pipeline's `trackStarted` arrives.
-        launch(at: cue.index, frame: cue.frame)
+        launch(at: cue.index, frame: cue.frame, for: .resume)
     }
 
     /// Ends the queue: the last track cued at its start. Now Playing keeps showing it, paused at 0, so the lock screen
@@ -363,6 +372,7 @@ public final class Player {
     }
 
     private func fail(_ message: String) {
+        Telemetry.logger.error("Player failed: \(message, privacy: .public)")
         retireEngine()
         status = .failed(message)
         currentIndex = nil
@@ -387,6 +397,7 @@ public final class Player {
         engine?.hasStarted = true
         switch event {
         case .planChanged(let plan):
+            Telemetry.logger.info("Plan changed: \(String(describing: plan), privacy: .public)")
             // Read the hardware side now, right after the pipeline configured the output for this plan: when the
             // output can see it, it is the honest rate (on the simulator it can stay at 48 kHz under a 44.1 kHz
             // client, ruling R17), and its channel count shows a downmix. The plan is for the track about to start,
@@ -413,7 +424,8 @@ public final class Player {
         case .trackEnded:
             // The next `trackStarted` or `queueEnded` follows.
             break
-        case .itemFailed(_, let message):
+        case .itemFailed(let index, let message):
+            Telemetry.logger.error("Item \(index, privacy: .public) failed: \(message, privacy: .public)")
             // The pipeline moves on to the next item by itself.
             lastFailure = message
         case .queueEnded:
@@ -426,6 +438,7 @@ public final class Player {
     }
 
     private func handle(_ event: SessionEvent) {
+        log(event)
         switch event {
         case .routeChanged(let reason, let port):
             let previous = signal.port
@@ -444,7 +457,7 @@ public final class Player {
                     // The hardware may run at another rate now. Restart at the same point, so the client rate matches
                     // it again, rather than let iOS resample silently.
                     let point = currentPoint()
-                    launch(at: point.index, frame: point.frame)
+                    launch(at: point.index, frame: point.frame, for: .restart)
                 }
             case .paused, .ended:
                 refreshIdleHardwareRate()
@@ -468,6 +481,22 @@ public final class Player {
         }
     }
 
+    /// Session events in the unified log. A route's name can be the user's device name, so it is private; volume
+    /// changes, which come in bursts while the user drags the slider, only at debug level.
+    private func log(_ event: SessionEvent) {
+        let logger = Telemetry.logger
+        switch event {
+        case .routeChanged(let reason, let port):
+            logger.info(
+                "Route changed (\(String(describing: reason), privacy: .public)): \(String(describing: port), privacy: .private)"
+            )
+        case .volumeChanged(let volume):
+            logger.debug("Volume \(volume, privacy: .public)")
+        case .interruptionBegan, .interruptionEnded, .mediaServicesReset:
+            logger.info("Session: \(String(describing: event), privacy: .public)")
+        }
+    }
+
     /// While nothing plays (paused, or ended with the last track cued), the next start re-negotiates; until then the
     /// strip follows the hardware, but only a real move. A notification that leaves the hardware at the rate the last
     /// negotiation read back (a category change, the session's own activation) changes nothing: overwriting the
@@ -485,9 +514,12 @@ public final class Player {
     ///
     /// A same-port route change (a category or configuration change) can move the hardware rate mid-track. It is also
     /// what the session's own activation and negotiation post, so the comparison must not set off a restart loop. It
-    /// cannot: a notification a negotiation causes arrives while that negotiation holds the session's turn (no settled
-    /// rate, ignored) or after it, when the read-back equals the live rate. `signal.plan` would not do here, because
-    /// the new plan's `.planChanged` can arrive after the notification its own negotiation caused.
+    /// cannot: a notification a negotiation or an activation causes arrives while that call holds the session's turn
+    /// (no settled rate, ignored) or after it, when the rate it recorded equals the live rate. An activation records
+    /// its rate for exactly this reason (ledger T13): otherwise the settled rate would be the previous negotiation's,
+    /// and a notification between a start's activation and its negotiation would restart the start for nothing.
+    /// `signal.plan` would not do here, because the new plan's `.planChanged` can arrive after the notification its own
+    /// negotiation caused.
     private var hardwareRateMoved: Bool {
         guard let settled = gate.settledRate else { return false }
         let live = session.sampleRate
@@ -506,7 +538,7 @@ public final class Player {
         retireEngine()
         arbiter.discardOutput()
         // If this fails, the next start tries again.
-        Task { [weak self] in try? await self?.activateSession() }
+        Task { [weak self] in try? await self?.activateSession(preferredRate: nil) }
     }
 
     /// A remote command, on the main actor.

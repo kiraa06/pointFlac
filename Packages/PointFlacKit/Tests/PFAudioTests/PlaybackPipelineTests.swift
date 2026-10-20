@@ -614,6 +614,42 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)
     }
 
+    /// Final review I6 (measurement): the start and seek intervals end at the first real frame the decode thread sees
+    /// rendered, never on hold or underrun silence. One that never gets a frame (superseded, or the pipeline stopped)
+    /// ends as abandoned.
+    @Test func firstFrameIntervalsEndOnRenderedAudio() async {
+        let rig = Rig()
+        let started = FirstFrameInterval(.play)
+        await rig.pipeline.start([item("s24-96000")], at: 0, fromFrame: 0, firstFrame: started)
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(started.outcome == nil, "ended before anything was rendered")
+        #expect(await rig.pull(upTo: 512))
+        #expect(await wait(upTo: .seconds(2)) { started.outcome != nil })
+        #expect(started.outcome == .rendered)
+
+        let superseded = FirstFrameInterval(.seek)
+        let seek = FirstFrameInterval(.seek)
+        await rig.pipeline.seek(toFrame: 1000, firstFrame: superseded)
+        await rig.pipeline.seek(toFrame: 2000, firstFrame: seek)
+        #expect(superseded.outcome == .abandoned)
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(seek.outcome == nil, "ended before the seek was served")
+        #expect(await rig.pump { rig.pulledFrames > 512 })
+        #expect(await wait(upTo: .seconds(2)) { seek.outcome != nil })
+        #expect(seek.outcome == .rendered)
+
+        let stopped = FirstFrameInterval(.seek)
+        await rig.pipeline.seek(toFrame: 100, firstFrame: stopped)
+        rig.pipeline.stop()
+        #expect(stopped.outcome == .abandoned)
+
+        let neverRendered = FirstFrameInterval(.play)
+        await rig.pipeline.start([item("s16-44100")], at: 0, fromFrame: 0, firstFrame: neverRendered)
+        rig.pipeline.stop()
+        #expect(await wait(upTo: .seconds(2)) { neverRendered.outcome != nil })
+        #expect(neverRendered.outcome == .abandoned)
+    }
+
     @Test func positionFollowsRenderedFrames() async {
         let rig = Rig()
         await rig.play([item("s24-48000", id: "a"), item("s24-48000", id: "b")])

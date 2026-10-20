@@ -38,7 +38,13 @@ final class PlayerEngine {
     }
 
     /// Stops the pipeline for good. The lease is revoked after `stop()`, which must still reach the output.
+    ///
+    /// Measured as a "Retire" signpost interval: it runs on the main actor and waits for the output to stop, so its
+    /// length is main-thread time (final review I5, to be judged on a device before the retire is made non-blocking).
     func retire() {
+        let signposter = Telemetry.signposter
+        let retiring = signposter.beginInterval("Retire")
+        defer { signposter.endInterval("Retire", retiring) }
         isRetired = true
         pipeline.stop()
         lease.revoke()

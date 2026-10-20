@@ -110,7 +110,7 @@ private final class SuspendingSession: AudioSessionControlling {
     /// The most requests that were inside the session at the same time.
     var mostInside: Int { state.withLock { $0.mostInside } }
 
-    func activate() async throws {}
+    func activate(preferredRate: Int?) async throws {}
 
     func requestSampleRate(_ hz: Int) async -> Int {
         await withCheckedContinuation { continuation in
@@ -138,6 +138,27 @@ private final class SuspendingSession: AudioSessionControlling {
             return s.waiting
         }
         for continuation in all { continuation.resume() }
+    }
+}
+
+/// Counts the items a pipeline opens. Items whose id starts "pattern-slow" block in the open, on the decode thread, until
+/// the test releases them, so a test can act between a start's activation and its negotiation.
+private final class OpenLog: Sendable {
+    private let opened = Atomic<Int>(0)
+    private let released = Atomic<Bool>(false)
+
+    var count: Int { opened.load(ordering: .acquiring) }
+
+    func open(_ item: PlaybackItem) throws -> PCMDecoding {
+        opened.add(1, ordering: .releasing)
+        if item.id.hasPrefix("pattern-slow") {
+            while !released.load(ordering: .acquiring) { usleep(200) }
+        }
+        return try decoderForItem(item)
+    }
+
+    func release() {
+        released.store(true, ordering: .releasing)
     }
 }
 
@@ -1038,6 +1059,60 @@ private final class Rig {
         #expect(rig.player.status == .ended)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+    }
+
+    // MARK: Activation (final review I6, ledger T13)
+
+    /// The first activation sets the first item's rate before activating, so a first play needs no deactivate and
+    /// reactivate cycle. An activation after an interruption asks for the cued item's rate.
+    @Test func activationAsksForTheCuedItemsRate() async {
+        let rig = Rig()
+        await rig.player.play([fixtureItem("s24-96000"), patternItem("b")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.session.activationRates == [96_000])
+        rig.session.emit(.interruptionBegan)
+        #expect(await eventually { rig.player.status == .paused })
+        await rig.player.next()
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.session.activationRates == [96_000, 44_100])
+    }
+
+    /// Ledger T13: activation records the rate it leaves the hardware at, as a negotiation does.
+    @Test func activationSettlesTheRate() async throws {
+        let session = FakeSession(rateResponse: { _ in 96_000 })
+        let gate = SessionGate(session: session)
+        #expect(gate.settledRate == nil)
+        try await gate.activate(preferredRate: 96_000)
+        #expect(gate.settledRate == 96_000)
+        session.sampleRate = 0
+        try await gate.activate(preferredRate: nil)
+        // An inactive session's 0 is no rate: the last real one stands.
+        #expect(gate.settledRate == 96_000)
+    }
+
+    /// Ledger T13: before the fix, the settled rate after an activation was the previous negotiation's, so a same-port
+    /// notification arriving between a start's activation and its negotiation (the activation itself posts them)
+    /// looked like the hardware moving, and restarted the start for nothing.
+    @Test func activationCausedNotificationDoesNotRestart() async {
+        let opens = OpenLog()
+        let rig = Rig(makeDecoder: { try opens.open($0) })
+        await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        rig.session.emit(.interruptionBegan)
+        #expect(await eventually { rig.player.status == .paused })
+
+        // Activation at 44.1 kHz; the pipeline then blocks opening the item, before it negotiates.
+        await rig.player.play([patternItem("slow")], startingAt: 0)
+        #expect(await eventually { rig.session.activationCount == 2 && opens.count == 2 })
+        #expect(rig.session.sampleRate == 44_100)
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(opens.count == 2, "the start was restarted")
+
+        opens.release()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.session.requestedRates == [48_000, 44_100])
     }
 
     /// Ruling 6: one session call at a time, in arrival order; a stopped pipeline's request never reaches the session.

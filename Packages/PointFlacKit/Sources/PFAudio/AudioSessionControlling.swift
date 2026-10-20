@@ -42,14 +42,21 @@ public enum SessionEvent: Sendable, Equatable {
 /// The audio session seen by the player: `SystemAudioSession` on iOS, `FakeSession` in host tests.
 public protocol AudioSessionControlling: AnyObject, Sendable {
     /// Configures the session for long-form playback and activates it.
-    func activate() async throws
+    ///
+    /// With a `preferredRate`, the rate is asked for before activation (spec §5.2: "preferred rate is set before
+    /// activation"), so a first play can come up at the file's rate, and the pipeline's negotiation that follows only
+    /// reads it back instead of deactivating and reactivating. It is a hint, like `requestSampleRate`'s: read
+    /// `sampleRate` for what the hardware took.
+    func activate(preferredRate: Int?) async throws
 
     /// Asks the hardware for `hz` and returns the rate it actually runs at.
     ///
     /// iOS treats the preferred rate as a hint, so the result may differ from `hz`. The pipeline compares the two and
     /// resamples itself when they differ; it never lets iOS resample silently. The read-back rate is returned on every
     /// path, including when a step of the negotiation failed, never `hz`. An inactive session can legitimately read
-    /// back 0, which the pipeline treats as "output rate unavailable".
+    /// back 0, which the pipeline treats as "output rate unavailable". When an active session already runs at `hz`, an
+    /// implementation should only read it back: a deactivate and reactivate cycle costs tens of milliseconds and posts
+    /// route changes, for nothing.
     func requestSampleRate(_ hz: Int) async -> Int
 
     var currentPort: OutputPort { get }
@@ -64,6 +71,13 @@ public protocol AudioSessionControlling: AnyObject, Sendable {
     /// The `outputVolume` KVO emits no initial value and fires reliably only while the session is active, so read
     /// `outputVolume` once at start rather than waiting for `.volumeChanged`.
     var events: AsyncStream<SessionEvent> { get }
+}
+
+extension AudioSessionControlling {
+    /// Activates with no preferred rate: whatever the hardware runs at.
+    public func activate() async throws {
+        try await activate(preferredRate: nil)
+    }
 }
 
 extension OutputPort {

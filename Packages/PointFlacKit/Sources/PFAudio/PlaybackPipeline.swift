@@ -79,18 +79,31 @@ public final class PlaybackPipeline: @unchecked Sendable {
     /// Replaces the queue and plays `items` from `index`, starting at `fromFrame`. Whatever was playing stops first.
     ///
     /// Returns once the queue is registered. The decode thread then negotiates the rate, configures and starts the
-    /// output (`.planChanged`), and fills the ring.
+    /// output (`.planChanged`), and fills the ring. A "Play to first frame" signpost interval runs from here to the
+    /// first real frame rendered.
     public func start(_ items: [PlaybackItem], at index: Int, fromFrame: Int64) async {
-        core.start(items, at: index, fromFrame: fromFrame)
+        core.start(items, at: index, fromFrame: fromFrame, firstFrame: FirstFrameInterval(.play))
+    }
+
+    /// `start(_:at:fromFrame:)` with the caller's own interval, begun when its request came in (the player's play,
+    /// resume or restart, before it activated the session), so the interval covers the whole path to the first frame.
+    func start(_ items: [PlaybackItem], at index: Int, fromFrame: Int64, firstFrame: FirstFrameInterval) async {
+        core.start(items, at: index, fromFrame: fromFrame, firstFrame: firstFrame)
     }
 
     /// Seeks within the item being rendered.
     ///
     /// Returns as soon as the request is registered, without waiting for audio: from then on nothing buffered before
     /// the request is rendered, and audio from `frame` follows once the decode thread has flushed the ring and
-    /// refilled it, which needs the output to keep pulling. A newer seek supersedes one not yet served.
+    /// refilled it, which needs the output to keep pulling. A newer seek supersedes one not yet served. A "Seek to
+    /// first frame" signpost interval runs from here to the first real frame at the new position.
     public func seek(toFrame frame: Int64) async {
-        core.seek(toFrame: frame)
+        core.seek(toFrame: frame, firstFrame: FirstFrameInterval(.seek))
+    }
+
+    /// `seek(toFrame:)` with the caller's own interval, begun when its request came in.
+    func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
+        core.seek(toFrame: frame, firstFrame: firstFrame)
     }
 
     /// Stops the output and ends the queue. Does not wait for the decode thread, which may be blocked in file I/O or
@@ -127,6 +140,8 @@ final class PipelineCore: @unchecked Sendable {
         var timeline = Timeline()
         /// The newest seek not yet taken by the decode thread.
         var requestedSeek: Int64?
+        /// `requestedSeek`'s signpost interval, taken by the decode thread with it.
+        var seekInterval: FirstFrameInterval?
     }
 
     let capabilities: OutputCapabilities
@@ -155,44 +170,56 @@ final class PipelineCore: @unchecked Sendable {
         self.continuation = continuation
     }
 
-    func start(_ items: [PlaybackItem], at index: Int, fromFrame: Int64) {
+    func start(_ items: [PlaybackItem], at index: Int, fromFrame: Int64, firstFrame: FirstFrameInterval) {
         let first = max(index, 0)
-        let session = DecodeSession(core: self, items: items, startIndex: first, startFrame: max(fromFrame, 0))
-        outputGate.withLock {
-            shared.withLock { s in
+        let session = DecodeSession(
+            core: self, items: items, startIndex: first, startFrame: max(fromFrame, 0), firstFrame: firstFrame)
+        let dropped = outputGate.withLock {
+            let dropped = shared.withLock { s in
                 s.session?.requestStop()
                 s.session = session
                 s.source = nil
                 s.timeline = Timeline(startIndex: first, startFrame: max(fromFrame, 0))
                 s.requestedSeek = nil
+                return s.seekInterval.take()
             }
             output.stop()
             output.source = nil
+            return dropped
         }
+        dropped?.end(.abandoned)
         session.launch()
     }
 
-    func seek(toFrame frame: Int64) {
-        shared.withLock { s in
-            guard let session = s.session else { return }
+    func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval) {
+        // The interval this request supersedes, or this one when there is nothing to seek. Ended outside the lock.
+        let abandoned = shared.withLock { s -> FirstFrameInterval? in
+            guard let session = s.session else { return firstFrame }
             s.requestedSeek = frame
+            let superseded = s.seekInterval
+            s.seekInterval = firstFrame
             s.source?.holdForSeek()
             s.timeline.pendingFrame = frame
             session.wake()
+            return superseded
         }
+        abandoned?.end(.abandoned)
     }
 
     func stop() {
-        outputGate.withLock {
-            shared.withLock { s in
+        let dropped = outputGate.withLock {
+            let dropped = shared.withLock { s in
                 s.session?.requestStop()
                 s.session = nil
                 s.requestedSeek = nil
                 s.timeline.pendingFrame = nil
+                return s.seekInterval.take()
             }
             output.stop()
             output.source = nil
+            return dropped
         }
+        dropped?.end(.abandoned)
     }
 
     func shutDown() {

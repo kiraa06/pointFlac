@@ -37,4 +37,19 @@ import Testing
         #expect(session.currentPort == .bluetooth("Buds"))
         #expect(session.outputVolume == 0.25)
     }
+
+    /// An activation with a preferred rate comes up at whatever the scripted hardware makes of it, as a real session
+    /// does when the rate is set before `setActive(true)`; one without leaves the rate alone.
+    @Test func activationAppliesThePreferredRate() async throws {
+        let session = FakeSession(rateResponse: { $0 > 48_000 ? 48_000 : $0 })
+        try await session.activate(preferredRate: 96_000)
+        #expect(session.sampleRate == 48_000)
+        try await session.activate(preferredRate: 44_100)
+        #expect(session.sampleRate == 44_100)
+        try await session.activate()
+        #expect(session.sampleRate == 44_100)
+        #expect(session.activationRates == [96_000, 44_100, nil])
+        #expect(session.activationCount == 3)
+        #expect(session.requestedRates.isEmpty)
+    }
 }
