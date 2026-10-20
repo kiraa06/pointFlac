@@ -457,7 +457,8 @@ struct TopK {
 
     init(limit: Int) {
         self.limit = max(0, limit)
-        items.reserveCapacity(self.limit + 1)
+        // Bounded, so a caller asking for "everything" (Int.max) cannot overflow the reservation.
+        items.reserveCapacity(min(self.limit, 256) + 1)
     }
 
     /// Higher keys first; equal keys in library order.

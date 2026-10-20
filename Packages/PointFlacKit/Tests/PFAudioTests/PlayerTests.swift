@@ -996,6 +996,19 @@ private final class Rig {
         #expect(mismatch(afterSeek, floats(PatternDecoder.samples(from: 44_100, count: 512), bits: 16)) == nil)
     }
 
+    /// Ledger M5: the decoder's length is authoritative too. A file replaced since import with a longer or shorter one
+    /// shows, and seeks within, the length that plays, not the one recorded at import.
+    @Test func decodedLengthIsAuthoritative() async {
+        let stale = QueueItem(
+            id: "pattern-short", url: URL(fileURLWithPath: "/dev/null"), title: "Stale", artist: "", album: "",
+            format: PatternDecoder.sourceFormat, totalFrames: 10)
+        let rig = Rig()
+        await rig.player.play([stale], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.queue[0].totalFrames == PatternDecoder.frames)
+        #expect(rig.player.queue[0].duration == stale.duration(ofFrames: PatternDecoder.frames))
+    }
+
     // MARK: Refreshing the strip while nothing plays (ledger T13)
 
     /// A notification that leaves the hardware at the negotiated rate must not overwrite the R17 hardware-side rate:

@@ -165,7 +165,7 @@ final class DecodeSession: @unchecked Sendable {
             converterInput = 0
         }
         if entry != .seek {
-            appendMarker(.trackStarted(target, nextFormat), at: boundary)
+            appendMarker(.trackStarted(target, nextFormat, totalFrames: next.totalFrames), at: boundary)
         }
         decoder = next
         index = target

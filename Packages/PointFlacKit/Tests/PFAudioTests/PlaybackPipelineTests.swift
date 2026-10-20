@@ -24,6 +24,11 @@ private func format(_ name: String) -> AudioFormat {
     return AudioFormat(sampleRate: f.sampleRate, bitsPerSample: f.bits, channels: f.channels)
 }
 
+/// `.trackStarted` for item `index` playing fixture `name`: its decoded format and its STREAMINFO length.
+private func started(_ index: Int, _ name: String) -> PipelineEvent {
+    .trackStarted(index, format(name), totalFrames: Fixtures.named(name).frames)
+}
+
 /// Native-range samples as the Float32 client receives them: v / 2^(b−1).
 private func floats(_ samples: some Sequence<Int32>, bits: Int) -> [Float] {
     let scale = Float(1 << (bits - 1))
@@ -332,7 +337,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
             #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: f.bits)) == nil)
         }
         #expect(rig.log.events.first == .planChanged(rig.output.plans[0]))
-        #expect(rig.log.contains(.trackStarted(0, format(name))))
+        #expect(rig.log.contains(started(0, name)))
     }
 
     static let thirtyTwoBitFixtures = pureFixtures.filter { Fixtures.named($0).bits == 32 }
@@ -364,8 +369,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(rig.output.plans == [plan])
         #expect(
             rig.log.events == [
-                .planChanged(plan), .trackStarted(0, format("s24-48000")), .trackEnded(0),
-                .trackStarted(1, format("s24-48000")), .trackEnded(1), .queueEnded,
+                .planChanged(plan), started(0, "s24-48000"), .trackEnded(0),
+                started(1, "s24-48000"), .trackEnded(1), .queueEnded,
             ])
     }
 
@@ -382,8 +387,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(Array(captured.dropFirst(first.count)), second) == nil)
         #expect(
             rig.log.events == [
-                .planChanged(floatPlan(44_100)), .trackStarted(0, format("s16-44100")), .trackEnded(0),
-                .planChanged(floatPlan(96_000)), .trackStarted(1, format("s24-96000")), .trackEnded(1), .queueEnded,
+                .planChanged(floatPlan(44_100)), started(0, "s16-44100"), .trackEnded(0),
+                .planChanged(floatPlan(96_000)), started(1, "s24-96000"), .trackEnded(1), .queueEnded,
             ])
     }
 
@@ -440,7 +445,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
             if case .itemFailed(0, _) = $0 { return true }
             return false
         }
-        let next = events.firstIndex(of: .trackStarted(1, format("s16-44100")))
+        let next = events.firstIndex(of: started(1, "s16-44100"))
         #expect(failed != nil && next != nil && failed! < next!, "events: \(events)")
         #expect(!events.contains(.trackEnded(0)))
         // The 1000 frames decoded before the failure play; then item 1 plays exactly.
@@ -465,7 +470,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         // The end markers queued before the seeks were never rendered, so they are dropped, not fired twice.
         #expect(
             rig.log.events == [
-                .planChanged(floatPlan(96_000)), .trackStarted(0, format("s24-96000")), .trackEnded(0), .queueEnded,
+                .planChanged(floatPlan(96_000)), started(0, "s24-96000"), .trackEnded(0), .queueEnded,
             ])
     }
 
@@ -518,7 +523,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         // trackEnded(0) and trackStarted(1) share frame 4096 and reach the log one at a time, so wait for both.
         #expect(
             await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
-                rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1, format("s24-48000")))
+                rig.log.contains(.trackEnded(0)) && rig.log.contains(started(1, "s24-48000"))
             }, "boundary events, \(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))
     }
@@ -536,15 +541,15 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(await rig.pull(upTo: 4458 + 32))
         #expect(
             await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
-                rig.log.contains(.trackStarted(1, format("s16-44100")))
+                rig.log.contains(started(1, "s16-44100"))
             }, "\(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))
         await rig.playToEnd()
         let plan = floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))
         #expect(
             rig.log.events == [
-                .planChanged(plan), .trackStarted(0, format("s16-44100")), .trackEnded(0),
-                .trackStarted(1, format("s16-44100")), .trackEnded(1), .queueEnded,
+                .planChanged(plan), started(0, "s16-44100"), .trackEnded(0),
+                started(1, "s16-44100"), .trackEnded(1), .queueEnded,
             ])
         let reference = try oneShotResample(floats(raw + raw, bits: 16), from: 44_100, to: 48_000, channels: 2)
         #expect(rig.output.capturedFloat.count == reference.count)
@@ -569,13 +574,13 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(ended, "events: \(rig.log.events)")
         var expected: [PipelineEvent] = [
             .planChanged(floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))),
-            .trackStarted(0, format("corrupt-mid-s16-44100")),
-            .trackEnded(0), .trackStarted(1, format("s16-44100")), .itemFailed(1, "ioError"),
+            started(0, "corrupt-mid-s16-44100"),
+            .trackEnded(0), started(1, "s16-44100"), .itemFailed(1, "ioError"),
         ]
         if followedByFormatChange {
             expected += [
                 .planChanged(floatPlan(48_000, resample: RateChange(from: 96_000, to: 48_000))),
-                .trackStarted(2, format("s24-96000")),
+                started(2, "s24-96000"),
                 .trackEnded(2),
             ]
         }
@@ -620,7 +625,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(
             rig.log.events == [
                 .itemFailed(0, "Output rate unavailable"), .planChanged(floatPlan(44_100)),
-                .trackStarted(1, format("s16-44100")),
+                started(1, "s16-44100"),
                 .trackEnded(1), .queueEnded,
             ])
         #expect(rig.output.plans == [floatPlan(44_100)])
@@ -644,7 +649,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(
             rig.log.events == [
                 .itemFailed(0, "Multichannel FLAC isn't supported yet"), .planChanged(floatPlan(44_100)),
-                .trackStarted(1, format("s16-44100")), .trackEnded(1), .queueEnded,
+                started(1, "s16-44100"), .trackEnded(1), .queueEnded,
             ])
         #expect(rig.output.plans == [floatPlan(44_100)])
         #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)

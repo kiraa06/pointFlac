@@ -170,6 +170,8 @@ private func highlighted(_ text: String, _ ranges: [Range<String.Index>]) -> [St
     #expect(hits.first?.kind == .artist && hits.first?.title == "Radiohead")
     #expect(sampleIndex.suggest("", limit: 5).isEmpty)
     #expect(sampleIndex.suggest("radio", limit: 0).isEmpty)
+    #expect(sampleIndex.suggest("radio", limit: .max).count == 5)
+    #expect(sampleIndex.search("radio", limit: .max).tracks.count == 3)
     #expect(hits.allSatisfy { !$0.id.isEmpty && !$0.subtitle.isEmpty })
 }
 
