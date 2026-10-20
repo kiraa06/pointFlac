@@ -11,6 +11,8 @@ struct MockUploader {
         case deny(String)
         case announceSize(UInt64)
         case dropAfter(Int)
+        /// Sends this many body bytes, then requires the client to close the F connection within 4 s.
+        case stallAfter(Int)
         /// Sends the TransferRequest over a second, server-forwarded P connection instead of ours.
         case indirectRequest(MockListener)
     }
@@ -75,10 +77,24 @@ struct MockUploader {
         let offset = try offsetReader.u64()
         var body = Array(content[Int(offset)...])
         if case .dropAfter(let count) = script { body = Array(body.prefix(count)) }
+        if case .stallAfter(let count) = script { body = Array(body.prefix(count)) }
         for chunk in stride(from: 0, to: body.count, by: 32 * 1024) {
-            try await file.send(Array(body[chunk..<min(chunk + 32 * 1024, body.count)]))
+            let piece = Array(body[chunk..<min(chunk + 32 * 1024, body.count)])
+            if case .stallAfter = script {
+                try? await file.send(piece)  // the client may already have closed; that is the point
+            } else {
+                try await file.send(piece)
+            }
         }
         if case .dropAfter = script { file.close() }
+        if case .stallAfter = script {
+            do {
+                _ = try await file.link.receive(timeout: .seconds(4))
+            } catch LinkError.timeout {
+                throw LinkError.failed("the client left the F connection open")
+            } catch {}
+            return offset
+        }
         // Hold the connection until the client has read everything and closed its side.
         _ = try? await file.link.receive(timeout: .seconds(3))
         control.close()

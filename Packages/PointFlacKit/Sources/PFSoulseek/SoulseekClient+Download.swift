@@ -196,7 +196,8 @@ extension SoulseekClient {
         do {
             try await framed.send(Outgoing.fileOffset(UInt64(offset)))
             events.yield(.started(offset: offset, size: size))
-            var lastReport = ContinuousClock.now
+            // The first chunk reports at once, later ones at most every 200 ms.
+            var lastReport = ContinuousClock.now - .seconds(1)
             var chunk = framed.drain()
             while true {
                 if !chunk.isEmpty {
