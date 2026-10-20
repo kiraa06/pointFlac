@@ -302,6 +302,123 @@ struct DownloadManagerTests {
         #expect(library.names == ["Song.flac"])
     }
 
+    // MARK: Providers that misbehave
+
+    @Test("after .finished the stream is drained first, so bytes written before it ends are what gets validated")
+    func drainsBeforeAdmitting() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let provider = ScriptedProvider { track, staging, _, events in
+            let file = try deliverFixture(track, staging)
+            events.yield(.finished(file))
+            try await Task.sleep(for: .milliseconds(100))
+            // Still writing after reporting the file done: the magic is overwritten.
+            let handle = try FileHandle(forWritingTo: file)
+            try handle.write(contentsOf: Data("XXXX".utf8))
+            try handle.close()
+        }
+        let manager = makeManager(folder, provider: provider, library: library)
+        await manager.enqueue(fixtureTrack("s16-44100"))
+        let items = try await waitFor(manager, allFinal)
+        #expect(failureMessage(items[0].state)?.contains("not a valid FLAC") == true)
+        #expect(library.names.isEmpty)
+    }
+
+    @Test("a writer that keeps its descriptor after the stream ends cannot change the published file")
+    func publishesASnapshot() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let original = try Data(contentsOf: Fixtures.url(Fixtures.named("s16-44100")))
+        let provider = ScriptedProvider { track, staging, _, events in
+            let file = try deliverFixture(track, staging)
+            let handle = try FileHandle(forWritingTo: file)
+            events.yield(.finished(file))
+            let published = library.folder.appending(path: "Song.flac")
+            Task.detached {
+                for _ in 0..<400 where !FileManager.default.fileExists(atPath: published.path) {
+                    try? await Task.sleep(for: .milliseconds(5))
+                }
+                try? handle.seek(toOffset: 0)
+                try? handle.write(contentsOf: Data(repeating: 0, count: 64))
+                try? handle.close()
+            }
+        }
+        let manager = makeManager(folder, provider: provider, library: library)
+        await manager.enqueue(fixtureTrack("s16-44100"))
+        let items = try await waitFor(manager, allFinal)
+        #expect(items[0].state == .published)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(try Data(contentsOf: library.folder.appending(path: "Song.flac")) == original)
+    }
+
+    @Test("a negative or overflowing size is refused before any download")
+    func impossibleSizes() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let provider = ScriptedProvider { _, _, _, _ in Issue.record("nothing should be downloaded") }
+        let manager = makeManager(folder, provider: provider, library: library) { $0.maxFileBytes = .max }
+        await manager.enqueue(fixtureTrack("s16-44100", id: "negative", size: -1))
+        await manager.enqueue(fixtureTrack("s16-44100", id: "huge", size: .max))
+        let items = try await waitFor(manager) { $0.count == 2 && allFinal($0) }
+        #expect(failureMessage(items[0].state)?.contains("impossible size") == true)
+        #expect(failureMessage(items[1].state)?.contains("too large") == true)
+    }
+
+    @Test(
+        "a provider of unknown size that keeps writing is stopped at the size limit, with or without progress",
+        arguments: [false, true])
+    func growthLimit(sendsProgress: Bool) async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let provider = ScriptedProvider { _, staging, _, events in
+            let file = staging.appending(path: "endless.part")
+            FileManager.default.createFile(atPath: file.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            for step in 0..<10_000 {
+                try handle.write(contentsOf: Data(repeating: 0xAB, count: 10_000))
+                if sendsProgress { events.yield(.progress(Double(step) / 10_000)) }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        let manager = makeManager(folder, provider: provider, library: library) {
+            $0.maxFileBytes = 100_000
+            // With progress the per-event check must catch it; without, only the watchdog can.
+            $0.growthCheckInterval = sendsProgress ? .seconds(600) : .milliseconds(20)
+        }
+        let id = await manager.enqueue(fixtureTrack("s16-44100", size: nil))
+        let items = try await waitFor(manager, allFinal)
+        #expect(items[0].state == .failed(DownloadManager.growthFailure))
+        try await waitFor(manager) { _ in provider.active.withLock { $0.now } == 0 }
+        #expect(!FileManager.default.fileExists(atPath: folder.sub("Staging").appending(path: id).path))
+    }
+
+    @Test("cancelling a job that was scheduled but had not started yet still removes its staging folder")
+    func cancelBeforeStart() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        // Every attempt drops the connection, leaving a part file behind for resume.
+        let provider = ScriptedProvider { _, staging, _, _ in
+            try Data([1, 2, 3]).write(to: staging.appending(path: "incoming.part"))
+            throw URLError(.networkConnectionLost)
+        }
+        let manager = makeManager(folder, provider: provider, library: library) { $0.maxAttempts = 1 }
+        let id = await manager.enqueue(fixtureTrack("s16-44100"))
+        try await waitFor(manager, allFinal)
+        let staging = folder.sub("Staging").appending(path: id)
+        for _ in 0..<20 {
+            try Data([1]).write(to: staging.appending(path: "incoming.part"))
+            #expect(await manager.retry(id))
+            #expect(await manager.cancel(id))
+            try await waitFor(manager) { $0.first?.state == .cancelled }
+            for _ in 0..<200 where FileManager.default.fileExists(atPath: staging.path) {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(!FileManager.default.fileExists(atPath: staging.path))
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        }
+    }
+
     // MARK: Persistence
 
     @Test("the queue survives a relaunch, and an interrupted download resumes and publishes")
@@ -349,13 +466,15 @@ struct DownloadManagerTests {
         let folder = try TempFolder()
         let library = try LibrarySpy(folder: folder.sub("Library"))
         let stateFile = folder.url.appending(path: "queue.json")
-        var item = DownloadItem(id: "job-1", track: fixtureTrack("s16-44100"), state: .saving, attempts: 1)
+        let firstID = UUID().uuidString
+        let secondID = UUID().uuidString
+        var item = DownloadItem(id: firstID, track: fixtureTrack("s16-44100"), state: .saving, attempts: 1)
         item.stagedFileName = "Song.flac"
-        var waiting = DownloadItem(id: "job-2", track: fixtureTrack("s16-44100", id: "t2"), state: .saving)
+        var waiting = DownloadItem(id: secondID, track: fixtureTrack("s16-44100", id: "t2"), state: .saving)
         waiting.stagedFileName = "Song.flac"
         try DownloadQueueStore(url: stateFile).save([item, waiting])
         // job-2's validated file is still in staging, so it is checked again and published.
-        let staging2 = folder.sub("Staging").appending(path: "job-2")
+        let staging2 = folder.sub("Staging").appending(path: secondID)
         try FileManager.default.createDirectory(at: staging2, withIntermediateDirectories: true)
         try FileManager.default.copyItem(
             at: Fixtures.url(Fixtures.named("s16-44100")), to: staging2.appending(path: "Song.flac"))
@@ -375,12 +494,67 @@ struct DownloadManagerTests {
         #expect(DiskSpace.available(at: folder.url.appending(path: "not/yet/here")) != nil)
     }
 
-    @Test("a damaged queue file is ignored rather than crashing")
+    @Test("a damaged queue file is moved aside rather than crashing or being overwritten")
     func damagedQueueFile() throws {
         let folder = try TempFolder()
         let file = folder.url.appending(path: "queue.json")
         try Data("{not json".utf8).write(to: file)
         #expect(DownloadQueueStore(url: file).load().isEmpty)
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.url.path)
+        #expect(names.contains { $0.hasPrefix("queue.json.corrupt-") })
+        #expect(!names.contains("queue.json"))
+    }
+
+    @Test("hostile ids and staged names in the queue file are dropped one item at a time")
+    func hostileQueueItems() throws {
+        let folder = try TempFolder()
+        let file = folder.url.appending(path: "queue.json")
+        var good = DownloadItem(id: UUID().uuidString, track: fixtureTrack("s16-44100"))
+        good.stagedFileName = "Song.flac"
+        try DownloadQueueStore(url: file).save([good])
+        let template = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        let goodItem = (template["items"] as! [[String: Any]])[0]
+        var traversal = goodItem
+        traversal["id"] = "../../Documents"
+        var stagedEscape = goodItem
+        stagedEscape["id"] = UUID().uuidString
+        stagedEscape["stagedFileName"] = "../../../evil.flac"
+        let broken: [String: Any] = ["id": UUID().uuidString, "state": 42]
+        let body: [String: Any] = ["version": 1, "items": [traversal, goodItem, stagedEscape, broken]]
+        try JSONSerialization.data(withJSONObject: body).write(to: file)
+
+        let loaded = DownloadQueueStore(url: file).load()
+        #expect(loaded.map(\.id) == [good.id])
+        #expect(loaded.first?.stagedFileName == "Song.flac")
+    }
+
+    @Test("the queue file is excluded from backups")
+    func queueFileNotBackedUp() throws {
+        let folder = try TempFolder()
+        let file = folder.url.appending(path: "queue.json")
+        try DownloadQueueStore(url: file).save([])
+        #expect(try file.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
+    @Test("restore removes staging folders that no live job owns")
+    func orphanedStaging() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let stateFile = folder.url.appending(path: "queue.json")
+        let done = DownloadItem(id: UUID().uuidString, track: fixtureTrack("s16-44100", id: "a"), state: .published)
+        let failed = DownloadItem(
+            id: UUID().uuidString, track: fixtureTrack("s16-44100", id: "b"), state: .failed("dropped"))
+        try DownloadQueueStore(url: stateFile).save([done, failed])
+        let root = folder.sub("Staging")
+        let orphan = UUID().uuidString
+        for name in [done.id, failed.id, orphan, "not-a-job"] {
+            try FileManager.default.createDirectory(at: root.appending(path: name), withIntermediateDirectories: true)
+        }
+        let provider = ScriptedProvider { _, _, _, _ in }
+        let manager = makeManager(folder, provider: provider, library: library, stateFile: stateFile)
+        await manager.restore()
+        let left = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+        #expect(left == [failed.id, "not-a-job"], "a failed job keeps its part file for retry")
     }
 }
 

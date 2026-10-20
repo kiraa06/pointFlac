@@ -39,4 +39,29 @@ struct SafeFileNameTests {
         #expect(name.hasSuffix(".flac"))
         #expect(name.hasPrefix("éé"))
     }
+
+    @Test(
+        "a separator hidden in a grapheme cluster with a combining mark still splits the path",
+        arguments: [
+            "x/\u{301}../\u{301}evil.flac", "a/\u{301}b.flac", "a\\\u{301}b.flac", "a:\u{301}b.flac", "/\u{301}.flac",
+        ])
+    func combiningMarkSeparators(input: String) throws {
+        let name = try #require(SafeFileName.sanitize(input))
+        #expect(!name.unicodeScalars.contains { $0 == "/" || $0 == "\\" || $0 == ":" })
+        #expect(name.unicodeScalars.first != ".")
+        #expect(name.hasSuffix(".flac"))
+    }
+
+    @Test("a single grapheme cluster too long to keep falls back to a visible name, never a bare .flac")
+    func oversizedCluster() {
+        let cluster = "e" + String(repeating: "\u{301}", count: 300)
+        #expect(SafeFileName.sanitize(cluster + ".flac") == "track.flac")
+        #expect(SafeFileName.sanitize(String(repeating: "\u{301}", count: 300) + ".flac") == "track.flac")
+    }
+
+    @Test("dots and spaces in any order cannot produce a hidden file")
+    func noHiddenNames() {
+        #expect(SafeFileName.sanitize(".. .x.flac") == "x.flac")
+        #expect(SafeFileName.sanitize(" . .flac") == "track.flac")
+    }
 }

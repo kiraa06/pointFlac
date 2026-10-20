@@ -24,12 +24,16 @@ public actor DownloadManager {
         public var backoff: @Sendable (Int) -> Duration
         /// Free bytes on the volume holding a folder; injectable so tests can simulate a full disk.
         public var freeSpace: @Sendable (URL) -> Int64?
+        /// How often a running job's staging folder is measured, so a provider that never reports a size (or
+        /// lies about it) cannot fill the disk past `maxFileBytes`.
+        public var growthCheckInterval: Duration
 
         public init(
             stagingRoot: URL, stateFile: URL? = nil, maxConcurrent: Int = 2, maxFileBytes: Int64 = 2 << 30,
             diskMargin: Int64 = 256 << 20, maxAttempts: Int = 3,
             backoff: @escaping @Sendable (Int) -> Duration = { .seconds(1 << min($0 - 1, 6)) },
-            freeSpace: @escaping @Sendable (URL) -> Int64? = DiskSpace.available(at:)
+            freeSpace: @escaping @Sendable (URL) -> Int64? = DiskSpace.available(at:),
+            growthCheckInterval: Duration = .milliseconds(500)
         ) {
             self.stagingRoot = stagingRoot
             self.stateFile = stateFile
@@ -39,6 +43,7 @@ public actor DownloadManager {
             self.maxAttempts = max(1, maxAttempts)
             self.backoff = backoff
             self.freeSpace = freeSpace
+            self.growthCheckInterval = growthCheckInterval
         }
     }
 
@@ -55,6 +60,9 @@ public actor DownloadManager {
     private var running: [String: Task<Void, Never>] = [:]
     private var subscribers: [UUID: AsyncStream<[DownloadItem]>.Continuation] = [:]
     private var restored = false
+    /// Why the manager itself stopped a job (e.g. it outgrew the size limit), as opposed to a user cancel.
+    private var abortReasons: [String: String] = [:]
+    private var lastGrowthCheck: [String: ContinuousClock.Instant] = [:]
 
     public init(providers: [any DownloadProvider], configuration: Configuration, publish: @escaping Publish) {
         self.providers = Dictionary(providers.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -88,8 +96,8 @@ public actor DownloadManager {
         restored = true
         guard let store else { return }
         let saved = store.load()
-        let known = Set(queue.map(\.id))
-        for var item in saved where !known.contains(item.id) {
+        var known = Set(queue.map(\.id))
+        for var item in saved where known.insert(item.id).inserted {
             if item.state == .saving, let staged = item.stagedFileName,
                 !FileManager.default.fileExists(atPath: stagingFolder(item.id).appending(path: staged).path)
             {
@@ -104,8 +112,19 @@ public actor DownloadManager {
             }
             queue.append(item)
         }
+        removeOrphanedStaging()
         changed(persist: true)
         pump()
+    }
+
+    /// Deletes staging folders no live job can use: those of unknown, published or cancelled jobs. Only
+    /// UUID-named folders are touched, so a misconfigured staging root never loses anything else.
+    private func removeOrphanedStaging() {
+        let keep = Set(queue.filter { $0.state != .published && $0.state != .cancelled }.map(\.id))
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: configuration.stagingRoot.path)) ?? []
+        for name in names where UUID(uuidString: name) != nil && !keep.contains(name) {
+            try? FileManager.default.removeItem(at: configuration.stagingRoot.appending(path: name))
+        }
     }
 
     /// Queues `track`, or returns the job already downloading it.
@@ -186,9 +205,15 @@ public actor DownloadManager {
     private func execute(_ id: String) async {
         defer {
             running[id] = nil
+            abortReasons[id] = nil
+            lastGrowthCheck[id] = nil
             pump()
         }
-        guard let item = queue.first(where: { $0.id == id }), item.state == .queued else { return }
+        guard let item = queue.first(where: { $0.id == id }), item.state == .queued else {
+            // Cancelled between being scheduled and starting: cancel() left the folder to this task.
+            if queue.first(where: { $0.id == id })?.state == .cancelled { removeStaging(id) }
+            return
+        }
         let staging = stagingFolder(id)
         do {
             let admitted: URL
@@ -208,7 +233,10 @@ public actor DownloadManager {
                 }
                 try Self.makePrivateFolder(staging)
                 try setState(id, .downloading(progress: nil))
+                let watchdog = startGrowthWatchdog(id)
+                defer { watchdog.cancel() }
                 let file = try await download(id, track: item.track, from: provider, into: staging)
+                watchdog.cancel()
                 try setState(id, .validating)
                 admitted = try await Self.admit(
                     file, staging: staging, track: item.track, maxBytes: configuration.maxFileBytes)
@@ -227,7 +255,11 @@ public actor DownloadManager {
             }
             removeStaging(id)
         } catch is CancellationError {
-            removeStaging(id)
+            if let reason = abortReasons[id] {
+                fail(id, DownloadFailure(reason))
+            } else {
+                removeStaging(id)
+            }
         } catch let failure as DownloadFailure {
             fail(id, failure)
         } catch {
@@ -240,11 +272,19 @@ public actor DownloadManager {
         guard SafeFileName.sanitize(track.fileName) != nil else {
             throw DownloadFailure("only .flac files are accepted")
         }
+        if let claimed = track.sizeBytes, claimed < 0 {
+            throw DownloadFailure("the source reported an impossible size")
+        }
         let size = track.sizeBytes ?? 0
         guard size <= configuration.maxFileBytes else {
             throw DownloadFailure("the file is larger than the \(configuration.maxFileBytes >> 20) MiB limit")
         }
-        let needed = size * 2 + configuration.diskMargin
+        // A known size needs room for staging plus a library copy. An unknown one is budgeted at the limit itself,
+        // which the growth watchdog enforces while it downloads.
+        let (budget, overflowA) =
+            track.sizeBytes == nil ? (configuration.maxFileBytes, false) : size.multipliedReportingOverflow(by: 2)
+        let (needed, overflowB) = budget.addingReportingOverflow(max(0, configuration.diskMargin))
+        guard !overflowA, !overflowB else { throw DownloadFailure("the file is too large") }
         if let free = configuration.freeSpace(configuration.stagingRoot), free < needed {
             throw DownloadFailure("not enough free space (\(needed >> 20) MiB needed)", retryable: true)
         }
@@ -259,20 +299,26 @@ public actor DownloadManager {
             attempt += 1
             update(id) { $0.attempts += 1 }
             do {
+                var finished: URL?
                 for try await event in provider.download(track, into: staging) {
                     try Task.checkCancellation()
+                    // After `.finished` the stream is drained to its end before the file is touched, so a provider
+                    // still writing cannot race admission. Later events are ignored.
+                    guard finished == nil else { continue }
                     switch event {
                     case .queued:
                         break
                     case .progress(let fraction):
+                        try checkGrowthOnProgress(id)
                         reportProgress(id, fraction)
                     case .finished(let url):
-                        return url
+                        finished = url
                     case .failed(let reason):
                         throw DownloadFailure(reason)
                     }
                 }
                 try Task.checkCancellation()
+                if let finished { return finished }
                 throw DownloadFailure("the source stopped without sending the file", retryable: true)
             } catch is CancellationError {
                 throw CancellationError()
@@ -289,6 +335,55 @@ public actor DownloadManager {
                 try setState(id, .downloading(progress: currentProgress(id)))
             }
         }
+    }
+
+    // MARK: Growth
+
+    static let growthFailure = "the download grew past the size limit"
+
+    /// Measures the job's staging folder every `growthCheckInterval` while it downloads, for providers that send
+    /// no progress at all.
+    private func startGrowthWatchdog(_ id: String) -> Task<Void, Never> {
+        let interval = configuration.growthCheckInterval
+        return Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                await self.abortIfOversized(id)
+            }
+        }
+    }
+
+    private func abortIfOversized(_ id: String) {
+        guard running[id] != nil, stagingBytes(id) > configuration.maxFileBytes else { return }
+        Self.log.error("download outgrew the size limit; stopping it")
+        abortReasons[id] = Self.growthFailure
+        running[id]?.cancel()
+    }
+
+    /// The same check on progress events, at most every 100 ms so a chatty provider costs little.
+    private func checkGrowthOnProgress(_ id: String) throws(DownloadFailure) {
+        let now = ContinuousClock.now
+        if let last = lastGrowthCheck[id], now - last < .milliseconds(100) { return }
+        lastGrowthCheck[id] = now
+        if stagingBytes(id) > configuration.maxFileBytes { throw DownloadFailure(Self.growthFailure) }
+    }
+
+    /// Total size of the regular files in the job's staging folder, without following links.
+    private func stagingBytes(_ id: String) -> Int64 {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        guard
+            let files = FileManager.default.enumerator(
+                at: stagingFolder(id), includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true })
+        else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in files {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else {
+                continue
+            }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
     }
 
     // MARK: State

@@ -75,14 +75,25 @@ public actor FridayDrops {
         self.now = now
     }
 
+    /// A shelf shorter than this is never saved: it would stand for the whole week.
+    public static let minimumToSave = shelfSize / 2
+
     /// This week's shelf: the saved snapshot if it is from this week, otherwise a fresh pick that is then saved.
     /// Offline at the start of a week, the last saved shelf is returned so the shelf is never empty.
+    ///
+    /// A pick with fewer than `minimumToSave` albums (the Archive half answering, most checks failing) is not saved,
+    /// so the next load tries again instead of showing a thin shelf all week. Meanwhile the last saved shelf is
+    /// shown if there is one, otherwise the short pick, unsaved.
     public func shelf() async throws -> DropShelf {
         let week = DropWeek(containing: now())
         let saved = loadSnapshot()
         if let saved, saved.week == week { return saved }
         do {
             let fresh = try await pick(for: week)
+            guard fresh.drops.count >= Self.minimumToSave else {
+                Self.log.info("friday drops: only \(fresh.drops.count, privacy: .public) albums; not saving")
+                return saved ?? fresh
+            }
             save(fresh)
             return fresh
         } catch {

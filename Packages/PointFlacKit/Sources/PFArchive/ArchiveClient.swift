@@ -120,7 +120,7 @@ final class ArchiveClient: Sendable {
 
     /// Opens a streaming response after pacing, retrying once if the Archive says it is busy. The body arrives
     /// as `Data` chunks, so a large download is written as it comes rather than handled byte by byte.
-    func open(_ request: URLRequest) async throws -> (ResponseBody, HTTPURLResponse) {
+    func open(_ request: URLRequest) async throws -> (StreamingTransfer, HTTPURLResponse) {
         guard request.url?.scheme?.lowercased() == "https" else { throw ArchiveError.insecure }
         var busyRetries = 0
         while true {
@@ -149,13 +149,15 @@ final class ArchiveClient: Sendable {
                 await pacer.backOff(delay)
                 continue
             }
-            return (transfer.body, http)
+            return (transfer, http)
         }
     }
 
     /// Fetches and decodes a JSON document no larger than `limit` bytes.
     func json<T: Decodable>(_ type: T.Type, from url: URL, limit: Int) async throws -> T {
-        let (body, response) = try await open(request(url, headers: ["Accept": "application/json"]))
+        let (transfer, response) = try await open(request(url, headers: ["Accept": "application/json"]))
+        // Every early exit below stops the transfer instead of letting the body keep arriving.
+        defer { transfer.cancel() }
         switch response.statusCode {
         case 200: break
         case 404, 410: throw ArchiveError.notFound
@@ -165,7 +167,8 @@ final class ArchiveClient: Sendable {
         var data = Data()
         data.reserveCapacity(min(limit, max(0, Int(response.expectedContentLength))))
         do {
-            for try await chunk in body {
+            for try await chunk in transfer.body {
+                transfer.consumed(chunk.count)
                 data.append(chunk)
                 if data.count > limit { throw ArchiveError.tooLarge }
             }
@@ -200,13 +203,32 @@ final class StreamingTransfer: NSObject, URLSessionDataDelegate, Sendable {
         var refused = false
         var waiting: CheckedContinuation<URLResponse, Error>?
         var task: URLSessionDataTask?
+        var buffered = 0
+        var throttled = false
     }
+
+    /// Unread body bytes above which the task is suspended, and below which it resumes. Dropping chunks would
+    /// corrupt the file, so the buffer is bounded by back-pressure instead.
+    static let highWater = 8 << 20
+    static let lowWater = 2 << 20
 
     init(allowedHost: String) {
         self.allowedHost = allowedHost.lowercased()
-        // Chunks are written to disk as they come, which keeps up with any network the phone has, so an unbounded
-        // buffer stays small in practice.
         (body, bodyContinuation) = ResponseBody.makeStream(bufferingPolicy: .unbounded)
+    }
+
+    /// Whether the task is suspended because the reader fell behind.
+    var isThrottled: Bool { state.withLock { $0.throttled } }
+
+    /// Readers call this for every chunk they take, so the transfer can resume once the backlog drains.
+    func consumed(_ count: Int) {
+        let resume = state.withLock { state -> URLSessionDataTask? in
+            state.buffered = max(0, state.buffered - count)
+            guard state.throttled, state.buffered < Self.lowWater else { return nil }
+            state.throttled = false
+            return state.task
+        }
+        resume?.resume()
     }
 
     /// Whether this request tried to redirect somewhere it may not go.
@@ -254,7 +276,14 @@ final class StreamingTransfer: NSObject, URLSessionDataDelegate, Sendable {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let suspend = state.withLock { state -> Bool in
+            state.buffered += data.count
+            guard !state.throttled, state.buffered > Self.highWater else { return false }
+            state.throttled = true
+            return true
+        }
         bodyContinuation.yield(data)
+        if suspend { dataTask.suspend() }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

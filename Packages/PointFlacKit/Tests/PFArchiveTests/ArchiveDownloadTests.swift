@@ -207,6 +207,93 @@ struct ArchiveDownloadTests {
         #expect(result.events.last == .failed(ArchiveError.insecure.localizedDescription))
     }
 
+    @Test("HTTPS redirects to look-alike hosts are refused", arguments: ["evil%@", "%@.evil.com"])
+    func lookAlikeRedirect(pattern: String) async throws {
+        let scratch = try Scratch()
+        let network = StubNetwork()
+        let target = pattern.replacingOccurrences(of: "%@", with: network.host)
+        network.route(Self.downloadPath) { _ in
+            .success(StubReply(status: 302, headers: ["Location": "https://\(target)/song.flac"]))
+        }
+        let result = await run(network.provider(), Self.track(for: Data([1])), into: scratch.url)
+        #expect(result.events.last == .failed(ArchiveError.insecure.localizedDescription))
+        #expect(network.paths() == [Self.downloadPath], "the look-alike host is never contacted")
+    }
+
+    @Test(
+        "early exits cancel the transfer instead of leaving it running",
+        arguments: [(404, "application/octet-stream"), (200, "text/html"), (200, "application/json")])
+    func earlyExitCancels(status: Int, type: String) async throws {
+        let scratch = try Scratch()
+        let network = StubNetwork()
+        network.route(Self.downloadPath) { _ in
+            .success(StubReply(status: status, headers: ["Content-Type": type], body: Data([1, 2, 3]), hang: true))
+        }
+        let provider = network.provider()
+        let result = await run(provider, Self.track(for: Data(count: 100)), into: scratch.url)
+        guard case .failed = result.events.last else {
+            Issue.record("expected a final failure, got \(result)")
+            return
+        }
+        var running = 1
+        for _ in 0..<100 {
+            running = await provider.client.session.allTasks.filter { $0.state == .running }.count
+            if running == 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(running == 0)
+    }
+
+    @Test("a 206 whose total size differs from the listing restarts instead of splicing")
+    func rangeTotalMismatch() async throws {
+        let scratch = try Scratch()
+        let data = Self.bytes("s24-96000")
+        let split = 10_000
+        let part = scratch.url.appending(path: "Song #1.flac.part")
+        try data.prefix(split).write(to: part)
+        let network = StubNetwork()
+        network.route(Self.downloadPath) { _ in
+            .success(
+                StubReply(
+                    status: 206, headers: ["Content-Range": "bytes \(split)-\(data.count)/\(data.count + 1)"],
+                    body: data.suffix(from: split)))
+        }
+        let result = await run(network.provider(), Self.track(for: data), into: scratch.url)
+        #expect(result.error as? ArchiveError == .truncated)
+        #expect(!FileManager.default.fileExists(atPath: part.path))
+    }
+
+    @Test(
+        "Content-Range parsing",
+        arguments: [
+            ("bytes 100-199/200", 100, 200), ("bytes 0-9/*", 0, nil), ("BYTES 5-9/10", 5, 10),
+        ])
+    func contentRange(header: String, start: Int64, total: Int64?) {
+        let response = HTTPURLResponse(
+            url: URL(string: "https://a.test")!, statusCode: 206, httpVersion: nil,
+            headerFields: ["Content-Range": header])!
+        let parsed = ArchiveDownload.contentRange(response)
+        #expect(parsed?.start == start)
+        #expect(parsed?.total == total)
+    }
+
+    @Test("the transfer suspends when the reader falls 8 MiB behind and resumes below 2 MiB")
+    func backPressure() {
+        let session = ArchiveClient.makeSession(protocolClasses: [StubURLProtocol.self])
+        let task = session.dataTask(with: URL(string: "https://nowhere.test/")!)
+        let transfer = StreamingTransfer(allowedHost: "nowhere.test")
+        let chunk = Data(count: 1 << 20)
+        for _ in 0..<8 { transfer.urlSession(session, dataTask: task, didReceive: chunk) }
+        #expect(!transfer.isThrottled)
+        transfer.urlSession(session, dataTask: task, didReceive: chunk)
+        #expect(transfer.isThrottled)
+        transfer.consumed(6 << 20)
+        #expect(transfer.isThrottled, "still above the low-water mark")
+        transfer.consumed(2 << 20)
+        #expect(!transfer.isThrottled)
+        task.cancel()
+    }
+
     @Test("a redirect to an Archive storage host is followed and keeps the Range header")
     func storageRedirect() async throws {
         let scratch = try Scratch()

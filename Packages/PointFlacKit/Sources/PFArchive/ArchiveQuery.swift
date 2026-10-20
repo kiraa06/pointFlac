@@ -1,4 +1,5 @@
 import Foundation
+import PFDownloads
 
 /// Builds Archive search queries that cannot be widened by what the user types.
 enum ArchiveQuery {
@@ -27,7 +28,8 @@ enum ArchiveQuery {
         let keep = CharacterSet.letters.union(.decimalDigits).union(.nonBaseCharacters)
             .union(CharacterSet(charactersIn: "-'._"))
         let separated = String(String.UnicodeScalarView(text.unicodeScalars.map { keep.contains($0) ? $0 : " " }))
-        return separated.split(separator: " ").map { String($0.prefix(64)) }.prefix(16).map { $0 }
+        return SafeFileName.components(of: separated, separators: [" "]).filter { !$0.isEmpty }
+            .map { String($0.prefix(64)) }.prefix(16).map { $0 }
     }
 
     /// `https://archive.org/advancedsearch.php?...`, most-downloaded first so the first page is the useful one.
@@ -71,8 +73,8 @@ enum ArchiveQuery {
         guard isValidIdentifier(identifier), ArchiveFileSelector.isSafePath(path) else { return nil }
         let unreserved = CharacterSet(
             charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-        let encoded = path.split(separator: "/").compactMap {
-            String($0).addingPercentEncoding(withAllowedCharacters: unreserved)
+        let encoded = SafeFileName.components(of: path, separators: ["/"]).compactMap {
+            $0.addingPercentEncoding(withAllowedCharacters: unreserved)
         }
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.percentEncodedPath = "/download/\(identifier)/" + encoded.joined(separator: "/")

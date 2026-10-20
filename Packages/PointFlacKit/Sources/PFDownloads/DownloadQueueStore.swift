@@ -17,34 +17,78 @@ public struct DownloadQueueStore: Sendable {
     }
 
     /// The saved queue, or an empty one when there is none or it cannot be read.
+    ///
+    /// The file is untrusted input: its ids become staging folder names and `stagedFileName` a file name inside
+    /// one. So items are decoded one at a time, and only those with a UUID id and a staged name that `SafeFileName`
+    /// leaves unchanged are kept; one bad item never costs the rest of the queue. A file that cannot be read at all
+    /// is moved aside, not overwritten, so it can still be inspected.
     public func load() -> [DownloadItem] {
         guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int else {
             return []
         }
         guard size <= Self.maxFileBytes else {
-            Self.log.error("download queue file is \(size, privacy: .public) bytes; ignoring it")
+            Self.log.error("download queue file is \(size, privacy: .public) bytes; moving it aside")
+            moveAside()
             return []
         }
         do {
             let data = try Data(contentsOf: url)
-            return try JSONDecoder().decode(Snapshot.self, from: data).items
+            let decoded = try JSONDecoder().decode(LossySnapshot.self, from: data).items
+            let items = decoded.compactMap(\.value).filter(Self.isAcceptable)
+            if items.count != decoded.count {
+                Self.log.error("dropped \(decoded.count - items.count, privacy: .public) unreadable queue items")
+            }
+            return items
         } catch {
             Self.log.error("download queue file unreadable: \(String(describing: error), privacy: .public)")
+            moveAside()
             return []
         }
     }
 
-    /// Writes atomically, so a crash mid-write leaves the previous queue rather than half a file.
+    /// Whether a loaded item is safe to turn into paths.
+    static func isAcceptable(_ item: DownloadItem) -> Bool {
+        guard UUID(uuidString: item.id) != nil else { return false }
+        if let staged = item.stagedFileName { return SafeFileName.sanitize(staged) == staged }
+        return true
+    }
+
+    /// Renames an unreadable queue file to `<name>.corrupt-<uuid>` beside it.
+    private func moveAside() {
+        let aside = url.deletingLastPathComponent().appending(
+            path: url.lastPathComponent + ".corrupt-\(UUID().uuidString)")
+        try? FileManager.default.moveItem(at: url, to: aside)
+    }
+
+    /// Writes atomically, so a crash mid-write leaves the previous queue rather than half a file. The queue says
+    /// what the user downloads, so it is encrypted while the device is locked and never leaves it in a backup.
     public func save(_ items: [DownloadItem]) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(Snapshot(version: 1, items: items))
-        try data.write(to: url, options: [.atomic])
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        var file = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try file.setResourceValues(values)
     }
 
     /// Versioned so a later format can migrate instead of discarding the queue.
     private struct Snapshot: Codable {
         var version: Int
         var items: [DownloadItem]
+    }
+
+    private struct LossySnapshot: Decodable {
+        var items: [Lossy<DownloadItem>]
+    }
+
+    /// Decodes one element, or `nil` instead of failing the whole array.
+    private struct Lossy<Value: Decodable>: Decodable {
+        var value: Value?
+
+        init(from decoder: Decoder) throws {
+            value = try? Value(from: decoder)
+        }
     }
 }

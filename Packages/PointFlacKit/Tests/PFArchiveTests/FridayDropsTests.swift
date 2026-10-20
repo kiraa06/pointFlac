@@ -112,4 +112,37 @@ struct FridayDropsTests {
             provider: network.provider(), snapshotFile: scratch.url.appending(path: "none.json"), now: { clock.value })
         await #expect(throws: ArchiveError.offline) { _ = try await fresh.shelf() }
     }
+
+    @Test("a short shelf is never saved for the week: last week's stays, and the next load tries again")
+    func shortShelfNotSaved() async throws {
+        let scratch = try Scratch()
+        let network = StubNetwork()
+        let pool = (0..<12).map { "label-\($0)" }
+        stubbedShelf(network, pool: pool, empty: [])
+        let snapshot = scratch.url.appending(path: "drops.json")
+        let clock = Locked(Self.date("2026-10-23T09:00:00Z"))
+        let drops = FridayDrops(provider: network.provider(), snapshotFile: snapshot, now: { clock.value })
+        let lastWeek = try await drops.shelf()
+        #expect(lastWeek.drops.count == 10)
+        let savedBytes = try Data(contentsOf: snapshot)
+
+        // Next week only two items answer with FLAC.
+        let thin = StubNetwork()
+        stubbedShelf(thin, pool: pool, empty: Set(pool.dropFirst(2)))
+        clock.update { $0 = Self.date("2026-10-30T09:00:00Z") }
+        let next = FridayDrops(provider: thin.provider(), snapshotFile: snapshot, now: { clock.value })
+        #expect(try await next.shelf() == lastWeek)
+        #expect(try Data(contentsOf: snapshot) == savedBytes, "the snapshot is not overwritten")
+
+        // The next load asks the Archive again rather than trusting a cached thin pick.
+        let before = thin.requests.withLock { $0.count }
+        _ = try await next.shelf()
+        #expect(thin.requests.withLock { $0.count } > before)
+
+        // With nothing saved at all, the short pick is shown but still not saved.
+        let fresh = scratch.url.appending(path: "fresh.json")
+        let first = try await FridayDrops(provider: thin.provider(), snapshotFile: fresh, now: { clock.value }).shelf()
+        #expect(first.drops.count == 2)
+        #expect(!FileManager.default.fileExists(atPath: fresh.path))
+    }
 }
