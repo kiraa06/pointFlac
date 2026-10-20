@@ -1,0 +1,98 @@
+{
+ "responseHeader": {
+  "status": 0,
+  "QTime": 77,
+  "params": {
+   "query": "(((text:dusty OR text:dusty OR text__reviews:dusty)(text:sense OR text:sense OR text__reviews:sense)) OR (text:&quot;dusty sense&quot; OR text:&quot;dusty sense&quot; OR text__reviews:&quot;dusty sense&quot;)) AND mediatype:audio AND format:(Flac OR &quot;24bit Flac&quot;) AND (licenseurl:*creativecommons.org* OR collection:etree)",
+   "qin": "(dusty sense) AND mediatype:audio AND format:(Flac OR &quot;24bit Flac&quot;) AND (licenseurl:*creativecommons.org* OR collection:etree)",
+   "fields": "identifier,title,creator,licenseurl,collection",
+   "wt": "json",
+   "sort": "downloads desc",
+   "rows": 50,
+   "start": 0
+  }
+ },
+ "response": {
+  "numFound": 9,
+  "start": 0,
+  "docs": [
+   {
+    "identifier": "dusty-sense",
+    "collection": [
+     "opensource_audio",
+     "community"
+    ],
+    "licenseurl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "title": "dusty-sense"
+   },
+   {
+    "identifier": "001netlabel.com-14_Atrio-Serenade_Devocion-Indomita",
+    "title": "001netlabel.com-14_Atrio-Serenade_Devocion-Indomita",
+    "creator": "Atrio Serenade",
+    "collection": [
+     "001records",
+     "netlabels",
+     "fav-ean80",
+     "fav-mosenoeshangai_kremer"
+    ],
+    "licenseurl": "http://creativecommons.org/licenses/by-nc-nd/3.0/"
+   },
+   {
+    "identifier": "commercial-album-rip",
+    "title": "A Commercial Album",
+    "creator": "Big Label Artist",
+    "collection": [
+     "opensource_audio"
+    ]
+   },
+   {
+    "identifier": "rights-reserved-item",
+    "title": "Rights Reserved",
+    "licenseurl": "http://rightsstatements.org/vocab/InC/1.0/",
+    "collection": [
+     "opensource_audio"
+    ]
+   },
+   {
+    "identifier": "gd1977-05-08.sbd.example",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08",
+    "creator": "Grateful Dead",
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ]
+   },
+   {
+    "identifier": "claims-cc-but-not",
+    "title": "Claims CC in search only",
+    "licenseurl": "https://creativecommons.org/licenses/by/4.0/",
+    "collection": [
+     "opensource_audio"
+    ]
+   },
+   {
+    "identifier": "gone-item",
+    "title": "Deleted since indexing",
+    "licenseurl": "https://creativecommons.org/licenses/by/4.0/",
+    "collection": [
+     "opensource_audio"
+    ]
+   },
+   {
+    "identifier": "dusty-sense",
+    "collection": [
+     "opensource_audio",
+     "community"
+    ],
+    "licenseurl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "title": "dusty-sense"
+   },
+   {
+    "identifier": "../../etc",
+    "title": "Hostile identifier",
+    "licenseurl": "https://creativecommons.org/licenses/by/4.0/"
+   }
+  ]
+ }
+}

@@ -1,0 +1,19 @@
+{
+ "created": 1700000000,
+ "metadata": {
+  "identifier": "claims-cc-but-not",
+  "title": "Claims CC in search only",
+  "collection": [
+   "opensource_audio"
+  ]
+ },
+ "files": [
+  {
+   "name": "song.flac",
+   "source": "original",
+   "format": "Flac",
+   "size": "1000",
+   "md5": "77777777777777777777777777777777"
+  }
+ ]
+}

@@ -14,6 +14,8 @@ let package = Package(
         .library(name: "PFFind", targets: ["PFFind"]),
         // Optional module: only the Soulseek build variant links this product (spec §5.6 "Build flag").
         .library(name: "PFSoulseek", targets: ["PFSoulseek"]),
+        .library(name: "PFDownloads", targets: ["PFDownloads"]),
+        .library(name: "PFArchive", targets: ["PFArchive"]),
     ],
     targets: [
         .target(
@@ -74,6 +76,16 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "PFDownloads",
+            dependencies: ["PFCore", "PFFlac"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFArchive",
+            dependencies: ["PFDownloads"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
@@ -122,6 +134,17 @@ let package = Package(
         .testTarget(
             name: "PFFindTests",
             dependencies: ["PFFind"],
+            resources: [.copy("Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFDownloadsTests",
+            dependencies: ["PFDownloads", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFArchiveTests",
+            dependencies: ["PFArchive", "PFDownloads", "PFTestSupport"],
             resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
