@@ -76,7 +76,9 @@ extension SoulseekClient {
             if searches[token]?.reachedCap == true { break }
         }
         flush(token)
-        searches[token] = nil
+        if let session = searches.removeValue(forKey: token) {
+            logger.info("Soulseek: search finished with \(session.delivered, privacy: .public) files")
+        }
         continuation.finish()
     }
 

@@ -317,3 +317,31 @@ struct PresentationTests {
         #expect(SoulseekTransferFailure.denied("Banned").reason.contains("Banned"))
     }
 }
+
+@Suite("Fuzz smoke: folder listings")
+struct FolderFuzzTests {
+    @Test("Mutated folder listings never crash the parser")
+    func listingsSurviveGarbage() {
+        var rng = FuzzTests.SeededGenerator(state: 0xF01D)
+        var body = WireWriter()
+        body.u32(1)
+        body.string("a\\b")
+        body.u32(1)
+        body.string("a\\b")
+        body.u32(1)
+        body.u8(1)
+        body.string("01.flac")
+        body.u64(10)
+        body.string("")
+        body.u32(0)
+        let valid = body.bytes
+        for _ in 0..<20_000 {
+            var bytes = valid
+            for _ in 0..<Int.random(in: 1...4, using: &rng) {
+                bytes[Int.random(in: 0..<bytes.count, using: &rng)] = UInt8.random(in: 0...255, using: &rng)
+            }
+            _ = try? FolderListing.parse(bytes)
+            _ = try? PeerMessage.parse(Frame(code: 37, payload: Mock.zlib(bytes)))
+        }
+    }
+}

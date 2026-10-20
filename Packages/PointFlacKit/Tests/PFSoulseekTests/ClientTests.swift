@@ -297,3 +297,30 @@ actor TokenBox {
     private(set) var value: UInt32 = 0
     func set(_ newValue: UInt32) { value = newValue }
 }
+
+@Suite("State updates", .timeLimit(.minutes(1)))
+struct StateUpdateTests {
+    @Test("Observers see connecting, logged in, then disconnected")
+    func sequence() async throws {
+        let server = try await MockListener.start()
+        let client = SoulseekClient(configuration: testConfiguration(serverPort: server.port))
+        let updates = await client.stateUpdates()
+        let recorder = Task {
+            var seen: [SoulseekConnectionState] = []
+            for await state in updates {
+                seen.append(state)
+                if state == .disconnected && seen.count > 1 { break }
+            }
+            return seen
+        }
+        async let serverSide: Void = {
+            let link = try await server.accept()
+            _ = try await link.expect(code: 1)
+            try await link.send(Mock.loginSuccess())
+        }()
+        try await client.login(username: "alice", password: "secret")
+        try await serverSide
+        await client.logout()
+        #expect(await recorder.value == [.disconnected, .connecting, .loggedIn(username: "alice"), .disconnected])
+    }
+}

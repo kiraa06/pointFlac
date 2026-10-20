@@ -25,7 +25,8 @@ public actor SoulseekClient {
         public var peakPeerConnections = 0
     }
 
-    let logger = Logger(subsystem: "app.pointflac", category: "soulseek")
+    /// Never logs credentials, queries, paths or message contents (§5.8); counts and states only.
+    nonisolated let logger = Logger(subsystem: "app.pointflac", category: "soulseek")
 
     private var credentials: (username: String, password: String)?
     /// Bumped by login, logout and Relogged, so a connect that was in flight when one of them happened is discarded.
@@ -175,6 +176,7 @@ public actor SoulseekClient {
         }
 
         if case .loginFailed(let reason) = reply {
+            logger.notice("Soulseek: login refused (\(reason, privacy: .public))")
             framed.close()
             server = nil
             switch reason {
@@ -223,6 +225,7 @@ public actor SoulseekClient {
                 }
             })
         setState(.loggedIn(username: credentials.username))
+        logger.info("Soulseek: logged in (protocol \(config.majorVersion, privacy: .public))")
     }
 
     private static func awaitLoginReply(_ framed: FramedLink, timeout: Duration) async throws -> ServerMessage {
@@ -260,6 +263,7 @@ public actor SoulseekClient {
                 attempt += 1
                 let delay = delays.isEmpty ? .seconds(5) : delays[min(attempt - 1, delays.count - 1)]
                 await self?.setState(.reconnecting(attempt: attempt))
+                self?.logger.info("Soulseek: reconnect attempt \(attempt, privacy: .public)")
                 try? await Task.sleep(for: delay)
                 guard !Task.isCancelled, let self else { return }
                 if await self.attemptReconnect() { return }
@@ -310,6 +314,7 @@ public actor SoulseekClient {
             credentials = nil
             reconnectTask?.cancel()
             setState(.kicked)
+            logger.notice("Soulseek: the account signed in elsewhere; staying signed out")
             tearDownServer()
             finishAllSearches(error: .kicked)
             // Transfers still waiting need the server for their indirect connections; a body already flowing can

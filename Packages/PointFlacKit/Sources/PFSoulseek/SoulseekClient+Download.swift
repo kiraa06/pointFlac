@@ -111,6 +111,9 @@ extension SoulseekClient {
                 destination: destination, config: config, events: events)
         }()
         await client.unregisterTransfer(id)
+        if case .failed(let failure) = outcome {
+            client.logger.info("Soulseek: download failed (\(failure.reason, privacy: .public))")
+        }
         return outcome
     }
 

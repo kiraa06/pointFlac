@@ -29,5 +29,5 @@
   CryptoKit, Synchronization, os).
 - SeeleseekCore (MIT, `github.com/bretth18/seeleseek`) was evaluated as the first-choice core and not adopted; no code
   was copied from it. The reasons are in `docs/spikes/S4-soulseek-core.md`. The soulseek-rs fallback was not needed.
-- GPL/AGPL Soulseek clients (Nicotine+, Soulseek.NET, slskd, Seeker) were not used, even as reading material, tonight;
-  the protocol facts come from a live probe and the public protocol description.
+- No code from GPL/AGPL Soulseek clients (Nicotine+, Soulseek.NET, slskd, Seeker) is used. Protocol behaviour follows
+  the live probe of 2026-10-21 and the publicly documented protocol, which is reading material only (§3.3).
