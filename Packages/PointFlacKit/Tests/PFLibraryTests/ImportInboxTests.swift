@@ -165,8 +165,8 @@ private struct CopyFailed: Error {}
     #expect(library.contents().isEmpty)
 }
 
-/// An import killed mid-copy leaves its hidden temporary file behind; the next inbox over the folder removes it, and
-/// nothing else.
+/// An import killed mid-copy leaves its hidden temporary file behind; the next inbox over the folder removes it before
+/// anything else it does, and removes nothing else.
 @Test func sweepsTemporaryFilesOnInit() async throws {
     let library = try TemporaryLibrary()
     try FileManager.default.createDirectory(at: library.folder, withIntermediateDirectories: true)
@@ -176,8 +176,9 @@ private struct CopyFailed: Error {}
 
     let inbox = ImportInbox(libraryFolder: library.folder)
 
-    #expect(library.contents() == [".keep", "s16-44100.flac"])
+    // The sweep runs first on the inbox's queue, so it is done by the time anything the inbox does returns.
     #expect(await inbox.list().map(\.id) == ["s16-44100.flac"])
+    #expect(library.contents() == [".keep", "s16-44100.flac"])
 }
 
 /// A hidden name would be copied in and then never listed, so it is refused, like any name that is not plain ".flac".
@@ -240,4 +241,53 @@ private struct CopyFailed: Error {}
     let multichannel = try #require(listed.first { $0.id == "s16-48000-6ch.flac" })
     #expect(multichannel.format.channels == 6 && !multichannel.isSupported)
     #expect(listed.filter(\.isSupported).map(\.id) == ["s16-44100-mono.flac", "s24-48000.flac"])
+}
+
+// MARK: Plan 2 entry gates
+
+/// The content identity survives a rename and a tag edit, and differs between recordings.
+@Test func importedFilesCarryAStableContentIdentity() async throws {
+    let library = try TemporaryLibrary()
+    let inbox = ImportInbox(libraryFolder: library.folder)
+    let first = try #require(await inbox.importFiles([fixture("s24-48000")]).added.first)
+    let other = try #require(await inbox.importFiles([fixture("s16-44100")]).added.first)
+    #expect(first.contentID.count == 32 && first.contentID != other.contentID)
+
+    try FileManager.default.moveItem(at: first.url, to: library.folder.appending(path: "Renamed.flac"))
+    let renamed = try #require(await inbox.list().first { $0.id == "Renamed.flac" })
+    #expect(renamed.contentID == first.contentID)
+}
+
+/// Spec §5.8: a source over the size bound is refused before it is read or copied.
+@Test func refusesFilesOverTheSizeBound() async throws {
+    let library = try TemporaryLibrary()
+    let inbox = ImportInbox(libraryFolder: library.folder, maxFileBytes: 10_000)
+
+    let result = await inbox.importFiles([fixture("s24-48000")])
+
+    #expect(result.added.isEmpty)
+    let rejection = try #require(result.rejected.first)
+    #expect(rejection.exceedsSizeLimit && rejection.message == "Too large to add")
+    #expect(library.contents().isEmpty)
+}
+
+/// `list()` reads a file once, and again only when its size or modification date changes.
+@Test func listingUsesItsIndex() async throws {
+    let library = try TemporaryLibrary()
+    let inbox = ImportInbox(libraryFolder: library.folder)
+    _ = await inbox.importFiles([fixture("s24-48000"), fixture("s16-44100")])
+
+    #expect(await inbox.list().count == 2)
+    #expect(await inbox.listingParses() == 2)
+    #expect(await inbox.list().count == 2)
+    #expect(await inbox.listingParses() == 2)
+
+    let changed = library.folder.appending(path: "s16-44100.flac")
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: changed.path)
+    #expect(await inbox.list().count == 2)
+    #expect(await inbox.listingParses() == 3)
+
+    try FileManager.default.removeItem(at: changed)
+    #expect(await inbox.list().map(\.id) == ["s24-48000.flac"])
 }
