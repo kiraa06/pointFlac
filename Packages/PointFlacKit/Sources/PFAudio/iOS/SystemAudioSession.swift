@@ -108,7 +108,12 @@
         public func requestSampleRate(_ hz: Int) async -> Int {
             let session = AVAudioSession.sharedInstance()
             let running = Int(session.sampleRate)
-            if running == hz, activity.isActive.load(ordering: .acquiring) { return running }
+            if running == hz, activity.isActive.load(ordering: .acquiring) {
+                // iOS can deactivate a suspended app's session without an interruption notification, which
+                // `isActive` cannot see. Re-asserting activation is idempotent and posts no route change.
+                try? session.setActive(true)
+                return Int(session.sampleRate)
+            }
             do {
                 try session.setActive(false)
                 activity.isActive.store(false, ordering: .releasing)

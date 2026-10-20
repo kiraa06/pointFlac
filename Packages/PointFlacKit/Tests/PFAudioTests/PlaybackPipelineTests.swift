@@ -519,7 +519,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(
             await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
                 rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1, format("s24-48000")))
-            })
+            }, "boundary events, \(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))
     }
 
