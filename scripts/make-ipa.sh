@@ -22,6 +22,8 @@ xcodebuild build -project PointFlac.xcodeproj -scheme PointFlac -configuration R
     || fail "the Release build failed; see the xcodebuild output above"
 
 [ -x "$APP/PointFlac" ] || fail "no app at $APP after the build"
+# The libFLAC BSD-3 notice must ship with every binary build, Release included.
+[ -s "$APP/ThirdPartyNotices.txt" ] || fail "the Release app lacks ThirdPartyNotices.txt (the libFLAC licence notice)"
 # Ruling R4: Release builds never carry the debug fixtures.
 if [ -n "$(find "$APP" -iname '*.flac' -print -quit)" ]; then
     fail "the Release app contains .flac files; the debug fixtures must be excluded from Release"

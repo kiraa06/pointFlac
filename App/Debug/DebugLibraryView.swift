@@ -61,6 +61,10 @@ struct DebugLibraryView: View {
                     Button("Add", systemImage: "plus") { picking = true }
                         .accessibilityIdentifier("importButton")
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink("Licences") { LicencesView() }
+                        .accessibilityIdentifier("licencesLink")
+                }
             }
             .fileImporter(
                 isPresented: $picking, allowedContentTypes: [Self.flac],
@@ -77,6 +81,29 @@ struct DebugLibraryView: View {
             }
         }
         .task { await model.load() }
+    }
+}
+
+/// The bundled `ThirdPartyNotices.txt`: libFLAC's BSD-3 notice and pointFlac's MIT licence. The file ships in every
+/// build, Release included, as the BSD licence requires of binary redistribution.
+private struct LicencesView: View {
+    private static let notices: String = {
+        guard let url = Bundle.main.url(forResource: "ThirdPartyNotices", withExtension: "txt"),
+            let text = try? String(contentsOf: url, encoding: .utf8)
+        else { return "The licence notices are missing from this build." }
+        return text
+    }()
+
+    var body: some View {
+        ScrollView {
+            Text(Self.notices)
+                .font(.footnote.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+                .accessibilityIdentifier("licenceNotices")
+        }
+        .navigationTitle("Licences")
     }
 }
 
