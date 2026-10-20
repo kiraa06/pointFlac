@@ -2,9 +2,11 @@ import SwiftUI
 
 @main
 struct PointFlacApp: App {
+    @State private var model = AppModel()
+
     var body: some Scene {
         WindowGroup {
-            Text("pointFlac")
+            DebugLibraryView(model: model)
         }
     }
 }

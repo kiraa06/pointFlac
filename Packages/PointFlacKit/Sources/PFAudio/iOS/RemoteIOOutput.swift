@@ -213,8 +213,8 @@
             /// Capture mode **mutes the output**: after copying, the callback zeroes the buffer it hands back to
             /// RemoteIO and flags it as silence, so test runs do not play full-scale test signals through the
             /// speakers. Verification is unaffected: the copy is taken before the unit, of exactly what pointFlac
-            /// handed it.
-            func installCapture(byteCapacity: Int) {
+            /// handed it. Public so the debug app's UI tests can mute playback the same way (`-PFMuteOutput`).
+            public func installCapture(byteCapacity: Int) {
                 assert(!running, "RemoteIOOutput.installCapture while started")
                 let buffer = CaptureBuffer(byteCapacity: byteCapacity)
                 let old = captureBuffer

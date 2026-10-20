@@ -5,7 +5,8 @@ output API? The tests are `RemoteIOOutputTests` (`Packages/PointFlacKit/Tests/PF
 `RemoteIOOutput` (`Sources/PFAudio/iOS/RemoteIOOutput.swift`).
 
 **Result on the simulator: PASS.** Every capture is byte-identical to the expected client samples, and the output
-latency and the end-to-end latency are both well under the 150 ms budget. The device run is pending (see the end).
+latency and the end-to-end latency are both well under the 150 ms budget. The debug app's signal strip agrees (see
+"The debug app on the simulator"). The device run is pending (see the end).
 
 ## API choice: RemoteIO
 
@@ -101,6 +102,31 @@ session gives, and prints the `S1: hw-side` lines above, read from `RemoteIOOutp
   rate equals the client rate (iOS never resamples silently) runs only on a device. It is in `acceptsFloat32Client`,
   `reportsHardwareSideRate` and both capture tests.
 
+## The debug app on the simulator (ruling R21)
+
+The 32-bit check that was to be done by hand in the app is now a UI test, `PlaybackSmokeTests` (`AppUITests`). It
+launches the Debug app with `-PFPreloadFixtures`, which imports the fixtures the Debug build bundles, and
+`-PFMuteOutput`, which puts `RemoteIOOutput` in capture mode so nothing reaches the speakers. It then taps a track and
+reads the strip. The whole real path runs: `ImportInbox`, `Player`, `SystemAudioSession`, `RemoteIOOutput` and
+`SystemNowPlaying`.
+
+iPhone 17 Pro simulator, iOS 26.5 runtime, Xcode 26.6 (2026-10-21):
+
+| Fixture     | Signal strip                            |
+| ----------- | --------------------------------------- |
+| `s24-48000` | `FLAC · 24-bit · 48 kHz · ● Pure`       |
+| `s32-48000` | `FLAC · 32-bit · 48 kHz · ● 32→24-bit`  |
+
+Both match the results above:
+
+- The hardware side runs at 48 kHz, so a 48 kHz source plays at its own rate and the strip can say "● Pure".
+- A 32-bit source goes to the Float32 client TPDF-reduced to 24 bits, because `OutputCapabilities.current` claims no
+  Int32 passthrough (R13). The strip discloses it.
+
+The tests assert these exact strings. On a Mac whose output device runs at 44.1 kHz, the hardware side would read
+44.1 kHz, the strip would say "● Resampled 48→44.1", and the tests would fail. That is the honest result on such a
+Mac, not a bug.
+
 ## Ruling R13: `OutputCapabilities.current` stays `int32Passthrough: false`
 
 Plan 1 keeps `current` at `false` despite the simulator accepting Int32:
@@ -116,7 +142,31 @@ honestly disclosed, and fixed later by flipping one line. `current` flips only o
 
 ## Device runs: pending
 
-The device run needs an Xcode build that supports the iPhone 17 Pro's iOS 27.2 beta (as for S3).
+The device route works: Xcode 26.6 with a free Personal Team installs on the iPhone 17 Pro running iOS 27.2. For the
+team, create `Config/Signing.local.xcconfig` from `Config/Signing.local.xcconfig.example` (git-ignored, never
+committed).
+
+### The debug app on the iPhone 17 Pro with EarPods
+
+The fixtures last 85 ms, which is enough to read the strip. Use a real, longer FLAC for the unplug and lock-screen
+checks.
+
+1. Plug the EarPods in and set the system volume to 100%.
+2. From the repository root, run `scripts/install-device.sh -- -PFPreloadFixtures`. It builds Debug, installs, and
+   launches the app with the bundled fixtures imported.
+3. Tap each track and record the strip. Expected results:
+   - `s16-44100`: `FLAC · 16-bit · 44.1 kHz · ● Pure`. If it reads "● Resampled 44.1→48", the route runs only at
+     48 kHz. Record that as a finding, not a bug.
+   - `s24-48000`: `FLAC · 24-bit · 48 kHz · ● Pure`.
+   - `s32-48000`: `FLAC · 32-bit · 48 kHz · ● 32→24-bit`.
+4. `s24-96000` is not bundled. Copy `Packages/PointFlacKit/Sources/PFTestSupport/Resources/Fixtures/s24-96000.flac`
+   to the phone (AirDrop to Files, or iCloud Drive), add it with the Add button, and tap it. Expected:
+   `FLAC · 24-bit · 48 kHz · ● Resampled 96→48`.
+5. Add a real FLAC of a few minutes and play it. Unplug the EarPods: playback must pause, and must not carry on
+   through the speaker. Plug them back in and resume.
+6. Play it again and lock the phone. The lock screen must show the title and artist, and play/pause must work. Use
+   Play All with two or more real tracks to check next and previous.
+7. Record the results here and in `S3-rate-negotiation.md`.
 
 ### iPhone 17 Pro with EarPods (24-bit/48 kHz cap)
 

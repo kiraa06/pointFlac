@@ -1,7 +1,7 @@
 import Foundation
 
 /// Why a file was refused admission as FLAC.
-public enum FlacRejection: Error, Equatable, Sendable {
+public enum FlacRejection: Error, Hashable, Sendable {
     case notFlacName
     case badMagic
     case badID3

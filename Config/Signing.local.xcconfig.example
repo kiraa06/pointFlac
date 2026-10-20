@@ -1,0 +1,4 @@
+// Copy to Config/Signing.local.xcconfig (git-ignored) and replace YOUR_TEAM_ID with your 10-character team ID.
+// A free Personal Team works for installing on your own device. Find the ID in Xcode > Settings > Accounts, or in the
+// Signing & Capabilities pane after choosing the team there.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID

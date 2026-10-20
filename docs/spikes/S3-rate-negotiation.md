@@ -20,8 +20,20 @@ side stays at the Mac output device's rate (48 kHz here), and the simulator resa
 
 ## iPhone 17 Pro + EarPods
 
-Pending. The device run needs an Xcode build that supports the phone's iOS 27.2 beta. To run it: execute the same
-test on the device with the EarPods connected and record the `S3:` lines here, then repeat with a USB DAC.
+Pending. The device route works (Xcode 26.6 with a free Personal Team; see `S1-output-path.md`). To run it:
+
+1. Connect the EarPods.
+2. Run from `Packages/PointFlacKit`:
+
+   ```
+   xcodebuild test -scheme PointFlacKit-Package -destination 'platform=iOS,name=<device name>' \
+       -only-testing:PFAudioTests/SystemAudioSessionTests -allowProvisioningUpdates DEVELOPMENT_TEAM=<team id>
+   ```
+
+3. Record the `S3:` lines here. Each one says what the hardware gave for 44.1, 48 and 96 kHz requests.
+4. Record the strips from the debug-app check in `S1-output-path.md`: they show the same negotiation end to end,
+   for 44.1, 48 and 96 kHz files.
+5. Repeat steps 2 and 3 with a USB DAC.
 
 ## What this means for the pipeline
 
