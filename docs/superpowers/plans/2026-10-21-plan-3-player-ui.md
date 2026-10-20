@@ -47,5 +47,6 @@ and the crate→deck hand-off, Get Music and Downloads, and a minimal Settings t
 
 ## Out of scope tonight
 
-Audible scrub, hold-to-stop, grabbing the record mid-flight, Friday Drops, pause/resume/retry on downloads, the
-strip's details sheet, bundled fonts (system grotesk, mono and a drawn dot-matrix stand in).
+Audible scrub, hold-to-stop, grabbing the record mid-flight, Friday Drops, pause/resume/retry on downloads (no
+contract API), the welcome screen (the first-run empty state carries the calls to action), bundled fonts (system
+grotesk, mono and a drawn dot-matrix stand in), real waveform peaks in the loupe.

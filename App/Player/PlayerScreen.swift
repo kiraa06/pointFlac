@@ -153,7 +153,7 @@ struct PlayerScreen: View {
         VStack {
             Spacer(minLength: 0)
             ShelfPanel(
-                library: model.library, playback: playback, theme: theme,
+                library: model.library, finder: model.finder, playback: playback, theme: theme,
                 close: { withAnimation(.spring(duration: 0.45)) { shelfOpen = false } },
                 getMusic: { tab = .getMusic },
                 pick: { album, track, frontRect in startHandoff(album, track: track, from: frontRect) }

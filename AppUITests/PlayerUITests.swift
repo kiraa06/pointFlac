@@ -39,6 +39,19 @@ final class PlayerUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["searchTiming"].exists)
     }
 
+    /// Spec §4.6: online results stream in under the local ones, labelled by source. Search starts them at once.
+    @MainActor
+    func testShelfStreamsOnlineResultsUnderLocalOnes() {
+        let app = launch()
+        openShelf(app)
+        let field = app.textFields["shelfSearch"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("verdigris\n")
+        XCTAssertTrue(app.buttons["result-track-Verdigris"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.buttons["shelfDownload-ia-Verdigris-1"].waitForExistence(timeout: 4))
+    }
+
     @MainActor
     func testFilterChipsNarrowTheShelf() {
         let app = launch()

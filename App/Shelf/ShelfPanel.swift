@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 /// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next and Add to Up Next.
 struct ShelfPanel: View {
     let library: any LibraryBrowsing
+    /// For the online results that stream in under the local ones (spec §4.6).
+    let finder: any MusicFinding
     let playback: PlaybackController
     let theme: Theme
     let close: () -> Void
@@ -21,6 +23,10 @@ struct ShelfPanel: View {
     @State private var crateFrame: CGRect = .zero
     @State private var importing = false
     @State private var importNote: String?
+    /// Online results by provider name, for the current phrase.
+    @State private var online: [(provider: String, rows: [RemoteResultRow])] = []
+    /// Search was pressed for the current phrase.
+    @State private var immediate = false
     @FocusState private var searching: Bool
 
     /// The front sleeve's size: smaller while typing, so the results stay above the keyboard.
@@ -63,6 +69,10 @@ struct ShelfPanel: View {
         .onChange(of: query, initial: true) { runSearch() }
         .onChange(of: filter) { runSearch() }
         .onChange(of: library.albums) { runSearch() }
+        // Keyed by the phrase and by Search: a new phrase cancels the old search, and Search skips the pause.
+        .task(id: "\(immediate)|\(query)") { await searchOnline(after: immediate ? .zero : .milliseconds(600)) }
+        .onSubmit { immediate = true }
+        .onChange(of: query) { immediate = false }
         .fileImporter(isPresented: $importing, allowedContentTypes: [Self.flac], allowsMultipleSelection: true) {
             result in
             switch result {
@@ -288,13 +298,63 @@ struct ShelfPanel: View {
                         .accessibilityIdentifier("result-track-\(track.title)")
                     }
                 }
-                if results.albums.isEmpty, results.tracks.isEmpty {
+                ForEach(online, id: \.provider) { group in
+                    header("Online · \(group.provider)")
+                    ForEach(group.rows) { row in
+                        onlineRow(row)
+                    }
+                }
+                if results.albums.isEmpty, results.tracks.isEmpty, online.isEmpty {
                     Text("Nothing on your shelf matches. Try Get Music to look online.")
                         .font(.footnote).foregroundStyle(theme.inkSecondary).padding(.vertical, 12)
                 }
             }
             .padding(.horizontal, 16)
         }
+    }
+
+    /// Online search starts by itself once typing pauses (about 0.6 s) with at least 3 characters, or at once on
+    /// Search. A new phrase cancels the old one: this runs in a task keyed by the query.
+    private func searchOnline(after pause: Duration) async {
+        online = []
+        let phrase = query.trimmingCharacters(in: .whitespaces)
+        guard phrase.count >= 3 else { return }
+        try? await Task.sleep(for: pause)
+        guard !Task.isCancelled, phrase == query.trimmingCharacters(in: .whitespaces) else { return }
+        for provider in finder.providers {
+            for await batch in finder.search(phrase, provider: provider.id) {
+                guard !Task.isCancelled else { return }
+                if let index = online.firstIndex(where: { $0.provider == provider.name }) {
+                    online[index].rows = batch
+                } else {
+                    online.append((provider.name, batch))
+                }
+            }
+        }
+    }
+
+    private func onlineRow(_ row: RemoteResultRow) -> some View {
+        let queued = finder.downloads.contains { $0.id == row.id }
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(highlighted(row.title)).font(.subheadline).lineLimit(1)
+                Text(row.subtitle).font(.caption).foregroundStyle(theme.inkSecondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Text("\(row.format.replacingOccurrences(of: "FLAC ", with: "")) · \(row.sizeText)")
+                .font(Typeface.monoSmall).foregroundStyle(theme.inkSecondary)
+            Button {
+                finder.download(row)
+            } label: {
+                Image(systemName: queued ? "checkmark.circle.fill" : "arrow.down.circle")
+            }
+            .buttonStyle(.plain)
+            .disabled(queued)
+            .accessibilityLabel(queued ? "Queued" : "Download \(row.title)")
+            .accessibilityIdentifier("shelfDownload-\(row.id)")
+        }
+        .padding(.vertical, 7)
+        .overlay(alignment: .bottom) { Rectangle().fill(theme.hairline.opacity(0.6)).frame(height: 0.5) }
     }
 
     private func header(_ text: String) -> some View {
