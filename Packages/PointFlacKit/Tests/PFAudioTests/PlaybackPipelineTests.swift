@@ -106,6 +106,72 @@ private final class FailingDecoder: PCMDecoding {
     }
 }
 
+/// A `negotiateRate` that does not answer until the test releases it, like an audio session stuck activating.
+private final class StuckNegotiation: Sendable {
+    private struct State {
+        var entered = false
+        var waiter: CheckedContinuation<Int, Never>?
+        var answer: Int?
+    }
+
+    private let state = Mutex(State())
+
+    var entered: Bool { state.withLock { $0.entered } }
+
+    func answer() async -> Int {
+        await withCheckedContinuation { continuation in
+            state.withLock { s in
+                s.entered = true
+                if let answer = s.answer {
+                    continuation.resume(returning: answer)
+                } else {
+                    s.waiter = continuation
+                }
+            }
+        }
+    }
+
+    func release(_ rate: Int) {
+        state.withLock { s in
+            s.answer = rate
+            s.waiter?.resume(returning: rate)
+            s.waiter = nil
+        }
+    }
+}
+
+/// Wraps a decoder and records when it is deallocated, to show a stopped session let go of it.
+private final class TrackedDecoder: PCMDecoding {
+    final class Lifetime: Sendable {
+        private let flag = Atomic<Bool>(false)
+        var ended: Bool { flag.load(ordering: .acquiring) }
+        func end() { flag.store(true, ordering: .releasing) }
+    }
+
+    private let inner: FlacDecoder
+    private let lifetime: Lifetime
+
+    init(_ inner: FlacDecoder, lifetime: Lifetime) {
+        self.inner = inner
+        self.lifetime = lifetime
+    }
+
+    deinit {
+        lifetime.end()
+    }
+
+    var format: AudioFormat { inner.format }
+    var totalFrames: Int64 { inner.totalFrames }
+
+    func read(into buffer: UnsafeMutableBufferPointer<Int32>, maxFrames: Int) throws -> Int {
+        try inner.read(into: buffer, maxFrames: maxFrames)
+    }
+
+    func seek(toFrame frame: Int64) throws {
+        try inner.seek(toFrame: frame)
+    }
+}
+
 /// A pipeline wired to a `FakeOutput`, with its events collected. The test plays the render thread by pulling
 /// 512-frame chunks.
 private final class Rig {
@@ -116,14 +182,15 @@ private final class Rig {
     /// Real frames pulled so far (the FakeOutput captures exactly these).
     private(set) var pulledFrames = 0
 
+    /// `negotiate`, when given, replaces `hardwareRate` as the pipeline's `negotiateRate`.
     init(
         hardwareRate: @escaping @Sendable (Int) -> Int = { $0 }, int32Passthrough: Bool = false,
-        ditherSeed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+        ditherSeed: UInt64 = 0x9E37_79B9_7F4A_7C15, negotiate: (@Sendable (Int) async -> Int)? = nil,
         makeDecoder: @escaping @Sendable (PlaybackItem) throws -> PCMDecoding = { try FlacDecoder(url: $0.url) }
     ) {
         let pipeline = PlaybackPipeline(
             output: output, capabilities: OutputCapabilities(int32Passthrough: int32Passthrough),
-            negotiateRate: { hardwareRate($0) }, makeDecoder: makeDecoder, ditherSeed: ditherSeed)
+            negotiateRate: negotiate ?? { hardwareRate($0) }, makeDecoder: makeDecoder, ditherSeed: ditherSeed)
         self.pipeline = pipeline
         let log = self.log
         collector = Task {
@@ -141,10 +208,24 @@ private final class Rig {
     }
 
     @discardableResult
-    func pull() -> Int {
-        let n = output.pull(frames: 512)
+    func pull(frames: Int = 512) -> Int {
+        let n = output.pull(frames: frames)
         pulledFrames += n
         return n
+    }
+
+    /// Pulls until exactly `target` real frames have been pulled in all, then stops. False on timeout.
+    @discardableResult
+    func pull(upTo target: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while pulledFrames < target {
+            guard clock.now < deadline else { return false }
+            if pull(frames: min(512, target - pulledFrames)) == 0 {
+                try? await Task.sleep(for: .microseconds(200))
+            }
+        }
+        return true
     }
 
     /// Pulls until `done()` holds or the timeout passes, and returns whether it held.
@@ -166,6 +247,47 @@ private final class Rig {
     func playToEnd() async {
         let ended = await pump { log.contains(.queueEnded) }
         #expect(ended, "no queueEnded; events so far: \(log.events)")
+    }
+}
+
+/// Waits, without pulling, until `condition` holds or the timeout passes, and returns whether it held.
+private func wait(upTo timeout: Duration, for condition: () -> Bool) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while !condition() {
+        guard clock.now < deadline else { return false }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return true
+}
+
+/// A long synthetic source, so the decode thread is still busy (blocked on a full ring) when a seek arrives.
+/// 16-bit stereo, ten seconds at 44.1 kHz; sample (n, c) = ((2n + c) mod 65536) − 32768.
+private final class PatternDecoder: PCMDecoding {
+    static let frames: Int64 = 441_000
+    static let item = PlaybackItem(
+        id: "pattern", url: URL(fileURLWithPath: "/dev/null"),
+        format: AudioFormat(sampleRate: 44_100, bitsPerSample: 16, channels: 2), totalFrames: frames)
+
+    static func samples(from frame: Int64, count frames: Int) -> [Int32] {
+        (0..<(frames * 2)).map { Int32((2 * frame + Int64($0)) % 65_536) - 32_768 }
+    }
+
+    let format = PatternDecoder.item.format
+    var totalFrames: Int64 { Self.frames }
+    private var position: Int64 = 0
+
+    func read(into buffer: UnsafeMutableBufferPointer<Int32>, maxFrames: Int) throws -> Int {
+        let n = Int(min(Int64(min(maxFrames, buffer.count / 2)), Self.frames - position))
+        for i in 0..<(n * 2) {
+            buffer[i] = Int32((2 * position + Int64(i)) % 65_536) - 32_768
+        }
+        position += Int64(n)
+        return n
+    }
+
+    func seek(toFrame frame: Int64) throws {
+        position = frame
     }
 }
 
@@ -361,12 +483,108 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         // Both tracks fit in the ring, so the decode thread passes the boundary long before it is rendered.
         try? await Task.sleep(for: .milliseconds(100))
         #expect(!rig.log.contains(.trackEnded(0)))
-        var framesWhenSeen: Int?
-        await rig.pump {
-            if rig.log.contains(.trackEnded(0)) { framesWhenSeen = rig.pulledFrames }
-            return framesWhenSeen != nil
+        // One frame short of the boundary: still not ended.
+        #expect(await rig.pull(upTo: 4095))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(!rig.log.contains(.trackEnded(0)))
+        // The boundary rendered, and nothing more pulled: the event follows promptly, the next track's end does not.
+        #expect(await rig.pull(upTo: 4096))
+        #expect(await wait(upTo: .milliseconds(50)) { rig.log.contains(.trackEnded(0)) })
+        #expect(rig.log.contains(.trackStarted(1)) && !rig.log.contains(.trackEnded(1)))
+    }
+
+    /// 44.1 → 48 kHz has no integer ratio, so the join's output frame is predicted (4096 · 48000/44100 ≈ 4458), and
+    /// the resampler's real output after its final flush can fall a frame short of the predicted end.
+    @Test func resampledGaplessJoinAtNonIntegerRatio() async throws {
+        let raw = Fixtures.rawSamples(Fixtures.named("s16-44100"))
+        let rig = Rig(hardwareRate: { _ in 48_000 })
+        await rig.play([item("s16-44100", id: "a"), item("s16-44100", id: "b")])
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(await rig.pull(upTo: 4458 - 32))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(!rig.log.contains(.trackEnded(0)))
+        #expect(await rig.pull(upTo: 4458 + 32))
+        #expect(await wait(upTo: .milliseconds(50)) { rig.log.contains(.trackStarted(1)) })
+        #expect(!rig.log.contains(.trackEnded(1)))
+        await rig.playToEnd()
+        let plan = floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))
+        #expect(
+            rig.log.events == [
+                .planChanged(plan), .trackStarted(0), .trackEnded(0), .trackStarted(1), .trackEnded(1), .queueEnded,
+            ])
+        let reference = try oneShotResample(floats(raw + raw, bits: 16), from: 44_100, to: 48_000, channels: 2)
+        #expect(rig.output.capturedFloat.count == reference.count)
+        #expect(maxDifference(rig.output.capturedFloat, reference) <= resampleJoinTolerance)
+    }
+
+    /// Regression: a resampled join predicted one frame past the true end of the stream, when the next item yields
+    /// nothing, used to strand every later event behind it. With `followedByFormatChange`, `.planChanged` used to
+    /// overtake `trackEnded(0)` as well.
+    @Test(arguments: [false, true])
+    func resampledJoinIntoAnEmptyItemStillEnds(followedByFormatChange: Bool) async {
+        let rig = Rig(
+            hardwareRate: { _ in 48_000 },
+            makeDecoder: { item in
+                let decoder = try FlacDecoder(url: item.url)
+                return item.id == "empty" ? FailingDecoder(decoder, failAfter: 0) : decoder
+            })
+        var items = [item("corrupt-mid-s16-44100"), item("s16-44100", id: "empty")]
+        if followedByFormatChange { items.append(item("s24-96000")) }
+        await rig.play(items)
+        let ended = await rig.pump(timeout: .seconds(5)) { rig.log.contains(.queueEnded) }
+        #expect(ended, "events: \(rig.log.events)")
+        var expected: [PipelineEvent] = [
+            .planChanged(floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))), .trackStarted(0),
+            .trackEnded(0), .trackStarted(1), .itemFailed(1, "ioError"),
+        ]
+        if followedByFormatChange {
+            expected += [
+                .planChanged(floatPlan(48_000, resample: RateChange(from: 96_000, to: 48_000))), .trackStarted(2),
+                .trackEnded(2),
+            ]
         }
-        #expect(framesWhenSeen != nil && framesWhenSeen! >= 4096, "seen after \(String(describing: framesWhenSeen))")
+        expected.append(.queueEnded)
+        #expect(rig.log.events == expected)
+    }
+
+    /// The realistic seek: mid-playback of a long track, with the decode thread blocked writing into a full ring.
+    @Test func seekWhileDecodingCompletesWithin50ms() async {
+        let rig = Rig(makeDecoder: { _ in PatternDecoder() })
+        await rig.play([PatternDecoder.item])
+        #expect(await rig.pump { rig.pulledFrames >= 8192 })
+        // Let the decode thread refill the half-second ring and block on it.
+        try? await Task.sleep(for: .milliseconds(20))
+        let mark = rig.output.capturedFloat.count
+        let clock = ContinuousClock()
+        let start = clock.now
+        await rig.pipeline.seek(toFrame: 300_000)
+        var latency: Duration?
+        while clock.now - start < .seconds(2) {
+            if rig.pull() > 0 {
+                latency = clock.now - start
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(latency != nil && latency! < .milliseconds(50), "seek latency \(String(describing: latency))")
+        let fresh = Array(rig.output.capturedFloat[mark...])
+        let expected = floats(PatternDecoder.samples(from: 300_000, count: fresh.count / 2), bits: 16)
+        #expect(!fresh.isEmpty && mismatch(fresh, expected) == nil)
+    }
+
+    /// `negotiateRate` returning no usable rate fails that item; the pipeline never assumes the source rate.
+    @Test func unavailableOutputRateFailsTheItem() async {
+        let raw = Fixtures.rawSamples(Fixtures.named("s16-44100"))
+        let rig = Rig(hardwareRate: { $0 == 96_000 ? 0 : $0 })
+        await rig.play([item("s24-96000"), item("s16-44100")])
+        await rig.playToEnd()
+        #expect(
+            rig.log.events == [
+                .itemFailed(0, "Output rate unavailable"), .planChanged(floatPlan(44_100)), .trackStarted(1),
+                .trackEnded(1), .queueEnded,
+            ])
+        #expect(rig.output.plans == [floatPlan(44_100)])
+        #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)
     }
 
     @Test func positionFollowsRenderedFrames() async {
@@ -381,6 +599,30 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         await rig.pump { rig.pulledFrames >= 4096 + 512 }
         position = rig.pipeline.position
         #expect(position.index == 1 && position.frame == 512)
+    }
+
+    /// `stop()` must not wait on `negotiateRate`, and the decode thread must unwind even though it never answers.
+    @Test func stopWhileNegotiationNeverAnswers() async {
+        let negotiation = StuckNegotiation()
+        let lifetime = TrackedDecoder.Lifetime()
+        let rig = Rig(
+            negotiate: { _ in await negotiation.answer() },
+            makeDecoder: { item in TrackedDecoder(try FlacDecoder(url: item.url), lifetime: lifetime) })
+        await rig.play([item("s16-44100")])
+        #expect(await wait(upTo: .seconds(2)) { negotiation.entered })
+        #expect(rig.pipeline.liveDecodeThreads == 1)
+        let clock = ContinuousClock()
+        let start = clock.now
+        rig.pipeline.stop()
+        let stopTook = clock.now - start
+        #expect(stopTook < .milliseconds(50), "stop() took \(stopTook)")
+        #expect(await wait(upTo: .seconds(1)) { rig.pipeline.liveDecodeThreads == 0 })
+        #expect(await wait(upTo: .seconds(1)) { lifetime.ended }, "the stopped session still holds its decoder")
+        // A late answer must not configure or start the output, or emit anything.
+        negotiation.release(44_100)
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(rig.output.plans.isEmpty && !rig.output.isStarted)
+        #expect(rig.log.events.isEmpty)
     }
 
     @Test func stopHaltsOutputAndStartReplacesTheQueue() async {
