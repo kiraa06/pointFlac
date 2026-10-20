@@ -148,8 +148,6 @@ struct ArchiveDownload {
     let client: ArchiveClient
     let base: URL
 
-    private static let chunkBytes = 256 << 10
-
     func run(progress: @Sendable (Double) -> Void) async throws -> URL {
         guard track.provider == ArchiveProvider.providerID, let identifier = track.detail["identifier"],
             let path = track.detail["path"], let expectedSize = track.sizeBytes, expectedSize > 0,
@@ -168,7 +166,7 @@ struct ArchiveDownload {
 
         if have < expectedSize {
             let headers = have > 0 ? ["Range": "bytes=\(have)-"] : [:]
-            let (bytes, response) = try await client.open(client.request(url, headers: headers))
+            let (body, response) = try await client.open(client.request(url, headers: headers))
             var offset: Int64
             switch response.statusCode {
             case 200:
@@ -193,7 +191,7 @@ struct ArchiveDownload {
             if response.expectedContentLength > 0, offset + response.expectedContentLength > expectedSize {
                 throw ArchiveError.tooLarge
             }
-            try await write(bytes, to: part, from: offset, expectedSize: expectedSize, progress: progress)
+            try await write(body, to: part, from: offset, expectedSize: expectedSize, progress: progress)
             have = (try? fileManager.attributesOfItem(atPath: part.path)[.size] as? NSNumber)?.int64Value ?? 0
         }
 
@@ -210,7 +208,7 @@ struct ArchiveDownload {
     }
 
     private func write(
-        _ bytes: URLSession.AsyncBytes, to part: URL, from offset: Int64, expectedSize: Int64,
+        _ body: ResponseBody, to part: URL, from offset: Int64, expectedSize: Int64,
         progress: @Sendable (Double) -> Void
     ) async throws {
         let fileManager = FileManager.default
@@ -224,38 +222,26 @@ struct ArchiveDownload {
         try handle.seekToEnd()
 
         var written = offset
-        var buffer = Data()
-        buffer.reserveCapacity(Self.chunkBytes)
         var lastReported = -1
-        func flush() throws {
-            guard !buffer.isEmpty else { return }
-            try handle.write(contentsOf: buffer)
-            buffer.removeAll(keepingCapacity: true)
-            let percent = Int(written * 100 / expectedSize)
-            if percent != lastReported {
-                lastReported = percent
-                progress(Double(written) / Double(expectedSize))
-            }
-        }
         do {
-            for try await byte in bytes {
-                written += 1
+            for try await chunk in body {
                 // Never accept more than the listing promised (spec §5.8: every untrusted input is bounded).
-                guard written <= expectedSize else {
+                guard written + Int64(chunk.count) <= expectedSize else {
+                    try? handle.close()
                     try? fileManager.removeItem(at: part)
                     throw ArchiveError.tooLarge
                 }
-                buffer.append(byte)
-                if buffer.count >= Self.chunkBytes { try flush() }
+                try handle.write(contentsOf: chunk)
+                written += Int64(chunk.count)
+                let percent = Int(written * 100 / expectedSize)
+                if percent != lastReported {
+                    lastReported = percent
+                    progress(Double(written) / Double(expectedSize))
+                }
             }
-            try flush()
         } catch let error as URLError {
-            try? flush()
             if error.code == .cancelled { throw CancellationError() }
             throw ArchiveError.from(error)
-        } catch is CancellationError {
-            try? flush()
-            throw CancellationError()
         }
     }
 

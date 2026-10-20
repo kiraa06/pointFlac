@@ -81,4 +81,36 @@ struct ArchiveLiveTests {
         #expect(shelf.drops.count == FridayDrops.shelfSize)
         #expect(shelf.drops.allSatisfy { !$0.tracks.isEmpty && $0.licence != ArchiveLicence.etree.name })
     }
+
+    @Test("a real download resumes from a part file with a Range request through the Archive's redirect")
+    func resume() async throws {
+        let provider = ArchiveProvider()
+        var found: [RemoteTrack] = []
+        for try await batch in provider.search("dusty-sense") { found += batch }
+        let track = try #require(found.first { $0.id == "archive:dusty-sense/dusty-sense.flac" })
+
+        let scratch = try Scratch()
+        let whole = scratch.url.appending(path: "whole", directoryHint: .isDirectory)
+        let partial = scratch.url.appending(path: "partial", directoryHint: .isDirectory)
+        for folder in [whole, partial] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        var first: URL?
+        for try await event in provider.download(track, into: whole) {
+            if case .finished(let url) = event { first = url }
+        }
+        let reference = try Data(contentsOf: try #require(first))
+        let split = 1_000_000
+        try reference.prefix(split).write(to: partial.appending(path: "dusty-sense.flac.part"))
+
+        var fractions: [Double] = []
+        var resumed: URL?
+        for try await event in provider.download(track, into: partial) {
+            if case .progress(let fraction) = event { fractions.append(fraction) }
+            if case .finished(let url) = event { resumed = url }
+        }
+        print("live: resume from \(split) bytes, first progress \(fractions.first ?? -1)")
+        #expect(try Data(contentsOf: try #require(resumed)) == reference)
+        #expect((fractions.first ?? 0) >= Double(split) / Double(reference.count), "the transfer started mid-file")
+    }
 }

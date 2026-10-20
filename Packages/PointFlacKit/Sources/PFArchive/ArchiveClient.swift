@@ -118,40 +118,44 @@ final class ArchiveClient: Sendable {
         return request
     }
 
-    /// Opens a streaming response after pacing, retrying once if the Archive says it is busy.
-    func open(_ request: URLRequest) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+    /// Opens a streaming response after pacing, retrying once if the Archive says it is busy. The body arrives
+    /// as `Data` chunks, so a large download is written as it comes rather than handled byte by byte.
+    func open(_ request: URLRequest) async throws -> (ResponseBody, HTTPURLResponse) {
         guard request.url?.scheme?.lowercased() == "https" else { throw ArchiveError.insecure }
         var busyRetries = 0
         while true {
             try await pacer.waitTurn()
-            // One guard per request, so a refusal is attributed to this request alone.
-            let redirectGuard = RedirectGuard(allowedHost: base.host() ?? "archive.org")
-            let bytes: URLSession.AsyncBytes
+            // One delegate per request, so a refused redirect is attributed to this request alone.
+            let transfer = StreamingTransfer(allowedHost: base.host() ?? "archive.org")
             let response: URLResponse
             do {
-                (bytes, response) = try await session.bytes(for: request, delegate: redirectGuard)
+                response = try await transfer.start(request, in: session)
             } catch let error as URLError {
-                if redirectGuard.refused { throw ArchiveError.insecure }
+                if transfer.refusedRedirect { throw ArchiveError.insecure }
                 if error.code == .cancelled { throw CancellationError() }
                 throw ArchiveError.from(error)
             }
             guard let http = response as? HTTPURLResponse else { throw ArchiveError.badResponse("not HTTP") }
-            // A redirect only reaches here when the guard refused to follow it.
-            if redirectGuard.refused || (300..<400).contains(http.statusCode) { throw ArchiveError.insecure }
+            // A redirect only reaches here when the transfer refused to follow it.
+            if transfer.refusedRedirect || (300..<400).contains(http.statusCode) {
+                transfer.cancel()
+                throw ArchiveError.insecure
+            }
             if http.statusCode == 429 || http.statusCode == 503, busyRetries < 1 {
+                transfer.cancel()
                 busyRetries += 1
                 let delay = retryAfter(http)
                 Self.log.info("archive busy (\(http.statusCode, privacy: .public)); waiting")
                 await pacer.backOff(delay)
                 continue
             }
-            return (bytes, http)
+            return (transfer.body, http)
         }
     }
 
     /// Fetches and decodes a JSON document no larger than `limit` bytes.
     func json<T: Decodable>(_ type: T.Type, from url: URL, limit: Int) async throws -> T {
-        let (bytes, response) = try await open(request(url, headers: ["Accept": "application/json"]))
+        let (body, response) = try await open(request(url, headers: ["Accept": "application/json"]))
         switch response.statusCode {
         case 200: break
         case 404, 410: throw ArchiveError.notFound
@@ -161,8 +165,8 @@ final class ArchiveClient: Sendable {
         var data = Data()
         data.reserveCapacity(min(limit, max(0, Int(response.expectedContentLength))))
         do {
-            for try await byte in bytes {
-                data.append(byte)
+            for try await chunk in body {
+                data.append(chunk)
                 if data.count > limit { throw ArchiveError.tooLarge }
             }
         } catch let error as URLError {
@@ -182,29 +186,97 @@ final class ArchiveClient: Sendable {
     }
 }
 
-/// Refuses redirects that leave HTTPS or the Archive's own hosts, so a download can never be steered elsewhere.
-final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
+typealias ResponseBody = AsyncThrowingStream<Data, Error>
+
+/// One request as a response plus a stream of body chunks, with a redirect policy: redirects that leave HTTPS or the
+/// Archive's own hosts are refused, so a download can never be steered elsewhere (spec §5.8).
+final class StreamingTransfer: NSObject, URLSessionDataDelegate, Sendable {
     let allowedHost: String
-    private let refusal = Mutex(false)
+    let body: ResponseBody
+    private let bodyContinuation: ResponseBody.Continuation
+    private let state = Mutex(State())
+
+    private struct State {
+        var refused = false
+        var waiting: CheckedContinuation<URLResponse, Error>?
+        var task: URLSessionDataTask?
+    }
+
+    init(allowedHost: String) {
+        self.allowedHost = allowedHost.lowercased()
+        // Chunks are written to disk as they come, which keeps up with any network the phone has, so an unbounded
+        // buffer stays small in practice.
+        (body, bodyContinuation) = ResponseBody.makeStream(bufferingPolicy: .unbounded)
+    }
 
     /// Whether this request tried to redirect somewhere it may not go.
-    var refused: Bool { refusal.withLock { $0 } }
+    var refusedRedirect: Bool { state.withLock { $0.refused } }
 
-    init(allowedHost: String) { self.allowedHost = allowedHost.lowercased() }
+    /// Starts the request and returns once the response headers arrive; the body follows on `body`.
+    func start(_ request: URLRequest, in session: URLSession) async throws -> URLResponse {
+        let task = session.dataTask(with: request)
+        task.delegate = self
+        state.withLock { $0.task = task }
+        bodyContinuation.onTermination = { _ in task.cancel() }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                state.withLock { $0.waiting = continuation }
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func cancel() {
+        state.withLock { $0.task }?.cancel()
+        bodyContinuation.finish()
+    }
 
     func isAllowed(_ url: URL?) -> Bool {
         guard let url, url.scheme?.lowercased() == "https", let host = url.host()?.lowercased() else { return false }
         return host == allowedHost || host.hasSuffix("." + allowedHost)
     }
 
+    private func takeWaiting() -> CheckedContinuation<URLResponse, Error>? {
+        state.withLock { state in
+            defer { state.waiting = nil }
+            return state.waiting
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        takeWaiting()?.resume(returning: response)
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        bodyContinuation.yield(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let waiting = takeWaiting() {
+            waiting.resume(throwing: error ?? URLError(.badServerResponse))
+        }
+        if let error {
+            bodyContinuation.finish(throwing: error)
+        } else {
+            bodyContinuation.finish()
+        }
+    }
+
     func urlSession(
         _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest
-    ) async -> URLRequest? {
-        // Returning nil hands the 3xx itself back to `open`, which refuses it.
+        newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        // Refusing hands the 3xx itself back to `open`, which rejects it.
         guard isAllowed(request.url) else {
-            refusal.withLock { $0 = true }
-            return nil
+            state.withLock { $0.refused = true }
+            completionHandler(nil)
+            return
         }
         var next = request
         next.setValue(ArchiveClient.userAgent, forHTTPHeaderField: "User-Agent")
@@ -212,6 +284,6 @@ final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
         if let range = task.originalRequest?.value(forHTTPHeaderField: "Range") {
             next.setValue(range, forHTTPHeaderField: "Range")
         }
-        return next
+        completionHandler(next)
     }
 }
