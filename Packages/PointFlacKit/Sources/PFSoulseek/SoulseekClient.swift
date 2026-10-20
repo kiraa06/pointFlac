@@ -190,13 +190,13 @@ public actor SoulseekClient {
                     await self?.serverConnectionEnded(generation: generation)
                 }
             })
+        // Keepalive: an idle server connection is otherwise dropped by NAT boxes and mobile networks.
         serverTasks.append(
-            Task { [weak self] in
+            Task {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: config.keepaliveInterval)
                     guard !Task.isCancelled else { return }
                     try? await framed.send(Outgoing.ping())
-                    _ = self
                 }
             })
         setState(.loggedIn(username: credentials.username))

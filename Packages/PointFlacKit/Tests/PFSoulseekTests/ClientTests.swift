@@ -35,7 +35,7 @@ struct LoginTests {
             var reader = WireReader(login.payload)
             #expect(try reader.string() == "alice")
             #expect(try reader.string() == "secret")
-            #expect(try reader.u32() == 160)
+            #expect(try reader.u32() == 177)
             #expect(try reader.string() == "c4e31313222cf05fcdd1fc068af5570e")
             #expect(try reader.u32() == 1)
             try await link.send(Mock.loginSuccess())

@@ -74,9 +74,10 @@ public struct SoulseekSearchOptions: Sendable {
 public struct SoulseekConfiguration: Sendable {
     public var serverHost = "server.slsknet.org"
     public var serverPort: UInt16 = 2242
-    /// Protocol major version. 160 / minor 1 was verified live on 2026-10-21. §5.6 asks for the experimental 177 in
-    /// development, so the caller can change it.
-    public var majorVersion: UInt32 = 160
+    /// Protocol major version. §5.6: 177 is the number for experimental clients, used in development; pointFlac asks
+    /// the Soulseek admins for its own number before any wider release. Both 177 and 160 (minor 1) logged in and
+    /// searched on the live server on 2026-10-21.
+    public var majorVersion: UInt32 = 177
     public var minorVersion: UInt32 = 1
     /// Port advertised with SetWaitPort. Behind NAT nothing connects to it; peers fall back to ConnectToPeer.
     public var listenPort: UInt32 = 2234
@@ -92,8 +93,9 @@ public struct SoulseekConfiguration: Sendable {
     /// Peer connections in flight at once (connecting or reading). The probe saw ~23,000 requests in 30 s.
     public var maxConcurrentPeerConnections = 300
     public var peerConnectTimeout: Duration = .seconds(4)
-    /// How long a pierced search connection may stay silent before it is dropped.
-    public var peerReadTimeout: Duration = .seconds(10)
+    /// How long a pierced search connection may stay silent before it is dropped. Honest peers answer within a second
+    /// or two of the pierce; a silent one holds one of the capped slots that the next peer could use.
+    public var peerReadTimeout: Duration = .seconds(6)
     /// Stop accepting new search peers this long before the window closes; they would not answer in time.
     public var searchTailCutoff: Duration = .seconds(2)
     /// How long to wait for the server to answer GetPeerAddress.

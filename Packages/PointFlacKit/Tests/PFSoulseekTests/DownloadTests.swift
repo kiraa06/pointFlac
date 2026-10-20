@@ -11,6 +11,8 @@ struct MockUploader {
         case deny(String)
         case announceSize(UInt64)
         case dropAfter(Int)
+        /// Sends the TransferRequest over a second, server-forwarded P connection instead of ours.
+        case indirectRequest(MockListener)
     }
 
     let pListener: MockListener
@@ -45,8 +47,17 @@ struct MockUploader {
         var size = UInt64(content.count)
         if case .announceSize(let announced) = script { size = announced }
         let transferToken: UInt32 = 777
-        try await control.send(Mock.transferRequest(token: transferToken, path: path, size: size))
-        let reply = try await control.expect(code: 41)
+        var requestLink = control
+        if case .indirectRequest(let second) = script {
+            try await server.send(Mock.connectToPeer(username: "bob", type: "P", port: second.port, token: 555))
+            requestLink = try await second.accept()
+            let pierce = try await requestLink.nextFrame(codeWidth: .u8)
+            var reader = WireReader(pierce.payload)
+            #expect(pierce.code == 0)
+            #expect(try reader.u32() == 555)
+        }
+        try await requestLink.send(Mock.transferRequest(token: transferToken, path: path, size: size))
+        let reply = try await requestLink.expect(code: 41)
         var replyReader = WireReader(reply.payload)
         #expect(try replyReader.u32() == transferToken)
         guard try replyReader.bool() else { return nil }
@@ -153,6 +164,23 @@ struct DownloadTests {
         #expect(secondEvents.contains(.started(offset: 100_000, size: Int64(Self.content.count))))
         guard case .finished(let url) = secondEvents.last else {
             Issue.record("expected finished, got \(String(describing: secondEvents.last))")
+            return
+        }
+        #expect(try Array(Data(contentsOf: url)) == Self.content)
+    }
+
+    @Test("A TransferRequest over a new server-forwarded P connection is accepted (bypasses the search cap)")
+    func indirectTransferRequest() async throws {
+        let (client, server, _) = try await loggedInClient { $0.maxConcurrentPeerConnections = 1 }
+        let uploader = try await MockUploader.start(path: Self.path, content: Self.content)
+        let second = try await MockListener.start()
+        let stream = client.download(Self.result(), into: try temporaryStaging())
+        try await answerPeerAddress(server, port: uploader.pListener.port)
+        async let peerSide = uploader.run(script: .indirectRequest(second), server: server)
+        let all = await events(stream)
+        #expect(try await peerSide == 0)
+        guard case .finished(let url) = all.last else {
+            Issue.record("expected finished, got \(String(describing: all.last))")
             return
         }
         #expect(try Array(Data(contentsOf: url)) == Self.content)
