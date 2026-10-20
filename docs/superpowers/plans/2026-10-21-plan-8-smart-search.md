@@ -80,5 +80,12 @@ pick ─▶ resolve(Suggestion) ─▶ ResolvedEntity (+ MusicBrainz track count
 - `ArchiveQueryBuilder.queries(for:)` → ordered advancedsearch/scrape `q` strings (creator + title + FLAC formats,
   then title-only), quoted and escaped. Stream B owns the provider.
 
-## Task 8: Opt-in live test, lint, report
+## Task 8: Integration helpers (added during the night)
+- `SearchPlanRunner`: runs a plan variant by variant through a process-wide Soulseek token bucket (5 s), re-ranks
+  after every batch, stops at enough complete albums.
+- `CoverArtArchive`: lazy, cached (hits and misses, 30 days) thumbnails, opt-in, size-capped.
+- `SmartSearch`: one-per-process facade (one MusicBrainz client, so one cache and one limiter) for the
+  `MusicFinding` adapter. Default buckets are statics, so a second client still shares one request per second.
+
+## Task 9: Opt-in live test, lint, report
 - `PF_LIVE_TESTS=1 swift test --filter PFFindLiveTests` once; `swift format lint --strict`; full `swift test`.

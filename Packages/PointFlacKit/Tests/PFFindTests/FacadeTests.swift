@@ -68,3 +68,65 @@ import Testing
         #expect(ranked.map(\.folder) == [#"music\Gorillaz\Demon Days"#])
     }
 }
+
+@Suite struct TypeaheadTimingTests {
+    @Test func liveRowsWaitForTheDebounce() async throws {
+        let registry = FakeRegistry(live: [[registryRow(.artist, "", artist: "Gorillaz")]])
+        let engine = TypeaheadEngine(
+            library: { _, _ in [] }, registry: registry, configuration: .init(debounce: .milliseconds(120)))
+        let clock = ContinuousClock()
+        let start = clock.now
+        var liveAt: Duration?
+        for await snapshot in engine.suggestions("gorillaz") where !snapshot.isEmpty {
+            liveAt = clock.now - start
+        }
+        let arrived = try #require(liveAt)
+        #expect(arrived >= .milliseconds(115))
+    }
+
+    @Test func aNewerKeystrokeCancelsTheMusicBrainzRequestInFlight() async throws {
+        let started = Locked(0)
+        let stub = StubMusicBrainz { _ in
+            started.withLock { $0 += 1 }
+            try await Task.sleep(for: .seconds(5))
+            return (200, [:], try fixture("mb-artist-gorill-prefix"))
+        }
+        let engine = TypeaheadEngine(
+            library: { _, _ in [] }, registry: MusicBrainzRegistry(client: stub.client()),
+            configuration: .init(debounce: .milliseconds(10)))
+        let clock = ContinuousClock()
+        let older = engine.suggestions("gorillaz")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(started.withLock { $0 } == 1)  // The older request reached the server and is hanging.
+        let start = clock.now
+        _ = engine.suggestions("gorillaz the")
+        _ = await collect(older)
+        #expect(clock.now - start < .seconds(2))
+    }
+
+    @Test func aLongerPhraseReusesTheShorterPhrasesCachedRows() async throws {
+        let stub = StubMusicBrainz { url in
+            url.lastPathComponent == "artist"
+                ? (200, [:], try fixture("mb-artist-gorill-prefix")) : (200, [:], Data(#"{"count": 0}"#.utf8))
+        }
+        let registry = MusicBrainzRegistry(client: stub.client())
+        for try await _ in registry.suggestions(for: "goril") {}
+        let cached = try #require(registry.cachedSuggestions(for: "gorill"))
+        #expect(cached.contains { $0.title == "Gorillaz" })
+        #expect(registry.cachedSuggestions(for: "blur") == nil)
+    }
+
+    @Test func featuredArtistsInTheQueryMatchTheFullCredit() {
+        var row = registryRow(.track, "Feel Good Inc.", artist: "Gorillaz")
+        row.entity.artistCredit = "Gorillaz featuring De La Soul"
+        let ranker = SuggestionRanker(query: "feel good inc feat de la soul")
+        #expect(ranker.score(row) > 0.85)
+    }
+}
+
+@Suite struct PlannerNumberTests {
+    @Test func bareNumberTitlesLeadWithTheArtist() {
+        let entity = ResolvedEntity(kind: .album, artist: "Adele", album: "21")
+        #expect(SoulseekQueryPlanner.plan(for: entity).variants.map(\.query) == ["adele 21"])
+    }
+}

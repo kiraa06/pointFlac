@@ -154,7 +154,8 @@ public actor MusicBrainzClient {
                 throw CancellationError()
             } catch {
                 if Task.isCancelled { throw CancellationError() }
-                logger.info("MusicBrainz unreachable: \(error.localizedDescription, privacy: .public)")
+                // Private: an error description can quote the request URL, which holds what the person typed.
+                logger.info("MusicBrainz unreachable: \(error.localizedDescription, privacy: .private)")
                 if let stale = disk?.read(key, allowStale: true) { return stale.data }
                 throw MusicBrainzError.offline
             }

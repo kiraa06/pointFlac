@@ -182,7 +182,10 @@ public struct SuggestionRanker: Sendable {
         guard !queryTokens.isEmpty else { return row.source == Suggestion.Source.library ? 0.5 : 0 }
         let entity = row.entity
         let titleTokens = FindText.tokens(FindText.coreTitle(row.title))
-        var names = [entity.artist]
+        // The full credit, so "feel good inc de la soul" matches "Gorillaz featuring De La Soul" ("featuring" is a
+        // stopword); for an artist row, every name it goes by.
+        var names = [entity.artistCredit ?? entity.artist]
+        if entity.artistCredit != nil, entity.artistCredit != entity.artist { names.append(entity.artist) }
         if row.kind == .artist { names = entity.artistNames }
         var best = 0.0
         for name in names {
