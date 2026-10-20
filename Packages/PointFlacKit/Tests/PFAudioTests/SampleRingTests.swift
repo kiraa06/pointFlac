@@ -94,6 +94,10 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
     #expect(elapsed < .seconds(spin ? 20 : 5), "took \(elapsed)")
 }
 
+// NOTE on Thread Sanitizer: TSan cannot observe this ring's storage handoff. The element copies go through
+// memmove, which is not instrumented against the atomic indices, so a missing barrier yields no TSan report
+// (a fully `.relaxed` ring is TSan-clean). The memory ordering is verified by review and by disassembly
+// (ldapr/stlr on arm64). `smallRingOrderingStress` in the release stage is a regression net, not a proof.
 @Suite struct SampleRingTests {
     @Test func wrapsAroundPreservingOrder() {
         let ring = SampleRing<Int32>(capacity: 8)
@@ -126,6 +130,36 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
         ring.reset()
         #expect(ring.availableToRead == 0)
         #expect(ring.availableToWrite == 8)
+    }
+
+    @Test func discardReadableDropsOnlyBufferedData() {
+        let ring = SampleRing<Int32>(capacity: 16)
+        #expect(write(ring, Array(0..<10)) == 10)
+        ring.discardReadable()
+        #expect(ring.availableToRead == 0)
+        #expect(write(ring, [100, 101, 102]) == 3)
+        #expect(read(ring, count: 16) == [100, 101, 102])
+    }
+
+    @Test func staleTailNeverLetsWriteExceedCapacity() {
+        let capacity = 16
+        let ring = SampleRing<Int32>(capacity: capacity)
+        let big = [Int32](repeating: 7, count: 100)
+
+        // Tail ahead of head (a reset() that raced the consumer): used clamps to 0, never negative.
+        ring._setIndicesForTesting(head: 10, tail: 14)
+        #expect(ring.availableToRead == 0)
+        #expect(ring.availableToWrite <= capacity)
+        #expect(ring.availableToWrite == capacity)
+        let written = write(ring, big)
+        #expect(written <= capacity)
+        #expect(written == capacity - 0)
+
+        // Head ahead of tail by more than capacity: used clamps to capacity, so nothing may be written.
+        ring._setIndicesForTesting(head: 100, tail: 10)
+        #expect(ring.availableToRead == capacity)
+        #expect(ring.availableToWrite == 0)
+        #expect(write(ring, big) == 0)
     }
 
     @Test func concurrentProducerConsumerIsExact() {

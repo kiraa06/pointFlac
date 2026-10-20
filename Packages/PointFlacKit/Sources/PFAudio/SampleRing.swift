@@ -62,7 +62,7 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         min(max(h - t, 0), capacity)
     }
 
-    /// Test hook: forces raw index values to simulate a `reset()` that raced the consumer. Never call in production.
+    /// Testing only: forces raw index values to simulate a `reset()` that raced the consumer. Never call in production.
     internal func _setIndicesForTesting(head h: Int, tail t: Int) {
         head.store(h, ordering: .releasing)
         tail.store(t, ordering: .releasing)
