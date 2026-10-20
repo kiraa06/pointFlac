@@ -77,6 +77,14 @@ public enum FlacValidator {
     }
 
     static func validate<R: FlacByteReader>(reader: inout R) throws(FlacRejection) -> FlacStreamInfo {
+        try validate(reader: &reader, wants: { _ in false }, collect: { _, _ in })
+    }
+
+    /// Validates like `validate(reader:)`, and hands the bodies of the blocks `wants` selects (by type) to
+    /// `collect`. Unselected blocks are skipped by seeking, never read.
+    static func validate<R: FlacByteReader>(
+        reader: inout R, wants: (UInt8) -> Bool, collect: (UInt8, [UInt8]) -> Void
+    ) throws(FlacRejection) -> FlacStreamInfo {
         guard reader.name.lowercased().hasSuffix(".flac") else { throw .notFlacName }
 
         var offset = 0
@@ -122,7 +130,12 @@ public enum FlacValidator {
                 info = try parseStreamInfo(try take(34, from: &reader))
             } else {
                 guard length <= maxBlockBytes else { throw .blockTooLarge }
-                try skip(length, from: &reader)
+                if wants(type) {
+                    guard offset + length <= reader.size else { throw .truncated }
+                    collect(type, try take(length, from: &reader))
+                } else {
+                    try skip(length, from: &reader)
+                }
             }
             if isLast { break }
         }

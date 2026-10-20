@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "Packages/PointFlacKit/Sources/PFTestSupport/Resources/Fixtures")
@@ -121,7 +122,7 @@ def run(cmd):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def encode(tmp, name, rate, bits, ch, samples, block=None):
+def encode(tmp, name, rate, bits, ch, samples, block=None, tags=None):
     src = os.path.join(tmp, name + ".pcm")
     dst = os.path.join(tmp, name + ".flac")
     if bits == 16:
@@ -134,7 +135,10 @@ def encode(tmp, name, rate, bits, ch, samples, block=None):
            "-f", fmt, "-ar", str(rate), "-ac", str(ch)]
     if ch == 6:
         cmd += ["-channel_layout", "5.1(side)"]
-    cmd += ["-i", src, "-map_metadata", "-1", "-c:a", "flac"]
+    cmd += ["-i", src, "-map_metadata", "-1"]
+    for key, value in (tags or {}).items():
+        cmd += ["-metadata", "%s=%s" % (key, value)]
+    cmd += ["-c:a", "flac"]
     if bits == 16:
         cmd += ["-sample_fmt", "s16"]
     else:
@@ -172,6 +176,35 @@ def id3v24_tag():
     return bytes(tag)
 
 
+# ---------- tags and cover ----------
+TAGS = {"title": "Fixture Title", "artist": "Fixture Artist", "album": "Fixture Album", "track": "2",
+        "date": "2023", "REPLAYGAIN_TRACK_GAIN": "-6.20 dB"}
+
+
+def png16():
+    """Deterministic 16x16 RGB PNG (a gradient), built with zlib."""
+    def chunk(tag, body):
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+    rows = b"".join(b"\x00" + b"".join(bytes((x * 16, y * 16, 128)) for x in range(16)) for y in range(16))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+
+
+def picture_block_body(png):
+    mime, desc = b"image/png", b"Fixture Cover"
+    return (struct.pack(">II", 3, len(mime)) + mime + struct.pack(">I", len(desc)) + desc
+            + struct.pack(">IIII", 16, 16, 24, 0) + struct.pack(">I", len(png)) + png)
+
+
+def append_picture(buf, body):
+    """Adds a PICTURE block (type 6) to the end of the metadata chain, fixing the last-block flags."""
+    blocks, first = metadata_blocks(buf)
+    last_typ, last_off, _ = blocks[-1]
+    buf[last_off - 4] &= 0x7F  # clear the previous last-block flag
+    header = bytes([0x80 | 6]) + len(body).to_bytes(3, "big")
+    return buf[:first] + header + body + buf[first:]
+
+
 # ---------- main ----------
 def main():
     if os.path.isdir(OUT):
@@ -204,14 +237,21 @@ def main():
         plain("s16-48000", 48000, 16, 2)
         plain("s16-44100-mono", 44100, 16, 1)
         for r in (44100, 48000, 88200, 96000, 176400, 192000, 384000):
-            plain("s24-%d" % r, r, 24, 2)
+            if r == 48000:
+                s = signal(FRAMES, 24, 2)
+                data = encode(tmp, "s24tagged", r, 24, 2, s, tags=TAGS)
+                data = append_picture(data, picture_block_body(png16()))
+                add("s24-48000", r, 24, 2, bytes(data), s)
+            else:
+                plain("s24-%d" % r, r, 24, 2)
         for r in (44100, 48000, 96000, 192000):
             plain("s32-%d" % r, r, 32, 2)
         plain("s16-48000-6ch", 48000, 16, 6, multichannel=True)
 
         # id3-s24-48000
         s = signal(FRAMES, 24, 2)
-        data = encode(tmp, "id3src", 48000, 24, 2, s)
+        data = encode(tmp, "id3src", 48000, 24, 2, s, tags=TAGS)
+        data = append_picture(data, picture_block_body(png16()))
         add("id3-s24-48000", 48000, 24, 2, id3v24_tag() + bytes(data), s)
 
         # nomd5-s16-44100
