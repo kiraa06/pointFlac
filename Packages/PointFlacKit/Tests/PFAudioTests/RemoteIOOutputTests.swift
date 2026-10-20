@@ -204,7 +204,7 @@
     /// taken inside the render callback, so they prove what pointFlac hands the unit (and mute the speaker meanwhile).
     /// Serialized, and exclusive with other suites (`.audioHardware`): every test drives the one audio session and the
     /// output hardware.
-    @Suite(.serialized, .audioHardware) struct RemoteIOOutputTests {
+    @Suite(.serialized, .audioOutputAvailable, .audioHardware) struct RemoteIOOutputTests {
         @Test func acceptsFloat32Client() async throws {
             let (_, rate) = try await activeSession()
             let output = try RemoteIOOutput()

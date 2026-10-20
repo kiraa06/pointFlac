@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # If the macos-26 label is unavailable, use the newest macOS image whose Xcode supports the iOS 26 SDK.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode 26.x
+        run: |
+          set -euo pipefail
+          latest="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$latest" ]; then
+            echo "::error::No /Applications/Xcode_26*.app on this runner image"
+            exit 1
+          fi
+          echo "Using $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Download the iOS platform if there is no iOS 26 runtime
+        run: |
+          set -euo pipefail
+          runtimes="$(xcrun simctl list runtimes)"
+          if ! grep -q 'iOS 26' <<< "$runtimes"; then
+            xcodebuild -downloadPlatform iOS
+          fi
+          xcrun simctl list runtimes
+
+      - name: Pick a simulator
+        run: |
+          set -euo pipefail
+          devices="$(xcrun simctl list devices available)"
+          if grep -q 'iPhone 17 Pro (' <<< "$devices"; then
+            echo "Using the default simulator, iPhone 17 Pro"
+          else
+            name="$(awk '
+              /^-- iOS 26/ { in26 = 1; next }
+              /^-- /        { in26 = 0 }
+              in26 && /iPhone/ { sub(/^ +/, ""); sub(/ \(.*/, ""); print; exit }' <<< "$devices")"
+            if [ -z "$name" ]; then
+              echo "::error::No available iPhone simulator on an iOS 26 runtime"
+              exit 1
+            fi
+            echo "Using $name"
+            echo "PF_SIM_NAME=$name" >> "$GITHUB_ENV"
+          fi
+
+      - name: Generate the Xcode project
+        run: scripts/bootstrap.sh
+
+      - name: Test
+        run: |
+          set -o pipefail
+          scripts/test.sh 2>&1 | tee test.log
+
+      - name: Collect xcresult bundles
+        if: failure()
+        run: |
+          mkdir -p ci-artifacts
+          find ~/Library/Developer/Xcode/DerivedData -name '*.xcresult' -maxdepth 6 -exec cp -R {} ci-artifacts/ \; || true
+          find . -name '*.xcresult' -not -path './ci-artifacts/*' -exec cp -R {} ci-artifacts/ \; || true
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            ci-artifacts
+            test.log
+          if-no-files-found: warn

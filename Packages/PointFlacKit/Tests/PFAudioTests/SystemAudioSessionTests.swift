@@ -5,7 +5,7 @@
 
     @testable import PFAudio
 
-    @Suite(.audioHardware) struct SystemAudioSessionTests {
+    @Suite(.audioOutputAvailable, .audioHardware) struct SystemAudioSessionTests {
         @Test func requestedRateIsReadBack() async throws {
             let session = SystemAudioSession()
             try await session.activate()

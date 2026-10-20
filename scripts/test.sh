@@ -1,7 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-DEST='platform=iOS Simulator,name=iPhone 17 Pro'
+# Override the simulator with PF_SIM_NAME, e.g. PF_SIM_NAME="iPhone 17" scripts/test.sh
+SIM_NAME="${PF_SIM_NAME:-iPhone 17 Pro}"
+DEST="platform=iOS Simulator,name=$SIM_NAME"
+echo "Simulator destination: $DEST"
 
 echo "== 1/5 swift format lint =="
 swift format lint --strict --recursive App AppUITests Packages
