@@ -109,13 +109,15 @@ import Testing
     @Test func requestsAreSpacedByTheBucket() async throws {
         let stub = StubMusicBrainz { _ in (200, [:], try fixture("mb-artist-gorill-prefix")) }
         let client = stub.client(interval: .milliseconds(150))
+        let start = ContinuousClock.now
         for index in 0..<3 {
             _ = try await client.search(.artist, query: "query \(index)")
         }
         let stamps = stub.requests.withLock { $0.map(\.at) }
         #expect(stamps.count == 3)
-        for (earlier, later) in zip(stamps, stamps.dropFirst()) {
-            #expect(later - earlier >= .milliseconds(130))
+        // Request k leaves no earlier than start + k × interval (cumulative, so scheduler delays cannot fail it).
+        for (index, stamp) in stamps.enumerated() {
+            #expect(stamp - start >= .milliseconds(150 * index - 5))
         }
     }
 

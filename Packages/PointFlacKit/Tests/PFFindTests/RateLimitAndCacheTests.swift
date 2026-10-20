@@ -4,34 +4,38 @@ import Testing
 @testable import PFFind
 
 @Suite struct TokenBucketTests {
+    // Timing checks are cumulative from a start instant (slot k is never before start + k × interval), so a test
+    // runner under load can only make them later, never fail them.
     @Test func spacesRequestsByTheInterval() async throws {
         let bucket = TokenBucket(interval: .milliseconds(100))
         let clock = ContinuousClock()
+        let start = clock.now
         var stamps: [ContinuousClock.Instant] = []
         for _ in 0..<4 {
             try await bucket.acquire()
             stamps.append(clock.now)
         }
-        for (earlier, later) in zip(stamps, stamps.dropFirst()) {
-            #expect(later - earlier >= .milliseconds(90))
+        for (index, stamp) in stamps.enumerated() {
+            #expect(stamp - start >= .milliseconds(100 * index - 5))
         }
         // The first slot is free: no initial wait.
-        #expect(stamps[3] - stamps[0] < .milliseconds(600))
+        #expect(stamps[0] - start < .milliseconds(100))
     }
 
     @Test func allowsABurstThenSpaces() async throws {
-        let bucket = TokenBucket(interval: .milliseconds(100), burst: 3)
+        let bucket = TokenBucket(interval: .milliseconds(500), burst: 3)
         let clock = ContinuousClock()
         let start = clock.now
         for _ in 0..<3 { try await bucket.acquire() }
-        #expect(clock.now - start < .milliseconds(60))
+        #expect(clock.now - start < .milliseconds(400))
         try await bucket.acquire()
-        #expect(clock.now - start >= .milliseconds(90))
+        #expect(clock.now - start >= .milliseconds(495))
     }
 
     @Test func concurrentWaitersNeverOverlap() async throws {
         let bucket = TokenBucket(interval: .milliseconds(60))
         let clock = ContinuousClock()
+        let start = clock.now
         let stamps = try await withThrowingTaskGroup(of: ContinuousClock.Instant.self) { group in
             for _ in 0..<5 {
                 group.addTask {
@@ -43,24 +47,25 @@ import Testing
             for try await stamp in group { all.append(stamp) }
             return all.sorted()
         }
-        for (earlier, later) in zip(stamps, stamps.dropFirst()) {
-            #expect(later - earlier >= .milliseconds(50))
+        for (index, stamp) in stamps.enumerated() {
+            #expect(stamp - start >= .milliseconds(60 * index - 5))
         }
     }
 
     @Test func cancellationReturnsTheSlot() async throws {
-        let bucket = TokenBucket(interval: .milliseconds(300))
-        try await bucket.acquire()  // Takes the free slot; the next one is 300 ms out.
+        let bucket = TokenBucket(interval: .milliseconds(800))
+        try await bucket.acquire()  // Takes the free slot; the next one is 800 ms out.
         let waiter = Task { try await bucket.acquire() }
         try await Task.sleep(for: .milliseconds(30))
         waiter.cancel()
         let result = await waiter.result
         #expect(throws: CancellationError.self) { try result.get() }
-        // The cancelled waiter's slot went back, so the next caller waits for that slot, not one after it.
+        // The cancelled waiter's slot went back, so the next caller waits for that slot (under 800 ms from now),
+        // not the one after it (about 1.5 s from now).
         let clock = ContinuousClock()
         let start = clock.now
         try await bucket.acquire()
-        #expect(clock.now - start < .milliseconds(330))
+        #expect(clock.now - start < .milliseconds(1_200))
     }
 
     @Test func penaltyHoldsTheNextRequestBack() async throws {

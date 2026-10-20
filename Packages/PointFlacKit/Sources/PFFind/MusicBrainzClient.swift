@@ -175,6 +175,8 @@ public actor MusicBrainzClient {
                 if let stale = disk?.read(key, allowStale: true) { return stale.data }
                 throw MusicBrainzError.busy
             default:
+                // 403 from a network filter, 5xx during an outage: an old answer still beats no answer.
+                if let stale = disk?.read(key, allowStale: true) { return stale.data }
                 throw MusicBrainzError.http(status: status)
             }
         }

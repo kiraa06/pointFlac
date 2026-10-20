@@ -11,6 +11,14 @@ struct PFFindLiveTests {
     func resolvesTheMountainGorillazLive() async throws {
         let folder = TemporaryDirectory()
         let client = MusicBrainzClient(disk: DiskCache(directory: folder.url))
+        // A direct request first, so a failure names its cause instead of showing up as "no rows".
+        let query = try #require(MusicBrainzQuery.releaseGroup("the mountain gorillaz", partial: false))
+        do {
+            let direct = try await client.search(.releaseGroup, query: query)
+            print("live: direct release-group search → \(direct.releaseGroups?.first?.title ?? "nothing")")
+        } catch {
+            Issue.record("live: direct release-group search failed: \(error)")
+        }
         let registry = MusicBrainzRegistry(client: client)
         let engine = TypeaheadEngine(library: { _, _ in [] }, registry: registry)
         let clock = ContinuousClock()
