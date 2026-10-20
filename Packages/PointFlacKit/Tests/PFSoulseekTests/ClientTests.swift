@@ -207,12 +207,13 @@ struct SearchTests {
     func rateLimit() async throws {
         let (client, link, _) = try await loggedInClient { $0.searchMinimumInterval = .milliseconds(400) }
         let options = SoulseekSearchOptions(window: .milliseconds(200))
+        // Measured from before either search starts, so a slow first delivery cannot shrink the gap.
+        let start = ContinuousClock.now
         async let first = collect(client.search("one", options: options))
         async let second = collect(client.search("two", options: options))
         _ = try await link.expect(code: 26)
-        let t0 = ContinuousClock.now
         _ = try await link.expect(code: 26)
-        #expect(ContinuousClock.now - t0 >= .milliseconds(350))
+        #expect(ContinuousClock.now - start >= .milliseconds(400))
         _ = await (first, second)
     }
 
