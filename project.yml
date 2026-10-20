@@ -42,6 +42,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac.uitests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   PointFlac:
     build:
