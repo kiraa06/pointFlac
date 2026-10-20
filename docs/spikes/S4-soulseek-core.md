@@ -47,9 +47,18 @@ connections with resume by offset. Everything is tested against a local mock ser
   zlib-compressed `FileSearchResponse` (peer code 9).
 - The server sends `ExcludedSearchPhrases` (160) after login.
 
+## Live results with the native client (2026-10-21, 05:00 IST)
+
+- Search "The Mountain", 20 s window, stop at 5,000 files: about 14,000 to 23,000 `ConnectToPeer` requests, the cap of
+  300 in flight reached, 216 to 278 responses, 0 malformed, 4,144 to 5,000 FLAC files from 141 to 168 peers. Six
+  excluded phrases received.
+- Download: one public-domain recording from a Musopen folder (Bach, Goldberg Variations BWV 988, Aria, 13.5 MB)
+  completed twice from two different peers, in 28 s and 168 s, through QueueUpload → TransferRequest →
+  server-forwarded F connection → PierceFireWall. The file starts with `fLaC` and matches the size from search. It was
+  deleted after the test.
+
 ## Open items
 
-- §5.6 says pointFlac should use the experimental major version 177 in development and ask the Soulseek admins for its
-  own number before wider release. The client's version is configurable; see the stream report for which default was
-  verified live.
+- The client defaults to the experimental major version 177 (§5.6); 177 and 160 both logged in and searched live on
+  2026-10-21. Before any wider release pointFlac must ask the Soulseek admins for its own number.
 - Peers may refuse uploads to users who share nothing (§10 risk); the UI must explain this (§4.7).

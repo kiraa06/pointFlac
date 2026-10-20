@@ -34,7 +34,10 @@ public actor SoulseekClient {
     public func search(_ query: String, options: SoulseekSearchOptions = .init())
         -> AsyncThrowingStream<[SearchResultFile], Error>   // batches; ends at the window, the cap or cancellation
     public func download(_ file: SearchResultFile, into staging: URL) -> AsyncStream<SoulseekTransferEvent>
+    public func browseFolder(_ folder: String, of peer: String, flacOnly: Bool = true)
+        async throws(SoulseekTransferFailure) -> [SearchResultFile]   // album preview (§4.7)
 }
+public struct SearchResultFolder { static func group(_ files: [SearchResultFile]) -> [SearchResultFolder] }
 public struct SearchResultFile: Sendable, Hashable, Identifiable {   // id = "peer\u{0}path"
     peer, path, fileName (sanitised), folder, sizeBytes, bitsPerSample (attr 5), sampleRate (attr 4),
     bitrate (attr 0), durationSeconds (attr 1), freeSlot, uploadSpeed, queueLength
@@ -70,7 +73,9 @@ Adapter mapping (controller): `RemoteTrack.id = file.id`, `provider = "soulseek"
 6. **Hardening sweep**: caps (server 4 MiB, peer 4 MiB, init 4 KiB), inflate 16 MiB (search) / 32 MiB (folders),
    path sanitiser tests (`..`, absolute, backslashes, control characters, reserved names, length), no uploads: incoming
    `TransferRequest` direction download, `QueueUpload`, browse and user-info requests are refused or ignored.
-7. **Live test** (`PF_LIVE_TESTS=1`, credentials from env `KM_USERNAME` / `KM_PASSWORD`): login and one search.
+7. **Live tests** (`PF_LIVE_TESTS=1`, credentials from env `KM_USERNAME` / `KM_PASSWORD`): login and one search;
+   with `PF_LIVE_DOWNLOAD=1` also one public-domain Musopen FLAC download (deleted afterwards).
+8. **Browse** (added): FolderContentsRequest/Response (36/37) for the album preview, 32 MiB inflate cap, entry cap.
 
 ## Tests (host, Swift Testing, `Tests/PFSoulseekTests`)
 
@@ -82,5 +87,6 @@ Adapter mapping (controller): `RemoteTrack.id = file.id`, `provider = "soulseek"
 ## Not in this cut
 
 - Inbound listener (we advertise a port but behind NAT inbound connections never arrive; indirect connections cover it).
-- Folder browse (FolderContentsRequest 36/37) for the album preview in §4.7; pause; distributed network beyond
-  HaveNoParent; `BGContinuedProcessingTask`.
+- Pause as a separate state: cancelling keeps the `.part` file and the next `download` resumes by offset, so the
+  downloads list can present cancel-then-resume as pause/resume. Distributed network beyond HaveNoParent;
+  `BGContinuedProcessingTask`; PlaceInQueueRequest polling.
