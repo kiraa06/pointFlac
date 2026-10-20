@@ -18,6 +18,9 @@ let package = Package(
             ],
             cSettings: [
                 .define("HAVE_CONFIG_H"),
+                // libFLAC's own default (non --enable-debug) build: no assert() aborts and no debug prints to
+                // stderr, such as "Rewinding, seeking necessary" when the decoder resyncs after a bad frame.
+                .define("NDEBUG"),
                 .headerSearchPath("."),
                 .headerSearchPath("include"),
                 .headerSearchPath("libFLAC/include"),
