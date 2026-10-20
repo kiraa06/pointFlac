@@ -54,6 +54,9 @@ public protocol AudioSessionControlling: AnyObject, Sendable {
 
     var currentPort: OutputPort { get }
     var outputVolume: Float { get }
+    /// The rate the hardware runs at now. It can move without a negotiation (a configuration change under the same
+    /// port), so the player compares it with the last negotiated rate on route changes. An inactive session can read 0.
+    var sampleRate: Int { get }
 
     /// Session events. Single consumer: the stream is created once, so a second iterator would compete with the
     /// first for elements. The stream is unbounded: events are never dropped, and none are coalesced.

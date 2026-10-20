@@ -15,6 +15,8 @@ final class SessionGate: Sendable {
     private struct State {
         var busy = false
         var waiting: [CheckedContinuation<Void, Never>] = []
+        /// What the last negotiation that reached the session read back.
+        var negotiated: Int?
     }
 
     private let session: AudioSessionControlling
@@ -33,13 +35,25 @@ final class SessionGate: Sendable {
     func requestSampleRate(_ hz: Int, for lease: OutputLease) async -> Int {
         await withTurn {
             guard lease.holdsOutput, !Task.isCancelled else { return 0 }
-            return await session.requestSampleRate(hz)
+            let rate = await session.requestSampleRate(hz)
+            state.withLock { $0.negotiated = rate }
+            return rate
         }
     }
 
     /// Configures and activates the session, in turn with the negotiations.
     func activate() async throws {
         try await withTurn { try await session.activate() }
+    }
+
+    /// The rate the last negotiation read back, once nothing is using the session. Nil while a call holds the turn,
+    /// whose answer is not in yet, and before the first negotiation.
+    ///
+    /// The player compares it with the session's live rate on a route change. A route notification that a negotiation
+    /// itself causes is handled either while that negotiation holds the turn (nil: ignored) or after it, when its
+    /// read-back equals the live rate. Either way it cannot set off another negotiation, so reacting cannot loop.
+    var settledRate: Int? {
+        state.withLock { $0.busy ? nil : $0.negotiated }
     }
 
     /// Calls waiting for their turn, not counting the one running. For tests.

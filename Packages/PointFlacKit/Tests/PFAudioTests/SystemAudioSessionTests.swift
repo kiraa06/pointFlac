@@ -13,6 +13,7 @@
                 let actual = await session.requestSampleRate(requested)
                 #expect(actual > 0)
                 #expect(actual == Int(AVAudioSession.sharedInstance().sampleRate))
+                #expect(session.sampleRate == actual)
                 #if targetEnvironment(simulator)
                     // The simulator honours every rate (the S3 finding), but only in what AVAudioSession reports:
                     // the unit's hardware side stays at the Mac device's rate and the simulator resamples after

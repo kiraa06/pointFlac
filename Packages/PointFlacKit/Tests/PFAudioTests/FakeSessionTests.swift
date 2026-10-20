@@ -28,6 +28,10 @@ import Testing
         #expect(b == 44_100)
         #expect(session.requestedRates == [96_000, 44_100])
         #expect(session.activationCount == 2)
+        // The hardware settles on the last response, until a test moves it.
+        #expect(session.sampleRate == 44_100)
+        session.sampleRate = 48_000
+        #expect(session.sampleRate == 48_000)
         session.currentPort = .bluetooth("Buds")
         session.outputVolume = 0.25
         #expect(session.currentPort == .bluetooth("Buds"))

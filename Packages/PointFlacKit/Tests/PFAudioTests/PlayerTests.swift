@@ -104,6 +104,7 @@ private final class SuspendingSession: AudioSessionControlling {
 
     var currentPort: OutputPort { .builtIn }
     var outputVolume: Float { 1 }
+    var sampleRate: Int { 48_000 }
     /// The rates requested so far, in the order they reached the session.
     var entered: [Int] { state.withLock { $0.entered } }
     /// The most requests that were inside the session at the same time.
@@ -137,6 +138,24 @@ private final class SuspendingSession: AudioSessionControlling {
             return s.waiting
         }
         for continuation in all { continuation.resume() }
+    }
+}
+
+/// A call queued on a `PlayerEngine` that waits until the test releases it. Calls queued after it wait too.
+@MainActor
+private final class CallHold {
+    private var waiting: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { waiting = $0 }
+    }
+
+    func release() {
+        released = true
+        waiting?.resume()
+        waiting = nil
     }
 }
 
@@ -273,10 +292,11 @@ private final class Rig {
     }
 
     /// Session events are handled in order, so once a volume change sent now has landed, every event sent before it
-    /// has been handled too.
+    /// has been handled too. The fake's volume moves first, as a real session's does before its notification.
     func barrier() async -> Bool {
         barriers += 1
         let marker = Float(barriers) / 1000
+        session.outputVolume = marker
         session.emit(.volumeChanged(marker))
         return await eventually { player.signal.systemVolume == marker }
     }
@@ -419,7 +439,8 @@ private final class Rig {
         #expect(await eventually { rig.player.currentIndex == 0 })
     }
 
-    /// Ruling 11(a): a route change while playing re-negotiates the rate and continues from the same frame.
+    /// Ruling 11(a): a route change to another port while playing re-negotiates the rate and continues from the same
+    /// frame. The reason is `.other` and the hardware rate is unchanged, so only the port change can cause the restart.
     @Test func routeChangeWhilePlayingRenegotiatesAndKeepsPosition() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
@@ -427,8 +448,9 @@ private final class Rig {
         #expect(await rig.pull(upTo: 22_050))
         #expect(await eventually { rig.player.position == .milliseconds(500) })
         #expect(rig.session.requestedRates == [44_100])
+        #expect(rig.session.sampleRate == 44_100)
 
-        rig.session.emit(.routeChanged(.newDeviceAvailable, .usb("DAC")))
+        rig.session.emit(.routeChanged(.other, .usb("DAC")))
         #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing })
         #expect(rig.session.requestedRates == [44_100, 44_100])
         #expect(rig.player.position == .milliseconds(500))
@@ -557,12 +579,196 @@ private final class Rig {
         #expect(rig.nowPlaying.clearCount == 1)
     }
 
+    /// Fix round 1, item 1: a same-port route change (a category or configuration change) leaves playback alone while
+    /// the hardware still runs at the negotiated rate. The session's own activation and negotiation post such changes,
+    /// so restarting on them would loop.
+    @Test func sameRouteAtTheSameRateDoesNotRestart() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        let pipeline = rig.player.pipeline
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.session.requestedRates == [44_100])
+        #expect(rig.player.pipeline === pipeline)
+        #expect(rig.player.status == .playing)
+    }
+
+    /// Fix round 1, item 1: the hardware rate moves under an unchanged port mid-track. The player restarts at the
+    /// same frame so the client rate matches the hardware again, and the restart's own negotiation leaves nothing to
+    /// react to, so a further notification is a no-op.
+    @Test func sameRouteRateChangeRestartsAtThePosition() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(await rig.pull(upTo: 22_050))
+        #expect(await eventually { rig.player.position == .milliseconds(500) })
+
+        rig.session.sampleRate = 48_000
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing })
+        #expect(rig.session.requestedRates == [44_100, 44_100])
+        #expect(rig.session.sampleRate == 44_100)
+        #expect(rig.player.position == .milliseconds(500))
+        #expect(rig.player.signal.indicator == .pure)
+
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.session.requestedRates.count == 2)
+
+        #expect(await rig.pull(upTo: 22_050 + 1024))
+        let continued = Array(rig.output.capturedFloat[(22_050 * 2)...])
+        #expect(mismatch(continued, floats(PatternDecoder.samples(from: 22_050, count: 1024), bits: 16)) == nil)
+    }
+
+    /// Fix round 1, item 1: while paused, a same-port rate change only refreshes the strip; resume re-negotiates.
+    @Test func sameRouteRateChangeWhilePausedUpdatesTheSignal() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        rig.player.pause()
+
+        rig.session.sampleRate = 48_000
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.player.status == .paused)
+        #expect(rig.session.requestedRates == [44_100])
+        #expect(rig.player.signal.hardwareRate == 48_000)
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.session.requestedRates == [44_100, 44_100])
+        #expect(rig.player.signal.hardwareRate == 44_100)
+        #expect(rig.player.signal.indicator == .pure)
+    }
+
+    /// Fix round 1, item 2: headphones pulled during a call. When the call ends with "should resume", the music must
+    /// not come back on through the speaker.
+    @Test func unplugDuringInterruptionDoesNotResume() async {
+        let session = FakeSession()
+        session.currentPort = .wired("EarPods")
+        let rig = Rig(session: session)
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        rig.session.emit(.interruptionBegan)
+        #expect(await eventually { rig.player.status == .paused })
+        rig.session.currentPort = .builtIn
+        rig.session.emit(.routeChanged(.oldDeviceUnavailable, .builtIn))
+        rig.session.emit(.interruptionEnded(shouldResume: true))
+        #expect(await rig.barrier())
+        #expect(rig.player.status == .paused)
+        #expect(rig.player.signal.port == .builtIn)
+    }
+
+    /// Fix round 1, item 3: a pause that lands after `seek(to:)` has moved the cue, but before the pipeline has the
+    /// seek, keeps the seek target rather than the frame the pipeline still reports.
+    @Test func pauseWhileSeekIsInFlightKeepsTheSeek() async throws {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(await rig.pull(upTo: 4410))
+        let engine = try #require(rig.player.currentEngine)
+
+        // Park a call on the engine's queue, so the seek's call into the pipeline waits behind it: the seek is in
+        // flight, deterministically, when the pause lands.
+        let hold = CallHold()
+        _ = engine.enqueue { _ in await hold.wait() }
+        let seeking = Task { await rig.player.seek(to: .seconds(2)) }
+        #expect(await eventually { rig.player.position == .seconds(2) })
+        #expect(engine.pipeline.position.frame == 4410)
+        rig.player.pause()
+        hold.release()
+        await seeking.value
+        #expect(rig.player.status == .paused)
+        #expect(rig.player.position == .seconds(2))
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(await rig.pull(upTo: 4410 + 1024))
+        let resumed = Array(rig.output.capturedFloat[(4410 * 2)...])
+        #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 88_200, count: 1024), bits: 16)) == nil)
+    }
+
+    /// Ruling 5: a media-server reset stops playback, pauses at the current point and re-activates the session.
+    @Test func mediaServicesResetPausesAndReactivates() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(await rig.pull(upTo: 4410))
+        #expect(rig.session.activationCount == 1)
+
+        rig.session.emit(.mediaServicesReset)
+        #expect(await eventually { rig.player.status == .paused })
+        #expect(rig.player.position == .milliseconds(100))
+        #expect(!rig.output.isStarted)
+        #expect(await eventually { rig.session.activationCount == 2 })
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(await rig.pull(upTo: 4410 + 512))
+        let resumed = Array(rig.output.capturedFloat[(4410 * 2)...])
+        #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 4410, count: 512), bits: 16)) == nil)
+    }
+
+    /// Ruling 10: Now Playing is published on changes, never by the 10 Hz position ticker.
+    @Test func nowPlayingIsNotRepublishedWhilePlaying() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        let published = rig.nowPlaying.shown.count
+        // About a second of audio, waiting each tenth of a second for the ticker to show it.
+        for tenth in 1...10 {
+            #expect(await rig.pull(upTo: tenth * 4410))
+            #expect(await eventually { rig.player.position == .milliseconds(100 * tenth) })
+        }
+        #expect(rig.nowPlaying.shown.count == published)
+    }
+
+    /// Ruling 2: after the queue ended, seek, previous and resume each play again on a fresh pipeline, which reports
+    /// a fresh `trackStarted` (status only turns `.playing` on one).
+    @Test func restartsAfterTheQueueEnded() async {
+        let rig = Rig()
+        await rig.player.play([fixtureItem("s24-48000", id: "a"), fixtureItem("s24-48000", id: "b")], startingAt: 0)
+        #expect(await rig.pump { rig.player.status == .ended })
+        #expect(rig.player.currentIndex == 1)
+        var negotiations = rig.session.requestedRates.count
+
+        await rig.player.seek(to: .milliseconds(40))
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.currentIndex == 1)
+        #expect(rig.session.requestedRates.count == negotiations + 1)
+        var before = rig.pulledFrames
+        #expect(await rig.pump { rig.player.status == .ended })
+        #expect(rig.pulledFrames - before == 4096 - 1920)
+        negotiations = rig.session.requestedRates.count
+
+        // At the start of the cued last track, previous goes back a track.
+        await rig.player.previous()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.currentIndex == 0)
+        #expect(rig.session.requestedRates.count == negotiations + 1)
+        before = rig.pulledFrames
+        #expect(await rig.pump { rig.player.status == .ended })
+        #expect(rig.pulledFrames - before == 8192)
+        negotiations = rig.session.requestedRates.count
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.currentIndex == 1)
+        #expect(rig.session.requestedRates.count == negotiations + 1)
+        before = rig.pulledFrames
+        #expect(await rig.pump { rig.player.status == .ended })
+        #expect(rig.pulledFrames - before == 4096)
+    }
+
     /// Ruling 6: one session call at a time, in arrival order; a stopped pipeline's request never reaches the session.
     @Test func negotiationIsSerialized() async {
         let session = SuspendingSession()
         let gate = SessionGate(session: session)
         let lease = OutputArbiter(output: FakeOutput()).lease()
 
+        #expect(gate.settledRate == nil)
         let first = Task.detached { await gate.requestSampleRate(44_100, for: lease) }
         #expect(await eventually { session.entered == [44_100] })
         let second = Task.detached { await gate.requestSampleRate(48_000, for: lease) }
@@ -573,6 +779,9 @@ private final class Rig {
 
         session.releaseOne()
         #expect(await first.value == 44_100)
+        // The second request holds the turn now, so the rate is not settled.
+        #expect(await eventually { session.entered.count == 2 })
+        #expect(gate.settledRate == nil)
         #expect(await eventually { session.entered == [44_100, 48_000] })
         // The third request's pipeline is stopped while it waits: it must not touch the session when its turn comes.
         // (Releasing everything inside, not just the second, makes a broken gate fail here instead of hanging.)
@@ -582,5 +791,7 @@ private final class Rig {
         #expect(await third.value == 0)
         #expect(session.entered == [44_100, 48_000])
         #expect(session.mostInside == 1)
+        // What the last negotiation that reached the session read back; the refused one records nothing.
+        #expect(gate.settledRate == 48_000)
     }
 }

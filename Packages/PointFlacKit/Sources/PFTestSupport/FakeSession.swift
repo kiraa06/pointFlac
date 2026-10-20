@@ -4,14 +4,17 @@ import Synchronization
 
 /// A host-side `AudioSessionControlling` that tests script by hand.
 ///
-/// `rateResponse` plays the hardware: it maps the requested rate to the rate the "device" settles on. All state sits
-/// behind one lock, so the class is checked `Sendable`. `events` is single-consumer, like the real session's.
+/// `rateResponse` plays the hardware: it maps the requested rate to the rate the "device" settles on, which
+/// `sampleRate` then reports until the next request, or until a test moves it to play a rate change under an unchanged
+/// port. All state sits behind one lock, so the class is checked `Sendable`. `events` is single-consumer, like the real
+/// session's.
 public final class FakeSession: AudioSessionControlling {
     private struct State {
         var requestedRates: [Int] = []
         var activationCount = 0
         var currentPort: OutputPort = .builtIn
         var outputVolume: Float = 0.5
+        var sampleRate = 48_000
     }
 
     public let events: AsyncStream<SessionEvent>
@@ -43,13 +46,22 @@ public final class FakeSession: AudioSessionControlling {
         set { state.withLock { $0.outputVolume = newValue } }
     }
 
+    public var sampleRate: Int {
+        get { state.withLock { $0.sampleRate } }
+        set { state.withLock { $0.sampleRate = newValue } }
+    }
+
     public func activate() async throws {
         state.withLock { $0.activationCount += 1 }
     }
 
     public func requestSampleRate(_ hz: Int) async -> Int {
-        state.withLock { $0.requestedRates.append(hz) }
-        return rateResponse(hz)
+        let rate = rateResponse(hz)
+        state.withLock { s in
+            s.requestedRates.append(hz)
+            s.sampleRate = rate
+        }
+        return rate
     }
 
     /// Delivers `e` to the `events` consumer, as the real session would.

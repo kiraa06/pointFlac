@@ -116,6 +116,7 @@
 
         public var currentPort: OutputPort { Self.readCurrentPort() }
         public var outputVolume: Float { AVAudioSession.sharedInstance().outputVolume }
+        public var sampleRate: Int { Int(AVAudioSession.sharedInstance().sampleRate) }
 
         private static func readCurrentPort() -> OutputPort {
             guard let port = AVAudioSession.sharedInstance().currentRoute.outputs.first else { return .other("") }

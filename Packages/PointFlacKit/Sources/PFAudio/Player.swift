@@ -80,8 +80,6 @@ public final class Player {
     /// Some item of the current queue has started; until one does, the queue ending means it failed.
     @ObservationIgnored private var anyItemStarted = false
     @ObservationIgnored private var lastFailure: String?
-    /// While a seek is on its way to the pipeline, its old position must not overwrite the target already shown.
-    @ObservationIgnored private var seeksInFlight = 0
     @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private var sessionEvents: Task<Void, Never>?
 
@@ -170,9 +168,9 @@ public final class Player {
             cue = Cue(index: index, frame: frame)
             position = item.duration(ofFrames: frame)
             nowPlaying.show(item, elapsed: position, playing: true)
-            seeksInFlight += 1
+            engine.seeksInFlight += 1
             await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame) }.value
-            seeksInFlight -= 1
+            engine.seeksInFlight -= 1
         case .paused:
             cue = Cue(index: index, frame: frame)
             showCue(playing: false)
@@ -207,6 +205,11 @@ public final class Player {
     /// The pipeline playing now, if any. For tests.
     var pipeline: PlaybackPipeline? {
         engine?.pipeline
+    }
+
+    /// The engine playing now, if any. For tests, which queue calls on it to hold later calls back.
+    var currentEngine: PlayerEngine? {
+        engine
     }
 
     // MARK: Starting and stopping engines
@@ -300,9 +303,11 @@ public final class Player {
         sessionLosses += 1
     }
 
-    /// Where playback is now: the pipeline's rendered position once it has the queue, the cue before that.
+    /// Where playback is now: the pipeline's rendered position once it has the queue, the cue before that. While a seek
+    /// is on its way to the pipeline, the pipeline still reports the old point and the cue already holds the target,
+    /// so a pause, restart or interruption then keeps the seek.
     private func currentPoint() -> Cue {
-        guard let engine, engine.hasStarted else { return cue }
+        guard let engine, engine.hasStarted, engine.seeksInFlight == 0 else { return cue }
         let reported = engine.pipeline.position
         return queue.indices.contains(reported.index) ? Cue(index: reported.index, frame: reported.frame) : cue
     }
@@ -389,17 +394,27 @@ public final class Player {
         case .routeChanged(let reason, let port):
             let previous = signal.port
             signal.port = port
-            guard status == .playing || status == .preparing else { return }
             if reason == .oldDeviceUnavailable {
-                // Headphones or DAC pulled: never carry on through the speaker.
-                pauseNow()
-            } else if reason == .newDeviceAvailable || port != previous {
-                // New hardware may run at another rate. Restart on it so the client rate matches it again, rather
-                // than let iOS resample silently. A change that keeps the port (a category or configuration change,
-                // which the session's own activation and rate negotiation can cause) is left alone: restarting on it
-                // could re-trigger it, in a loop.
-                let point = currentPoint()
-                launch(at: point.index, frame: point.frame)
+                // Headphones or DAC pulled: never carry on through the speaker, including when an interruption that
+                // paused playback ends with "should resume".
+                resumeAfterInterruption = false
+            }
+            switch status {
+            case .playing, .preparing:
+                if reason == .oldDeviceUnavailable {
+                    pauseNow()
+                } else if reason == .newDeviceAvailable || port != previous || hardwareRateMoved {
+                    // The hardware may run at another rate now. Restart at the same point, so the client rate matches
+                    // it again, rather than let iOS resample silently.
+                    let point = currentPoint()
+                    launch(at: point.index, frame: point.frame)
+                }
+            case .paused:
+                // Resume re-negotiates. Until then the strip shows the rate the hardware runs at now.
+                let rate = session.sampleRate
+                if rate > 0 { signal.hardwareRate = rate }
+            case .idle, .ended, .failed:
+                break
             }
         case .interruptionBegan:
             // The system has deactivated the session; the next start re-activates it.
@@ -416,6 +431,19 @@ public final class Player {
         case .mediaServicesReset:
             resetMediaServices()
         }
+    }
+
+    /// Whether the hardware has moved off the rate the last negotiation read back, with nothing negotiating now.
+    ///
+    /// A same-port route change (a category or configuration change) can move the hardware rate mid-track. It is also
+    /// what the session's own activation and negotiation post, so the comparison must not set off a restart loop. It
+    /// cannot: a notification a negotiation causes arrives while that negotiation holds the session's turn (no settled
+    /// rate, ignored) or after it, when the read-back equals the live rate. `signal.plan` would not do here, because
+    /// the new plan's `.planChanged` can arrive after the notification its own negotiation caused.
+    private var hardwareRateMoved: Bool {
+        guard let settled = gate.settledRate else { return false }
+        let live = session.sampleRate
+        return live > 0 && live != settled
     }
 
     /// The media server died, and the session's configuration with it (ruling 5). Stops the pipeline, pauses at the
@@ -469,7 +497,7 @@ public final class Player {
 
     /// Maps the pipeline's position (source frames, derived from rendered audio) to time in the current track.
     private func updatePosition() {
-        guard status == .playing, seeksInFlight == 0, let engine, let index = currentIndex else { return }
+        guard status == .playing, let engine, engine.seeksInFlight == 0, let index = currentIndex else { return }
         let reported = engine.pipeline.position
         // Across a gapless join the pipeline renders the next track a moment before its `trackStarted` is handled.
         guard reported.index == index else { return }

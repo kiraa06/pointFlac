@@ -8,6 +8,9 @@ final class PlayerEngine {
     var events: Task<Void, Never>?
     /// The pipeline has the queue, so its `position` means something.
     var hasStarted = false
+    /// Seeks issued but not yet registered by the pipeline. Meanwhile its `position` is the old point, which must not
+    /// overwrite the target the player already shows or remembers.
+    var seeksInFlight = 0
     private(set) var isRetired = false
     private var lastCall: Task<Void, Never>?
 

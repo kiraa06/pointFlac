@@ -19,6 +19,9 @@
         public var onCommand: ((RemoteCommand) -> Void)?
         /// Every handler added to `MPRemoteCommandCenter`, removed again in `deinit`.
         private var targets: [(command: MPRemoteCommand, token: Any)] = []
+        /// The current item's artwork. `show` runs on every pause, seek and cue, and decoding the image each time
+        /// would be wasted work.
+        private var artwork: (itemID: String, value: MPMediaItemArtwork?)?
 
         public init() {
             let center = MPRemoteCommandCenter.shared()
@@ -55,14 +58,23 @@
                 MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
                 MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
             ]
-            if let data = item.artwork, let image = UIImage(data: data) {
-                info[MPMediaItemPropertyArtwork] = Self.artwork(image)
+            if let artwork = artwork(for: item) {
+                info[MPMediaItemPropertyArtwork] = artwork
             }
             MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
 
         public func clear() {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            artwork = nil
+        }
+
+        /// `item`'s artwork, decoded once per item.
+        private func artwork(for item: QueueItem) -> MPMediaItemArtwork? {
+            if let artwork, artwork.itemID == item.id { return artwork.value }
+            let value = item.artwork.flatMap { UIImage(data: $0) }.map { Self.artwork($0) }
+            artwork = (item.id, value)
+            return value
         }
 
         private func register(
