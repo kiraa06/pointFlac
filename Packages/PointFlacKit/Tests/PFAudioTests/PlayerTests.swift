@@ -217,26 +217,57 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     return true
 }
 
+/// The player's output factory in tests. It keeps every output it built, newest last. Given a fixed output it returns
+/// that one on every build, so a test can script it beforehand; otherwise each build is a fresh `FakeOutput`.
+@MainActor
+private final class OutputFactory {
+    let fixed: FakeOutput?
+    private(set) var built: [FakeOutput] = []
+    /// While set, every build throws it, as `RemoteIOOutput()` throws when no unit can be created.
+    var failure: (any Error)?
+
+    init(fixed: FakeOutput? = nil) {
+        self.fixed = fixed
+    }
+
+    func make() throws -> AudioOutput {
+        if let failure { throw failure }
+        let output = fixed ?? FakeOutput()
+        built.append(output)
+        return output
+    }
+}
+
 /// A player wired to `FakeSession`, `FakeOutput` and `FakeNowPlaying`. The test plays the render thread by pulling.
 @MainActor
 private final class Rig {
     let session: FakeSession
-    let output: FakeOutput
+    let outputs: OutputFactory
     let nowPlaying = FakeNowPlaying()
     let player: Player
     /// Real frames pulled so far, across every pipeline the player started (the FakeOutput captures exactly these).
     private(set) var pulledFrames = 0
     private var barriers = 0
+    /// Stands in for `output` before the factory has built anything.
+    private let unbuilt = FakeOutput()
 
+    /// `output` is the one output the player gets, on every build; `outputs`, when given, builds them instead.
     init(
-        session: FakeSession = FakeSession(), output: FakeOutput = FakeOutput(),
+        session: FakeSession = FakeSession(), output: FakeOutput = FakeOutput(), outputs: OutputFactory? = nil,
         makeDecoder: @escaping @Sendable (PlaybackItem) throws -> PCMDecoding = decoderForItem
     ) {
         self.session = session
-        self.output = output
+        let outputs = outputs ?? OutputFactory(fixed: output)
+        self.outputs = outputs
         player = Player(
-            session: session, output: output, capabilities: OutputCapabilities(int32Passthrough: false),
-            nowPlaying: nowPlaying, makeDecoder: makeDecoder)
+            session: session, makeOutput: { try outputs.make() },
+            capabilities: OutputCapabilities(int32Passthrough: false), nowPlaying: nowPlaying,
+            makeDecoder: makeDecoder)
+    }
+
+    /// The output the player renders through now: the one built last.
+    var output: FakeOutput {
+        outputs.built.last ?? outputs.fixed ?? unbuilt
     }
 
     @discardableResult
@@ -720,6 +751,54 @@ private final class Rig {
         #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 4410, count: 512), bits: 16)) == nil)
     }
 
+    /// I4: a media-services reset kills the RemoteIO unit with the server. The next start builds a fresh output through
+    /// the factory; the old one is stopped at the reset, dropped, and never called again.
+    @Test func mediaServicesResetRebuildsTheOutput() async throws {
+        let outputs = OutputFactory()
+        let rig = Rig(outputs: outputs)
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(outputs.built.count == 1)
+        let old = try #require(outputs.built.first)
+        #expect(await rig.pull(upTo: 4410))
+
+        rig.session.emit(.mediaServicesReset)
+        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.session.activationCount == 2 })
+        #expect(!old.isStarted && !old.hasSource, "the old output was not stopped")
+        let callsAtReset = old.outputCalls
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(outputs.built.count == 2 && outputs.built.last !== old)
+        #expect(await rig.pull(upTo: 4410 + 512))
+        #expect(old.outputCalls == callsAtReset, "the dropped output was called again")
+        #expect(old.capturedFloat.count == 4410 * 2)
+        let resumed = rig.output.capturedFloat
+        #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 4410, count: 512), bits: 16)) == nil)
+    }
+
+    /// When the factory cannot build an output, the start fails with the reason, at the first play and after a reset.
+    @Test func outputFactoryFailureFailsTheStart() async {
+        let outputs = OutputFactory()
+        outputs.failure = AudioOutputError.unitUnavailable(-1)
+        let rig = Rig(outputs: outputs)
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(rig.player.status == .failed("Audio output unavailable: unitUnavailable(-1)"))
+        assertNoPath(rig.player.signal)
+        #expect(rig.session.activationCount == 0)
+
+        outputs.failure = nil
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        rig.session.emit(.mediaServicesReset)
+        #expect(await eventually { rig.player.status == .paused })
+        outputs.failure = AudioOutputError.unitUnavailable(-2)
+        rig.player.resume()
+        #expect(rig.player.status == .failed("Audio output unavailable: unitUnavailable(-2)"))
+        #expect(outputs.built.count == 1)
+    }
+
     /// Ruling 10: Now Playing is published on changes, never by the 10 Hz position ticker.
     @Test func nowPlayingIsNotRepublishedWhilePlaying() async {
         let rig = Rig()
@@ -842,7 +921,7 @@ private final class Rig {
         let output = FakeOutput()
         output.hardwareSideSampleRate = 48_000
         let player = Player(
-            session: session, output: output, capabilities: OutputCapabilities(int32Passthrough: false),
+            session: session, makeOutput: { output }, capabilities: OutputCapabilities(int32Passthrough: false),
             nowPlaying: FakeNowPlaying(), makeDecoder: decoderForItem)
         await player.play([patternItem("a")], startingAt: 0)
         #expect(await eventually { session.entered == [44_100] })
@@ -962,10 +1041,10 @@ private final class Rig {
     }
 
     /// Ruling 6: one session call at a time, in arrival order; a stopped pipeline's request never reaches the session.
-    @Test func negotiationIsSerialized() async {
+    @Test func negotiationIsSerialized() async throws {
         let session = SuspendingSession()
         let gate = SessionGate(session: session)
-        let lease = OutputArbiter(output: FakeOutput()).lease()
+        let lease = try OutputArbiter().lease(building: { FakeOutput() })
 
         #expect(gate.settledRate == nil)
         let first = Task.detached { await gate.requestSampleRate(44_100, for: lease) }

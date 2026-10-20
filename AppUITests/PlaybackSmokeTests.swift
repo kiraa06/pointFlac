@@ -69,14 +69,10 @@ final class PlaybackSmokeTests: XCTestCase {
     }
 
     /// Taps the row for `stem` and returns the strip once it describes the track. Skips when this machine has no
-    /// usable audio output: the app could not create one, or the player could not activate the audio session.
+    /// usable audio output: the player could not build one, or could not activate the audio session.
     @MainActor
     private func play(_ stem: String, in app: XCUIApplication) throws -> String {
         let row = row(stem, in: app)
-        let outputError = app.staticTexts["outputError"]
-        if outputError.exists {
-            throw XCTSkip("No audio output on this machine: \(outputError.label)")
-        }
         row.tap()
         let strip = app.staticTexts["signalStrip"]
         XCTAssertTrue(strip.waitForExistence(timeout: 2))
@@ -85,8 +81,9 @@ final class PlaybackSmokeTests: XCTestCase {
         let started = XCTNSPredicateExpectation(predicate: begins, object: strip)
         if XCTWaiter.wait(for: [started], timeout: 2) != .completed {
             let status = app.staticTexts["playerStatus"]
-            if status.exists, status.label.hasPrefix("Failed: Audio session unavailable") {
-                throw XCTSkip("No audio session on this machine: \(status.label)")
+            for unavailable in ["Failed: Audio session unavailable", "Failed: Audio output unavailable"]
+            where status.exists && status.label.hasPrefix(unavailable) {
+                throw XCTSkip("No audio output on this machine: \(status.label)")
             }
             XCTFail("the strip never described \(stem): it reads \"\(strip.label)\", the status \"\(status.label)\"")
         }

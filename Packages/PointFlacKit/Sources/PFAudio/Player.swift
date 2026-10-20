@@ -69,6 +69,8 @@ public final class Player {
     private let capabilities: OutputCapabilities
     private let nowPlaying: NowPlayingPublishing
     private let makeDecoder: @Sendable (PlaybackItem) throws -> PCMDecoding
+    /// Builds the output, under the arbiter, when a start finds none.
+    @ObservationIgnored private let makeOutput: () throws -> AudioOutput
 
     /// The pipeline playing now. Nil whenever nothing plays: idle, paused, ended or failed.
     @ObservationIgnored private var engine: PlayerEngine?
@@ -92,15 +94,20 @@ public final class Player {
     @ObservationIgnored private var sessionEvents: Task<Void, Never>?
 
     /// - Parameters:
-    ///   - output: shared by every pipeline the player starts, one at a time.
+    ///   - makeOutput: builds the output every pipeline the player starts renders through, one at a time. Called on
+    ///     the main actor by the first start, and again by the first start after a media-services reset, which takes
+    ///     the old output's audio unit down with the server. It is the only source of outputs: the player never keeps
+    ///     one it did not get from here. If it throws, that start fails with "Audio output unavailable: …".
     ///   - makeDecoder: opens an item. Called on a pipeline's decode thread.
     public init(
-        session: AudioSessionControlling, output: AudioOutput, capabilities: OutputCapabilities,
-        nowPlaying: NowPlayingPublishing, makeDecoder: @escaping @Sendable (PlaybackItem) throws -> PCMDecoding
+        session: AudioSessionControlling, makeOutput: @escaping () throws -> AudioOutput,
+        capabilities: OutputCapabilities, nowPlaying: NowPlayingPublishing,
+        makeDecoder: @escaping @Sendable (PlaybackItem) throws -> PCMDecoding
     ) {
         self.session = session
         gate = SessionGate(session: session)
-        arbiter = OutputArbiter(output: output)
+        arbiter = OutputArbiter()
+        self.makeOutput = makeOutput
         self.capabilities = capabilities
         self.nowPlaying = nowPlaying
         self.makeDecoder = makeDecoder
@@ -248,7 +255,13 @@ public final class Player {
         status = .preparing
         // The new pipeline negotiates afresh, so nothing the last one established holds any more.
         showPending(for: index)
-        let engine = makeEngine()
+        let engine: PlayerEngine
+        do {
+            engine = try makeEngine()
+        } catch {
+            fail("Audio output unavailable: \(error)")
+            return Task {}
+        }
         self.engine = engine
         let items = queue.map(\.playbackItem)
         let needsActivation = !sessionActive
@@ -268,10 +281,11 @@ public final class Player {
         }
     }
 
-    private func makeEngine() -> PlayerEngine {
+    /// Throws when there is no output and `makeOutput` cannot build one.
+    private func makeEngine() throws -> PlayerEngine {
+        let lease = try arbiter.lease(building: makeOutput)
         generations += 1
         let generation = generations
-        let lease = arbiter.lease()
         let gate = self.gate
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
@@ -483,13 +497,14 @@ public final class Player {
     /// The media server died, and the session's configuration with it (ruling 5). Stops the pipeline, pauses at the
     /// current position and re-activates the session; the user resumes.
     ///
-    /// Out of scope: an output whose underlying unit died with the server (a stale RemoteIO instance) is not rebuilt.
-    /// The player does not construct its output; the app model that does (Task 14) has to replace it.
+    /// The output's audio unit died with the server (final review I4), so the output is stopped and dropped here, and
+    /// the next start builds a fresh one through `makeOutput`.
     private func resetMediaServices() {
         resumeAfterInterruption = false
         loseSession()
         pauseNow()
         retireEngine()
+        arbiter.discardOutput()
         // If this fails, the next start tries again.
         Task { [weak self] in try? await self?.activateSession() }
     }

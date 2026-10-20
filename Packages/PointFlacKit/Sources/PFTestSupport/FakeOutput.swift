@@ -21,6 +21,7 @@ public final class FakeOutput: AudioOutput, Sendable {
         var capturedInt32: [Int32] = []
         var hardwareSideSampleRate: Int?
         var hardwareSideChannels: Int?
+        var outputCalls = 0
     }
 
     public let maximumFramesPerPull: Int
@@ -35,9 +36,26 @@ public final class FakeOutput: AudioOutput, Sendable {
     }
 
     public var source: RenderSource? {
-        get { state.withLock { $0.source } }
-        set { state.withLock { $0.source = newValue } }
+        get {
+            state.withLock { s in
+                s.outputCalls += 1
+                return s.source
+            }
+        }
+        set {
+            state.withLock { s in
+                s.outputCalls += 1
+                s.source = newValue
+            }
+        }
     }
+
+    /// Calls made through `AudioOutput` so far: `configure`, `start`, `stop`, and reading or setting `source` or reading
+    /// the hardware side. `pull` and the accessors meant for tests do not count. A test uses it to show that an output
+    /// the player dropped is never touched again.
+    public var outputCalls: Int { state.withLock { $0.outputCalls } }
+    /// Whether a source is set; for tests, so not counted in `outputCalls`.
+    public var hasSource: Bool { state.withLock { $0.source != nil } }
 
     /// Every plan passed to `configure`, in order.
     public var plans: [OutputPlan] { state.withLock { $0.plans } }
@@ -50,20 +68,31 @@ public final class FakeOutput: AudioOutput, Sendable {
     /// What the output reports for its hardware side. Nil by default, like an output that cannot tell; a test sets a
     /// rate to play a device that resamples after the unit (ruling R17).
     public var hardwareSideSampleRate: Int? {
-        get { state.withLock { $0.hardwareSideSampleRate } }
+        get {
+            state.withLock { s in
+                s.outputCalls += 1
+                return s.hardwareSideSampleRate
+            }
+        }
         set { state.withLock { $0.hardwareSideSampleRate = newValue } }
     }
 
     /// What the output reports for its hardware side's channel count. Nil by default; a test sets 1 to play a mono
     /// route under a stereo client, where the system downmixes.
     public var hardwareSideChannels: Int? {
-        get { state.withLock { $0.hardwareSideChannels } }
+        get {
+            state.withLock { s in
+                s.outputCalls += 1
+                return s.hardwareSideChannels
+            }
+        }
         set { state.withLock { $0.hardwareSideChannels = newValue } }
     }
 
     public func configure(_ plan: OutputPlan, channels: Int) throws {
         let byteCount = maximumFramesPerPull * channels * MemoryLayout<UInt32>.stride
         state.withLock { s in
+            s.outputCalls += 1
             s.buffer?.deallocate()
             s.buffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
             s.plan = plan
@@ -73,11 +102,17 @@ public final class FakeOutput: AudioOutput, Sendable {
     }
 
     public func start() throws {
-        state.withLock { $0.started = true }
+        state.withLock { s in
+            s.outputCalls += 1
+            s.started = true
+        }
     }
 
     public func stop() {
-        state.withLock { $0.started = false }
+        state.withLock { s in
+            s.outputCalls += 1
+            s.started = false
+        }
     }
 
     /// One render callback of `frames` frames. Does nothing unless the output is started. Captures the real-audio

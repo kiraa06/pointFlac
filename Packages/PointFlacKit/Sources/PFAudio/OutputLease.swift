@@ -1,7 +1,8 @@
 import Foundation
 import PFCore
 
-/// Lends the player's one `AudioOutput` to one pipeline at a time.
+/// Lends the player's one `AudioOutput` to one pipeline at a time, and holds that output: built on the first lease, and
+/// again on the first lease after `discardOutput()`.
 ///
 /// The player builds a fresh `PlaybackPipeline` for every start, so that a stopped pipeline's unread events arrive on a
 /// stream the player no longer reads. They all render through the same output, and each reaches it only through its
@@ -16,20 +17,21 @@ import PFCore
 /// Lock order: a pipeline's own output lock, then this one. Nothing is called back while this lock is held.
 final class OutputArbiter: @unchecked Sendable {
     private let lock = NSLock()
-    /// Touched only while holding `lock`.
-    private let output: AudioOutput
+    /// Nil until the first lease builds it, and after `discardOutput()`. Touched only while holding `lock`.
+    private var output: AudioOutput?
     /// The lease that may drive the output, or nil. Guarded by `lock`.
     private var holder: UInt64?
     /// Guarded by `lock`.
     private var issued: UInt64 = 0
 
-    init(output: AudioOutput) {
-        self.output = output
-    }
-
     /// A lease that holds the output from now on. Whichever lease held it before loses it.
-    func lease() -> OutputLease {
-        let id = lock.withLock {
+    ///
+    /// With no output yet (the first start, or the first since `discardOutput()`), `build` makes one first. It runs
+    /// under the lock, so no pipeline can reach a half-installed output. If it throws, no lease is issued, and the
+    /// lease that held the output before keeps it.
+    func lease(building build: () throws -> AudioOutput) throws -> OutputLease {
+        let id = try lock.withLock {
+            if output == nil { output = try build() }
             issued += 1
             holder = issued
             return issued
@@ -39,12 +41,28 @@ final class OutputArbiter: @unchecked Sendable {
 
     /// The output's hardware-side rate after its last `configure`.
     var hardwareSideSampleRate: Int? {
-        lock.withLock { output.hardwareSideSampleRate }
+        lock.withLock { output?.hardwareSideSampleRate }
     }
 
     /// The output's hardware-side channel count after its last `configure`.
     var hardwareSideChannels: Int? {
-        lock.withLock { output.hardwareSideChannels }
+        lock.withLock { output?.hardwareSideChannels }
+    }
+
+    /// Stops the output and drops it for good; the next `lease` builds a fresh one. For a media-services reset, after
+    /// which the old output's audio unit is dead. Every lease loses it, so no pipeline, current or retired, can reach the
+    /// old output again; it is stopped and its source cleared once, here, and then released.
+    func discardOutput() {
+        let old = lock.withLock { () -> AudioOutput? in
+            defer {
+                output = nil
+                holder = nil
+            }
+            return output
+        }
+        // Outside the lock: no lease can reach `old` any more, so nothing else calls it.
+        old?.stop()
+        old?.source = nil
     }
 
     fileprivate func revoke(_ id: UInt64) {
@@ -59,7 +77,10 @@ final class OutputArbiter: @unchecked Sendable {
 
     /// Runs `body` on the output if lease `id` holds it; nil otherwise.
     fileprivate func withOutput<T>(for id: UInt64, _ body: (AudioOutput) throws -> T) rethrows -> T? {
-        try lock.withLock { holder == id ? try body(output) : nil }
+        try lock.withLock {
+            guard holder == id, let output else { return nil }
+            return try body(output)
+        }
     }
 }
 

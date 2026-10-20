@@ -26,9 +26,9 @@ final class AppModel {
     private(set) var rejections: [ImportRejection] = []
     /// One line about the latest import, or why the picker failed.
     private(set) var importSummary: String?
-    /// Nil when the audio output could not be created. Then `outputError` says why, and nothing can play.
-    let player: Player?
-    let outputError: String?
+    /// Builds its RemoteIO output when a start needs one: at the first play, and again after a media-services reset.
+    /// Should that fail, the player's status says "Audio output unavailable: …", and the library still works.
+    let player: Player
 
     private let inbox: ImportInbox
     #if DEBUG
@@ -43,24 +43,22 @@ final class AppModel {
         inbox = ImportInbox(libraryFolder: library)
         #if DEBUG
             preloadFixtures = arguments.contains("-PFPreloadFixtures")
+            let mute = arguments.contains("-PFMuteOutput")
         #endif
-        do {
-            let output = try RemoteIOOutput()
-            #if DEBUG
-                if arguments.contains("-PFMuteOutput") {
-                    // The capture only has to exist for the mute; what it records is never read here.
-                    output.installCapture(byteCapacity: 4096)
-                }
-            #endif
-            player = Player(
-                session: SystemAudioSession(), output: output, capabilities: .current, nowPlaying: SystemNowPlaying(),
-                makeDecoder: { try FlacDecoder(url: $0.url) })
-            outputError = nil
-        } catch {
-            // Show it in the UI rather than crash: the library still works without an output.
-            player = nil
-            outputError = "Audio output unavailable: \(error)"
-        }
+        player = Player(
+            session: SystemAudioSession(),
+            makeOutput: {
+                let output = try RemoteIOOutput()
+                #if DEBUG
+                    if mute {
+                        // Every output the player builds is muted. The capture only has to exist for the mute; what it
+                        // records is never read here.
+                        output.installCapture(byteCapacity: 4096)
+                    }
+                #endif
+                return output
+            },
+            capabilities: .current, nowPlaying: SystemNowPlaying(), makeDecoder: { try FlacDecoder(url: $0.url) })
     }
 
     /// Lists the library, after importing the bundled fixtures when asked to.
@@ -96,13 +94,13 @@ final class AppModel {
     /// Plays `file` alone, if v1 can play it.
     func play(_ file: ImportedFile) async {
         guard file.isSupported else { return }
-        await player?.play([QueueItem(file)], startingAt: 0)
+        await player.play([QueueItem(file)], startingAt: 0)
     }
 
     /// Plays the whole library, in order, from the first track, leaving out what v1 cannot play (multichannel files,
     /// which would only fail one by one).
     func playAll() async {
-        await player?.play(files.filter(\.isSupported).map { QueueItem($0) }, startingAt: 0)
+        await player.play(files.filter(\.isSupported).map { QueueItem($0) }, startingAt: 0)
     }
 
     #if DEBUG

@@ -18,11 +18,6 @@ struct DebugLibraryView: View {
     var body: some View {
         NavigationStack {
             List {
-                if let error = model.outputError {
-                    Section {
-                        Text(error).foregroundStyle(.red).accessibilityIdentifier("outputError")
-                    }
-                }
                 Section("Tracks") {
                     if model.files.isEmpty {
                         Text("No tracks yet. Tap Add to bring in FLAC files from Files.")
@@ -31,7 +26,7 @@ struct DebugLibraryView: View {
                         Button("Play All", systemImage: "play.square.stack") {
                             Task { await model.playAll() }
                         }
-                        .disabled(model.player == nil || !model.files.contains(where: \.isSupported))
+                        .disabled(!model.files.contains(where: \.isSupported))
                         .accessibilityIdentifier("playAllButton")
                     }
                     ForEach(model.files) { file in
@@ -40,7 +35,7 @@ struct DebugLibraryView: View {
                         } label: {
                             TrackRow(file: file)
                         }
-                        .disabled(model.player == nil || !file.isSupported)
+                        .disabled(!file.isSupported)
                         .accessibilityIdentifier("trackRow-\(file.stem)")
                     }
                 }
@@ -78,9 +73,7 @@ struct DebugLibraryView: View {
             }
             .refreshable { await model.reload() }
             .safeAreaInset(edge: .bottom) {
-                if let player = model.player {
-                    DebugNowPlayingView(player: player)
-                }
+                DebugNowPlayingView(player: model.player)
             }
         }
         .task { await model.load() }
