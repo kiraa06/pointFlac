@@ -1,0 +1,50 @@
+name: PointFlac
+options:
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+packages:
+  PointFlacKit:
+    path: Packages/PointFlacKit
+targets:
+  PointFlac:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: PointFlacKit
+        product: PFCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: pointFlac
+        UIBackgroundModes: [audio]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UILaunchScreen: {}
+  PointFlacUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: PointFlac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac.uitests
+schemes:
+  PointFlac:
+    build:
+      targets:
+        PointFlac: all
+    test:
+      targets:
+        - PointFlacUITests
