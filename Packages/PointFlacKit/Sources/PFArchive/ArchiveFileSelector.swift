@@ -37,7 +37,7 @@ enum ArchiveFileSelector {
         }
 
         return selected.prefix(maxTracksPerItem).compactMap { track, entry, size, md5 in
-            let baseName = entry.name.split(separator: "/").last.map(String.init) ?? entry.name
+            let baseName = SafeFileName.components(of: entry.name, separators: ["/"]).last ?? entry.name
             guard SafeFileName.sanitize(baseName) != nil else { return nil }
             let stem = String(baseName.dropLast(5))
             var detail = [
@@ -69,14 +69,19 @@ enum ArchiveFileSelector {
 
     /// A relative path inside an item: no empty, `.` or `..` segments, no backslashes or control characters.
     static func isSafePath(_ path: String) -> Bool {
-        guard !path.isEmpty, path.utf8.count <= 1024, !path.hasPrefix("/"), !path.contains("\\") else { return false }
-        guard !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+        // Scalar-level checks throughout: "/\u{301}" is one Character, so Character-level checks would miss it.
+        let scalars = path.unicodeScalars
+        guard !path.isEmpty, path.utf8.count <= 1024, scalars.first != "/" else { return false }
+        guard !scalars.contains(where: { $0 == "\\" || CharacterSet.controlCharacters.contains($0) }) else {
             return false
         }
-        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
-        return segments.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+        let segments = SafeFileName.components(of: path, separators: ["/"])
+        return segments.allSatisfy { segment in
+            // A segment that is only dots, optionally followed by combining marks, could still read as "." or "..".
+            let base = segment.unicodeScalars.filter { !CharacterSet.nonBaseCharacters.contains($0) }
+            return !base.isEmpty && !base.allSatisfy { $0 == "." }
+        }
     }
-
     /// "01", "1/12" or "A1" style track numbers; only the leading digits count.
     static func trackNumber(_ raw: String?) -> Int? {
         guard let raw else { return nil }

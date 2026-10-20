@@ -79,5 +79,15 @@ struct ArchiveLicenceTests {
         #expect(ArchiveQuery.downloadURL(base: base, identifier: "ok", path: "/abs.flac") == nil)
         #expect(ArchiveQuery.downloadURL(base: base, identifier: "ok", path: "a//b.flac") == nil)
         #expect(ArchiveQuery.metadataURL(base: base, identifier: "id with space") == nil)
+        // A separator followed by a combining mark is one Character but still a separator.
+        #expect(
+            ArchiveFileSelector.isSafePath("a/\u{301}../b.flac") == false, "a dot segment with a mark is still dots")
+        #expect(ArchiveFileSelector.isSafePath("disc 1/\u{301}b.flac"))
+        #expect(ArchiveFileSelector.isSafePath("a/..\u{301}/b.flac") == false)
+        #expect(ArchiveFileSelector.isSafePath("a/\u{301}/b.flac") == false)
+        #expect(ArchiveFileSelector.isSafePath("/\u{301}b.flac") == false)
+        #expect(ArchiveFileSelector.isSafePath("a\\\u{301}b.flac") == false)
+        let encoded = ArchiveQuery.downloadURL(base: base, identifier: "ok", path: "d/\u{301}x.flac")?.absoluteString
+        #expect(encoded == "https://archive.org/download/ok/d/%CC%81x.flac")
     }
 }
