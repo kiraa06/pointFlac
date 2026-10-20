@@ -69,6 +69,15 @@ jobs:
             echo "PF_SIM_NAME=$name" >> "$GITHUB_ENV"
           fi
 
+      # A cold simulator's first boot and CoreAudio bring-up stalled the whole test process for ~12 s on the first CI
+      # run. Boot it here, outside any test's time budget.
+      - name: Boot the simulator
+        run: |
+          set -euo pipefail
+          sim="${PF_SIM_NAME:-iPhone 17 Pro}"
+          xcrun simctl boot "$sim" 2>/dev/null || true
+          xcrun simctl bootstatus "$sim" -b
+
       - name: Generate the Xcode project
         run: scripts/bootstrap.sh
 
