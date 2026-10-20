@@ -85,10 +85,3 @@ struct DebugNowPlayingView: View {
         return String(format: "%d:%02d", whole / 60, whole % 60)
     }
 }
-
-extension Duration {
-    fileprivate var seconds: Double {
-        let (seconds, attoseconds) = components
-        return Double(seconds) + Double(attoseconds) / 1e18
-    }
-}

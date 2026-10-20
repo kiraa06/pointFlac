@@ -1,0 +1,183 @@
+import XCTest
+
+/// Plan 3's app: the tabs, the Shelf's search, the Deck/Cover switch, the tonearm, Get Music's suggestions and the
+/// Downloads list. Every launch is muted (ruling R22). The demo albums ship in Debug builds with the fixtures, so the
+/// shelf has records to find and the deck has sides to seek across.
+final class PlayerUITests: XCTestCase {
+    override func setUp() {
+        continueAfterFailure = false
+    }
+
+    @MainActor
+    func testTabsNavigate() {
+        let app = launch()
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 5))
+        app.tabBars.buttons["Get Music"].tap()
+        XCTAssertTrue(app.navigationBars["Get Music"].waitForExistence(timeout: 3))
+        app.tabBars.buttons["Downloads"].tap()
+        XCTAssertTrue(app.navigationBars["Downloads"].waitForExistence(timeout: 3))
+        app.tabBars.buttons["Settings"].tap()
+        XCTAssertTrue(app.buttons["diagnosticsLink"].waitForExistence(timeout: 3))
+        app.tabBars.buttons["Player"].tap()
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
+    }
+
+    @MainActor
+    func testShelfSearchShowsResultsAsYouType() {
+        let app = launch()
+        openShelf(app)
+        let field = app.textFields["shelfSearch"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("neon")
+        XCTAssertTrue(app.buttons["result-track-Neon Mile"].waitForExistence(timeout: 2))
+        // One-letter typo tolerance: "lumin" still finds Lumen Arcade's album.
+        field.typeText(XCUIKeyboardKey.delete.rawValue + XCUIKeyboardKey.delete.rawValue)
+        field.typeText(XCUIKeyboardKey.delete.rawValue + XCUIKeyboardKey.delete.rawValue)
+        field.typeText("lumin")
+        XCTAssertTrue(app.buttons["result-album-Night Drive"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.staticTexts["searchTiming"].exists)
+    }
+
+    @MainActor
+    func testFilterChipsNarrowTheShelf() {
+        let app = launch()
+        openShelf(app)
+        let field = app.textFields["shelfSearch"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("o")
+        app.buttons["chip-32bit"].tap()
+        // Hydrophone is the only 32-bit album; Paper Moons is 16/44.1.
+        XCTAssertTrue(app.buttons["result-album-Hydrophone"].waitForExistence(timeout: 2))
+        XCTAssertFalse(app.buttons["result-album-Paper Moons"].exists)
+    }
+
+    @MainActor
+    func testSleeveTapRunsTheHandoffAndPlays() {
+        let app = launch()
+        openShelf(app)
+        let sleeve = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(sleeve.waitForExistence(timeout: 3))
+        sleeve.tap()
+        // Mid-flight frames, kept in the result bundle for review: the record leaving the sleeve, then on the platter.
+        for (delay, name) in [(1.6, "handoff-1.6s"), (1.4, "handoff-3.0s"), (1.0, "handoff-4.0s")] {
+            Thread.sleep(forTimeInterval: delay)
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = name
+            shot.lifetime = .keepAlways
+            add(shot)
+        }
+        // The hand-off takes about 4.7 s at Kiran's slow-mo pace; then the needle drops and the title shows.
+        let title = app.staticTexts["nowPlayingTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 8))
+        let playing = NSPredicate(format: "label == 'Pause'")
+        expectation(for: playing, evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 5)
+    }
+
+    @MainActor
+    func testDeckCoverSwitch() {
+        let app = launch(demoPlay: true)
+        XCTAssertTrue(app.descendants(matching: .any)["deckRecord"].waitForExistence(timeout: 8))
+        tapUntil(app.buttons["stageCover"], shows: app.descendants(matching: .any)["coverArt"])
+        XCTAssertFalse(app.descendants(matching: .any)["tonearmHandle"].exists)
+        tapUntil(app.buttons["stageDeck"], shows: app.descendants(matching: .any)["tonearmHandle"])
+    }
+
+    @MainActor
+    func testTonearmDragSeeksAcrossTheSide() {
+        let app = launch(demoPlay: true)
+        let title = app.staticTexts["nowPlayingTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 8))
+        XCTAssertEqual(title.label, "Ignition")
+        let handle = app.descendants(matching: .any)["tonearmHandle"]
+        let record = app.descendants(matching: .any)["deckRecord"]
+        XCTAssertTrue(handle.waitForExistence(timeout: 3) && record.exists)
+        let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let end = record.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.62))
+        start.press(forDuration: 0.3, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
+        // The needle went down well inside side A (Ignition, Neon Mile, Overpass): another track, or far into this one.
+        let moved = NSPredicate { _, _ in
+            title.label != "Ignition" || Self.seconds(app.staticTexts["elapsedTime"].label) >= 20
+        }
+        expectation(for: moved, evaluatedWith: nil)
+        waitForExpectations(timeout: 5)
+    }
+
+    @MainActor
+    func testGetMusicSuggestionsAppearAsYouType() {
+        let app = launch()
+        app.tabBars.buttons["Get Music"].tap()
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("lumen")
+        // The library's hit at once, then the registry's.
+        XCTAssertTrue(app.buttons["suggestion-0"].waitForExistence(timeout: 2))
+        let library = app.buttons.matching(NSPredicate(format: "label CONTAINS 'In your library'")).firstMatch
+        XCTAssertTrue(library.exists)
+        let registry = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Demo registry'")).firstMatch
+        XCTAssertTrue(registry.waitForExistence(timeout: 3))
+        app.buttons["suggestion-0"].tap()
+        let download = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'download-'")).firstMatch
+        XCTAssertTrue(download.waitForExistence(timeout: 4))
+    }
+
+    @MainActor
+    func testDownloadShowsProgressInDownloads() {
+        let app = launch()
+        app.tabBars.buttons["Get Music"].tap()
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("test\n")
+        let download = app.buttons["download-ia-Test-1"]
+        XCTAssertTrue(download.waitForExistence(timeout: 4))
+        // Internet Archive rows show their licence.
+        XCTAssertTrue(app.descendants(matching: .any)["licence-ia-Test-1"].exists)
+        download.tap()
+        app.tabBars.buttons["Downloads"].tap()
+        let row = app.descendants(matching: .any)["downloadRow-ia-Test-1"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        expectation(for: NSPredicate(format: "label CONTAINS 'Downloading'"), evaluatedWith: row)
+        waitForExpectations(timeout: 4)
+        expectation(for: NSPredicate(format: "label CONTAINS 'Done'"), evaluatedWith: row)
+        waitForExpectations(timeout: 10)
+    }
+
+    // MARK: Helpers
+
+    @MainActor
+    private func launch(demoPlay: Bool = false) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
+        if demoPlay { app.launchArguments.append("-PFDemoPlay") }
+        app.launch()
+        return app
+    }
+
+    @MainActor
+    private func openShelf(_ app: XCUIApplication) {
+        let button = app.buttons["shelfButton"]
+        XCTAssertTrue(button.waitForExistence(timeout: 5))
+        button.tap()
+    }
+
+    /// Taps `button` until `target` shows. The simulator sometimes drops a system banner over the top of the screen
+    /// (where the Deck/Cover switch sits) for a few seconds after boot; a second tap lands once it has gone.
+    @MainActor
+    private func tapUntil(_ button: XCUIElement, shows target: XCUIElement) {
+        for _ in 0..<4 {
+            button.tap()
+            if target.waitForExistence(timeout: 3) { return }
+        }
+        XCTFail("\(button) never showed \(target)")
+    }
+
+    /// m:ss as seconds.
+    private static func seconds(_ clock: String) -> Int {
+        let parts = clock.split(separator: ":").compactMap { Int($0) }
+        return parts.count == 2 ? parts[0] * 60 + parts[1] : 0
+    }
+}

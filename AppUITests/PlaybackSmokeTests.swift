@@ -1,6 +1,7 @@
 import XCTest
 
-/// The debug app end to end on the simulator, against the fixtures it bundles in Debug builds.
+/// The debug app end to end on the simulator, against the fixtures it bundles in Debug builds. Since Plan 3 the debug
+/// library and player live under Settings → Diagnostics, so each launch goes there first.
 ///
 /// Every launch passes `-PFMuteOutput`, so nothing plays through the Mac's speakers (ruling R22). The app's library
 /// folder outlives a launch, so after the first launch the preload finds duplicates and skips them; the tests look for
@@ -57,6 +58,10 @@ final class PlaybackSmokeTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput"]
         app.launch()
+        app.tabBars.buttons["Settings"].tap()
+        let diagnostics = app.buttons["diagnosticsLink"]
+        XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
+        diagnostics.tap()
         return app
     }
 

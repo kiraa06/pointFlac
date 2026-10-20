@@ -15,9 +15,27 @@ struct DebugLibraryView: View {
     let model: AppModel
     @State private var picking = false
 
+    private var listed: [ImportedFile] {
+        model.files.sorted { ($0.id.hasPrefix("demo-") ? 1 : 0, $0.id) < ($1.id.hasPrefix("demo-") ? 1 : 0, $1.id) }
+    }
+
     var body: some View {
-        NavigationStack {
+        // Pushed inside Settings' navigation stack (Settings → Diagnostics), so it brings none of its own. The app
+        // root loads the library at launch, so this only lists again on appear.
+        Group {
             List {
+                // Refusals first, then the Plan 1 fixtures, then the demo albums: since Plan 3 the library holds
+                // eighteen demo tracks, and the fixtures the smoke tests and S1 checks use must stay on screen.
+                if !model.rejections.isEmpty {
+                    Section("Not added") {
+                        ForEach(Array(model.rejections.enumerated()), id: \.offset) { _, rejection in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(rejection.fileName)
+                                Text(rejection.message).font(.footnote).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
                 Section("Tracks") {
                     if model.files.isEmpty {
                         Text("No tracks yet. Tap Add to bring in FLAC files from Files.")
@@ -29,24 +47,14 @@ struct DebugLibraryView: View {
                         .disabled(!model.files.contains(where: \.isSupported))
                         .accessibilityIdentifier("playAllButton")
                     }
-                    ForEach(model.files) { file in
+                    ForEach(listed) { file in
                         Button {
                             Task { await model.play(file) }
                         } label: {
-                            TrackRow(file: file)
+                            DebugTrackRow(file: file)
                         }
                         .disabled(!file.isSupported)
                         .accessibilityIdentifier("trackRow-\(file.stem)")
-                    }
-                }
-                if !model.rejections.isEmpty {
-                    Section("Not added") {
-                        ForEach(Array(model.rejections.enumerated()), id: \.offset) { _, rejection in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(rejection.fileName)
-                                Text(rejection.message).font(.footnote).foregroundStyle(.secondary)
-                            }
-                        }
                     }
                 }
                 if let summary = model.importSummary {
@@ -80,13 +88,13 @@ struct DebugLibraryView: View {
                 DebugNowPlayingView(player: model.player)
             }
         }
-        .task { await model.load() }
+        .task { await model.reload() }
     }
 }
 
 /// The bundled `ThirdPartyNotices.txt`: libFLAC's BSD-3 notice and pointFlac's MIT licence. The file ships in every
 /// build, Release included, as the BSD licence requires of binary redistribution.
-private struct LicencesView: View {
+struct LicencesView: View {
     private static let notices: String = {
         guard let url = Bundle.main.url(forResource: "ThirdPartyNotices", withExtension: "txt"),
             let text = try? String(contentsOf: url, encoding: .utf8)
@@ -108,7 +116,7 @@ private struct LicencesView: View {
 }
 
 /// A track's title, with its artist and format under it, and a note when v1 cannot play it.
-private struct TrackRow: View {
+private struct DebugTrackRow: View {
     let file: ImportedFile
 
     var body: some View {

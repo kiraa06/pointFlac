@@ -16,6 +16,8 @@ final class LaunchTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-PFMuteOutput"]
         app.launch()
+        // Settings → Licences, since Plan 3 (the player is home now).
+        app.tabBars.buttons["Settings"].tap()
         let link = app.buttons["licencesLink"]
         XCTAssertTrue(link.waitForExistence(timeout: 5))
         link.tap()

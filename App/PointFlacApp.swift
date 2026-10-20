@@ -6,7 +6,7 @@ struct PointFlacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            DebugLibraryView(model: model)
+            RootView(model: model)
         }
     }
 }
