@@ -10,6 +10,8 @@ let package = Package(
         .library(name: "PFDSP", targets: ["PFDSP"]),
         .library(name: "PFAudio", targets: ["PFAudio"]),
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
+        // Optional module: only the Soulseek build variant links this product (spec §5.6 "Build flag").
+        .library(name: "PFSoulseek", targets: ["PFSoulseek"]),
     ],
     targets: [
         .target(
@@ -58,6 +60,15 @@ let package = Package(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFSoulseek",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFSoulseekTests",
+            dependencies: ["PFSoulseek"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
