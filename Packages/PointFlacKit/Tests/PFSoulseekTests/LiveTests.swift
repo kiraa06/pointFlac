@@ -5,7 +5,8 @@ import Testing
 
 /// Opt-in check against the real Soulseek network: `PF_LIVE_TESTS=1`, with the account in `KM_USERNAME` /
 /// `KM_PASSWORD` (Keymaster injects them; nothing is ever printed). It logs in and runs one search. It never downloads.
-@Suite("Live network", .enabled(if: ProcessInfo.processInfo.environment["PF_LIVE_TESTS"] == "1"))
+/// Serialized: both tests sign in with the same account, and a second sign-in kicks the first (Relogged).
+@Suite("Live network", .serialized, .enabled(if: ProcessInfo.processInfo.environment["PF_LIVE_TESTS"] == "1"))
 struct LiveTests {
     @Test("Login and one search on server.slsknet.org", .timeLimit(.minutes(2)))
     func loginAndSearch() async throws {
