@@ -225,12 +225,21 @@ private func assertNoPath(_ signal: SignalState, sourceLocation: SourceLocation 
     #expect(signal.indicator == .idle, sourceLocation: sourceLocation)
 }
 
+/// `eventually`'s timeout, before `LatencyBudget` scales it.
+private let eventuallyTimeout: Duration = .seconds(5)
+
+/// The note for `#expect(await eventually { … }, waited)`, so a timeout names what it was held to, CI multiplier and
+/// all.
+private let waited = Comment(rawValue: "not met within \(LatencyBudget.describe(eventuallyTimeout))")
+
 /// Waits, without pulling, until `condition` holds or `timeout` passes, and returns whether it held. Each check
-/// sleeps first, which hands the main actor to the player's event tasks.
+/// sleeps first, which hands the main actor to the player's event tasks. A hang guard, not a latency budget: on a
+/// loaded CI runner the whole test process can stall for seconds (about 12 s on the first GitHub run), so `timeout` is
+/// scaled by `LatencyBudget` (×3 under CI), as the other polling helpers here are.
 @MainActor
-private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
+private func eventually(timeout: Duration = eventuallyTimeout, _ condition: () -> Bool) async -> Bool {
     let clock = ContinuousClock()
-    let deadline = clock.now + timeout
+    let deadline = clock.now + LatencyBudget.scaled(timeout)
     while !condition() {
         guard clock.now < deadline else { return false }
         try? await Task.sleep(for: .milliseconds(1))
@@ -299,9 +308,10 @@ private final class Rig {
     }
 
     /// Pulls until exactly `target` real frames have been pulled in all, letting the player run between pulls.
+    /// `timeout` is scaled by `LatencyBudget`, as in every polling helper here.
     func pull(upTo target: Int, timeout: Duration = .seconds(10)) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while pulledFrames < target {
             guard clock.now < deadline else { return false }
             if pull(frames: min(512, target - pulledFrames)) == 0 {
@@ -316,7 +326,7 @@ private final class Rig {
     /// Pulls until `done()` holds, letting the player run between pulls.
     func pump(timeout: Duration = .seconds(10), until done: () -> Bool) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while !done() {
             guard clock.now < deadline else { return false }
             if pull() == 0 {
@@ -332,7 +342,7 @@ private final class Rig {
     /// sees none of what the pipeline emits meanwhile.
     func pullHoldingMainActor(upTo target: Int, timeout: Duration = .seconds(10)) -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while pulledFrames < target {
             guard clock.now < deadline else { return false }
             if pull(frames: min(512, target - pulledFrames)) == 0 { usleep(200) }
@@ -343,7 +353,7 @@ private final class Rig {
     /// Pulls (which answers a seek's flush) without suspending until `condition` holds.
     func pullHoldingMainActor(until condition: () -> Bool, timeout: Duration = .seconds(10)) -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while !condition() {
             guard clock.now < deadline else { return false }
             pull()
@@ -370,7 +380,7 @@ private final class Rig {
     @Test func playsQueueAndEnds() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s16-44100", id: "a"), fixtureItem("s24-48000", id: "b")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .pure)
         #expect(await rig.pump { rig.player.status == .ended }, "status: \(rig.player.status)")
         #expect(rig.pulledFrames == 8192)
@@ -386,10 +396,10 @@ private final class Rig {
         session.currentPort = .wired("EarPods")
         let rig = Rig(session: session)
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410))
         rig.session.emit(.routeChanged(.oldDeviceUnavailable, .builtIn))
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         #expect(rig.player.signal.port == .builtIn)
         #expect(rig.player.position == .milliseconds(100))
         #expect(!rig.output.isStarted)
@@ -399,38 +409,38 @@ private final class Rig {
     @Test func resumesAfterInterruptionOnlyWhenAllowed() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
 
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         rig.session.emit(.interruptionEnded(shouldResume: true))
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
 
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         rig.session.emit(.interruptionEnded(shouldResume: false))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .paused)
 
         // A user pause during the interruption wins over the system's suggestion to resume.
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         rig.player.pause()
         rig.session.emit(.interruptionEnded(shouldResume: true))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .paused)
     }
 
     @Test func previousRestartsAfterThreeSeconds() async {
         let rig = Rig()
         await rig.player.play([patternItem("a"), patternItem("b")], startingAt: 1)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         await rig.player.seek(to: .seconds(4))
         #expect(rig.player.position == .seconds(4))
         #expect(await rig.pull(upTo: 4410))
-        #expect(await eventually { rig.player.position == .milliseconds(4100) })
+        #expect(await eventually { rig.player.position == .milliseconds(4100) }, waited)
         let afterSeek = floats(PatternDecoder.samples(from: 176_400, count: 4410), bits: 16)
         #expect(mismatch(rig.output.capturedFloat, afterSeek) == nil)
 
@@ -443,16 +453,16 @@ private final class Rig {
 
         // Within the restart window, previous goes back a track instead.
         await rig.player.previous()
-        #expect(await eventually { rig.player.currentIndex == 0 && rig.player.status == .playing })
+        #expect(await eventually { rig.player.currentIndex == 0 && rig.player.status == .playing }, waited)
     }
 
     @Test func signalFollowsRoute() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .pure)
         rig.session.emit(.routeChanged(.newDeviceAvailable, .bluetooth("AirPods")))
-        #expect(await eventually { rig.player.signal.port == .bluetooth("AirPods") })
+        #expect(await eventually { rig.player.signal.port == .bluetooth("AirPods") }, waited)
         #expect(rig.player.signal.indicator == .bluetoothLossy)
     }
 
@@ -464,16 +474,16 @@ private final class Rig {
         #expect(rig.player.signal.port == .usb("DAC"))
         #expect(rig.player.signal.volumeWarningPercent == 80)
         rig.session.emit(.volumeChanged(0.5))
-        #expect(await eventually { rig.player.signal.volumeWarningPercent == 50 })
+        #expect(await eventually { rig.player.signal.volumeWarningPercent == 50 }, waited)
         rig.session.emit(.volumeChanged(1.0))
-        #expect(await eventually { rig.player.signal.systemVolume == 1.0 })
+        #expect(await eventually { rig.player.signal.systemVolume == 1.0 }, waited)
         #expect(rig.player.signal.volumeWarningPercent == nil)
     }
 
     @Test func nowPlayingShowsCurrentTrack() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s24-48000", title: "Fixture Title")], startingAt: 0)
-        #expect(await eventually { rig.nowPlaying.shown.contains { $0.playing } })
+        #expect(await eventually { rig.nowPlaying.shown.contains { $0.playing } }, waited)
         #expect(rig.nowPlaying.shown.last == .init(title: "Fixture Title", elapsed: .zero, playing: true))
         rig.player.pause()
         #expect(rig.nowPlaying.shown.last == .init(title: "Fixture Title", elapsed: .zero, playing: false))
@@ -482,22 +492,22 @@ private final class Rig {
     @Test func remoteCommandsDrivePlayer() async {
         let rig = Rig()
         await rig.player.play([patternItem("a"), patternItem("b")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.nowPlaying.onCommand != nil)
 
         rig.nowPlaying.onCommand?(.pause)
         #expect(rig.player.status == .paused)
         rig.nowPlaying.onCommand?(.next)
-        #expect(await eventually { rig.player.currentIndex == 1 })
+        #expect(await eventually { rig.player.currentIndex == 1 }, waited)
         #expect(rig.player.status == .paused)
         rig.nowPlaying.onCommand?(.play)
-        #expect(await eventually { rig.player.status == .playing && rig.player.currentIndex == 1 })
+        #expect(await eventually { rig.player.status == .playing && rig.player.currentIndex == 1 }, waited)
         rig.nowPlaying.onCommand?(.toggle)
         #expect(rig.player.status == .paused)
         rig.nowPlaying.onCommand?(.seek(.seconds(1)))
-        #expect(await eventually { rig.player.position == .seconds(1) })
+        #expect(await eventually { rig.player.position == .seconds(1) }, waited)
         rig.nowPlaying.onCommand?(.previous)
-        #expect(await eventually { rig.player.currentIndex == 0 })
+        #expect(await eventually { rig.player.currentIndex == 0 }, waited)
     }
 
     /// Ruling 11(a): a route change to another port while playing re-negotiates the rate and continues from the same
@@ -505,14 +515,14 @@ private final class Rig {
     @Test func routeChangeWhilePlayingRenegotiatesAndKeepsPosition() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 22_050))
-        #expect(await eventually { rig.player.position == .milliseconds(500) })
+        #expect(await eventually { rig.player.position == .milliseconds(500) }, waited)
         #expect(rig.session.requestedRates == [44_100])
         #expect(rig.session.sampleRate == 44_100)
 
         rig.session.emit(.routeChanged(.other, .usb("DAC")))
-        #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing })
+        #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing }, waited)
         #expect(rig.session.requestedRates == [44_100, 44_100])
         #expect(rig.player.position == .milliseconds(500))
         #expect(rig.player.signal.port == .usb("DAC"))
@@ -532,7 +542,7 @@ private final class Rig {
             return item.id == "old" ? ObservedDecoder(decoder, seeks: seeks) : decoder
         })
         await rig.player.play([fixtureItem("s16-44100", id: "old")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 2048))
         let old = try #require(rig.player.pipeline)
 
@@ -545,7 +555,7 @@ private final class Rig {
         #expect(rig.pullHoldingMainActor(until: { seeks.count > 0 }))
 
         await rig.player.play([fixtureItem("s24-48000", id: "new")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing && rig.player.queue.map(\.id) == ["new"] })
+        #expect(await eventually { rig.player.status == .playing && rig.player.queue.map(\.id) == ["new"] }, waited)
         let before = rig.pulledFrames
         #expect(await rig.pump { rig.player.status != .playing })
         #expect(rig.player.status == .ended)
@@ -557,10 +567,10 @@ private final class Rig {
     @Test func retiredPipelineCannotSilenceItsSuccessor() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         var old = rig.player.pipeline
         await rig.player.play([patternItem("b")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(old != nil && old !== rig.player.pipeline)
         old = nil
         #expect(rig.output.isStarted)
@@ -571,7 +581,7 @@ private final class Rig {
     @Test func seekWhilePausedUpdatesPositionWithoutStarting() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410))
         rig.player.pause()
         #expect(rig.player.position == .milliseconds(100))
@@ -584,7 +594,7 @@ private final class Rig {
         #expect(rig.nowPlaying.shown.last == .init(title: "Pattern a", elapsed: .seconds(2), playing: false))
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410 + 1024))
         let resumed = Array(rig.output.capturedFloat[(4410 * 2)...])
         #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 88_200, count: 1024), bits: 16)) == nil)
@@ -596,14 +606,14 @@ private final class Rig {
         let f = Fixtures.named("s24-48000")
         let rig = Rig()
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 1500))
         rig.player.pause()
         #expect(rig.player.position == .microseconds(31_250))
         #expect(!rig.output.isStarted)
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pump { rig.player.status == .ended })
         #expect(mismatch(rig.output.capturedFloat, floats(Fixtures.rawSamples(f), bits: 24)) == nil)
         #expect(rig.session.requestedRates == [48_000, 48_000])
@@ -616,7 +626,7 @@ private final class Rig {
         output.hardwareSideSampleRate = 48_000
         let rig = Rig(output: output)
         await rig.player.play([fixtureItem("s16-44100")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.plan?.clientSampleRate == 44_100)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
@@ -627,7 +637,7 @@ private final class Rig {
     @Test func itemFailureSkipsAndFailsOnlyWhenNothingPlays() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s16-44100", id: "broken-1"), fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.currentIndex == 1)
 
         await rig.player.play([fixtureItem("s16-44100", id: "broken-2")], startingAt: 0)
@@ -635,7 +645,7 @@ private final class Rig {
             await eventually {
                 if case .failed = rig.player.status { return true }
                 return false
-            })
+            }, waited)
         #expect(rig.player.currentIndex == nil)
         #expect(rig.nowPlaying.clearCount == 1)
     }
@@ -646,10 +656,10 @@ private final class Rig {
     @Test func sameRouteAtTheSameRateDoesNotRestart() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         let pipeline = rig.player.pipeline
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.session.requestedRates == [44_100])
         #expect(rig.player.pipeline === pipeline)
         #expect(rig.player.status == .playing)
@@ -661,20 +671,20 @@ private final class Rig {
     @Test func sameRouteRateChangeRestartsAtThePosition() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 22_050))
-        #expect(await eventually { rig.player.position == .milliseconds(500) })
+        #expect(await eventually { rig.player.position == .milliseconds(500) }, waited)
 
         rig.session.sampleRate = 48_000
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing })
+        #expect(await eventually { rig.session.requestedRates.count == 2 && rig.player.status == .playing }, waited)
         #expect(rig.session.requestedRates == [44_100, 44_100])
         #expect(rig.session.sampleRate == 44_100)
         #expect(rig.player.position == .milliseconds(500))
         #expect(rig.player.signal.indicator == .pure)
 
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.session.requestedRates.count == 2)
 
         #expect(await rig.pull(upTo: 22_050 + 1024))
@@ -686,19 +696,19 @@ private final class Rig {
     @Test func sameRouteRateChangeWhilePausedUpdatesTheSignal() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         rig.player.pause()
 
         rig.session.sampleRate = 48_000
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .paused)
         #expect(rig.session.requestedRates == [44_100])
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.session.requestedRates == [44_100, 44_100])
         #expect(rig.player.signal.hardwareRate == 44_100)
         #expect(rig.player.signal.indicator == .pure)
@@ -711,13 +721,13 @@ private final class Rig {
         session.currentPort = .wired("EarPods")
         let rig = Rig(session: session)
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         rig.session.currentPort = .builtIn
         rig.session.emit(.routeChanged(.oldDeviceUnavailable, .builtIn))
         rig.session.emit(.interruptionEnded(shouldResume: true))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .paused)
         #expect(rig.player.signal.port == .builtIn)
     }
@@ -727,7 +737,7 @@ private final class Rig {
     @Test func pauseWhileSeekIsInFlightKeepsTheSeek() async throws {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410))
         let engine = try #require(rig.player.currentEngine)
 
@@ -736,7 +746,7 @@ private final class Rig {
         let hold = CallHold()
         _ = engine.enqueue { _ in await hold.wait() }
         let seeking = Task { await rig.player.seek(to: .seconds(2)) }
-        #expect(await eventually { rig.player.position == .seconds(2) })
+        #expect(await eventually { rig.player.position == .seconds(2) }, waited)
         #expect(engine.pipeline.position.frame == 4410)
         rig.player.pause()
         hold.release()
@@ -745,7 +755,7 @@ private final class Rig {
         #expect(rig.player.position == .seconds(2))
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410 + 1024))
         let resumed = Array(rig.output.capturedFloat[(4410 * 2)...])
         #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 88_200, count: 1024), bits: 16)) == nil)
@@ -755,18 +765,18 @@ private final class Rig {
     @Test func mediaServicesResetPausesAndReactivates() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410))
         #expect(rig.session.activationCount == 1)
 
         rig.session.emit(.mediaServicesReset)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         #expect(rig.player.position == .milliseconds(100))
         #expect(!rig.output.isStarted)
-        #expect(await eventually { rig.session.activationCount == 2 })
+        #expect(await eventually { rig.session.activationCount == 2 }, waited)
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(await rig.pull(upTo: 4410 + 512))
         let resumed = Array(rig.output.capturedFloat[(4410 * 2)...])
         #expect(mismatch(resumed, floats(PatternDecoder.samples(from: 4410, count: 512), bits: 16)) == nil)
@@ -778,19 +788,19 @@ private final class Rig {
         let outputs = OutputFactory()
         let rig = Rig(outputs: outputs)
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(outputs.built.count == 1)
         let old = try #require(outputs.built.first)
         #expect(await rig.pull(upTo: 4410))
 
         rig.session.emit(.mediaServicesReset)
-        #expect(await eventually { rig.player.status == .paused })
-        #expect(await eventually { rig.session.activationCount == 2 })
+        #expect(await eventually { rig.player.status == .paused }, waited)
+        #expect(await eventually { rig.session.activationCount == 2 }, waited)
         #expect(!old.isStarted && !old.hasSource, "the old output was not stopped")
         let callsAtReset = old.outputCalls
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(outputs.built.count == 2 && outputs.built.last !== old)
         #expect(await rig.pull(upTo: 4410 + 512))
         #expect(old.outputCalls == callsAtReset, "the dropped output was called again")
@@ -811,9 +821,9 @@ private final class Rig {
 
         outputs.failure = nil
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         rig.session.emit(.mediaServicesReset)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         outputs.failure = AudioOutputError.unitUnavailable(-2)
         rig.player.resume()
         #expect(rig.player.status == .failed("Audio output unavailable: unitUnavailable(-2)"))
@@ -824,12 +834,12 @@ private final class Rig {
     @Test func nowPlayingIsNotRepublishedWhilePlaying() async {
         let rig = Rig()
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         let published = rig.nowPlaying.shown.count
         // About a second of audio, waiting each tenth of a second for the ticker to show it.
         for tenth in 1...10 {
             #expect(await rig.pull(upTo: tenth * 4410))
-            #expect(await eventually { rig.player.position == .milliseconds(100 * tenth) })
+            #expect(await eventually { rig.player.position == .milliseconds(100 * tenth) }, waited)
         }
         #expect(rig.nowPlaying.shown.count == published)
     }
@@ -844,7 +854,7 @@ private final class Rig {
         var negotiations = rig.session.requestedRates.count
 
         await rig.player.seek(to: .milliseconds(40))
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.currentIndex == 1)
         #expect(rig.session.requestedRates.count == negotiations + 1)
         var before = rig.pulledFrames
@@ -854,7 +864,7 @@ private final class Rig {
 
         // At the start of the cued last track, previous goes back a track.
         await rig.player.previous()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.currentIndex == 0)
         #expect(rig.session.requestedRates.count == negotiations + 1)
         before = rig.pulledFrames
@@ -863,7 +873,7 @@ private final class Rig {
         negotiations = rig.session.requestedRates.count
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.currentIndex == 1)
         #expect(rig.session.requestedRates.count == negotiations + 1)
         before = rig.pulledFrames
@@ -879,11 +889,11 @@ private final class Rig {
         output.hardwareSideChannels = 2
         let rig = Rig(output: output)
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .pure && rig.player.signal.hardwareChannels == 2)
 
         await rig.player.play([fixtureItem("s16-44100", id: "broken")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .failed("ioError") })
+        #expect(await eventually { rig.player.status == .failed("ioError") }, waited)
         assertNoPath(rig.player.signal)
         #expect(SignalStrip.text(rig.player.signal) == "No record")
         #expect(rig.player.signal.port == .builtIn)
@@ -893,7 +903,7 @@ private final class Rig {
     @Test func emptyPlayClearsTheSignalPath() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         await rig.player.play([], startingAt: 0)
         #expect(rig.player.status == .idle)
         assertNoPath(rig.player.signal)
@@ -905,12 +915,12 @@ private final class Rig {
     @Test func multichannelQueueFails() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s16-48000-6ch")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .failed("Multichannel FLAC isn't supported yet") })
+        #expect(await eventually { rig.player.status == .failed("Multichannel FLAC isn't supported yet") }, waited)
         assertNoPath(rig.player.signal)
         #expect(rig.output.plans.isEmpty)
 
         await rig.player.play([fixtureItem("s16-48000-6ch"), fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.currentIndex == 1)
         #expect(rig.player.signal.source?.channels == 2)
     }
@@ -919,7 +929,7 @@ private final class Rig {
     @Test func pausedTrackChangeShowsThePendingTrack() async {
         let rig = Rig()
         await rig.player.play([patternItem("a"), fixtureItem("s24-96000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .pure)
         rig.player.pause()
         await rig.player.next()
@@ -930,7 +940,7 @@ private final class Rig {
         #expect(SignalStrip.text(rig.player.signal) == "FLAC · 24-bit · 96 kHz · ● Starting…")
 
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.plan?.clientSampleRate == 96_000)
         #expect(rig.player.signal.indicator == .pure)
     }
@@ -945,22 +955,22 @@ private final class Rig {
             session: session, makeOutput: { output }, capabilities: OutputCapabilities(int32Passthrough: false),
             nowPlaying: FakeNowPlaying(), makeDecoder: decoderForItem)
         await player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { session.entered == [44_100] })
+        #expect(await eventually { session.entered == [44_100] }, waited)
         #expect(player.status == .preparing && player.signal.indicator == .pending)
         session.releaseAll()
-        #expect(await eventually { player.status == .playing })
+        #expect(await eventually { player.status == .playing }, waited)
         #expect(player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
 
         // A new start forgets the old plan at once; it is not left describing the new track.
         await player.play([patternItem("b")], startingAt: 0)
-        #expect(await eventually { session.entered == [44_100, 44_100] })
+        #expect(await eventually { session.entered == [44_100, 44_100] }, waited)
         #expect(player.status == .preparing)
         #expect(player.signal.source == PatternDecoder.sourceFormat)
         #expect(player.signal.plan == nil && player.signal.hardwareRate == nil)
         #expect(player.signal.indicator == .pending)
         #expect(SignalStrip.text(player.signal) == "FLAC · 16-bit · 44.1 kHz · ● Starting…")
         session.releaseAll()
-        #expect(await eventually { player.status == .playing })
+        #expect(await eventually { player.status == .playing }, waited)
     }
 
     /// Stereo into a hardware side with one channel: the system downmixes, and the strip says so.
@@ -969,7 +979,7 @@ private final class Rig {
         output.hardwareSideChannels = 1
         let rig = Rig(output: output)
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.hardwareChannels == 1)
         #expect(rig.player.signal.indicator == .downmixed(from: 2, to: 1))
         #expect(SignalStrip.text(rig.player.signal) == "FLAC · 24-bit · 48 kHz · ● Downmixed 2→1")
@@ -983,13 +993,13 @@ private final class Rig {
             format: AudioFormat(sampleRate: 48_000, bitsPerSample: 24, channels: 2), totalFrames: PatternDecoder.frames)
         let rig = Rig()
         await rig.player.play([stale], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.source == PatternDecoder.sourceFormat)
         #expect(SignalStrip.text(rig.player.signal) == "FLAC · 16-bit · 44.1 kHz · ● Pure")
         #expect(rig.player.queue[0].format == PatternDecoder.sourceFormat)
         #expect(await rig.pull(upTo: 4410))
         // 4410 frames are 100 ms at 44.1 kHz; at the stale 48 kHz they would read as 91.875 ms.
-        #expect(await eventually { rig.player.position == .milliseconds(100) })
+        #expect(await eventually { rig.player.position == .milliseconds(100) }, waited)
         await rig.player.seek(to: .seconds(1))
         #expect(await rig.pull(upTo: 4410 + 512))
         let afterSeek = Array(rig.output.capturedFloat[(4410 * 2)...])
@@ -1006,23 +1016,23 @@ private final class Rig {
         output.hardwareSideSampleRate = 48_000
         let rig = Rig(output: output)
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
         rig.player.pause()
 
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
 
         rig.session.sampleRate = 96_000
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.signal.hardwareRate == 96_000)
 
         rig.session.sampleRate = 44_100
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.session.requestedRates == [44_100])
     }
@@ -1034,14 +1044,14 @@ private final class Rig {
         session.currentPort = .wired("EarPods")
         let rig = Rig(session: session)
         await rig.player.play([fixtureItem("s24-96000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
         rig.player.pause()
 
         session.sampleRate = 96_000
         session.currentPort = .usb("DAC")
         session.emit(.routeChanged(.newDeviceAvailable, .usb("DAC")))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .paused)
         #expect(rig.player.signal.hardwareRate == 96_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
@@ -1056,13 +1066,13 @@ private final class Rig {
         session.currentPort = .wired("EarPods")
         let rig = Rig(session: session)
         await rig.player.play([patternItem("a")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.player.signal.indicator == .pure)
 
         session.sampleRate = 48_000
         session.currentPort = .builtIn
         session.emit(.routeChanged(.oldDeviceUnavailable, .builtIn))
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
     }
@@ -1076,7 +1086,7 @@ private final class Rig {
 
         rig.session.sampleRate = 48_000
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(rig.player.status == .ended)
         #expect(rig.player.signal.hardwareRate == 48_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
@@ -1089,13 +1099,13 @@ private final class Rig {
     @Test func activationAsksForTheCuedItemsRate() async {
         let rig = Rig()
         await rig.player.play([fixtureItem("s24-96000"), patternItem("b")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.session.activationRates == [96_000])
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
         await rig.player.next()
         rig.player.resume()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.session.activationRates == [96_000, 44_100])
     }
 
@@ -1119,20 +1129,20 @@ private final class Rig {
         let opens = OpenLog()
         let rig = Rig(makeDecoder: { try opens.open($0) })
         await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         rig.session.emit(.interruptionBegan)
-        #expect(await eventually { rig.player.status == .paused })
+        #expect(await eventually { rig.player.status == .paused }, waited)
 
         // Activation at 44.1 kHz; the pipeline then blocks opening the item, before it negotiates.
         await rig.player.play([patternItem("slow")], startingAt: 0)
-        #expect(await eventually { rig.session.activationCount == 2 && opens.count == 2 })
+        #expect(await eventually { rig.session.activationCount == 2 && opens.count == 2 }, waited)
         #expect(rig.session.sampleRate == 44_100)
         rig.session.emit(.routeChanged(.other, .builtIn))
-        #expect(await rig.barrier())
+        #expect(await rig.barrier(), waited)
         #expect(opens.count == 2, "the start was restarted")
 
         opens.release()
-        #expect(await eventually { rig.player.status == .playing })
+        #expect(await eventually { rig.player.status == .playing }, waited)
         #expect(rig.session.requestedRates == [48_000, 44_100])
     }
 
@@ -1144,19 +1154,19 @@ private final class Rig {
 
         #expect(gate.settledRate == nil)
         let first = Task.detached { await gate.requestSampleRate(44_100, for: lease) }
-        #expect(await eventually { session.entered == [44_100] })
+        #expect(await eventually { session.entered == [44_100] }, waited)
         let second = Task.detached { await gate.requestSampleRate(48_000, for: lease) }
-        #expect(await eventually { gate.waiting == 1 || session.entered.count > 1 })
+        #expect(await eventually { gate.waiting == 1 || session.entered.count > 1 }, waited)
         let third = Task.detached { await gate.requestSampleRate(96_000, for: lease) }
-        #expect(await eventually { gate.waiting == 2 || session.entered.count > 1 })
+        #expect(await eventually { gate.waiting == 2 || session.entered.count > 1 }, waited)
         #expect(session.entered == [44_100])
 
         session.releaseOne()
         #expect(await first.value == 44_100)
         // The second request holds the turn now, so the rate is not settled.
-        #expect(await eventually { session.entered.count == 2 })
+        #expect(await eventually { session.entered.count == 2 }, waited)
         #expect(gate.settledRate == nil)
-        #expect(await eventually { session.entered == [44_100, 48_000] })
+        #expect(await eventually { session.entered == [44_100, 48_000] }, waited)
         // The third request's pipeline is stopped while it waits: it must not touch the session when its turn comes.
         // (Releasing everything inside, not just the second, makes a broken gate fail here instead of hanging.)
         lease.revoke()

@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import PFTestSupport
 import Synchronization
 import Testing
 
@@ -32,7 +33,14 @@ private func read(_ ring: SampleRing<Int32>, count: Int) -> [Int32] {
     return Array(out.prefix(n))
 }
 
-private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin: Bool) {
+/// How long a stress run may take before it counts as hung: a deadlocked ring would otherwise hang CI. A hang guard,
+/// not a performance check. Both runs take about 0.5 s: 2,000,000 elements in a debug simulator build, 10,000,000
+/// spinning in the release stage. On the first GitHub run, short of CPU beside the other suites on a 3-vCPU runner, the
+/// debug run moved 318,488 elements in 5 s, a pace that needs about 31 s for them all; ×3 under CI (`LatencyBudget`),
+/// this covers that pace about twice over.
+private let stressHangGuard: Duration = .seconds(20)
+
+private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin: Bool) async {
     let ring = SampleRing<Int32>(capacity: capacity)
     let abort = Atomic<Bool>(false)
     let producerDone = DispatchSemaphore(value: 0)
@@ -79,19 +87,31 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
         consumerDone.signal()
     }
 
+    // The decode thread, the ring's real producer, runs at this QoS. At the default one, a loaded runner serves the
+    // pair after the decode threads of the suites running alongside.
+    producer.qualityOfService = .userInitiated
+    consumer.qualityOfService = .userInitiated
+
+    let hangGuard = LatencyBudget.scaled(stressHangGuard)
     let start = ContinuousClock.now
     producer.start()
     consumer.start()
-    let deadline = DispatchTime.now() + .seconds(spin ? 20 : 5)
-    let producerFinished = producerDone.wait(timeout: deadline) == .success
-    let consumerFinished = consumerDone.wait(timeout: deadline) == .success
-    abort.store(true, ordering: .relaxed)  // timeout guard: unblock a stuck thread so CI never hangs
+    // The wait blocks a thread of its own, never a cooperative-pool thread: this task suspends until the wait ends.
+    let finished = await withCheckedContinuation { (finished: CheckedContinuation<Bool, Never>) in
+        Thread {
+            let deadline = DispatchTime.now() + .milliseconds(Int(hangGuard / .milliseconds(1)))
+            let producerFinished = producerDone.wait(timeout: deadline) == .success
+            let consumerFinished = consumerDone.wait(timeout: deadline) == .success
+            abort.store(true, ordering: .relaxed)  // timeout guard: unblock a stuck thread so CI never hangs
+            finished.resume(returning: producerFinished && consumerFinished)
+        }.start()
+    }
     let elapsed = ContinuousClock.now - start
 
-    #expect(producerFinished && consumerFinished, "producer/consumer did not finish within the deadline")
+    #expect(
+        finished, "producer/consumer did not finish within \(LatencyBudget.describe(stressHangGuard)); took \(elapsed)")
     #expect(mismatches.load(ordering: .relaxed) == 0)
     #expect(consumed.load(ordering: .relaxed) == total)
-    #expect(elapsed < .seconds(spin ? 20 : 5), "took \(elapsed)")
 }
 
 // NOTE on Thread Sanitizer: TSan cannot observe this ring's storage handoff. The element copies go through
@@ -162,8 +182,8 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
         #expect(write(ring, big) == 0)
     }
 
-    @Test func concurrentProducerConsumerIsExact() {
-        runStress(total: 2_000_000, capacity: 16_384, chunks: 1...4096, spin: false)
+    @Test func concurrentProducerConsumerIsExact() async {
+        await runStress(total: 2_000_000, capacity: 16_384, chunks: 1...4096, spin: false)
     }
 }
 
@@ -172,7 +192,7 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
 /// Only reliable in an optimized build, so it skips itself in debug; `scripts/test.sh` runs it with `-c release`.
 @Suite struct SampleRingOrderingTests {
     @Test(.enabled(if: !_isDebugAssertConfiguration(), "needs an optimized build"))
-    func smallRingOrderingStress() {
-        runStress(total: 10_000_000, capacity: 16, chunks: 1...4, spin: true)
+    func smallRingOrderingStress() async {
+        await runStress(total: 10_000_000, capacity: 16, chunks: 1...4, spin: true)
     }
 }

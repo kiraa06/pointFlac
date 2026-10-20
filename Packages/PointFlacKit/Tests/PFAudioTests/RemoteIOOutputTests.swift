@@ -110,18 +110,30 @@
         }
     }
 
+    /// The pipeline calls `negotiateRate` from a detached task, which does not inherit the suite's executor
+    /// preference, so the real session's blocking rate change is sent to `AudioHardwareQueue` here.
     private func makePipeline(
         _ output: RemoteIOOutput, session: SystemAudioSession, capabilities: OutputCapabilities
     ) -> PlaybackPipeline {
         PlaybackPipeline(
-            output: output, capabilities: capabilities, negotiateRate: { await session.requestSampleRate($0) },
+            output: output, capabilities: capabilities,
+            negotiateRate: { rate in
+                await withTaskExecutorPreference(AudioHardwareQueue.shared) { await session.requestSampleRate(rate) }
+            },
             makeDecoder: { try FlacDecoder(url: $0.url) }, ditherSeed: ditherSeed)
     }
 
-    /// Waits until `condition` holds or `timeout` passes, and returns whether it held.
+    /// Stands in for `SystemAudioSession.requestSampleRate`: a nonisolated async function, which runs on the task's
+    /// preferred executor when it has one.
+    private func isOnAudioHardwareQueue() async -> Bool {
+        AudioHardwareQueue.isCurrent
+    }
+
+    /// Waits until `condition` holds or `timeout` passes, and returns whether it held. A hang guard, so `timeout` is
+    /// scaled by `LatencyBudget` (×3 under CI).
     private func wait(upTo timeout: Duration, for condition: () -> Bool) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while !condition() {
             guard clock.now < deadline else { return false }
             try? await Task.sleep(for: .milliseconds(1))
@@ -205,6 +217,21 @@
     /// Serialized, and exclusive with other suites (`.audioHardware`): every test drives the one audio session and the
     /// output hardware.
     @Suite(.serialized, .audioOutputAvailable, .audioHardware) struct RemoteIOOutputTests {
+        /// The suite's blocking AVAudioSession and AudioUnit calls run on `AudioHardwareQueue`, never on the
+        /// cooperative pool, where on a 3-vCPU CI runner each one held a third of the pool for as long as it blocked.
+        @Test func runsOnTheAudioHardwareQueue() async throws {
+            #expect(AudioHardwareQueue.isCurrent, "test body")
+            _ = try await activeSession()
+            #expect(AudioHardwareQueue.isCurrent, "after activating the session")
+            // As the pipeline calls `negotiateRate` (see `makePipeline`): from a detached task, which does not inherit
+            // the suite's executor preference.
+            let negotiation = await Task.detached {
+                await withTaskExecutorPreference(AudioHardwareQueue.shared) { await isOnAudioHardwareQueue() }
+            }.value
+            #expect(negotiation, "a rate negotiation from the pipeline's detached task")
+            #expect(await Task.detached { await isOnAudioHardwareQueue() }.value == false, "the check itself")
+        }
+
         @Test func acceptsFloat32Client() async throws {
             let (_, rate) = try await activeSession()
             let output = try RemoteIOOutput()

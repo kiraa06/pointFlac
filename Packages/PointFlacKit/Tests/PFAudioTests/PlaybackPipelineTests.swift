@@ -220,11 +220,12 @@ private final class Rig {
         return n
     }
 
-    /// Pulls until exactly `target` real frames have been pulled in all, then stops. False on timeout.
+    /// Pulls until exactly `target` real frames have been pulled in all, then stops. False on timeout. Every polling
+    /// helper here scales its timeout by `LatencyBudget` (×3 under CI).
     @discardableResult
     func pull(upTo target: Int, timeout: Duration = .seconds(10)) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while pulledFrames < target {
             guard clock.now < deadline else { return false }
             if pull(frames: min(512, target - pulledFrames)) == 0 {
@@ -236,9 +237,9 @@ private final class Rig {
 
     /// Pulls until `done()` holds or the timeout passes, and returns whether it held.
     @discardableResult
-    func pump(timeout: Duration = .seconds(20), until done: () -> Bool) async -> Bool {
+    func pump(timeout: Duration = pumpTimeout, until done: () -> Bool) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + LatencyBudget.scaled(timeout)
         while !done() {
             guard clock.now < deadline else { return false }
             if pull() == 0 {
@@ -252,14 +253,18 @@ private final class Rig {
 
     func playToEnd() async {
         let ended = await pump { log.contains(.queueEnded) }
-        #expect(ended, "no queueEnded; events so far: \(log.events)")
+        #expect(ended, "no queueEnded within \(LatencyBudget.describe(pumpTimeout)); events so far: \(log.events)")
     }
 }
 
-/// Waits, without pulling, until `condition` holds or the timeout passes, and returns whether it held.
+/// `Rig.pump`'s timeout, before `LatencyBudget` scales it.
+private let pumpTimeout: Duration = .seconds(20)
+
+/// Waits, without pulling, until `condition` holds or the timeout passes, and returns whether it held. `timeout` is a
+/// budget, scaled by `LatencyBudget` (×3 under CI): pass the spec's figure, not a scaled one.
 private func wait(upTo timeout: Duration, for condition: () -> Bool) async -> Bool {
     let clock = ContinuousClock()
-    let deadline = clock.now + timeout
+    let deadline = clock.now + LatencyBudget.scaled(timeout)
     while !condition() {
         guard clock.now < deadline else { return false }
         try? await Task.sleep(for: .milliseconds(1))
@@ -517,7 +522,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(await rig.pull(upTo: 4096))
         // trackEnded(0) and trackStarted(1) share frame 4096 and reach the log one at a time, so wait for both.
         #expect(
-            await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
+            await wait(upTo: .milliseconds(50)) {
                 rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1, format("s24-48000")))
             }, "boundary events, \(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))
@@ -535,7 +540,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(!rig.log.contains(.trackEnded(0)))
         #expect(await rig.pull(upTo: 4458 + 32))
         #expect(
-            await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
+            await wait(upTo: .milliseconds(50)) {
                 rig.log.contains(.trackStarted(1, format("s16-44100")))
             }, "\(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))

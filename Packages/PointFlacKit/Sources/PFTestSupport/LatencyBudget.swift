@@ -6,6 +6,9 @@ import Foundation
 /// a regression net. Hosted runners are noisy: the ledger measured a 50 ms seek at 23–28 ms under parallel load on a
 /// developer's Mac alone. So under CI every budget is multiplied by 3 (spec §6.5: "CI uses tolerances because shared
 /// runners are noisy"). Failure messages name the budget and the multiplier, so a CI failure says what it was held to.
+///
+/// Hang guards scale the same way: the timeouts of the tests' polling helpers and stress runs. On a 3-vCPU runner the
+/// suites running alongside compete for the same threads and CPU, and the whole test process can stall for seconds.
 public enum LatencyBudget {
     /// 3 under CI, 1 otherwise.
     public static let multiplier = multiplier(environment: ProcessInfo.processInfo.environment)
