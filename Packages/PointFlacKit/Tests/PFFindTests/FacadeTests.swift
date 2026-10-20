@@ -96,8 +96,13 @@ import Testing
             configuration: .init(debounce: .milliseconds(10)))
         let clock = ContinuousClock()
         let older = engine.suggestions("gorillaz")
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(started.withLock { $0 } == 1)  // The older request reached the server and is hanging.
+        // Wait for the older request to reach the server and hang there. Poll with a generous bound instead of a fixed
+        // sleep: on a loaded machine the debounce and the hop to the stub can take far longer than 200 ms.
+        let reachDeadline = clock.now + .seconds(10)
+        while started.withLock({ $0 }) == 0, clock.now < reachDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(started.withLock { $0 } == 1)
         let start = clock.now
         _ = engine.suggestions("gorillaz the")
         _ = await collect(older)
