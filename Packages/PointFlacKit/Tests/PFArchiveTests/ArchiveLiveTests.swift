@@ -65,4 +65,20 @@ struct ArchiveLiveTests {
         #expect(tracks.allSatisfy { $0.fileName.lowercased().hasSuffix(".flac") && $0.detail["licence"] != nil })
         #expect(tracks.allSatisfy { ($0.sizeBytes ?? 0) > 0 && $0.detail["md5"]?.count == 32 })
     }
+
+    @Test("this week's real Friday Drops shelf holds confirmed open-licence FLAC albums", .timeLimit(.minutes(2)))
+    func fridayDrops() async throws {
+        let scratch = try Scratch()
+        let started = ContinuousClock.now
+        let shelf = try await FridayDrops(
+            provider: ArchiveProvider(), snapshotFile: scratch.url.appending(path: "d.json")
+        )
+        .shelf()
+        print("live: Friday Drops \(shelf.week) → \(shelf.drops.count) albums in \(ContinuousClock.now - started)")
+        for drop in shelf.drops {
+            print("live:   \(drop.id) | \(drop.title) | \(drop.licence) | \(drop.tracks.count) tracks")
+        }
+        #expect(shelf.drops.count == FridayDrops.shelfSize)
+        #expect(shelf.drops.allSatisfy { !$0.tracks.isEmpty && $0.licence != ArchiveLicence.etree.name })
+    }
 }

@@ -54,9 +54,14 @@ minimum interval between requests (default 250 ms), `429`/`503` honour `Retry-Af
 (scrape 4 MiB, metadata 8 MiB). Errors: `offline`, `notFound`, `http(Int)`, `tooLarge`, `badResponse`.
 
 ### 6. Search and selection
-- `ArchiveQuery.build(userQuery)`: escapes Lucene syntax, then
-  `(<terms>) AND mediatype:audio AND format:(Flac OR "24bit Flac") AND (licenseurl:*creativecommons.org* OR collection:etree)`.
-- Scrape API (`/services/search/v1/scrape`, `sorts=downloads desc`, `count=100`), first `maxItems` (20) identifiers.
+- `ArchiveQuery.build(userQuery)`: splits the text into plain words (everything but letters, digits, marks and
+  `-'._` separates), quotes each, then
+  `("w1" "w2") AND mediatype:audio AND format:(Flac OR "24bit Flac") AND (licenseurl:*creativecommons.org* OR collection:etree)`.
+  Backslash escaping was tried first; the Archive's backend errors on `\-` and on `/` even inside quotes.
+- **Deviation from §4.7:** advanced search (`/advancedsearch.php`, `sort[]=downloads desc`, `rows=50`) instead of the
+  scrape API. On 2026-10-21 the scrape API answered a new `q` with the cached result of an earlier query whenever the
+  other parameters matched (reproduced with curl). Advanced search's 10,000-result ceiling does not matter for a
+  first page. First `maxItems` (20) identifiers get a metadata request.
 - Metadata API per item (`/metadata/<id>`), one batch yielded per item as it arrives. `{}` means missing.
 - `ArchiveLicence.classify(licenseurl, collections)`: CC licences and public-domain marks, or `etree`; anything else,
   including no licence, hides the item. The client re-checks; the query filter is only a hint.
@@ -76,9 +81,15 @@ payload passes the provider and is refused by the manager.
 Searches the real Archive for `dusty-sense` (CC0, 3.5 MB 24-bit FLAC) and runs it through `DownloadManager` into a temp
 library. Run once, result recorded in the report.
 
-### 9. Friday Drops (only if time allows)
-Deterministic weekly pick of ten netlabel albums from the UTC ISO week, snapshotted per week. Skipped cleanly if not
-done properly.
+### 9. Friday Drops
+`FridayDrops` actor: a pool of up to 300 CC-licensed `collection:netlabels` FLAC releases, ordered by a SplitMix64
+Fisher-Yates shuffle seeded by the UTC ISO week (pool sorted first, so the Archive's ordering does not matter),
+then confirmed one by one against the metadata API until ten albums with selectable FLAC are found (at most 25
+checks). The first shelf of a week is saved as JSON and reused for that week; offline at the start of a week, the
+last shelf is kept. No claim limit. Runout's exact selection code was not available, so this is a week-seeded
+pick in Runout's spirit, not a port.
+Tests: UTC/ISO week boundaries, order independence and a pinned order, shelf of ten skipping empty items,
+snapshot reuse without network, new-week refresh, offline fallback.
 
 ## Not in this plan
 Background `URLSession` (needs the app delegate; integration work), pause, MD5 "Verify album" badges, the UI.

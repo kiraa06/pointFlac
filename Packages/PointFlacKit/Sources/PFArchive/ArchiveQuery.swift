@@ -42,7 +42,7 @@ enum ArchiveQuery {
             + fields.map { URLQueryItem(name: "fl[]", value: $0) }
             + [
                 URLQueryItem(name: "sort[]", value: "downloads desc"),
-                URLQueryItem(name: "rows", value: String(min(max(1, rows), 100))),
+                URLQueryItem(name: "rows", value: String(min(max(1, rows), 500))),
                 URLQueryItem(name: "page", value: "1"),
                 URLQueryItem(name: "output", value: "json"),
             ]
