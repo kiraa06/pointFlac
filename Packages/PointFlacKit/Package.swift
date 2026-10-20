@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "PFCore", targets: ["PFCore"]),
         .library(name: "PFFlac", targets: ["PFFlac"]),
+        .library(name: "PFDSP", targets: ["PFDSP"]),
     ],
     targets: [
         .target(
@@ -37,6 +38,11 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "PFDSP",
+            dependencies: ["PFCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
             name: "PFTestSupport",
             resources: [.copy("Resources/Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -49,6 +55,11 @@ let package = Package(
         .testTarget(
             name: "PFFlacTests",
             dependencies: ["PFFlac", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFDSPTests",
+            dependencies: ["PFDSP", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
