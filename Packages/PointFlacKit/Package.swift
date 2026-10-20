@@ -50,6 +50,7 @@ let package = Package(
         ),
         .target(
             name: "PFTestSupport",
+            dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
