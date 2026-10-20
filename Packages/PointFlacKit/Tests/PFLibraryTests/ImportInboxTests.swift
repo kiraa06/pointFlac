@@ -130,6 +130,71 @@ private func fixture(_ name: String) -> URL {
     #expect(library.contents().isEmpty)
 }
 
+/// What a copy throws when it fails part-way, as on a full disk or a provider file evicted mid-read.
+private struct CopyFailed: Error {}
+
+/// A copy that dies half-way leaves neither a partial file nor its temporary file, and the name stays free.
+@Test func failedCopyLeavesNothingBehind() async throws {
+    let library = try TemporaryLibrary()
+    let inbox = ImportInbox(libraryFolder: library.folder) { source, destination in
+        let bytes = try Data(contentsOf: source)
+        try bytes.prefix(bytes.count / 2).write(to: destination)
+        throw CopyFailed()
+    }
+
+    let result = await inbox.importFiles([fixture("s24-48000")])
+
+    #expect(result.added.isEmpty && result.rejected.map(\.reason) == [.unreadable])
+    // The listing includes hidden files, so a leftover temporary file would show here too.
+    #expect(library.contents().isEmpty)
+    let retry = await ImportInbox(libraryFolder: library.folder).importFiles([fixture("s24-48000")])
+    #expect(retry.added.map(\.id) == ["s24-48000.flac"])
+}
+
+/// The source changed between the check and the copy, so what arrived is not FLAC: it never takes the name.
+@Test func copyThatFailsValidationLeavesNothingBehind() async throws {
+    let library = try TemporaryLibrary()
+    let disguised = fixture("renamed-mp3")
+    let inbox = ImportInbox(libraryFolder: library.folder) { _, destination in
+        try FileManager.default.copyItem(at: disguised, to: destination)
+    }
+
+    let result = await inbox.importFiles([fixture("s24-48000")])
+
+    #expect(result.added.isEmpty && result.rejected.map(\.reason) == [.badMagic])
+    #expect(library.contents().isEmpty)
+}
+
+/// An import killed mid-copy leaves its hidden temporary file behind; the next inbox over the folder removes it, and
+/// nothing else.
+@Test func sweepsTemporaryFilesOnInit() async throws {
+    let library = try TemporaryLibrary()
+    try FileManager.default.createDirectory(at: library.folder, withIntermediateDirectories: true)
+    try Data([0x66, 0x4C]).write(to: library.folder.appending(path: ".import-\(UUID().uuidString).flac"))
+    try Data().write(to: library.folder.appending(path: ".keep"))
+    try FileManager.default.copyItem(at: fixture("s16-44100"), to: library.folder.appending(path: "s16-44100.flac"))
+
+    let inbox = ImportInbox(libraryFolder: library.folder)
+
+    #expect(library.contents() == [".keep", "s16-44100.flac"])
+    #expect(await inbox.list().map(\.id) == ["s16-44100.flac"])
+}
+
+/// A hidden name would be copied in and then never listed, so it is refused, like any name that is not plain ".flac".
+/// That covers the "._Song.flac" AppleDouble files that copies from external drives leave beside real ones.
+@Test func rejectsHiddenNames() async throws {
+    let library = try TemporaryLibrary()
+    let hidden = try library.source("s24-48000", as: ".Song.flac")
+    let appleDouble = try library.source("s24-48000", as: "._Song.flac")
+
+    let result = await ImportInbox(libraryFolder: library.folder).importFiles([hidden, appleDouble])
+
+    #expect(result.added.isEmpty)
+    #expect(result.rejected.map(\.reason) == [.notFlacName, .notFlacName])
+    #expect(result.rejected.map(\.message) == ["Only .flac files can be added", "Only .flac files can be added"])
+    #expect(library.contents().isEmpty)
+}
+
 @Test func rejectionMessages() async throws {
     let library = try TemporaryLibrary()
     let inbox = ImportInbox(libraryFolder: library.folder)

@@ -33,7 +33,7 @@ struct DebugNowPlayingView: View {
             HStack {
                 Text(Self.clock(scrubbing ?? player.position.seconds))
                 Spacer()
-                Text(status).foregroundStyle(.secondary)
+                Text(status).foregroundStyle(.secondary).accessibilityIdentifier("playerStatus")
                 Spacer()
                 Text(Self.clock(length))
             }

@@ -5,21 +5,25 @@ import XCTest
 /// Every launch passes `-PFMuteOutput`, so nothing plays through the Mac's speakers (ruling R22). The app's library
 /// folder outlives a launch, so after the first launch the preload finds duplicates and skips them; the tests look for
 /// specific rows, never for counts. Rows are found by file name, because the fixtures' titles are not unique (R20).
+///
+/// The strip depends on the Mac: the simulator's hardware side is the Mac's output device (R17). So the tests check
+/// what follows from the source on any Mac, and the exact strings only when the strip shows no resampling, which is
+/// the case at 48 kHz (where S1 records them as verified). On a machine with no usable audio output, a headless CI
+/// runner say, the playback tests skip rather than fail.
 final class PlaybackSmokeTests: XCTestCase {
     @MainActor
-    func testPreloadedFixturePlaysWithHonestStrip() {
+    func testPreloadedFixturePlaysWithHonestStrip() throws {
         let app = launch()
-        row("s24-48000", in: app).tap()
-        let strip = app.staticTexts["signalStrip"]
-        XCTAssertTrue(strip.waitForExistence(timeout: 2))
-        // The strip reads "No record" until the track starts. The simulator's hardware side runs at 48 kHz (R17), so
-        // a 48 kHz source plays untouched.
-        XCTAssertTrue(
-            strip.wait(for: \.label, toEqual: "FLAC · 24-bit · 48 kHz · ● Pure", timeout: 2),
-            "the signal strip reads \"\(strip.label)\"")
-        XCTAssertTrue(strip.label.hasPrefix("FLAC · 24-bit · "))
-        XCTAssertTrue(strip.label.contains("●"))
-        XCTAssertFalse(strip.label.localizedCaseInsensitiveContains("bit-perfect"))
+        let strip = try play("s24-48000", in: app)
+        XCTAssertTrue(strip.hasPrefix("FLAC · 24-bit · "), "the signal strip reads \"\(strip)\"")
+        XCTAssertTrue(strip.contains("●"))
+        XCTAssertFalse(strip.localizedCaseInsensitiveContains("bit-perfect"))
+        if strip.contains("Resampled") {
+            // This Mac's output runs at another rate, so iOS resamples after the unit, and the strip has to say so.
+            XCTAssertTrue(strip.contains("● Resampled 48→"), "the signal strip reads \"\(strip)\"")
+        } else {
+            XCTAssertEqual(strip, "FLAC · 24-bit · 48 kHz · ● Pure")
+        }
     }
 
     @MainActor
@@ -34,14 +38,18 @@ final class PlaybackSmokeTests: XCTestCase {
     /// Ruling R21: a 32-bit source is TPDF-reduced to 24 bits, because `OutputCapabilities.current` claims no Int32
     /// passthrough (R13), and the strip says so.
     @MainActor
-    func testThirtyTwoBitFixtureShowsDepthReduction() {
+    func testThirtyTwoBitFixtureShowsDepthReduction() throws {
         let app = launch()
-        row("s32-48000", in: app).tap()
-        let strip = app.staticTexts["signalStrip"]
-        XCTAssertTrue(strip.waitForExistence(timeout: 2))
-        XCTAssertTrue(
-            strip.wait(for: \.label, toEqual: "FLAC · 32-bit · 48 kHz · ● 32→24-bit", timeout: 2),
-            "the signal strip reads \"\(strip.label)\"")
+        let strip = try play("s32-48000", in: app)
+        XCTAssertTrue(strip.hasPrefix("FLAC · 32-bit · "), "the signal strip reads \"\(strip)\"")
+        XCTAssertTrue(strip.contains("●"))
+        XCTAssertFalse(strip.localizedCaseInsensitiveContains("bit-perfect"))
+        if strip.contains("Resampled") {
+            // As above. Resampling outranks the depth reduction in `SignalState.indicator`, so the strip shows it.
+            XCTAssertTrue(strip.contains("● Resampled 48→"), "the signal strip reads \"\(strip)\"")
+        } else {
+            XCTAssertEqual(strip, "FLAC · 32-bit · 48 kHz · ● 32→24-bit")
+        }
     }
 
     @MainActor
@@ -58,5 +66,30 @@ final class PlaybackSmokeTests: XCTestCase {
         let row = app.buttons["trackRow-\(stem)"]
         XCTAssertTrue(row.waitForExistence(timeout: 10), "no library row for \(stem)")
         return row
+    }
+
+    /// Taps the row for `stem` and returns the strip once it describes the track. Skips when this machine has no
+    /// usable audio output: the app could not create one, or the player could not activate the audio session.
+    @MainActor
+    private func play(_ stem: String, in app: XCUIApplication) throws -> String {
+        let row = row(stem, in: app)
+        let outputError = app.staticTexts["outputError"]
+        if outputError.exists {
+            throw XCTSkip("No audio output on this machine: \(outputError.label)")
+        }
+        row.tap()
+        let strip = app.staticTexts["signalStrip"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 2))
+        // The strip reads "No record" until the track starts.
+        let begins = NSPredicate(format: "label BEGINSWITH 'FLAC'")
+        let started = XCTNSPredicateExpectation(predicate: begins, object: strip)
+        if XCTWaiter.wait(for: [started], timeout: 2) != .completed {
+            let status = app.staticTexts["playerStatus"]
+            if status.exists, status.label.hasPrefix("Failed: Audio session unavailable") {
+                throw XCTSkip("No audio session on this machine: \(status.label)")
+            }
+            XCTFail("the strip never described \(stem): it reads \"\(strip.label)\", the status \"\(status.label)\"")
+        }
+        return strip.label
     }
 }

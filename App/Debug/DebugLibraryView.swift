@@ -7,6 +7,10 @@ import UniformTypeIdentifiers
 /// opens the Files picker. Tapping a track plays it alone; Play All queues the library, for next, previous and gapless
 /// joins. Now Playing sits at the bottom.
 struct DebugLibraryView: View {
+    /// The SDK has no `UTType.flac`; the extension resolves to the system's `org.xiph.flac`. Should it ever not
+    /// resolve, the picker offers all audio, and the inbox still refuses anything that is not FLAC.
+    private static let flac = UTType(filenameExtension: "flac") ?? .audio
+
     let model: AppModel
     @State private var picking = false
 
@@ -15,7 +19,7 @@ struct DebugLibraryView: View {
             List {
                 if let error = model.outputError {
                     Section {
-                        Text(error).foregroundStyle(.red)
+                        Text(error).foregroundStyle(.red).accessibilityIdentifier("outputError")
                     }
                 }
                 Section("Tracks") {
@@ -63,7 +67,7 @@ struct DebugLibraryView: View {
                 }
             }
             .fileImporter(
-                isPresented: $picking, allowedContentTypes: [UTType(filenameExtension: "flac")!],
+                isPresented: $picking, allowedContentTypes: [Self.flac],
                 allowsMultipleSelection: true
             ) { result in
                 switch result {

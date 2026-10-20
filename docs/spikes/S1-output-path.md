@@ -110,7 +110,7 @@ launches the Debug app with `-PFPreloadFixtures`, which imports the fixtures the
 reads the strip. The whole real path runs: `ImportInbox`, `Player`, `SystemAudioSession`, `RemoteIOOutput` and
 `SystemNowPlaying`.
 
-iPhone 17 Pro simulator, iOS 26.5 runtime, Xcode 26.6 (2026-10-21):
+iPhone 17 Pro simulator, iOS 26.5 runtime, Xcode 26.6, on a Mac whose output device runs at 48 kHz (2026-10-21):
 
 | Fixture     | Signal strip                            |
 | ----------- | --------------------------------------- |
@@ -123,9 +123,12 @@ Both match the results above:
 - A 32-bit source goes to the Float32 client TPDF-reduced to 24 bits, because `OutputCapabilities.current` claims no
   Int32 passthrough (R13). The strip discloses it.
 
-The tests assert these exact strings. On a Mac whose output device runs at 44.1 kHz, the hardware side would read
-44.1 kHz, the strip would say "● Resampled 48→44.1", and the tests would fail. That is the honest result on such a
-Mac, not a bug.
+These exact strings were verified at 48 kHz, and the tests assert them whenever the strip shows no resampling. On a
+Mac whose output device runs at another rate, 44.1 kHz say, the hardware side reads that rate and iOS resamples after
+the unit. The strip then honestly reads "● Resampled 48→44.1" for both fixtures: resampling outranks the depth
+reduction in `SignalState.indicator`. The tests accept that, and on any Mac they still check the source-derived
+part: the `FLAC · 24-bit · ` or `FLAC · 32-bit · ` prefix, the "●" indicator, and no "bit-perfect". On a machine with
+no usable audio output (a headless CI runner), the two playback tests skip.
 
 ## Ruling R13: `OutputCapabilities.current` stays `int32Passthrough: false`
 
