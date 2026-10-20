@@ -143,7 +143,39 @@ this as a disclosed limit: the 24-bit TPDF quantisation noise (about −144 dBFS
 If this is wrong, the cost is that 32-bit files get 24-bit TPDF on hardware that might take 32-bit. That is inaudible,
 honestly disclosed, and fixed later by flipping one line. `current` flips only on the device evidence below.
 
-## Device runs: pending
+## Device results: iPhone 17 Pro, iOS 27.2 beta, USB-C EarPods (2026-10-21)
+
+Kiran ran these with his own music on a Release build installed through `scripts/install-device.sh`.
+
+| File | Strip shown | Verdict |
+|---|---|---|
+| 16-bit / 44.1 kHz | `FLAC · 16-bit · 44.1 kHz · ● Pure` | ✓ the route switched to 44.1 kHz, so no resampling |
+| 24-bit / 48 kHz | `FLAC · 24-bit · 48 kHz · ● Pure` | ✓ |
+| 24-bit / 192 kHz | `FLAC · 24-bit · 48 kHz · ● Resampled 192→48` | ✓ the EarPods cap at 48 kHz, and the strip says so |
+| Unplug mid-song | playback paused | ✓ |
+| Lock screen | title shown; play, pause and skip work | ✓ |
+| Seek slider | jumps cleanly, with no stale audio | ✓ |
+| 32-bit file | not yet tested | pending: needs a 32-bit FLAC |
+
+The listener's notes on the 192 kHz track: noticeably less grain than the Android reference player, but now and then
+it seemed to have less treble. Measured on the Mac, through pointFlac's own `SampleRateConverter` (sine tones, fed in
+the pipeline's 4096-frame chunks):
+
+| 192 kHz → 48 kHz | Result |
+|---|---|
+| Response from 1 to 23 kHz | flat within ±0.01 dB at every point tested (1, 5, 10, 15, 18, 20, 21, 22 and 23 kHz) |
+| Tones from 25 to 60 kHz, folded back into the 48 kHz band | −150 to −157 dB, below the 24-bit noise floor |
+
+The resampler removes no audible treble. The likeliest explanation is that a weaker resampler aliases ultrasonic
+content back into the audible band, where it is heard as grit and extra "sparkle". When that grit is gone, a track can
+seem less bright even though it is more accurate. Level differences between players also change how bright a track
+sounds. To check by ear, play the same master as 24/48 and as 24/192 in pointFlac and compare. If they sound alike, the
+resampler is cleared.
+
+Still to measure on the device: the signpost intervals (play → first sample, seek, retire), and the device run of
+`reportsHardwareSideRate`.
+
+## Device runs: procedure
 
 The device route works: Xcode 26.6 with a free Personal Team installs on the iPhone 17 Pro running iOS 27.2. For the
 team, create `Config/Signing.local.xcconfig` from `Config/Signing.local.xcconfig.example` (git-ignored, never

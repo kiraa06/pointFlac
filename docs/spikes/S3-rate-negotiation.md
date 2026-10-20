@@ -20,7 +20,17 @@ side stays at the Mac output device's rate (48 kHz here), and the simulator resa
 
 ## iPhone 17 Pro + EarPods
 
-Pending. The device route works (Xcode 26.6 with a free Personal Team; see `S1-output-path.md`). To run it:
+**End-to-end result (2026-10-21, debug app, Release build):**
+
+| Requested | Granted | Strip |
+|---|---|---|
+| 44.1 kHz | 44.1 kHz | `● Pure` |
+| 48 kHz | 48 kHz | `● Pure` |
+| 192 kHz | 48 kHz | `● Resampled 192→48` |
+
+The route moves between 44.1 and 48 kHz as the spec expects, and refuses anything above 48 kHz. The full figures are in
+`S1-output-path.md`. The `S3:` lines from the test suite are still to be captured on the device. The device route
+works (Xcode 26.6 with a free Personal Team; see `S1-output-path.md`). To run it:
 
 1. Connect the EarPods.
 2. Run from `Packages/PointFlacKit`:
