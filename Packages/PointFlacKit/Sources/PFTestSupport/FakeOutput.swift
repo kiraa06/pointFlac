@@ -50,9 +50,9 @@ public final class FakeOutput: AudioOutput, Sendable {
         }
     }
 
-    /// Calls made through `AudioOutput` so far: `configure`, `start`, `stop`, and reading or setting `source` or reading
-    /// the hardware side. `pull` and the accessors meant for tests do not count. A test uses it to show that an output
-    /// the player dropped is never touched again.
+    /// Calls made through `AudioOutput` so far: `configure`, `start`, `stop`, and reading or setting `source` or
+    /// reading the hardware side. `pull` and the accessors meant for tests do not count. A test uses it to show that
+    /// an output the player dropped is never touched again.
     public var outputCalls: Int { state.withLock { $0.outputCalls } }
     /// Whether a source is set; for tests, so not counted in `outputCalls`.
     public var hasSource: Bool { state.withLock { $0.source != nil } }

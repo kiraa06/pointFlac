@@ -6,7 +6,8 @@ import Synchronization
 public struct PlaybackItem: Sendable, Hashable, Identifiable {
     public var id: String
     public var url: URL
-    /// The format recorded at import. During playback the decoder's own format is authoritative.
+    /// The format recorded at import. During playback the decoder's own format is authoritative, and `.trackStarted`
+    /// reports it.
     public var format: AudioFormat
     public var totalFrames: Int64
 
@@ -23,7 +24,10 @@ public struct PlaybackItem: Sendable, Hashable, Identifiable {
 public enum PipelineEvent: Sendable, Equatable {
     /// The output was configured for a new plan: for the first item, and at each boundary where the plan changes.
     case planChanged(OutputPlan)
-    case trackStarted(Int)
+    /// Item `index` started rendering, in the format its decoder reports. That format is authoritative: the
+    /// import-time `PlaybackItem.format` may be stale (the file replaced since), and the strip and positions must
+    /// follow what plays.
+    case trackStarted(Int, AudioFormat)
     case trackEnded(Int)
     /// The item could not be opened, positioned, decoded or output. Playback moves on to the next item, and the failed
     /// item gets no `trackEnded`. Audio decoded before a mid-track failure still plays; the event fires after it.
@@ -116,6 +120,12 @@ public final class PlaybackPipeline: @unchecked Sendable {
     /// decoder runs up to half a second ahead). While a seek is pending this reports its target.
     public var position: (index: Int, frame: Int64) {
         core.position
+    }
+
+    /// Frames of silence rendered because the ring ran dry mid-stream, over the whole queue
+    /// (`RenderSource.underrunFrames`). For diagnostics and tests.
+    var underrunFrames: Int64 {
+        core.shared.withLock { $0.source?.underrunFrames ?? 0 }
     }
 
     /// Decode threads still running, including a stopped session's thread that has not unwound yet. Tests use it to

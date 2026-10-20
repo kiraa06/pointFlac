@@ -18,6 +18,12 @@ private func item(_ name: String, id: String? = nil) -> PlaybackItem {
         totalFrames: f.frames)
 }
 
+/// The format fixture `name` decodes to, as `.trackStarted` reports it.
+private func format(_ name: String) -> AudioFormat {
+    let f = Fixtures.named(name)
+    return AudioFormat(sampleRate: f.sampleRate, bitsPerSample: f.bits, channels: f.channels)
+}
+
 /// Native-range samples as the Float32 client receives them: v / 2^(b−1).
 private func floats(_ samples: some Sequence<Int32>, bits: Int) -> [Float] {
     let scale = Float(1 << (bits - 1))
@@ -300,37 +306,50 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
 // Serialized: every test runs a decode thread and a pull loop, and `seekCompletesWithin50ms` measures wall-clock
 // latency. Run in parallel under TSan the seek took 23–28 ms (half the budget) against 8–10 ms serialized.
 @Suite(.serialized) struct PlaybackPipelineTests {
-    @Test(arguments: ["s16-44100", "s24-96000"])
-    func pureFloatPathIsBitExact(_ name: String) async {
+    /// Every accepted fixture v1 plays (mono and stereo, 16 to 32 bits, 44.1 to 384 kHz), on the pure path at its own
+    /// rate. corrupt-mid is left out: its damaged block decodes to silence, not to its `.raw` (see FlacDecoderTests).
+    static let pureFixtures = Fixtures.all.filter {
+        $0.expect == .accept && $0.channels <= 2 && $0.name != "corrupt-mid-s16-44100"
+    }.map(\.name)
+
+    /// Spec §6.3: what the pipeline hands the output equals the decoded source exactly, with the negotiated rate equal
+    /// to the source's. Up to 24 bits that is the Float32 client, v / 2^(b−1); a 32-bit source needs the Int32 client,
+    /// so the capabilities allow it here.
+    @Test(arguments: pureFixtures)
+    func purePathIsBitExact(_ name: String) async {
         let f = Fixtures.named(name)
-        let rig = Rig()
+        let rig = Rig(int32Passthrough: true)
         await rig.play([item(name)])
         await rig.playToEnd()
-        #expect(rig.output.plans == [floatPlan(f.sampleRate)])
-        #expect(mismatch(rig.output.capturedFloat, floats(Fixtures.rawSamples(f), bits: f.bits)) == nil)
+        let raw = Fixtures.rawSamples(f)
+        #expect(raw.count == Int(f.frames) * f.channels)
+        if f.bits > 24 {
+            let plan = OutputPlan(client: .int32, clientSampleRate: f.sampleRate, resample: nil, reduceTo24: false)
+            #expect(rig.output.plans == [plan])
+            #expect(mismatch(rig.output.capturedInt32, raw) == nil)
+        } else {
+            #expect(rig.output.plans == [floatPlan(f.sampleRate)])
+            #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: f.bits)) == nil)
+        }
+        #expect(rig.log.events.first == .planChanged(rig.output.plans[0]))
+        #expect(rig.log.contains(.trackStarted(0, format(name))))
     }
 
-    @Test func int32PathIsBitExact() async {
-        let f = Fixtures.named("s32-96000")
-        let rig = Rig(int32Passthrough: true)
-        await rig.play([item("s32-96000")])
-        await rig.playToEnd()
-        let plan = OutputPlan(client: .int32, clientSampleRate: 96_000, resample: nil, reduceTo24: false)
-        #expect(rig.output.plans == [plan])
-        #expect(mismatch(rig.output.capturedInt32, Fixtures.rawSamples(f)) == nil)
-    }
+    static let thirtyTwoBitFixtures = pureFixtures.filter { Fixtures.named($0).bits == 32 }
 
-    /// Ruling R3: one `TPDFDither(seed:)` per track, run over its samples in order, so a capture is reproducible.
-    @Test func reducedDepthPathMatchesSeededDither() async {
-        let f = Fixtures.named("s32-96000")
+    /// Ruling R3: one `TPDFDither(seed:)` per track, run over its samples in order, so a capture is reproducible. The
+    /// dither itself is pinned to fixed numbers by `ditherGoldenVector`.
+    @Test(arguments: thirtyTwoBitFixtures)
+    func reducedDepthPathMatchesSeededDither(_ name: String) async {
+        let f = Fixtures.named(name)
         let seed: UInt64 = 0x0123_4567_89AB_CDEF
         let rig = Rig(ditherSeed: seed)
-        await rig.play([item("s32-96000")])
+        await rig.play([item(name)])
         await rig.playToEnd()
         var expected = Fixtures.rawSamples(f)
         var dither = TPDFDither(seed: seed)
         expected.withUnsafeMutableBufferPointer { dither.reduce32To24($0) }
-        #expect(rig.output.plans == [floatPlan(96_000, reduceTo24: true)])
+        #expect(rig.output.plans == [floatPlan(f.sampleRate, reduceTo24: true)])
         #expect(mismatch(rig.output.capturedFloat, floats(expected, bits: 32)) == nil)
     }
 
@@ -345,7 +364,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(rig.output.plans == [plan])
         #expect(
             rig.log.events == [
-                .planChanged(plan), .trackStarted(0), .trackEnded(0), .trackStarted(1), .trackEnded(1), .queueEnded,
+                .planChanged(plan), .trackStarted(0, format("s24-48000")), .trackEnded(0),
+                .trackStarted(1, format("s24-48000")), .trackEnded(1), .queueEnded,
             ])
     }
 
@@ -362,8 +382,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(Array(captured.dropFirst(first.count)), second) == nil)
         #expect(
             rig.log.events == [
-                .planChanged(floatPlan(44_100)), .trackStarted(0), .trackEnded(0),
-                .planChanged(floatPlan(96_000)), .trackStarted(1), .trackEnded(1), .queueEnded,
+                .planChanged(floatPlan(44_100)), .trackStarted(0, format("s16-44100")), .trackEnded(0),
+                .planChanged(floatPlan(96_000)), .trackStarted(1, format("s24-96000")), .trackEnded(1), .queueEnded,
             ])
     }
 
@@ -420,7 +440,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
             if case .itemFailed(0, _) = $0 { return true }
             return false
         }
-        let next = events.firstIndex(of: .trackStarted(1))
+        let next = events.firstIndex(of: .trackStarted(1, format("s16-44100")))
         #expect(failed != nil && next != nil && failed! < next!, "events: \(events)")
         #expect(!events.contains(.trackEnded(0)))
         // The 1000 frames decoded before the failure play; then item 1 plays exactly.
@@ -443,7 +463,10 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(Array(rig.output.capturedFloat[mark...]), floats(raw[6000...], bits: 24)) == nil)
         #expect(rig.pipeline.position.frame == 4096)
         // The end markers queued before the seeks were never rendered, so they are dropped, not fired twice.
-        #expect(rig.log.events == [.planChanged(floatPlan(96_000)), .trackStarted(0), .trackEnded(0), .queueEnded])
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(96_000)), .trackStarted(0, format("s24-96000")), .trackEnded(0), .queueEnded,
+            ])
     }
 
     @Test func midstreamDamagePlaysThrough() async {
@@ -472,7 +495,10 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
             }
             try? await Task.sleep(for: .milliseconds(1))
         }
-        #expect(latency != nil && latency! < .milliseconds(50), "seek latency \(String(describing: latency))")
+        let budget = LatencyBudget.scaled(.milliseconds(50))
+        #expect(
+            latency != nil && latency! < budget,
+            "seek latency \(String(describing: latency)), \(LatencyBudget.describe(.milliseconds(50)))")
         let fresh = Array(rig.output.capturedFloat[mark...])
         #expect(!fresh.isEmpty && mismatch(fresh, floats(raw[4000..<(4000 + fresh.count)], bits: 24)) == nil)
     }
@@ -491,8 +517,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(await rig.pull(upTo: 4096))
         // trackEnded(0) and trackStarted(1) share frame 4096 and reach the log one at a time, so wait for both.
         #expect(
-            await wait(upTo: .milliseconds(50)) {
-                rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1))
+            await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
+                rig.log.contains(.trackEnded(0)) && rig.log.contains(.trackStarted(1, format("s24-48000")))
             })
         #expect(!rig.log.contains(.trackEnded(1)))
     }
@@ -508,13 +534,17 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         try? await Task.sleep(for: .milliseconds(30))
         #expect(!rig.log.contains(.trackEnded(0)))
         #expect(await rig.pull(upTo: 4458 + 32))
-        #expect(await wait(upTo: .milliseconds(50)) { rig.log.contains(.trackStarted(1)) })
+        #expect(
+            await wait(upTo: LatencyBudget.scaled(.milliseconds(50))) {
+                rig.log.contains(.trackStarted(1, format("s16-44100")))
+            }, "\(LatencyBudget.describe(.milliseconds(50)))")
         #expect(!rig.log.contains(.trackEnded(1)))
         await rig.playToEnd()
         let plan = floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))
         #expect(
             rig.log.events == [
-                .planChanged(plan), .trackStarted(0), .trackEnded(0), .trackStarted(1), .trackEnded(1), .queueEnded,
+                .planChanged(plan), .trackStarted(0, format("s16-44100")), .trackEnded(0),
+                .trackStarted(1, format("s16-44100")), .trackEnded(1), .queueEnded,
             ])
         let reference = try oneShotResample(floats(raw + raw, bits: 16), from: 44_100, to: 48_000, channels: 2)
         #expect(rig.output.capturedFloat.count == reference.count)
@@ -538,12 +568,14 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         let ended = await rig.pump(timeout: .seconds(5)) { rig.log.contains(.queueEnded) }
         #expect(ended, "events: \(rig.log.events)")
         var expected: [PipelineEvent] = [
-            .planChanged(floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))), .trackStarted(0),
-            .trackEnded(0), .trackStarted(1), .itemFailed(1, "ioError"),
+            .planChanged(floatPlan(48_000, resample: RateChange(from: 44_100, to: 48_000))),
+            .trackStarted(0, format("corrupt-mid-s16-44100")),
+            .trackEnded(0), .trackStarted(1, format("s16-44100")), .itemFailed(1, "ioError"),
         ]
         if followedByFormatChange {
             expected += [
-                .planChanged(floatPlan(48_000, resample: RateChange(from: 96_000, to: 48_000))), .trackStarted(2),
+                .planChanged(floatPlan(48_000, resample: RateChange(from: 96_000, to: 48_000))),
+                .trackStarted(2, format("s24-96000")),
                 .trackEnded(2),
             ]
         }
@@ -570,7 +602,10 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
             }
             try? await Task.sleep(for: .milliseconds(1))
         }
-        #expect(latency != nil && latency! < .milliseconds(50), "seek latency \(String(describing: latency))")
+        let budget = LatencyBudget.scaled(.milliseconds(50))
+        #expect(
+            latency != nil && latency! < budget,
+            "seek latency \(String(describing: latency)), \(LatencyBudget.describe(.milliseconds(50)))")
         let fresh = Array(rig.output.capturedFloat[mark...])
         let expected = floats(PatternDecoder.samples(from: 300_000, count: fresh.count / 2), bits: 16)
         #expect(!fresh.isEmpty && mismatch(fresh, expected) == nil)
@@ -584,7 +619,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         await rig.playToEnd()
         #expect(
             rig.log.events == [
-                .itemFailed(0, "Output rate unavailable"), .planChanged(floatPlan(44_100)), .trackStarted(1),
+                .itemFailed(0, "Output rate unavailable"), .planChanged(floatPlan(44_100)),
+                .trackStarted(1, format("s16-44100")),
                 .trackEnded(1), .queueEnded,
             ])
         #expect(rig.output.plans == [floatPlan(44_100)])
@@ -608,7 +644,7 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(
             rig.log.events == [
                 .itemFailed(0, "Multichannel FLAC isn't supported yet"), .planChanged(floatPlan(44_100)),
-                .trackStarted(1), .trackEnded(1), .queueEnded,
+                .trackStarted(1, format("s16-44100")), .trackEnded(1), .queueEnded,
             ])
         #expect(rig.output.plans == [floatPlan(44_100)])
         #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)
@@ -650,6 +686,23 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(neverRendered.outcome == .abandoned)
     }
 
+    /// The underrun counter through the pipeline: the silence after the queue's last frame is the stream's end, which
+    /// the decode thread marks, so a clean play-through counts no underrun (with the mark missing, the pulls after the
+    /// end would count).
+    @Test func cleanPlayThroughCountsNoUnderrun() async {
+        let rig = Rig()
+        await rig.play([item("s24-48000"), item("s16-44100")])
+        // Paced so the render never outruns the decode thread: each 85 ms track sits whole in the ring before it is
+        // pulled, and the format change's drain and reconfiguration finish between the two.
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(await rig.pull(upTo: 4096))
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(await rig.pull(upTo: 8192))
+        #expect(await wait(upTo: .seconds(2)) { rig.log.contains(.queueEnded) })
+        for _ in 0..<8 { #expect(rig.pull() == 0) }
+        #expect(rig.pipeline.underrunFrames == 0)
+    }
+
     @Test func positionFollowsRenderedFrames() async {
         let rig = Rig()
         await rig.play([item("s24-48000", id: "a"), item("s24-48000", id: "b")])
@@ -678,7 +731,9 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         let start = clock.now
         rig.pipeline.stop()
         let stopTook = clock.now - start
-        #expect(stopTook < .milliseconds(50), "stop() took \(stopTook)")
+        #expect(
+            stopTook < LatencyBudget.scaled(.milliseconds(50)),
+            "stop() took \(stopTook), \(LatencyBudget.describe(.milliseconds(50)))")
         #expect(await wait(upTo: .seconds(1)) { rig.pipeline.liveDecodeThreads == 0 })
         #expect(await wait(upTo: .seconds(1)) { lifetime.ended }, "the stopped session still holds its decoder")
         // A late answer must not configure or start the output, or emit anything.

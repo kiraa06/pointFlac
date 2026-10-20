@@ -141,6 +141,8 @@ final class DecodeSession: @unchecked Sendable {
             if let step = flushConverter() { return step }
             boundary = written
             placeBoundaryEvents(at: boundary)
+            // The output stops once this is rendered: the silence until then is the gap, not an underrun.
+            source?.markEndOfStream()
             if let step = drain() { return step }
             switch reconfigure(for: nextFormat) {
             case .configured: break
@@ -163,7 +165,7 @@ final class DecodeSession: @unchecked Sendable {
             converterInput = 0
         }
         if entry != .seek {
-            appendMarker(.trackStarted(target), at: boundary)
+            appendMarker(.trackStarted(target, nextFormat), at: boundary)
         }
         decoder = next
         index = target
@@ -261,6 +263,7 @@ final class DecodeSession: @unchecked Sendable {
 
     private func finishQueue() -> Step {
         if let step = flushConverter() { return step }
+        source?.markEndOfStream()
         placeBoundaryEvents(at: written)
         appendMarker(.queueEnded, at: written)
         _ = core.withShared(for: self) { s in

@@ -151,8 +151,9 @@
         }
     }
 
-    /// What `SystemAudioSession` knows of the session's activity, shared with its notification observers. AVAudioSession
-    /// has no public "is active" query, so the session object tracks what it did and what the system told it.
+    /// What `SystemAudioSession` knows of the session's activity, shared with its notification observers.
+    /// AVAudioSession has no public "is active" query, so the session object tracks what it did and what the system
+    /// told it.
     private final class SessionActivity: Sendable {
         let isActive = Atomic<Bool>(false)
         let deactivations = Atomic<Int>(0)

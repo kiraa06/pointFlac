@@ -141,8 +141,8 @@ private final class SuspendingSession: AudioSessionControlling {
     }
 }
 
-/// Counts the items a pipeline opens. Items whose id starts "pattern-slow" block in the open, on the decode thread, until
-/// the test releases them, so a test can act between a start's activation and its negotiation.
+/// Counts the items a pipeline opens. Items whose id starts "pattern-slow" block in the open, on the decode thread,
+/// until the test releases them, so a test can act between a start's activation and its negotiation.
 private final class OpenLog: Sendable {
     private let opened = Atomic<Int>(0)
     private let released = Atomic<Bool>(false)
@@ -975,6 +975,27 @@ private final class Rig {
         #expect(SignalStrip.text(rig.player.signal) == "FLAC · 24-bit · 48 kHz · ● Downmixed 2→1")
     }
 
+    /// The decoder's format, which `trackStarted` carries, is authoritative over the one recorded at import (a file
+    /// replaced since): the strip shows what plays, and positions convert at the rate that plays.
+    @Test func decodedFormatIsAuthoritative() async {
+        let stale = QueueItem(
+            id: "pattern-stale", url: URL(fileURLWithPath: "/dev/null"), title: "Stale", artist: "", album: "",
+            format: AudioFormat(sampleRate: 48_000, bitsPerSample: 24, channels: 2), totalFrames: PatternDecoder.frames)
+        let rig = Rig()
+        await rig.player.play([stale], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.source == PatternDecoder.sourceFormat)
+        #expect(SignalStrip.text(rig.player.signal) == "FLAC · 16-bit · 44.1 kHz · ● Pure")
+        #expect(rig.player.queue[0].format == PatternDecoder.sourceFormat)
+        #expect(await rig.pull(upTo: 4410))
+        // 4410 frames are 100 ms at 44.1 kHz; at the stale 48 kHz they would read as 91.875 ms.
+        #expect(await eventually { rig.player.position == .milliseconds(100) })
+        await rig.player.seek(to: .seconds(1))
+        #expect(await rig.pull(upTo: 4410 + 512))
+        let afterSeek = Array(rig.output.capturedFloat[(4410 * 2)...])
+        #expect(mismatch(afterSeek, floats(PatternDecoder.samples(from: 44_100, count: 512), bits: 16)) == nil)
+    }
+
     // MARK: Refreshing the strip while nothing plays (ledger T13)
 
     /// A notification that leaves the hardware at the negotiated rate must not overwrite the R17 hardware-side rate:
@@ -1024,7 +1045,7 @@ private final class Rig {
         #expect(rig.player.status == .paused)
         #expect(rig.player.signal.hardwareRate == 96_000)
         #expect(rig.player.signal.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
-        // The barrier leaves the volume below full scale, so the USB volume warning follows; not what this test is about.
+        // The barrier leaves the volume below full scale, so the USB volume warning follows: not this test's concern.
         #expect(SignalStrip.text(rig.player.signal).hasPrefix("FLAC · 24-bit · 96 kHz · ● Resampled 96→48"))
     }
 

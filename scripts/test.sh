@@ -5,8 +5,11 @@ cd "$(dirname "$0")/.."
 SIM_NAME="${PF_SIM_NAME:-iPhone 17 Pro}"
 DEST="platform=iOS Simulator,name=$SIM_NAME"
 echo "Simulator destination: $DEST"
+# Latency-budget tests multiply their budgets by 3 when CI=true (GitHub Actions sets it; see LatencyBudget). xcodebuild
+# hands TEST_RUNNER_-prefixed variables to the test process without the prefix, so the simulator stages see it too.
+export TEST_RUNNER_CI="${CI:-}"
 
-echo "== 1/6 licence guard =="
+echo "== 1/7 licence guard =="
 # Only BSD, MIT, zlib, Apache-2.0 or public-domain code may be vendored, so no file in the libFLAC copy may carry a GPL
 # or LGPL notice. Headers wrap the licence's name mid-phrase ("GNU Lesser General Public\n * License"), so the guard
 # matches the fragments as well as the full names.
@@ -29,18 +32,22 @@ for licence in Packages/PointFlacKit/Sources/CFLAC/COPYING.Xiph LICENSE; do
 done
 echo "licence guard: clean"
 
-echo "== 2/6 swift format lint =="
+echo "== 2/7 swift format lint =="
 swift format lint --strict --recursive App AppUITests Packages
 
-echo "== 3/6 swift test (host) =="
+echo "== 3/7 swift test (host) =="
 swift test --package-path Packages/PointFlacKit
 
-echo "== 4/6 SampleRing ordering stress (release build) =="
+echo "== 4/7 thread sanitizer: pipeline, player, ring (host) =="
+# TSan cannot see the ring's memmove copies (ruling R9), so stage 5 stresses their ordering in a release build.
+swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'PlaybackPipelineTests|PlayerTests|SampleRingTests'
+
+echo "== 5/7 SampleRing ordering stress (release build) =="
 swift test -c release -Xswiftc -enable-testing --package-path Packages/PointFlacKit --filter SampleRingOrderingTests
 
-echo "== 5/6 package tests on simulator =="
+echo "== 6/7 package tests on simulator =="
 (cd Packages/PointFlacKit && xcodebuild test -scheme PointFlacKit-Package -destination "$DEST")
 
-echo "== 6/6 app + UI tests on simulator =="
+echo "== 7/7 app + UI tests on simulator =="
 scripts/bootstrap.sh
 xcodebuild test -scheme PointFlac -destination "$DEST"

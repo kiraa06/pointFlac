@@ -22,6 +22,13 @@ import Synchronization
 /// written before the request. The producer's acquire load of the acknowledgement then orders the discard before
 /// anything it writes next.
 ///
+/// ## Underruns
+/// `render` counts the frames of silence it fills because the ring ran dry mid-stream (`underrunFrames`), with a few
+/// atomic loads and stores and no clock or lock, so the count is real-time safe. Deliberate silence is not counted:
+/// flushes, seek holds, the start-up before this source's first real frame, and the end of the stream once the
+/// producer has marked it (`markEndOfStream`). What remains is audio that should have been there: a decode thread or
+/// file read too slow, and the short gap after a seek before the new position's audio arrives.
+///
 /// ## Seek holds
 /// A flush needs the decode thread, which may take a few milliseconds to notice a seek, and the audio before the seek
 /// must not keep playing meanwhile. So `seek(toFrame:)` first places a hold (`seeksRequested` += 1). While
@@ -43,6 +50,14 @@ public final class RenderSource: @unchecked Sendable {
     private let seeksRequested: Atomic<UInt64>
     /// Written only by the producer.
     private let seeksServed: Atomic<UInt64>
+    /// Frames of silence filled because the ring ran dry mid-stream, including those of the sources this one replaced.
+    /// Written only by `render`.
+    private let underruns: Atomic<Int64>
+    /// `renderedFrames` when this source was made: until `render` passes it, the ring is still filling (start-up).
+    private let startFrames: Int64
+    /// Set by the producer after the last audio it will write for now (the end of the queue, or a drain before a
+    /// format change); cleared by its next write.
+    private let endOfStream = Atomic<Bool>(false)
 
     /// - Parameters:
     ///   - capacityFrames: ring size in frames (rounded up to a power of two in samples).
@@ -56,6 +71,8 @@ public final class RenderSource: @unchecked Sendable {
         self.ring = ring
         unretainedRing = .passUnretained(ring)
         rendered = Atomic(renderedFrames)
+        startFrames = renderedFrames
+        underruns = Atomic(previous?.underrunFrames ?? 0)
         seeksRequested = Atomic(previous?.seeksRequested.load(ordering: .acquiring) ?? 0)
         seeksServed = Atomic(previous?.seeksServed.load(ordering: .acquiring) ?? 0)
     }
@@ -64,6 +81,11 @@ public final class RenderSource: @unchecked Sendable {
     /// from this.
     public var renderedFrames: Int64 {
         rendered.load(ordering: .acquiring)
+    }
+
+    /// Frames of silence rendered because the ring ran dry mid-stream (see "Underruns"). Any thread; read-only.
+    public var underrunFrames: Int64 {
+        underruns.load(ordering: .acquiring)
     }
 
     /// Render thread only, one call at a time; real-time safe.
@@ -93,8 +115,12 @@ public final class RenderSource: @unchecked Sendable {
             (words + got).update(repeating: 0, count: count - got)
         }
         let real = got / channels
+        let before = rendered.load(ordering: .relaxed)
         if real > 0 {
-            rendered.store(rendered.load(ordering: .relaxed) + Int64(real), ordering: .releasing)
+            rendered.store(before + Int64(real), ordering: .releasing)
+        }
+        if real < frames, before > startFrames, !endOfStream.load(ordering: .acquiring) {
+            underruns.store(underruns.load(ordering: .relaxed) + Int64(frames - real), ordering: .releasing)
         }
         return real
     }
@@ -109,9 +135,17 @@ public final class RenderSource: @unchecked Sendable {
     /// Writes as many whole frames of `words` as fit and returns how many words it wrote. Partial frames are never
     /// written, so the render side always reads whole frames.
     func write(_ words: UnsafeBufferPointer<UInt32>) -> Int {
+        if endOfStream.load(ordering: .relaxed) { endOfStream.store(false, ordering: .releasing) }
         let fit = min(words.count, ring.availableToWrite) / channels * channels
         guard fit > 0 else { return 0 }
         return ring.write(UnsafeBufferPointer(rebasing: words[0..<fit]))
+    }
+
+    /// Producer only: everything to be written for now is written (the end of the queue, or before a drain for a
+    /// format change), so from here the ring running dry is the stream's end, not an underrun. The next `write`
+    /// clears it.
+    func markEndOfStream() {
+        endOfStream.store(true, ordering: .releasing)
     }
 
     /// Asks `render` to drop everything buffered. Call after the last write of the audio to drop; returns the

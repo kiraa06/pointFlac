@@ -50,8 +50,8 @@ final class OutputArbiter: @unchecked Sendable {
     }
 
     /// Stops the output and drops it for good; the next `lease` builds a fresh one. For a media-services reset, after
-    /// which the old output's audio unit is dead. Every lease loses it, so no pipeline, current or retired, can reach the
-    /// old output again; it is stopped and its source cleared once, here, and then released.
+    /// which the old output's audio unit is dead. Every lease loses it, so no pipeline, current or retired, can reach
+    /// the old output again; it is stopped and its source cleared once, here, and then released.
     func discardOutput() {
         let old = lock.withLock { () -> AudioOutput? in
             defer {

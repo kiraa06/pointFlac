@@ -406,10 +406,13 @@ public final class Player {
             engine?.negotiated = SignalPath(
                 plan: plan, hardwareRate: arbiter.hardwareSideSampleRate ?? plan.clientSampleRate,
                 hardwareChannels: arbiter.hardwareSideChannels)
-        case .trackStarted(let index):
+        case .trackStarted(let index, let format):
             guard queue.indices.contains(index) else { return }
             anyItemStarted = true
-            signal.source = queue[index].format
+            // The decoder's format is authoritative (the file may have changed since import). The queue entry takes
+            // it, so the strip, positions and seeks all follow what plays.
+            if queue[index].format != format { queue[index].format = format }
+            signal.source = format
             // A gapless join keeps the running plan: it has no `planChanged` of its own.
             if let path = engine?.negotiated {
                 engine?.negotiated = nil
@@ -487,9 +490,9 @@ public final class Player {
         let logger = Telemetry.logger
         switch event {
         case .routeChanged(let reason, let port):
-            logger.info(
-                "Route changed (\(String(describing: reason), privacy: .public)): \(String(describing: port), privacy: .private)"
-            )
+            let why = String(describing: reason)
+            let to = String(describing: port)
+            logger.info("Route changed (\(why, privacy: .public)): \(to, privacy: .private)")
         case .volumeChanged(let volume):
             logger.debug("Volume \(volume, privacy: .public)")
         case .interruptionBegan, .interruptionEnded, .mediaServicesReset:

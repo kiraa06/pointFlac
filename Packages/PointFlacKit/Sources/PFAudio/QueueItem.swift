@@ -8,7 +8,8 @@ public struct QueueItem: Sendable, Hashable, Identifiable {
     public var title: String
     public var artist: String
     public var album: String
-    /// The format recorded at import. Positions convert between frames and time at its sample rate.
+    /// The format recorded at import, until the track starts: then the player replaces it with the decoder's own, which
+    /// is authoritative. Positions convert between frames and time at its sample rate.
     public var format: AudioFormat
     /// Total frames, or 0 when unknown.
     public var totalFrames: Int64

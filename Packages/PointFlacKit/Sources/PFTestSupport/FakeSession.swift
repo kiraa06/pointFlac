@@ -6,8 +6,8 @@ import Synchronization
 ///
 /// `rateResponse` plays the hardware: it maps the requested rate (or the preferred rate an activation brings) to the
 /// rate the "device" settles on, which `sampleRate` then reports until the next request, or until a test moves it to
-/// play a rate change under an unchanged port. All state sits behind one lock, so the class is checked `Sendable`. `events` is single-consumer, like the real
-/// session's.
+/// play a rate change under an unchanged port. All state sits behind one lock, so the class is checked `Sendable`.
+/// `events` is single-consumer, like the real session's.
 public final class FakeSession: AudioSessionControlling {
     private struct State {
         var requestedRates: [Int] = []

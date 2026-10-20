@@ -22,16 +22,23 @@ public struct TPDFDither: Sendable {
         return state &* 0x2545_F491_4F6C_DD1D
     }
 
+    /// The next draw of triangular noise, in the 32-bit input's units: the sum of two independent uniform integers in
+    /// [−128, 127], so −256 … 254. `reduce32To24` adds one draw to each sample. Internal so tests can check its shape
+    /// directly (variance 2·256²/12, triangular), not only through the rounding.
+    mutating func nextNoise() -> Int64 {
+        let r = next()
+        let a = Int64((r >> 56) & 0xFF) - 128
+        let b = Int64((r >> 48) & 0xFF) - 128
+        return a + b
+    }
+
     /// Dithers `samples` in place, in order. Output values are multiples of 256.
     public mutating func reduce32To24(_ samples: UnsafeMutableBufferPointer<Int32>) {
         let maxOut = Int64(Int32.max & ~255)
         let minOut = Int64(Int32.min)
         for i in samples.indices {
-            let r = next()
-            let a = Int64((r >> 56) & 0xFF) - 128
-            let b = Int64((r >> 48) & 0xFF) - 128
             // Add 128, then floor to a multiple of 256: round to nearest.
-            let rounded = (Int64(samples[i]) + a + b + 128) & ~255
+            let rounded = (Int64(samples[i]) + nextNoise() + 128) & ~255
             samples[i] = Int32(min(max(rounded, minOut), maxOut))
         }
     }

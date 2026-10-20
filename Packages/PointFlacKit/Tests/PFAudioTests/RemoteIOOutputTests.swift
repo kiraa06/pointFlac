@@ -340,9 +340,12 @@
             let latency = try #require(output.firstRenderLatency)
             let renderedAt = try #require(output.firstRealRenderUptimeNanos)
             let endToEnd = Duration.nanoseconds(Int64(renderedAt) - Int64(requestedAt))
-            print("S1: firstRenderLatency=\(milliseconds(latency)) endToEnd=\(milliseconds(endToEnd))")
-            #expect(latency < .milliseconds(150))
-            #expect(endToEnd < .milliseconds(150))
+            let budget = LatencyBudget.describe(.milliseconds(150))
+            print("S1: firstRenderLatency=\(milliseconds(latency)) endToEnd=\(milliseconds(endToEnd)) \(budget)")
+            #expect(
+                latency < LatencyBudget.scaled(.milliseconds(150)), "first render \(milliseconds(latency)), \(budget)")
+            #expect(
+                endToEnd < LatencyBudget.scaled(.milliseconds(150)), "end to end \(milliseconds(endToEnd)), \(budget)")
         }
 
         /// Rulings 3, 5 and 6 at the callback itself, called directly on a stopped unit with rendering switched on by
