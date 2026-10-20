@@ -13,9 +13,10 @@
         public let events: AsyncStream<SessionEvent>
         private let continuation: AsyncStream<SessionEvent>.Continuation
 
-        /// Observer tokens and the KVO handle. Neither `NSObjectProtocol` nor `NSKeyValueObservation` is `Sendable`,
-        /// so `@unchecked` is forced on this struct; it is safe because it only lives inside the `Mutex` below and is
-        /// touched only in `init` and `deinit`.
+        /// Observer tokens and the KVO handle, held in a `Mutex`, touched only in `init` and `deinit`.
+        /// `@unchecked Sendable` is forced: without it the iOS build fails with "'inout sending' parameter '$0'
+        /// cannot be task-isolated at end of function" where `init` assigns the non-Sendable `NSObjectProtocol` tokens
+        /// and `NSKeyValueObservation` inside `withLock`.
         private struct Observers: @unchecked Sendable {
             var tokens: [any NSObjectProtocol] = []
             var volume: NSKeyValueObservation?
@@ -34,13 +35,8 @@
             tokens.append(
                 center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) {
                     @Sendable note in
-                    let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-                    let reason: RouteChangeReason =
-                        switch raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) {
-                        case .oldDeviceUnavailable: .oldDeviceUnavailable
-                        case .newDeviceAvailable: .newDeviceAvailable
-                        default: .other
-                        }
+                    let reason = RouteChangeReason(
+                        routeChangeRawValue: note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
                     continuation.yield(.routeChanged(reason, Self.readCurrentPort()))
                 })
 
@@ -48,19 +44,10 @@
                 center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) {
                     @Sendable note in
                     let info = note.userInfo
-                    guard let raw = info?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                        let type = AVAudioSession.InterruptionType(rawValue: raw)
-                    else { return }
-                    switch type {
-                    case .began:
-                        continuation.yield(.interruptionBegan)
-                    case .ended:
-                        let options = (info?[AVAudioSessionInterruptionOptionKey] as? UInt)
-                            .map(AVAudioSession.InterruptionOptions.init(rawValue:))
-                        continuation.yield(.interruptionEnded(shouldResume: options?.contains(.shouldResume) ?? false))
-                    @unknown default:
-                        break
-                    }
+                    let event = SessionEvent.interruption(
+                        typeRawValue: info?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                        optionsRawValue: info?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                    if let event { continuation.yield(event) }
                 })
 
             // After a reset the owner must set the category again and reactivate; that is the player's job.
@@ -95,17 +82,34 @@
 
         /// Deactivates, sets the preferred rate, reactivates, then reads the hardware rate back.
         ///
-        /// If any step throws, the failure is swallowed and the read-back rate is still returned: it is whatever the
-        /// hardware runs at, and the pipeline resamples to it. Returning `hz` instead would claim a rate the
-        /// hardware may not have.
+        /// The read-back rate is returned on every path, including when a step throws: it is whatever the hardware
+        /// runs at, and the pipeline resamples to it. Returning `hz` instead would claim a rate the hardware may not
+        /// have. An inactive session can read back 0.
+        ///
+        /// Threading: despite `async`, every AVAudioSession call here is synchronous and may block for tens to
+        /// hundreds of milliseconds, occupying the calling thread. That is acceptable for a rare per-track call. The
+        /// caller must have stopped the output first (the pipeline does); otherwise `setActive(false)` throws a busy
+        /// error and the rate does not change, though the read-back keeps the result correct.
         public func requestSampleRate(_ hz: Int) async -> Int {
             let session = AVAudioSession.sharedInstance()
             do {
                 try session.setActive(false)
+            } catch {
+                // Still active (busy output): the preferred rate cannot take effect. Read back what is running.
+                return Int(session.sampleRate)
+            }
+            // Deactivation succeeded, so reactivation must be attempted even if setting the preferred rate fails.
+            // Otherwise the session would stay inactive while playback continues, and the read-back would come from
+            // an inactive session.
+            do {
                 try session.setPreferredSampleRate(Double(hz))
+            } catch {
+                // Not fatal: reactivate at whatever rate the hardware picks.
+            }
+            do {
                 try session.setActive(true)
             } catch {
-                // Fall through to the read-back below.
+                // Nothing more to do; the read-back below reports what the session has.
             }
             return Int(session.sampleRate)
         }
