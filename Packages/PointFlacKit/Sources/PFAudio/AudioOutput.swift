@@ -16,6 +16,15 @@ public protocol AudioOutput: AnyObject {
     func start() throws
     func stop()
     var source: RenderSource? { get set }
+    /// The rate the output's hardware side runs at after the last `configure`, when the output can tell; nil when it
+    /// cannot. If it differs from the plan's client rate, the system resamples after pointFlac, and the signal strip
+    /// must say so rather than show "Pure" (ruling R17). Read it only while no `configure` can run concurrently.
+    var hardwareSideSampleRate: Int? { get }
+}
+
+extension AudioOutput {
+    /// An output that cannot see its hardware side reports nothing, and the player falls back to the client rate.
+    public var hardwareSideSampleRate: Int? { nil }
 }
 
 /// Why an output could not be set up or started. Each case carries the `OSStatus` the system returned.

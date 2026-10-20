@@ -19,6 +19,7 @@ public final class FakeOutput: AudioOutput, Sendable {
         var plans: [OutputPlan] = []
         var capturedFloat: [Float] = []
         var capturedInt32: [Int32] = []
+        var hardwareSideSampleRate: Int?
     }
 
     public let maximumFramesPerPull: Int
@@ -44,6 +45,13 @@ public final class FakeOutput: AudioOutput, Sendable {
     /// Real frames rendered while the configured client was Int32.
     public var capturedInt32: [Int32] { state.withLock { $0.capturedInt32 } }
     public var isStarted: Bool { state.withLock { $0.started } }
+
+    /// What the output reports for its hardware side. Nil by default, like an output that cannot tell; a test sets a
+    /// rate to play a device that resamples after the unit (ruling R17).
+    public var hardwareSideSampleRate: Int? {
+        get { state.withLock { $0.hardwareSideSampleRate } }
+        set { state.withLock { $0.hardwareSideSampleRate = newValue } }
+    }
 
     public func configure(_ plan: OutputPlan, channels: Int) throws {
         let byteCount = maximumFramesPerPull * channels * MemoryLayout<UInt32>.stride

@@ -14,6 +14,9 @@ public enum SignalIndicator: Equatable, Sendable {
 public struct SignalState: Sendable, Equatable {
     public var source: AudioFormat?
     public var plan: OutputPlan?
+    /// The rate the hardware actually runs at, as far as pointFlac can tell: the output unit's hardware side when it
+    /// reports one, otherwise the negotiated client rate. Set together with `plan`, from the same negotiation. When it
+    /// differs from `plan.clientSampleRate`, iOS is resampling after pointFlac's output, and `indicator` says so.
     public var hardwareRate: Int?
     public var port: OutputPort?
     public var systemVolume: Float?
@@ -33,12 +36,18 @@ public struct SignalState: Sendable, Equatable {
         self.scrubbing = scrubbing
     }
 
-    /// Precedence: scrubbing > bluetoothLossy > processing > resampled > depthReduced > pure.
+    /// Precedence: scrubbing > bluetoothLossy > processing > resampled after the unit (`hardwareRate` differs from
+    /// `plan.clientSampleRate`, shown as source → hardware rate) > resampled by pointFlac (`plan.resample`) >
+    /// depthReduced > pure. Resampling after the unit outranks the plan, so the strip never says "Pure" while the system
+    /// resamples behind pointFlac's back.
     public var indicator: SignalIndicator {
         guard source != nil else { return .idle }
         if scrubbing { return .scrubbing }
         if port?.isBluetooth == true { return .bluetoothLossy }
         if !activeProcessing.isEmpty { return .processing(activeProcessing.count) }
+        if let source, let plan, let hardwareRate, hardwareRate != plan.clientSampleRate {
+            return .resampled(RateChange(from: source.sampleRate, to: hardwareRate))
+        }
         if let change = plan?.resample { return .resampled(change) }
         if plan?.reduceTo24 == true, let bits = source?.bitsPerSample { return .depthReduced(from: bits, to: 24) }
         return .pure

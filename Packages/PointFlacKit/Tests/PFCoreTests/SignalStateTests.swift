@@ -61,6 +61,26 @@ private let allStates: [SignalState] = [
     #expect(s.indicator == .resampled(RateChange(from: 192_000, to: 48_000)))
 }
 
+/// Ruling R17: the hardware runs at a rate other than the unit's client rate, so iOS resamples after pointFlac. The
+/// strip must not say "Pure" then, whatever the plan says.
+@Test func resamplingAfterTheUnitIsShown() {
+    var s = state(44_100, 16, hardware: 44_100)
+    #expect(s.indicator == .pure)
+    s.hardwareRate = 48_000
+    #expect(s.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+    #expect(SignalStrip.text(s) == "FLAC · 16-bit · 48 kHz · ● Resampled 44.1→48")
+    // Below processing in precedence…
+    s.activeProcessing = ["EQ"]
+    #expect(s.indicator == .processing(1))
+    // …and above the plan's own resampling and depth reduction.
+    var resampled = state(96_000, 24, hardware: 48_000)
+    resampled.hardwareRate = 44_100
+    #expect(resampled.indicator == .resampled(RateChange(from: 96_000, to: 44_100)))
+    var deep = state(96_000, 32, hardware: 96_000)
+    deep.hardwareRate = 48_000
+    #expect(deep.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
+}
+
 @Test func volumeWarningOnlyOnUSB() {
     #expect(state(96_000, 24, hardware: 96_000, port: .usb("DAC"), volume: 0.8).volumeWarningPercent == 80)
     #expect(state(96_000, 24, hardware: 96_000, port: .builtIn, volume: 0.8).volumeWarningPercent == nil)
