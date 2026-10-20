@@ -25,6 +25,21 @@ private func readFrames(_ d: FlacDecoder, _ frames: Int) throws -> [Int32] {
     return Array(out[0..<(n * d.format.channels)])
 }
 
+/// A temporary copy of corrupt-mid whose first block (frames 0..<4096) is damaged too, as well as its third.
+private func copyWithDamagedFirstBlock() throws -> URL {
+    var bytes = [UInt8](try Data(contentsOf: Fixtures.url(Fixtures.named("corrupt-mid-s16-44100"))))
+    var offset = 4  // after "fLaC"; walk the metadata blocks to the first frame
+    var isLast = false
+    while !isLast {
+        isLast = bytes[offset] & 0x80 != 0
+        offset += 4 + (Int(bytes[offset + 1]) << 16 | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3]))
+    }
+    bytes[offset + 200] ^= 0xFF  // well inside the first frame's subframe data
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(UUID()).flac")
+    try Data(bytes).write(to: url)
+    return url
+}
+
 @Suite struct FlacDecoderTests {
     @Test(arguments: Fixtures.all.filter { $0.expect == .accept && $0.name != "corrupt-mid-s16-44100" })
     func decodesBitExactly(_ f: Fixture) throws {
@@ -114,10 +129,11 @@ private func readFrames(_ d: FlacDecoder, _ frames: Int) throws -> [Int32] {
     }
 
     /// libFLAC 1.5.0 (verified against stream_decoder.c and by this test) does not output the frame whose CRC-16
-    /// fails: it reports `FRAME_CRC_MISMATCH`, drops the frame and resynchronises. When the next good frame
-    /// arrives, its sample number exposes the gap, libFLAC reports `MISSING_FRAME` and writes silent frames
-    /// to fill it. The caller therefore sees silence in place of the damaged block, and the total sample count
-    /// is preserved.
+    /// fails: it reports `FRAME_CRC_MISMATCH`, drops the frame and resynchronises (reporting `LOST_SYNC` and
+    /// `BAD_HEADER` for false syncs inside the damaged payload). When the next good frame arrives, its sample number
+    /// exposes the gap and libFLAC writes silent frames to fill it (`MISSING_FRAME` is reported only if nothing
+    /// was reported yet). The caller therefore sees silence in place of the damaged block, and the total sample
+    /// count is preserved.
     @Test(arguments: [1000, 7, 4096, 16384])
     func reportsMidstreamDamageAndContinues(chunk: Int) throws {
         let f = Fixtures.named("corrupt-mid-s16-44100")
@@ -132,6 +148,59 @@ private func readFrames(_ d: FlacDecoder, _ frames: Int) throws -> [Int32] {
         #expect(out[damaged].allSatisfy { $0 == 0 })
         #expect(out[..<damaged.lowerBound] == raw[..<damaged.lowerBound])
         #expect(out[damaged.upperBound...] == raw[damaged.upperBound...])
+    }
+
+    /// libFLAC's own seek cannot land inside a block whose CRC fails: its bisection ends in SEEK_ERROR. The decoder
+    /// then seeks to an earlier good position and decodes forward, so it lands where a linear decode would.
+    @Test(arguments: [8192, 8193, 9000, 10_240, 12_287] as [Int64])
+    func seekIntoADamagedBlockLandsWhereALinearDecodeWould(target: Int64) throws {
+        let url = Fixtures.url(Fixtures.named("corrupt-mid-s16-44100"))
+        let linear = try decodeToEnd(FlacDecoder(url: url), chunk: 4096)
+        let d = try FlacDecoder(url: url)
+        _ = try readFrames(d, 200)
+        try d.seek(toFrame: target)
+        #expect(d.currentFrame == target)
+        #expect(try decodeToEnd(d, chunk: 1000) == Array(linear[(Int(target) * 2)...]))
+        #expect(d.currentFrame == 16384)
+        try d.seek(toFrame: 0)
+        #expect(try decodeToEnd(d, chunk: 1000) == linear)
+    }
+
+    @Test func failedSeekRestoresThePreviousPosition() throws {
+        let url = try copyWithDamagedFirstBlock()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let raw = Fixtures.rawSamples(Fixtures.named("corrupt-mid-s16-44100"))
+        let d = try FlacDecoder(url: url)
+        try d.seek(toFrame: 5000)
+        #expect(try readFrames(d, 100) == Array(raw[(5000 * 2)..<(5100 * 2)]))
+        // Frame 1000 lies in the damaged first block, and there is no earlier position to decode forward from.
+        #expect(throws: FlacDecodeError.seekFailed) { try d.seek(toFrame: 1000) }
+        #expect(d.currentFrame == 5100)
+        #expect(try readFrames(d, 1000) == Array(raw[(5100 * 2)..<(6100 * 2)]))
+    }
+
+    @Test func failedSeekToAndFromTheEndKeepsTheEnd() throws {
+        let url = try copyWithDamagedFirstBlock()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let d = try FlacDecoder(url: url)
+        try d.seek(toFrame: d.totalFrames)
+        #expect(throws: FlacDecodeError.seekFailed) { try d.seek(toFrame: 1000) }
+        #expect(d.currentFrame == d.totalFrames)
+        #expect(try readFrames(d, 100).isEmpty)
+    }
+
+    @Test func failedSeekFromAnUnreachablePositionRefusesToReadUntilTheNextSeek() throws {
+        let url = try copyWithDamagedFirstBlock()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let raw = Fixtures.rawSamples(Fixtures.named("corrupt-mid-s16-44100"))
+        // A fresh decoder sits at frame 0, inside the damaged first block, where libFLAC cannot seek back to.
+        let d = try FlacDecoder(url: url)
+        #expect(throws: FlacDecodeError.seekFailed) { try d.seek(toFrame: 1000) }
+        #expect(throws: FlacDecodeError.seekFailed) { try readFrames(d, 100) }
+        #expect(throws: FlacDecodeError.seekFailed) { try readFrames(d, 100) }
+        try d.seek(toFrame: 13_000)
+        #expect(d.currentFrame == 13_000)
+        #expect(try readFrames(d, 1000) == Array(raw[(13_000 * 2)..<(14_000 * 2)]))
     }
 
     @Test func refusesFilesThatAreNotDecodableFlac() {

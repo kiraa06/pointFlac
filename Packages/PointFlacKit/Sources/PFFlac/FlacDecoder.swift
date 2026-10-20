@@ -33,6 +33,8 @@ public final class FlacDecoder {
     private let channels: Int
     /// libFLAC has nothing more to deliver: end of stream, or a seek to `totalFrames`.
     private var exhausted = false
+    /// A failed seek could not return to the previous position either; reads throw until a seek succeeds.
+    private var positionLost = false
 
     public convenience init(url: URL) throws(FlacDecodeError) {
         try self.init(url: url, verifyingMD5: false)
@@ -63,7 +65,9 @@ public final class FlacDecoder {
 
     /// Fills `buffer` with up to `maxFrames` interleaved frames (fewer only if the buffer is smaller) and returns
     /// how many it wrote. Returns 0 at the end of the stream, or when the buffer cannot hold a single frame.
+    /// Throws `seekFailed` while the position is lost after a failed seek (see `seek(toFrame:)`).
     public func read(into buffer: UnsafeMutableBufferPointer<Int32>, maxFrames: Int) throws(FlacDecodeError) -> Int {
+        guard !positionLost else { throw .seekFailed }
         let capacity = min(maxFrames, buffer.count / channels)
         guard capacity > 0, let base = buffer.baseAddress else { return 0 }
         var filled = context.drainLeftover(into: base, maxFrames: capacity)
@@ -80,28 +84,22 @@ public final class FlacDecoder {
     }
 
     /// Positions the decoder so the next `read` starts exactly at `frame`. `seek(toFrame: totalFrames)` positions
-    /// it at the end. After a `seekFailed` thrown by libFLAC, the position is unspecified until the next successful
-    /// seek.
+    /// it at the end.
+    ///
+    /// A frame inside a damaged block is reached by decoding forward from an earlier good position, so it lands
+    /// where a linear decode would. If `frame` cannot be reached at all, this throws `seekFailed` and the decoder
+    /// returns to the position it had before the call. If even that position cannot be reached again, every
+    /// `read` throws `seekFailed` until a later seek succeeds.
     public func seek(toFrame frame: Int64) throws(FlacDecodeError) {
         let total = totalFrames
         guard frame >= 0, total == 0 || frame <= total else { throw .seekFailed }
-        // libFLAC delivers the target block through the write callback during the seek, so clear first.
-        context.discardLeftover()
-        if total > 0 && frame == total {
-            // libFLAC refuses seek_absolute(total_samples); the end of the stream needs no decoding.
-            exhausted = true
-            currentFrame = frame
-            return
+        if move(to: frame) { return }
+        // A failed libFLAC seek leaves the file at whatever byte the bisection stopped on. Go back, so the stream
+        // neither ends early nor plays from an unknown position under a stale `currentFrame`.
+        if positionLost || !move(to: currentFrame) {
+            positionLost = true
         }
-        guard FLAC__stream_decoder_seek_absolute(decoder, UInt64(frame)) != 0 else {
-            if FLAC__stream_decoder_get_state(decoder) == FLAC__STREAM_DECODER_SEEK_ERROR {
-                _ = FLAC__stream_decoder_flush(decoder)
-            }
-            context.discardLeftover()
-            throw .seekFailed
-        }
-        exhausted = false
-        currentFrame = frame
+        throw .seekFailed
     }
 
     // MARK: Integrity support
@@ -119,6 +117,72 @@ public final class FlacDecoder {
     }
 
     // MARK: Private
+
+    /// Makes `frame` the next frame `read` returns. Returns false, with the position unusable, when it cannot.
+    private func move(to frame: Int64) -> Bool {
+        let total = totalFrames
+        if total > 0 && frame == total {
+            // libFLAC refuses seek_absolute(total_samples); the end of the stream needs no decoding.
+            context.discardLeftover()
+            exhausted = true
+            land(at: frame)
+            return true
+        }
+        if seekAbsolute(frame) {
+            land(at: frame)
+            return true
+        }
+        // libFLAC's bisection cannot land inside a block whose CRC fails (it ends in SEEK_ERROR). Seek to the start
+        // of an earlier block and decode forward instead: libFLAC then fills the damaged block with silence exactly
+        // as in linear playback. The anchor must be a block start. A seek into the middle of a block hands libFLAC
+        // a trimmed frame, and libFLAC fills no gap after a frame shorter than 16 samples and caps the fill at 50
+        // such frames. Block starts are known only for fixed-size blocks.
+        let blockSize = Int64(streamInfo.maxBlockSize)
+        guard blockSize > 0, streamInfo.minBlockSize == streamInfo.maxBlockSize else { return false }
+        let targetBlock = frame / blockSize
+        for blocksBack: Int64 in [1, 2, 4, 8, 16, 32] {
+            let anchor = max(0, targetBlock - blocksBack) * blockSize
+            if seekAbsolute(anchor) && skip(frame - anchor) {
+                land(at: frame)
+                return true
+            }
+            if anchor == 0 { break }
+        }
+        return false
+    }
+
+    /// One libFLAC seek. The target block arrives through the write callback during the seek, so the leftover is
+    /// cleared first. Clears `exhausted`.
+    private func seekAbsolute(_ frame: Int64) -> Bool {
+        context.discardLeftover()
+        exhausted = false
+        guard FLAC__stream_decoder_seek_absolute(decoder, UInt64(frame)) != 0 else {
+            if FLAC__stream_decoder_get_state(decoder) == FLAC__STREAM_DECODER_SEEK_ERROR {
+                _ = FLAC__stream_decoder_flush(decoder)
+            }
+            context.discardLeftover()
+            return false
+        }
+        return true
+    }
+
+    /// Decodes and discards `frames` frames. False if the stream ends first or libFLAC fails. Sets `exhausted` when
+    /// libFLAC reaches the end, even on success (the leftover may still hold the frames that follow).
+    private func skip(_ frames: Int64) -> Bool {
+        var remaining = frames
+        while true {
+            remaining -= Int64(context.dropLeftover(maxFrames: Int(clamping: remaining)))
+            if remaining == 0 { return true }
+            if exhausted { return false }
+            let ok = FLAC__stream_decoder_process_single(decoder) != 0
+            do { try checkState(afterProcessing: ok) } catch { return false }
+        }
+    }
+
+    private func land(at frame: Int64) {
+        currentFrame = frame
+        positionLost = false
+    }
 
     private func checkState(afterProcessing ok: Bool) throws(FlacDecodeError) {
         let state = FLAC__stream_decoder_get_state(decoder)
@@ -259,6 +323,15 @@ final class FlacDecodeContext {
         guard leftoverEnd > leftoverStart, let base = leftover.baseAddress else { return 0 }
         let frames = min((leftoverEnd - leftoverStart) / channels, maxFrames)
         out.update(from: base + leftoverStart, count: frames * channels)
+        leftoverStart += frames * channels
+        if leftoverStart == leftoverEnd { discardLeftover() }
+        return frames
+    }
+
+    /// Throws away up to `maxFrames` leftover frames and returns how many it threw away.
+    func dropLeftover(maxFrames: Int) -> Int {
+        guard leftoverEnd > leftoverStart else { return 0 }
+        let frames = min((leftoverEnd - leftoverStart) / channels, maxFrames)
         leftoverStart += frames * channels
         if leftoverStart == leftoverEnd { discardLeftover() }
         return frames
