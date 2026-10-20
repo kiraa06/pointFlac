@@ -186,18 +186,24 @@ public struct SuggestionRanker: Sendable {
         // stopword); for an artist row, every name it goes by.
         var names = [entity.artistCredit ?? entity.artist]
         if entity.artistCredit != nil, entity.artistCredit != entity.artist { names.append(entity.artist) }
-        if row.kind == .artist { names = entity.artistNames }
+        var primaryNames = names.count
+        if row.kind == .artist {
+            names = entity.artistNames
+            primaryNames = entity.artistSortName == nil || entity.artistSortName == entity.artist ? 1 : 2
+        }
         var best = 0.0
-        for name in names {
+        for (index, name) in names.enumerated() {
+            // An alias match counts for less: "gorill" should put Gorillaz above Lupe Fiasco ("Lupe the Gorilla").
+            let weight = index < primaryNames ? 1 : 0.85
             let artistTokens = FindText.tokens(FindText.withoutLeadingArticle(name))
             let candidates: [[String]] =
                 row.kind == .artist
                 ? [FindText.tokens(name), artistTokens]
                 : [titleTokens, titleTokens + artistTokens, artistTokens + titleTokens]
             for candidate in candidates {
-                best = max(
-                    best,
-                    FuzzyMatcher.score(queryTokens: queryTokens, candidateTokens: candidate, lastIsPartial: partial))
+                let value = FuzzyMatcher.score(
+                    queryTokens: queryTokens, candidateTokens: candidate, lastIsPartial: partial)
+                best = max(best, value * weight)
             }
         }
         var value = best

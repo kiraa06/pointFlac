@@ -130,3 +130,15 @@ import Testing
         #expect(SoulseekQueryPlanner.plan(for: entity).variants.map(\.query) == ["adele 21"])
     }
 }
+
+@Suite struct AliasRankingTests {
+    @Test func primaryNamesOutrankAliasMatches() throws {
+        let response = try JSONDecoder().decode(MB.SearchResponse.self, from: fixture("mb-artist-gorill-prefix"))
+        let rows = (response.artists ?? []).map(MusicBrainzRegistry.suggestion(artist:))
+        let ranked = SuggestionRanker(query: "gorill").merge(library: [], registry: rows)
+        #expect(ranked.first?.title == "Gorillaz")
+        let lupe = try #require(ranked.firstIndex { $0.title == "Lupe Fiasco" })
+        let zoe = try #require(ranked.firstIndex { $0.title == "Gorilla Zoe" })
+        #expect(zoe < lupe)
+    }
+}
