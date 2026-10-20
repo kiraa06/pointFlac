@@ -10,7 +10,8 @@ import PFCore
 /// in-flight `start` or `seek` call keeps it alive), and that last `stop()` would otherwise silence its successor.
 ///
 /// The lock also serialises output calls across pipelines, since each pipeline serialises only its own. And it lets
-/// the main actor read `hardwareSideSampleRate` while a decode thread may be configuring the output.
+/// the main actor read `hardwareSideSampleRate` and `hardwareSideChannels` while a decode thread may be configuring the
+/// output.
 ///
 /// Lock order: a pipeline's own output lock, then this one. Nothing is called back while this lock is held.
 final class OutputArbiter: @unchecked Sendable {
@@ -39,6 +40,11 @@ final class OutputArbiter: @unchecked Sendable {
     /// The output's hardware-side rate after its last `configure`.
     var hardwareSideSampleRate: Int? {
         lock.withLock { output.hardwareSideSampleRate }
+    }
+
+    /// The output's hardware-side channel count after its last `configure`.
+    var hardwareSideChannels: Int? {
+        lock.withLock { output.hardwareSideChannels }
     }
 
     fileprivate func revoke(_ id: UInt64) {
@@ -105,5 +111,9 @@ final class OutputLease: AudioOutput, Sendable {
 
     var hardwareSideSampleRate: Int? {
         arbiter.withOutput(for: id) { $0.hardwareSideSampleRate } ?? nil
+    }
+
+    var hardwareSideChannels: Int? {
+        arbiter.withOutput(for: id) { $0.hardwareSideChannels } ?? nil
     }
 }

@@ -175,6 +175,9 @@ final class DecodeSession: @unchecked Sendable {
     /// Opens `first`, or the first item after it that opens, positioned at `frame` (clamped to the item). A seek
     /// within the current item reuses its decoder. Each failure becomes an `.itemFailed` at the coming boundary, and
     /// the next item is tried from its start. Nil when the queue runs out.
+    ///
+    /// An item v1 does not play (`ChannelPolicy`: more than two channels) fails here, on the decoder's own format, so
+    /// the output is never configured for it and nothing of it reaches the ring.
     private func open(
         from first: Int, frame: Int64, entry: Entry
     ) -> (decoder: PCMDecoding, index: Int, frame: Int64, entry: Entry)? {
@@ -188,6 +191,9 @@ final class DecodeSession: @unchecked Sendable {
                     candidate = decoder
                 } else {
                     candidate = try core.makeDecoder(items[target])
+                }
+                guard ChannelPolicy.isPlayable(candidate.format) else {
+                    throw Unplayable(description: ChannelPolicy.unsupportedMessage)
                 }
                 if frame != 0 || entry == .seek {
                     let total = candidate.totalFrames
@@ -525,6 +531,11 @@ final class DecodeSession: @unchecked Sendable {
         let microseconds = min(max(Double(frames) / rate * 1_000_000, 1_000), 8_000)
         _ = wakeup.wait(timeout: .now() + .microseconds(Int(microseconds)))
     }
+}
+
+/// An item the pipeline refuses to play. Its description is the `.itemFailed` message, word for word.
+private struct Unplayable: Error, CustomStringConvertible {
+    var description: String
 }
 
 /// Hands `negotiateRate`'s answer from its task to the decode thread, which blocks for it. Blocking is fine there:

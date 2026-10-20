@@ -20,6 +20,7 @@ public final class FakeOutput: AudioOutput, Sendable {
         var capturedFloat: [Float] = []
         var capturedInt32: [Int32] = []
         var hardwareSideSampleRate: Int?
+        var hardwareSideChannels: Int?
     }
 
     public let maximumFramesPerPull: Int
@@ -51,6 +52,13 @@ public final class FakeOutput: AudioOutput, Sendable {
     public var hardwareSideSampleRate: Int? {
         get { state.withLock { $0.hardwareSideSampleRate } }
         set { state.withLock { $0.hardwareSideSampleRate = newValue } }
+    }
+
+    /// What the output reports for its hardware side's channel count. Nil by default; a test sets 1 to play a mono
+    /// route under a stereo client, where the system downmixes.
+    public var hardwareSideChannels: Int? {
+        get { state.withLock { $0.hardwareSideChannels } }
+        set { state.withLock { $0.hardwareSideChannels = newValue } }
     }
 
     public func configure(_ plan: OutputPlan, channels: Int) throws {

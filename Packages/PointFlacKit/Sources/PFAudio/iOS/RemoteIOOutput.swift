@@ -45,6 +45,10 @@
         /// unit, which pointFlac must never allow silently. On the simulator it is the Mac output device's rate,
         /// whatever the session reports (spike S1). Nil before a successful `configure`, or if the unit does not say.
         public private(set) var hardwareSideSampleRate: Int?
+        /// The channel count on the unit's hardware side (output scope, bus 0), read with `hardwareSideSampleRate`.
+        /// Fewer channels than the client means the system downmixes after the unit (stereo into a mono route), which
+        /// the signal strip must disclose. Nil before a successful `configure`, or if the unit does not say.
+        public private(set) var hardwareSideChannels: Int?
         /// The strong reference behind the context's unretained `source`.
         private var renderSource: RenderSource?
         #if DEBUG
@@ -125,6 +129,7 @@
             precondition(channels > 0, "RemoteIOOutput needs at least one channel")
             stop()
             hardwareSideSampleRate = nil
+            hardwareSideChannels = nil
             // Harmless before the first `configure`. The stream format can only change on an uninitialised unit.
             AudioUnitUninitialize(unit)
             let bytesPerFrame = UInt32(channels * MemoryLayout<UInt32>.size)
@@ -146,6 +151,9 @@
                 unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &hardware, &size)
             if read == noErr, hardware.mSampleRate > 0 {
                 hardwareSideSampleRate = Int(hardware.mSampleRate.rounded())
+            }
+            if read == noErr, hardware.mChannelsPerFrame > 0 {
+                hardwareSideChannels = Int(hardware.mChannelsPerFrame)
             }
         }
 

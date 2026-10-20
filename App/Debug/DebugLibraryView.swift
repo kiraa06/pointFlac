@@ -5,7 +5,8 @@ import UniformTypeIdentifiers
 
 /// Plan 1's stand-in for the library: the imported tracks, what the latest import refused, and an Add button that
 /// opens the Files picker. Tapping a track plays it alone; Play All queues the library, for next, previous and gapless
-/// joins. Now Playing sits at the bottom.
+/// joins. A track v1 cannot play (multichannel, spec §5.3) is listed as "Not supported in v1" and cannot be tapped.
+/// Now Playing sits at the bottom.
 struct DebugLibraryView: View {
     /// The SDK has no `UTType.flac`; the extension resolves to the system's `org.xiph.flac`. Should it ever not
     /// resolve, the picker offers all audio, and the inbox still refuses anything that is not FLAC.
@@ -30,7 +31,7 @@ struct DebugLibraryView: View {
                         Button("Play All", systemImage: "play.square.stack") {
                             Task { await model.playAll() }
                         }
-                        .disabled(model.player == nil)
+                        .disabled(model.player == nil || !model.files.contains(where: \.isSupported))
                         .accessibilityIdentifier("playAllButton")
                     }
                     ForEach(model.files) { file in
@@ -39,7 +40,7 @@ struct DebugLibraryView: View {
                         } label: {
                             TrackRow(file: file)
                         }
-                        .disabled(model.player == nil)
+                        .disabled(model.player == nil || !file.isSupported)
                         .accessibilityIdentifier("trackRow-\(file.stem)")
                     }
                 }
@@ -86,7 +87,7 @@ struct DebugLibraryView: View {
     }
 }
 
-/// A track's title, with its artist and format under it.
+/// A track's title, with its artist and format under it, and a note when v1 cannot play it.
 private struct TrackRow: View {
     let file: ImportedFile
 
@@ -94,6 +95,9 @@ private struct TrackRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(file.title)
             Text(details).font(.footnote).foregroundStyle(.secondary)
+            if !file.isSupported {
+                Text("Not supported in v1").font(.footnote).foregroundStyle(.orange)
+            }
         }
     }
 

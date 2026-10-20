@@ -11,6 +11,9 @@ final class PlayerEngine {
     /// Seeks issued but not yet registered by the pipeline. Meanwhile its `position` is the old point, which must not
     /// overwrite the target the player already shows or remembers.
     var seeksInFlight = 0
+    /// The path negotiated for the track about to start (its `.planChanged`), waiting for that track's `trackStarted`.
+    /// The strip pairs a plan only with the track it was negotiated for, never with the one before it.
+    var negotiated: SignalPath?
     private(set) var isRetired = false
     private var lastCall: Task<Void, Never>?
 

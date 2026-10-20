@@ -195,6 +195,15 @@ private func mismatch(_ got: [Float], _ want: [Float]) -> String? {
     return "first difference at sample \(i): \(got[i]) ≠ \(want[i])"
 }
 
+/// The strip knows nothing about a path: no source, plan or hardware side.
+private func assertNoPath(_ signal: SignalState, sourceLocation: SourceLocation = #_sourceLocation) {
+    #expect(signal.source == nil, sourceLocation: sourceLocation)
+    #expect(signal.plan == nil, sourceLocation: sourceLocation)
+    #expect(signal.hardwareRate == nil, sourceLocation: sourceLocation)
+    #expect(signal.hardwareChannels == nil, sourceLocation: sourceLocation)
+    #expect(signal.indicator == .idle, sourceLocation: sourceLocation)
+}
+
 /// Waits, without pulling, until `condition` holds or `timeout` passes, and returns whether it held. Each check
 /// sleeps first, which hands the main actor to the player's event tasks.
 @MainActor
@@ -760,6 +769,196 @@ private final class Rig {
         before = rig.pulledFrames
         #expect(await rig.pump { rig.player.status == .ended })
         #expect(rig.pulledFrames - before == 4096)
+    }
+
+    // MARK: The strip outlives nothing it describes (final review C1, I3)
+
+    /// A failure clears what the strip shows about the path: the old track's plan must not describe nothing.
+    @Test func failureClearsTheSignalPath() async {
+        let output = FakeOutput()
+        output.hardwareSideChannels = 2
+        let rig = Rig(output: output)
+        await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.indicator == .pure && rig.player.signal.hardwareChannels == 2)
+
+        await rig.player.play([fixtureItem("s16-44100", id: "broken")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .failed("ioError") })
+        assertNoPath(rig.player.signal)
+        #expect(SignalStrip.text(rig.player.signal) == "No record")
+        #expect(rig.player.signal.port == .builtIn)
+    }
+
+    /// `play([])` leaves the player idle, with nothing on the strip.
+    @Test func emptyPlayClearsTheSignalPath() async {
+        let rig = Rig()
+        await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        await rig.player.play([], startingAt: 0)
+        #expect(rig.player.status == .idle)
+        assertNoPath(rig.player.signal)
+        #expect(SignalStrip.text(rig.player.signal) == "No record")
+    }
+
+    /// C1 through the player: a multichannel file never plays, and a queue of nothing else fails with the policy's
+    /// message.
+    @Test func multichannelQueueFails() async {
+        let rig = Rig()
+        await rig.player.play([fixtureItem("s16-48000-6ch")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .failed("Multichannel FLAC isn't supported yet") })
+        assertNoPath(rig.player.signal)
+        #expect(rig.output.plans.isEmpty)
+
+        await rig.player.play([fixtureItem("s16-48000-6ch"), fixtureItem("s24-48000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.currentIndex == 1)
+        #expect(rig.player.signal.source?.channels == 2)
+    }
+
+    /// A paused track change cues the new track: the strip shows it as starting, not with the old track's plan.
+    @Test func pausedTrackChangeShowsThePendingTrack() async {
+        let rig = Rig()
+        await rig.player.play([patternItem("a"), fixtureItem("s24-96000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.indicator == .pure)
+        rig.player.pause()
+        await rig.player.next()
+        #expect(rig.player.status == .paused && rig.player.currentIndex == 1)
+        #expect(rig.player.signal.source == AudioFormat(sampleRate: 96_000, bitsPerSample: 24, channels: 2))
+        #expect(rig.player.signal.plan == nil && rig.player.signal.hardwareRate == nil)
+        #expect(rig.player.signal.indicator == .pending)
+        #expect(SignalStrip.text(rig.player.signal) == "FLAC · 24-bit · 96 kHz · ● Starting…")
+
+        rig.player.resume()
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.plan?.clientSampleRate == 96_000)
+        #expect(rig.player.signal.indicator == .pure)
+    }
+
+    /// "Pure" must be earned by each start: until the new pipeline's plan arrives with its track, the strip reads
+    /// "Starting…", never the previous track's state.
+    @Test func startShowsPendingUntilTheTrackStarts() async {
+        let session = SuspendingSession()
+        let output = FakeOutput()
+        output.hardwareSideSampleRate = 48_000
+        let player = Player(
+            session: session, output: output, capabilities: OutputCapabilities(int32Passthrough: false),
+            nowPlaying: FakeNowPlaying(), makeDecoder: decoderForItem)
+        await player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { session.entered == [44_100] })
+        #expect(player.status == .preparing && player.signal.indicator == .pending)
+        session.releaseAll()
+        #expect(await eventually { player.status == .playing })
+        #expect(player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+
+        // A new start forgets the old plan at once; it is not left describing the new track.
+        await player.play([patternItem("b")], startingAt: 0)
+        #expect(await eventually { session.entered == [44_100, 44_100] })
+        #expect(player.status == .preparing)
+        #expect(player.signal.source == PatternDecoder.sourceFormat)
+        #expect(player.signal.plan == nil && player.signal.hardwareRate == nil)
+        #expect(player.signal.indicator == .pending)
+        #expect(SignalStrip.text(player.signal) == "FLAC · 16-bit · 44.1 kHz · ● Starting…")
+        session.releaseAll()
+        #expect(await eventually { player.status == .playing })
+    }
+
+    /// Stereo into a hardware side with one channel: the system downmixes, and the strip says so.
+    @Test func signalShowsADownmix() async {
+        let output = FakeOutput()
+        output.hardwareSideChannels = 1
+        let rig = Rig(output: output)
+        await rig.player.play([fixtureItem("s24-48000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.hardwareChannels == 1)
+        #expect(rig.player.signal.indicator == .downmixed(from: 2, to: 1))
+        #expect(SignalStrip.text(rig.player.signal) == "FLAC · 24-bit · 48 kHz · ● Downmixed 2→1")
+    }
+
+    // MARK: Refreshing the strip while nothing plays (ledger T13)
+
+    /// A notification that leaves the hardware at the negotiated rate must not overwrite the R17 hardware-side rate:
+    /// on the simulator that flipped "Resampled 44.1→48" to "Pure" while paused. Once the hardware really moves the
+    /// strip follows it, and when it comes back the hardware-side rate is shown again.
+    @Test func pausedRefreshKeepsTheHardwareSideRate() async {
+        let output = FakeOutput()
+        output.hardwareSideSampleRate = 48_000
+        let rig = Rig(output: output)
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+        rig.player.pause()
+
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.player.signal.hardwareRate == 48_000)
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+
+        rig.session.sampleRate = 96_000
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.player.signal.hardwareRate == 96_000)
+
+        rig.session.sampleRate = 44_100
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.player.signal.hardwareRate == 48_000)
+        #expect(rig.session.requestedRates == [44_100])
+    }
+
+    /// EarPods → DAC while paused: a 96 kHz track planned at 48 kHz, and the hardware now at 96 kHz. The strip must
+    /// never read "Resampled 96→96"; pointFlac's own 96→48 is what is shown.
+    @Test func pausedRouteSwapNeverShowsAResampleToTheSameRate() async {
+        let session = FakeSession(rateResponse: { _ in 48_000 })
+        session.currentPort = .wired("EarPods")
+        let rig = Rig(session: session)
+        await rig.player.play([fixtureItem("s24-96000")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
+        rig.player.pause()
+
+        session.sampleRate = 96_000
+        session.currentPort = .usb("DAC")
+        session.emit(.routeChanged(.newDeviceAvailable, .usb("DAC")))
+        #expect(await rig.barrier())
+        #expect(rig.player.status == .paused)
+        #expect(rig.player.signal.hardwareRate == 96_000)
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 96_000, to: 48_000)))
+        // The barrier leaves the volume below full scale, so the USB volume warning follows; not what this test is about.
+        #expect(SignalStrip.text(rig.player.signal).hasPrefix("FLAC · 24-bit · 96 kHz · ● Resampled 96→48"))
+    }
+
+    /// Unplugging while playing pauses, and takes the same refresh as a route change while paused: the speaker's rate
+    /// shows at once.
+    @Test func unplugWhilePlayingRefreshesTheRate() async {
+        let session = FakeSession()
+        session.currentPort = .wired("EarPods")
+        let rig = Rig(session: session)
+        await rig.player.play([patternItem("a")], startingAt: 0)
+        #expect(await eventually { rig.player.status == .playing })
+        #expect(rig.player.signal.indicator == .pure)
+
+        session.sampleRate = 48_000
+        session.currentPort = .builtIn
+        session.emit(.routeChanged(.oldDeviceUnavailable, .builtIn))
+        #expect(await eventually { rig.player.status == .paused })
+        #expect(rig.player.signal.hardwareRate == 48_000)
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
+    }
+
+    /// After the queue ended, the cued last track is refreshed like a paused one.
+    @Test func endedQueueRefreshesTheRate() async {
+        let rig = Rig()
+        await rig.player.play([fixtureItem("s16-44100")], startingAt: 0)
+        #expect(await rig.pump { rig.player.status == .ended })
+        #expect(rig.player.signal.indicator == .pure)
+
+        rig.session.sampleRate = 48_000
+        rig.session.emit(.routeChanged(.other, .builtIn))
+        #expect(await rig.barrier())
+        #expect(rig.player.status == .ended)
+        #expect(rig.player.signal.hardwareRate == 48_000)
+        #expect(rig.player.signal.indicator == .resampled(RateChange(from: 44_100, to: 48_000)))
     }
 
     /// Ruling 6: one session call at a time, in arrival order; a stopped pipeline's request never reaches the session.

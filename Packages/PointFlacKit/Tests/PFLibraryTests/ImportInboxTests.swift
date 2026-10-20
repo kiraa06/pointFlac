@@ -224,3 +224,20 @@ private struct CopyFailed: Error {}
     #expect(files.map(\.format.bitsPerSample) == [16, 32])
     #expect(await ImportInbox(libraryFolder: library.root.appending(path: "Missing")).list().isEmpty)
 }
+
+/// Spec §5.3: a multichannel file is imported and listed like any other, but marked as not supported in v1, so the
+/// UI can show it and refuse to play it.
+@Test func multichannelIsImportedButMarkedUnsupported() async throws {
+    let library = try TemporaryLibrary()
+    let inbox = ImportInbox(libraryFolder: library.folder)
+
+    let result = await inbox.importFiles([fixture("s16-48000-6ch"), fixture("s24-48000"), fixture("s16-44100-mono")])
+
+    #expect(result.rejected.isEmpty)
+    #expect(result.added.map(\.id) == ["s16-48000-6ch.flac", "s24-48000.flac", "s16-44100-mono.flac"])
+    #expect(result.added.map(\.isSupported) == [false, true, true])
+    let listed = await inbox.list()
+    let multichannel = try #require(listed.first { $0.id == "s16-48000-6ch.flac" })
+    #expect(multichannel.format.channels == 6 && !multichannel.isSupported)
+    #expect(listed.filter(\.isSupported).map(\.id) == ["s16-44100-mono.flac", "s24-48000.flac"])
+}

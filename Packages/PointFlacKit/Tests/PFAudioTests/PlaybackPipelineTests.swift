@@ -591,6 +591,29 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)
     }
 
+    /// C1: a file with more channels than v1 plays fails closed. It gets an `itemFailed` with the policy's message, the
+    /// output is never configured for it and nothing of it is rendered, and the queue moves on.
+    @Test func multichannelItemFailsClosed() async {
+        let alone = Rig()
+        await alone.play([item("s16-48000-6ch")])
+        await alone.playToEnd()
+        #expect(alone.log.events == [.itemFailed(0, "Multichannel FLAC isn't supported yet"), .queueEnded])
+        #expect(alone.output.plans.isEmpty && !alone.output.isStarted)
+        #expect(alone.output.capturedFloat.isEmpty && alone.output.capturedInt32.isEmpty)
+
+        let raw = Fixtures.rawSamples(Fixtures.named("s16-44100"))
+        let rig = Rig()
+        await rig.play([item("s16-48000-6ch"), item("s16-44100")])
+        await rig.playToEnd()
+        #expect(
+            rig.log.events == [
+                .itemFailed(0, "Multichannel FLAC isn't supported yet"), .planChanged(floatPlan(44_100)),
+                .trackStarted(1), .trackEnded(1), .queueEnded,
+            ])
+        #expect(rig.output.plans == [floatPlan(44_100)])
+        #expect(mismatch(rig.output.capturedFloat, floats(raw, bits: 16)) == nil)
+    }
+
     @Test func positionFollowsRenderedFrames() async {
         let rig = Rig()
         await rig.play([item("s24-48000", id: "a"), item("s24-48000", id: "b")])

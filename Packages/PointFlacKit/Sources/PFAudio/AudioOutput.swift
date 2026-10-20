@@ -20,11 +20,17 @@ public protocol AudioOutput: AnyObject {
     /// cannot. If it differs from the plan's client rate, the system resamples after pointFlac, and the signal strip
     /// must say so rather than show "Pure" (ruling R17). Read it only while no `configure` can run concurrently.
     var hardwareSideSampleRate: Int? { get }
+    /// The channel count of the output's hardware side after the last `configure`, when the output can tell; nil when
+    /// it cannot. Fewer channels than the client means the system downmixes after pointFlac (stereo into a mono route),
+    /// and the strip says so. Read it only while no `configure` can run concurrently.
+    var hardwareSideChannels: Int? { get }
 }
 
 extension AudioOutput {
     /// An output that cannot see its hardware side reports nothing, and the player falls back to the client rate.
     public var hardwareSideSampleRate: Int? { nil }
+    /// Nothing known: the strip then assumes no downmix, as it did before outputs could tell.
+    public var hardwareSideChannels: Int? { nil }
 }
 
 /// Why an output could not be set up or started. Each case carries the `OSStatus` the system returned.

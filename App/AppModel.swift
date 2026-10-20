@@ -93,14 +93,16 @@ final class AppModel {
         importSummary = "The picker failed: \(error.localizedDescription)"
     }
 
-    /// Plays `file` alone.
+    /// Plays `file` alone, if v1 can play it.
     func play(_ file: ImportedFile) async {
+        guard file.isSupported else { return }
         await player?.play([QueueItem(file)], startingAt: 0)
     }
 
-    /// Plays the whole library, in order, from the first track.
+    /// Plays the whole library, in order, from the first track, leaving out what v1 cannot play (multichannel files,
+    /// which would only fail one by one).
     func playAll() async {
-        await player?.play(files.map { QueueItem($0) }, startingAt: 0)
+        await player?.play(files.filter(\.isSupported).map { QueueItem($0) }, startingAt: 0)
     }
 
     #if DEBUG

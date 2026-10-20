@@ -18,6 +18,10 @@ public struct ImportedFile: Sendable, Hashable, Identifiable {
     /// Total frames from STREAMINFO, or 0 when the encoder did not record them.
     public var totalFrames: Int64
 
+    /// Whether v1 can play the file. A multichannel file is imported, per spec §5.3, but marked "not supported in v1"
+    /// and never played (`ChannelPolicy`). Derived from `format`, so it can never disagree with it.
+    public var isSupported: Bool { ChannelPolicy.isPlayable(format) }
+
     public init(
         id: String, url: URL, title: String, artist: String, album: String, format: AudioFormat, totalFrames: Int64
     ) {

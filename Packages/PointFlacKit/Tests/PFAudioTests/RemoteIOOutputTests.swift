@@ -213,6 +213,8 @@
             let hardware = streamFormat(output, kAudioUnitScope_Output)
             #expect(isClientFormat(client, .float32, rate: rate, channels: 2), "client side: \(describe(client))")
             #expect(output.hardwareSideSampleRate == hardware.map { Int($0.mSampleRate) })
+            #expect(output.hardwareSideChannels == hardware.map { Int($0.mChannelsPerFrame) })
+            #expect(output.hardwareSideChannels ?? 0 > 0, "hardware side: \(describe(hardware))")
             #if !targetEnvironment(simulator)
                 // Client rate == hardware rate, so RemoteIO has nothing to resample. The simulator's hardware side
                 // stays at the Mac device's rate instead (`reportsHardwareSideRate`).

@@ -55,7 +55,12 @@ public final class Player {
     /// Time into the current track. Updated at 10 Hz while playing, and at once on start, pause, seek and track change.
     public private(set) var position: Duration = .zero
     /// The signal path, for the strip. The plan and source come from the pipeline as it configures and starts tracks,
-    /// and the port and volume from the session. While paused on another track, it still shows the last one played.
+    /// and the port and volume from the session.
+    ///
+    /// "Pure" has to be earned by each start (final review I3). Every start shows its track as pending (no plan) until
+    /// the new pipeline's plan arrives with that track. A paused track change shows the cued track as pending too.
+    /// A failure, or `play([])`, clears the path altogether. Pause and the end of the queue keep the last track's path
+    /// on show, refreshed only when the hardware really moves (`refreshIdleHardwareRate`).
     public private(set) var signal: SignalState
 
     private let session: AudioSessionControlling
@@ -67,6 +72,9 @@ public final class Player {
 
     /// The pipeline playing now. Nil whenever nothing plays: idle, paused, ended or failed.
     @ObservationIgnored private var engine: PlayerEngine?
+    /// The negotiated path `signal` shows; nil whenever `signal.plan` is. Kept so the idle refresh can return to the
+    /// negotiated hardware-side rate once the hardware comes back to the negotiated rate.
+    @ObservationIgnored private var shownPath: SignalPath?
     /// Engines created so far; each takes the next number as its generation.
     @ObservationIgnored private var generations: UInt64 = 0
     /// Where the current engine started, or where playback will resume when paused or ended.
@@ -129,6 +137,7 @@ public final class Player {
             status = .idle
             currentIndex = nil
             position = .zero
+            clearSignal()
             nowPlaying.clear()
             return
         }
@@ -221,6 +230,7 @@ public final class Player {
             await launch(at: index, frame: 0).value
         case .paused:
             cue = Cue(index: index, frame: 0)
+            showPending(for: index)
             showCue(playing: false)
         case .idle, .failed:
             break
@@ -236,6 +246,8 @@ public final class Player {
         currentIndex = index
         position = queue[index].duration(ofFrames: frame)
         status = .preparing
+        // The new pipeline negotiates afresh, so nothing the last one established holds any more.
+        showPending(for: index)
         let engine = makeEngine()
         self.engine = engine
         let items = queue.map(\.playbackItem)
@@ -341,6 +353,7 @@ public final class Player {
         status = .failed(message)
         currentIndex = nil
         position = .zero
+        clearSignal()
         nowPlaying.clear()
     }
 
@@ -360,14 +373,23 @@ public final class Player {
         engine?.hasStarted = true
         switch event {
         case .planChanged(let plan):
-            // Together, from the same negotiation (T7). The hardware side, when the output can see it, is the honest
-            // rate: on the simulator it can stay at 48 kHz under a 44.1 kHz client (ruling R17).
-            signal.plan = plan
-            signal.hardwareRate = arbiter.hardwareSideSampleRate ?? plan.clientSampleRate
+            // Read the hardware side now, right after the pipeline configured the output for this plan: when the
+            // output can see it, it is the honest rate (on the simulator it can stay at 48 kHz under a 44.1 kHz
+            // client, ruling R17), and its channel count shows a downmix. The plan is for the track about to start,
+            // so it waits for that track's `trackStarted` and is shown with it (T7: plan and rates together). Until
+            // then the strip still describes what played last, or "Starting…".
+            engine?.negotiated = SignalPath(
+                plan: plan, hardwareRate: arbiter.hardwareSideSampleRate ?? plan.clientSampleRate,
+                hardwareChannels: arbiter.hardwareSideChannels)
         case .trackStarted(let index):
             guard queue.indices.contains(index) else { return }
             anyItemStarted = true
             signal.source = queue[index].format
+            // A gapless join keeps the running plan: it has no `planChanged` of its own.
+            if let path = engine?.negotiated {
+                engine?.negotiated = nil
+                show(path)
+            }
             status = .playing
             // A resumed track starts mid-way: the pipeline reports the frame it started from.
             let reported = engine?.pipeline.position
@@ -403,17 +425,16 @@ public final class Player {
             case .playing, .preparing:
                 if reason == .oldDeviceUnavailable {
                     pauseNow()
+                    refreshIdleHardwareRate()
                 } else if reason == .newDeviceAvailable || port != previous || hardwareRateMoved {
                     // The hardware may run at another rate now. Restart at the same point, so the client rate matches
                     // it again, rather than let iOS resample silently.
                     let point = currentPoint()
                     launch(at: point.index, frame: point.frame)
                 }
-            case .paused:
-                // Resume re-negotiates. Until then the strip shows the rate the hardware runs at now.
-                let rate = session.sampleRate
-                if rate > 0 { signal.hardwareRate = rate }
-            case .idle, .ended, .failed:
+            case .paused, .ended:
+                refreshIdleHardwareRate()
+            case .idle, .failed:
                 break
             }
         case .interruptionBegan:
@@ -431,6 +452,19 @@ public final class Player {
         case .mediaServicesReset:
             resetMediaServices()
         }
+    }
+
+    /// While nothing plays (paused, or ended with the last track cued), the next start re-negotiates; until then the
+    /// strip follows the hardware, but only a real move. A notification that leaves the hardware at the rate the last
+    /// negotiation read back (a category change, the session's own activation) changes nothing: overwriting the
+    /// hardware-side rate with the session's rate then would flip the simulator's "Resampled 44.1→48" to "Pure" (R17).
+    /// When the hardware has moved, the strip shows the rate it runs at now. When it comes back to the negotiated rate,
+    /// the negotiated hardware-side rate is shown again. A pending track (no plan) has nothing to refresh.
+    private func refreshIdleHardwareRate() {
+        guard let path = shownPath, let settled = gate.settledRate else { return }
+        let live = session.sampleRate
+        guard live > 0 else { return }
+        signal.hardwareRate = live != settled ? live : path.hardwareRate
     }
 
     /// Whether the hardware has moved off the rate the last negotiation read back, with nothing negotiating now.
@@ -472,6 +506,35 @@ public final class Player {
         }
     }
 
+    // MARK: Signal path
+
+    /// Shows `path`, from the negotiation for the track that has just started.
+    private func show(_ path: SignalPath) {
+        shownPath = path
+        signal.plan = path.plan
+        signal.hardwareRate = path.hardwareRate
+        signal.hardwareChannels = path.hardwareChannels
+    }
+
+    /// Shows `queue[index]` as on its way: its format as recorded at import, and no path until its pipeline has one.
+    private func showPending(for index: Int) {
+        signal.source = queue[index].format
+        forgetPath()
+    }
+
+    /// Nothing to describe: no track, no path. The port and volume stay, as the session reports them.
+    private func clearSignal() {
+        signal.source = nil
+        forgetPath()
+    }
+
+    private func forgetPath() {
+        shownPath = nil
+        signal.plan = nil
+        signal.hardwareRate = nil
+        signal.hardwareChannels = nil
+    }
+
     // MARK: Position
 
     /// 10 Hz while playing. Cancelled whenever the engine is retired, and on failure.
@@ -504,6 +567,14 @@ public final class Player {
         let elapsed = queue[index].duration(ofFrames: reported.frame)
         if elapsed != position { position = elapsed }
     }
+}
+
+/// What one negotiation established about the path: the plan, and what the output reports for its hardware side.
+struct SignalPath: Equatable {
+    var plan: OutputPlan
+    /// The output's hardware-side rate, or the plan's client rate when the output cannot tell.
+    var hardwareRate: Int
+    var hardwareChannels: Int?
 }
 
 /// A point in the queue: an item and a source frame in it.

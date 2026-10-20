@@ -80,8 +80,8 @@ final class PlaybackSmokeTests: XCTestCase {
         row.tap()
         let strip = app.staticTexts["signalStrip"]
         XCTAssertTrue(strip.waitForExistence(timeout: 2))
-        // The strip reads "No record" until the track starts.
-        let begins = NSPredicate(format: "label BEGINSWITH 'FLAC'")
+        // The strip reads "No record" until the track is on its way, then "● Starting…" until its pipeline has a plan.
+        let begins = NSPredicate(format: "label BEGINSWITH 'FLAC' AND NOT (label CONTAINS 'Starting')")
         let started = XCTNSPredicateExpectation(predicate: begins, object: strip)
         if XCTWaiter.wait(for: [started], timeout: 2) != .completed {
             let status = app.staticTexts["playerStatus"]
