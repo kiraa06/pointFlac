@@ -1,6 +1,6 @@
 # pointFlac
 
-pointFlac is a native iOS player for hi-res FLAC music, written in Swift 6 and SwiftUI. It decodes with libFLAC, asks the hardware for each file's sample rate and plays at the rate the hardware runs at, resampling itself when the two differ. Its signal strip shows whenever anything changes the audio, whether pointFlac, iOS or the route does it.
+pointFlac is a native iOS player for hi-res FLAC music, written in Swift 6 and SwiftUI. It decodes with libFLAC, asks the hardware for each file's sample rate and plays at the rate the hardware runs at, resampling itself when the two differ. Its signal strip says what pointFlac does to the audio (nothing, a resample, or a 32→24-bit reduction) and flags what it can detect beyond that: iOS resampling after the output, Bluetooth, AirPlay, downmixing and USB volume below 100%. Processing iOS applies without telling apps, such as speaker tuning, can't be detected.
 
 Status: audio core (plan 1 of 7).
 
