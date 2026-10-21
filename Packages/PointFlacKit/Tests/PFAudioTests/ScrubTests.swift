@@ -362,11 +362,15 @@ struct ScrubTests {
             rig.player.scrub(offsetSeconds: offset, speed: 1)
             await rig.pull(512)
         }
+        let needle = rig.player.pipeline?.scrubTap.voicePosition ?? 0
         rig.player.pause()
         #expect(!rig.player.isScrubbing && !rig.player.signal.scrubbing)
         #expect(rig.player.status == .paused)
+        // Pause keeps the needle that was heard, which the hand moved by its offset from where it took hold (plus
+        // the slip while the needle's music decoded: milliseconds on a device, more under the thread sanitizer).
         let paused = Double(rig.player.position / .seconds(1)) * 44_100
-        #expect(abs(paused - (Double(anchor) + offset * 44_100)) < 2_000)
+        #expect(abs(paused - needle) < 2)
+        #expect(abs(paused - (Double(anchor) + offset * 44_100)) < 0.1 * 44_100)
     }
 
     @Test("A seek while a paused record is held wins: the scrub ends and the cue is the seek's")

@@ -259,6 +259,9 @@ public final class RenderSource: @unchecked Sendable {
         case .hand:
             if let hand = tap.readHand(after: state.pointee.handSequence) {
                 state.pointee.handSequence = hand.sequence
+                // Offsets count from where the voice took over. A playing record's ring plays on for the few
+                // milliseconds the needle's music takes to decode, so the record slips that much under the finger:
+                // pulling the needle back to where the hand took hold would zip audibly.
                 var target = max(0, state.pointee.start + hand.offset)
                 if window.totalFrames > 0 { target = min(target, Double(window.totalFrames)) }
                 voice.hand(target: target, speed: hand.speed)
