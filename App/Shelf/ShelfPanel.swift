@@ -401,7 +401,10 @@ struct ShelfPanel: View {
             guard let lower = AttributedString.Index(range.lowerBound, within: attributed),
                 let upper = AttributedString.Index(range.upperBound, within: attributed)
             else { continue }
-            attributed[lower..<upper].backgroundColor = Color.yellow.opacity(theme.isDark ? 0.35 : 0.45)
+            attributed[lower..<upper].backgroundColor =
+                theme.isMonochrome
+                ? Color(white: theme.isDark ? 1 : 0.4).opacity(0.3)
+                : Color.yellow.opacity(theme.isDark ? 0.35 : 0.45)
             attributed[lower..<upper].font = .subheadline.bold()
         }
         return attributed

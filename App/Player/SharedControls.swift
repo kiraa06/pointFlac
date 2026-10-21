@@ -154,7 +154,8 @@ struct SharedControls: View {
                     .overlay(alignment: .topTrailing) {
                         if !playback.upNext.isEmpty {
                             Text("\(playback.upNext.count)").font(.caption2.bold()).padding(3)
-                                .background(Circle().fill(theme.ok)).foregroundStyle(.black)
+                                .background(Circle().fill(theme.ok)).foregroundStyle(
+                                    theme.isMonochrome ? theme.playGlyph : .black)
                         }
                     }
             }
@@ -185,7 +186,7 @@ struct ProgressRow: View {
     private var player: Player { playback.player }
 
     /// The playing record's colours: the played part of the bar is drawn in them.
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac") }
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
 
     var body: some View { progress }
 
@@ -442,6 +443,7 @@ struct UpNextSheet: View {
                         AlbumLine(album: entry.album)
                             .swipeActions {
                                 Button("Remove", role: .destructive) { playback.removeUpNext(entry) }
+                                    .monoDestructive()
                             }
                     }
                     .onMove { playback.moveUpNext(from: $0, to: $1) }
@@ -468,7 +470,7 @@ struct AlbumLine: View {
             }
             Spacer()
             Text(album.bestFormat.replacingOccurrences(of: "FLAC ", with: ""))
-                .font(Typeface.mono).foregroundStyle(.green)
+                .font(Typeface.mono).monoForeground(.green)
         }
     }
 }

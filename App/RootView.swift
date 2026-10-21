@@ -1,5 +1,6 @@
 import PFAudio
 import SwiftUI
+import UIKit
 
 enum AppTab: Hashable {
     case player, getMusic, downloads, settings
@@ -10,6 +11,7 @@ enum AppTab: Hashable {
 struct RootView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
+    @AppStorage("monochrome") private var monochrome = false
     @State private var tab: AppTab = Self.launchTab
     @Environment(\.scenePhase) private var scenePhase
     @State private var grace = BackgroundGrace()
@@ -31,6 +33,12 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(appearance.colorScheme)
+        // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
+        // colour of their own read the flag. The look switches live, over a short fade.
+        .tint(monochrome ? Theme.monochromeInk : nil)
+        .environment(\.isMonochrome, monochrome)
+        .animation(.easeInOut(duration: 0.3), value: monochrome)
+        .onChange(of: monochrome, initial: true) { _, on in Self.tintWindows(on) }
         .task { await model.load() }
         .onChange(of: scenePhase) { old, new in
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
@@ -49,6 +57,14 @@ struct RootView: View {
         }
         .onChange(of: model.player.currentIndex) { old, new in
             model.playback.playerTrackChanged(from: old, to: new)
+        }
+    }
+
+    /// UIKit-hosted pieces (alerts) take their tint from the window, not from SwiftUI's `.tint`.
+    private static func tintWindows(_ monochrome: Bool) {
+        let tint = monochrome ? UIColor(Theme.monochromeInk) : nil
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for window in scene.windows { window.tintColor = tint }
         }
     }
 

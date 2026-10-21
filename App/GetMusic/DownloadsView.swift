@@ -4,6 +4,8 @@ import SwiftUI
 /// done only after validation and saving; the states come from the finder as words.
 struct DownloadsView: View {
     let finder: any MusicFinding
+    @Environment(\.isMonochrome) private var mono
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         NavigationStack {
@@ -35,11 +37,12 @@ struct DownloadsView: View {
                     .swipeActions {
                         if row.state.hasPrefix("Failed") || row.state.hasPrefix("Cancelled") {
                             Button("Retry", systemImage: "arrow.clockwise") { finder.retryDownload(row.id) }
-                                .tint(.blue)
+                                .tint(mono ? .primary : .blue)
                         } else if !row.state.hasPrefix("Done") {
                             Button("Cancel", systemImage: "xmark", role: .destructive) {
                                 finder.cancelDownload(row.id)
                             }
+                            .monoDestructive()
                         }
                     }
                 }
@@ -61,8 +64,9 @@ struct DownloadsView: View {
     }
 
     private func color(_ state: String) -> Color {
-        if state.hasPrefix("Done") { return .green }
-        if state.hasPrefix("Failed") { return .orange }
-        return .secondary
+        let tone: Color? =
+            state.hasPrefix("Done") ? .green : state.hasPrefix("Failed") ? .orange : nil
+        guard let tone else { return .secondary }
+        return mono ? tone.monochrome(dark: scheme == .dark) : tone
     }
 }
