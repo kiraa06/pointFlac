@@ -356,9 +356,15 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     /// The flow capsule's word: the name, short enough for the row.
     var capsuleName: String { self == .correction ? "Correction" : name }
 
-    /// The order of the Sound tab's sections (ruling R4-UI-a): the EQ first, as the block used most, then the rest in
-    /// chain order. The flow row and the Pure card keep chain order (`allCases`), since they describe the signal path.
-    static let pageOrder: [SoundBlock] = [.eq] + allCases.filter { $0 != .eq }
+    /// The order of the Sound tab's sections (rulings R4-UI-a and R4-UI-b): the EQ first, as the block used most, then
+    /// the other tonal blocks (tone, headphone correction, crossfeed), then the ones set once (ReplayGain, the preamp,
+    /// the limiter, crossfade). The flow row and the Pure card keep chain order (`allCases`), since they describe the
+    /// signal path. Every block appears exactly once (checked in Debug builds), so a new one cannot go missing.
+    static let pageOrder: [SoundBlock] = {
+        let order: [SoundBlock] = [.eq, .tone, .correction, .crossfeed, .replayGain, .preamp, .limiter, .crossfade]
+        assert(order.count == allCases.count && Set(order) == Set(allCases), "pageOrder must list every block once")
+        return order
+    }()
 
     /// The block in a sentence: "Show headphone correction settings".
     var settingsName: String {

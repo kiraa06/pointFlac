@@ -5,8 +5,9 @@ import SwiftUI
 
 /// The Sound tab (spec §4.8), laid out like a pro tool: the Pure master switch, the signal flow with a capsule per
 /// block, the output meter and its clip LED, then each block with its own switch: the EQ first, as the block used
-/// most, then the rest in chain order (`SoundBlock.pageOrder`, ruling R4-UI-a). The flow row and the Pure card keep
-/// the chain's own order, since they describe the signal path; a capsule's menu scrolls to its block.
+/// most, then the other tonal blocks, then those set once (`SoundBlock.pageOrder`, rulings R4-UI-a and R4-UI-b). The
+/// flow row and the Pure card keep the chain's own order, since they describe the signal path; a capsule's menu scrolls
+/// to its block.
 ///
 /// Pure is the master. While it is on, every block row and capsule is greyed and inert, and the graph shows what Pure
 /// bypasses; the blocks keep their own switches, so turning Pure off brings them back as they were.

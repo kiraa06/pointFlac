@@ -265,7 +265,7 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == 'Off'"), evaluatedWith: tone)
         waitForExpectations(timeout: 2)
 
-        // The correction block sits far below the EQ: its capsule's menu scrolls there.
+        // The correction block sits below the EQ and Tone: its capsule's menu scrolls there.
         let capsule = app.descendants(matching: .any)["block-Headphone correction"]
         XCTAssertTrue(capsule.waitForExistence(timeout: 2))
         capsule.press(forDuration: 1.2)
