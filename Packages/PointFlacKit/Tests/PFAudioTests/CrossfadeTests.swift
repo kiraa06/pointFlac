@@ -1247,4 +1247,24 @@ private final class PlayerRig {
         #expect(rig.output.plans == [floatPlan(48_000), floatPlan(48_000)])
         #expect(rig.player.currentIndex == 1)
     }
+    /// Two overlaps mixed ahead in the ring and none heard yet: a seek back inside item 0 must not report item 1 ended
+    /// before it has started (re-review 2, R2-1; it did with `!=` in the seek's end-marker cut).
+    @Test func aSeekBeforeBackToBackOverlapsKeepsTheEventOrder() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(550, seconds: 0.4)
+        let c = tone(660, seconds: 2)
+        let rig = PipelineRig(["a": a, "b": b, "c": c])
+        await rig.pipeline.start(
+            [rig.item("a"), rig.item("b"), rig.item("c")], at: 0, fromFrame: 0, crossfade: always(1))
+        #expect(await rig.puller.pull(upTo: 80_000))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(rig.pipeline.position.index == 0)
+        await rig.pipeline.seek(toFrame: 1000)
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        let events = rig.log.events
+        let ended1 = events.firstIndex(of: .trackEnded(1))
+        let started1 = events.firstIndex(of: rig.started(1, "b"))
+        #expect(ended1 != nil && started1 != nil && ended1! > started1!, "events: \(events)")
+        #expect(events.filter { $0 == .trackEnded(1) }.count == 1, "events: \(events)")
+    }
 }

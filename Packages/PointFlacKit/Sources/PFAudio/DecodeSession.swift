@@ -1061,7 +1061,12 @@ final class DecodeSession: @unchecked Sendable {
         // off: its end fires now, after the incoming item's `trackStarted`, whether its overlap is still being mixed
         // or only its end marker waits. Before that the seek lands in the outgoing item, which overlaps afresh when
         // its end comes round again.
-        var cut = markers.filter { $0.overlapStart != nil && Self.item(of: $0.event) != rendering }.map(\.event)
+        // Only items before the one the seek lands in: an overlap mixed ahead but never heard belongs to an item that has
+        // not started, and must not report its end.
+        var cut = markers.filter { marker in
+            marker.overlapStart != nil
+                && (Self.item(of: marker.event).map { item in rendering.map { item < $0 } ?? true } ?? false)
+        }.map(\.event)
         if let overlap, rendering == overlap.index { cut.append(overlap.outgoingEnd ?? .trackEnded(index)) }
         if !cut.isEmpty { core.emit(cut, for: self) }
         let incoming = overlap.map {
