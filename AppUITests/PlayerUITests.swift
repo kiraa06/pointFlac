@@ -123,6 +123,26 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// Spec §4.3 and §6.4: turning the record scrubs (the music follows the hand), and letting go spins it back up and
+    /// plays on, with the strip back from "Scrubbing".
+    @MainActor
+    func testPlatterScrubPlaysOnAfterLettingGo() {
+        let app = launch(demoPlay: true)
+        let record = app.descendants(matching: .any)["deckRecord"]
+        XCTAssertTrue(record.waitForExistence(timeout: 8))
+        let playing = NSPredicate(format: "label == 'Pause'")
+        expectation(for: playing, evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 5)
+        let from = record.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5))
+        let to = record.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85))
+        from.press(forDuration: 0.4, thenDragTo: to, withVelocity: .slow, thenHoldForDuration: 0.4)
+        let settled = NSPredicate { _, _ in
+            app.buttons["playButton"].label == "Pause" && !app.buttons["signalStrip"].label.contains("Scrubbing")
+        }
+        expectation(for: settled, evaluatedWith: nil)
+        waitForExpectations(timeout: 6)
+    }
+
     @MainActor
     func testGetMusicSuggestionsAppearAsYouType() {
         let app = launch()

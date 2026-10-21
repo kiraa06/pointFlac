@@ -91,15 +91,31 @@ struct DeckStage: View {
     @State private var armDrag: Double?
     @State private var snapTrack: Int?
     @State private var jog: Jog?
+    @State private var holdTimer: Task<Void, Never>?
     @State private var flip = 0.0
     @State private var restTick = 0
 
-    /// A finger on the record: where the record was when grabbed, and how far it has turned since.
+    /// A finger on the record. Until it engages (it moves, or holds still for `holdToEngage`) it may still be a tap,
+    /// and the record carries on as it was. Once engaged, the hand holds the record: the picture follows the finger
+    /// and the music follows the hand.
     struct Jog {
         var baseAngle: Double
         var lastFinger: Double
         var degrees: Double
+        var lastTime: Date
+        /// The hand's turning speed, smoothed over a few touches, in degrees per second.
+        var velocity: Double
+        var engaged: Bool
+        let began: Date
+        /// How far the finger has moved, in points.
+        var travel: CGFloat
+        var lastLocation: CGPoint
     }
+
+    /// A finger that holds still this long holds the record (a playing one brakes to a stop under it).
+    static let holdToEngage: Duration = .milliseconds(150)
+    /// A finger that moves this far holds the record at once.
+    static let travelToEngage: CGFloat = 3
 
     var body: some View {
         GeometryReader { proxy in
@@ -171,7 +187,7 @@ struct DeckStage: View {
     }
 
     private func recordAngle(_ now: Double) -> Double {
-        if let jog { return jog.baseAngle + jog.degrees }
+        if let jog, jog.engaged { return jog.baseAngle + jog.degrees }
         return spin.angle(at: now)
     }
 
@@ -246,12 +262,12 @@ struct DeckStage: View {
             .shadow(color: .black.opacity(0.35), radius: 8, y: 5)
             .contentShape(Circle())
             .gesture(jogGesture(layout))
-            .onTapGesture { tapRecord() }
             .position(layout.recordCenter)
             .accessibilityElement()
             .accessibilityLabel("Record, \(album.title)")
             .accessibilityHint("Turn to scrub. Tap while the needle is up to turn it over.")
             .accessibilityIdentifier("deckRecord")
+            .accessibilityAction { tapRecord() }
             .accessibilityAction(named: "Back 5 seconds") { jogBy(-5) }
             .accessibilityAction(named: "Forward 5 seconds") { jogBy(5) }
             .id(album.id)
@@ -312,7 +328,7 @@ struct DeckStage: View {
             )
             .position(x: layout.size.width * 0.32, y: layout.size.height * 0.2)
             .allowsHitTesting(false)
-        } else if let jog {
+        } else if let jog, jog.engaged {
             let offset = JogMath.seconds(forDegrees: jog.degrees)
             let target = max(0, playback.player.position.seconds + offset)
             Loupe(
@@ -360,28 +376,68 @@ struct DeckStage: View {
             }
     }
 
+    /// The record under a finger (spec §4.3): turn it to scrub (the music follows the hand, one turn is 1.8 s), hold it
+    /// still to stop it, let go and it spins back up. A quick touch that does not move is a tap, which turns the
+    /// record over while the needle is up.
     private func jogGesture(_ layout: DeckLayout) -> some Gesture {
-        DragGesture(minimumDistance: 4, coordinateSpace: .local)
+        DragGesture(minimumDistance: 0, coordinateSpace: .local)
             .onChanged { value in
                 let r = layout.recordRadius
                 let finger = atan2(value.location.y - r, value.location.x - r) * 180 / .pi
-                if var current = jog {
-                    current.degrees += JogMath.delta(from: current.lastFinger, to: finger)
-                    current.lastFinger = finger
+                guard var current = jog else {
+                    jog = Jog(
+                        baseAngle: 0, lastFinger: finger, degrees: 0, lastTime: value.time, velocity: 0,
+                        engaged: false, began: value.time, travel: 0, lastLocation: value.location)
+                    holdTimer?.cancel()
+                    holdTimer = Task {
+                        try? await Task.sleep(for: Self.holdToEngage)
+                        guard !Task.isCancelled else { return }
+                        engageJog()
+                    }
+                    return
+                }
+                current.travel += hypot(
+                    value.location.x - current.lastLocation.x, value.location.y - current.lastLocation.y)
+                current.lastLocation = value.location
+                let delta = JogMath.delta(from: current.lastFinger, to: finger)
+                current.lastFinger = finger
+                let dt = value.time.timeIntervalSince(current.lastTime)
+                current.lastTime = value.time
+                if current.engaged {
+                    current.degrees += delta
+                    if dt > 0 { current.velocity = current.velocity * 0.5 + delta / dt * 0.5 }
                     jog = current
+                    playback.scrub(degrees: current.degrees, degreesPerSecond: current.velocity)
                 } else {
-                    let now = Date.timeIntervalSinceReferenceDate
-                    jog = Jog(baseAngle: spin.angle(at: now), lastFinger: finger, degrees: 0)
+                    jog = current
+                    if current.travel >= Self.travelToEngage { engageJog() }
                 }
             }
             .onEnded { _ in
+                holdTimer?.cancel()
+                holdTimer = nil
                 guard let ended = jog else { return }
                 jog = nil
+                guard ended.engaged else {
+                    tapRecord()
+                    return
+                }
                 let now = Date.timeIntervalSinceReferenceDate
                 spin.place(at: ended.baseAngle + ended.degrees, time: now, spinning: false)
                 spin.setSpinning(playback.isPlaying, at: now)
-                jogBy(JogMath.seconds(forDegrees: ended.degrees))
+                playback.endScrub(spinUpSeconds: spin.spinUpSeconds)
             }
+    }
+
+    /// The finger takes hold of the record: the picture stops under it, where it was, and the music follows the hand.
+    private func engageJog() {
+        guard var current = jog, !current.engaged else { return }
+        current.engaged = true
+        current.baseAngle = spin.angle(at: Date.timeIntervalSinceReferenceDate)
+        current.degrees = 0
+        current.velocity = 0
+        jog = current
+        playback.beginScrub()
     }
 
     private func jogBy(_ seconds: Double) {

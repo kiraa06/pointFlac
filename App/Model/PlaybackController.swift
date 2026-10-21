@@ -172,6 +172,25 @@ final class PlaybackController {
         await play(fromTrack: layout.sides[side].tracks.lowerBound + local, at: offset)
     }
 
+    // MARK: A finger on the record
+
+    /// The hand holds the record (spec §4.3): from now until `endScrub`, the music follows it.
+    func beginScrub() {
+        player.beginScrub()
+    }
+
+    /// The hand has turned the record `degrees` since it took hold (clockwise forward), turning it at
+    /// `degreesPerSecond` now.
+    func scrub(degrees: Double, degreesPerSecond: Double) {
+        player.scrub(
+            offsetSeconds: JogMath.seconds(forDegrees: degrees), speed: degreesPerSecond / SpinModel.fullSpeed)
+    }
+
+    /// The hand let go: a playing record spins back up over `spinUpSeconds`, a paused one stays where it was left.
+    func endScrub(spinUpSeconds: Double) {
+        player.endScrub(spinUpSeconds: spinUpSeconds)
+    }
+
     /// Seeks within the playing track (the progress bar).
     func seek(to seconds: Double) async {
         await perform { [weak self] in
