@@ -61,12 +61,21 @@ public struct DownloadQueueStore: Sendable {
     }
 
     /// Writes atomically, so a crash mid-write leaves the previous queue rather than half a file. The queue says
-    /// what the user downloads, so it is encrypted while the device is locked and never leaves it in a backup.
+    /// what the user downloads, so it is encrypted at rest and never leaves the device in a backup.
+    ///
+    /// Protection class: "until first user authentication", not "complete". pointFlac keeps playing and downloading
+    /// with the screen locked, and a complete-protection file cannot be written then, so every state change while
+    /// locked would fail. macOS (host tests) has no data-protection classes for this file, so none is requested there.
     public func save(_ items: [DownloadItem]) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(Snapshot(version: 1, items: items))
-        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        #if os(iOS)
+            let options: Data.WritingOptions = [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+        #else
+            let options: Data.WritingOptions = [.atomic]
+        #endif
+        try data.write(to: url, options: options)
         var file = url
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
