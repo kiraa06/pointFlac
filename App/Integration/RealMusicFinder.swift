@@ -128,6 +128,44 @@ final class RealMusicFinder: MusicFinding {
         Task { _ = await manager.retry(job) }
     }
 
+    /// A row stands for every job of its track, so every finished one goes with it: an older job left behind would
+    /// surface as the row again. Jobs still running are the manager's to keep; it refuses to remove them.
+    func removeDownload(_ id: DownloadRow.ID) {
+        removeJobs { Self.rowID($0.track) == id }
+    }
+
+    /// Works on rows, as the list shows them: a row is cleared when its newest job is finished (published) or failed
+    /// (failed or cancelled), and with it go all its track's final jobs, as in `removeDownload`. Clearing by job would
+    /// let an older job of another state surface as the row ("Clear Finished" turning a row into "Failed").
+    /// The library keeps every published song.
+    func clearDownloads(finished: Bool, failed: Bool) {
+        var newest: [String: DownloadState] = [:]
+        // Oldest first, so each track's newest job is the last one written.
+        for item in observer.items { newest[Self.rowID(item.track)] = item.state }
+        let rows = Set(
+            newest.compactMap { row, state -> String? in
+                let cleared =
+                    switch state {
+                    case .published: finished
+                    case .failed, .cancelled: failed
+                    case .queued, .downloading, .waiting, .validating, .saving: false
+                    }
+                return cleared ? row : nil
+            })
+        guard !rows.isEmpty else { return }
+        removeJobs { rows.contains(Self.rowID($0.track)) }
+    }
+
+    /// Takes the final jobs matching `include` off the manager's list.
+    private func removeJobs(where include: (DownloadItem) -> Bool) {
+        let jobs = observer.items.filter { $0.state.isFinal && include($0) }.map(\.id)
+        guard !jobs.isEmpty else { return }
+        let manager = manager
+        Task {
+            for job in jobs { await manager.remove(job) }
+        }
+    }
+
     /// The manager's job behind a Downloads row: the newest for that track, as `downloads` shows.
     private func latestJob(for rowID: DownloadRow.ID) -> String? {
         observer.items.last { Self.rowID($0.track) == rowID }?.id

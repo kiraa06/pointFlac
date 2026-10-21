@@ -14,7 +14,7 @@ private func track(
             albumArtist: albumArtist, artist: artist, album: album, compilation: false, folder: "f"),
         discNumber: disc, trackNumber: number, year: year,
         format: AudioFormat(sampleRate: rate, bitsPerSample: bits, channels: 2), totalFrames: Int64(rate) * 3,
-        artworkID: nil)
+        artworkID: nil, isInLibraryFolder: true)
 }
 
 @Test func albumKeysFoldCaseAccentsAndSpaces() {

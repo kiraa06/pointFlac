@@ -201,6 +201,95 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 10)
     }
 
+    /// A finished download can be swiped off the list, and the footer says its song stays in the library. Clear
+    /// shows only while there is something to clear.
+    @MainActor
+    func testFinishedDownloadCanBeRemoved() {
+        let app = launch()
+        app.tabBars.buttons["Get Music"].tap()
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("test\n")
+        let download = app.buttons["download-ia-Test-1"]
+        XCTAssertTrue(download.waitForExistence(timeout: 4))
+        download.tap()
+        app.tabBars.buttons["Downloads"].tap()
+        let row = app.descendants(matching: .any)["downloadRow-ia-Test-1"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        expectation(for: NSPredicate(format: "label CONTAINS 'Done'"), evaluatedWith: row)
+        waitForExpectations(timeout: 12)
+        XCTAssertTrue(app.staticTexts["Removing a finished download keeps the song in your library."].exists)
+        XCTAssertTrue(app.buttons["clearDownloads"].exists)
+
+        row.swipeLeft()
+        // A long swipe runs the only action at once; a short one shows its button.
+        let remove = app.buttons["Remove"]
+        if remove.waitForExistence(timeout: 2) { remove.tap() }
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
+        waitForExpectations(timeout: 3)
+        XCTAssertFalse(app.buttons["clearDownloads"].exists)
+    }
+
+    /// Kiran's request: an album can be deleted from the shelf. The fixtures were imported into the app's own library
+    /// folder, so the dialog deletes them from the iPhone, and the sleeve leaves the crate while the others stay. The
+    /// next launch's preload imports them again, so no other test misses them.
+    @MainActor
+    func testDeleteAlbumFromTheShelf() {
+        let app = launch()
+        openShelf(app)
+        let front = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(front.waitForExistence(timeout: 3))
+        let deleted = front.label
+        XCTAssertFalse(deleted.isEmpty)
+        front.press(forDuration: 1.2)
+        let delete = app.buttons["Delete Album…"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let confirm = app.buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        let onlyDeletes = NSPredicate(format: "label BEGINSWITH 'Deletes ' AND label ENDSWITH ' from this iPhone.'")
+        XCTAssertTrue(app.staticTexts.matching(onlyDeletes).firstMatch.exists)
+        confirm.tap()
+
+        let sleeve = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", deleted)).firstMatch
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: sleeve)
+        waitForExpectations(timeout: 5)
+        let next = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(next.waitForExistence(timeout: 3))
+        XCTAssertNotEqual(next.label, deleted)
+        XCTAssertTrue(app.descendants(matching: .any)["sleeve-1"].exists)
+        // Everything went, so the shelf has nothing to report as left behind.
+        XCTAssertFalse(app.staticTexts["importNote"].exists)
+    }
+
+    /// Deleting the record that is playing stops it and empties the platter, so nothing tries to play a deleted file.
+    @MainActor
+    func testDeletingThePlayingAlbumEmptiesTheDeck() {
+        let app = launch(demoPlay: true)
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        openShelf(app)
+        let field = app.textFields["shelfSearch"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("night drive")
+        let result = app.buttons["result-album-Night Drive"]
+        XCTAssertTrue(result.waitForExistence(timeout: 2))
+        result.press(forDuration: 1.2)
+        let delete = app.buttons["Delete Album…"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let confirm = app.buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
+
+        let screen = app.descendants(matching: .any)["deckScreen"]
+        expectation(for: NSPredicate(format: "label BEGINSWITH 'NO RECORD'"), evaluatedWith: screen)
+        waitForExpectations(timeout: 5)
+        XCTAssertFalse(app.buttons["result-album-Night Drive"].exists)
+    }
+
     /// The crate's flick, measured: UIKit's scroll-deceleration hitch ratio while the coverflow decelerates. No
     /// baseline is set; the numbers land in the log. The simulator's figures only hint at the device's (spec §8
     /// wants < 1 ms/s at 120 Hz on the iPhone itself).

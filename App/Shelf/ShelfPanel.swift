@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 
 /// The Shelf (spec §4.6): search at the top, the filter chips, the crate, and the results under it. Local results
 /// update on every keystroke; the search runs in `onChange`, never in `body`, and the field shows how long it took.
-/// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next and Add to Up Next.
+/// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next, Add to Up Next and
+/// Delete, which asks first and says whether the songs leave this iPhone or only pointFlac.
 struct ShelfPanel: View {
     let library: any LibraryBrowsing
     /// For the online results that stream in under the local ones (spec §4.6).
@@ -24,11 +25,14 @@ struct ShelfPanel: View {
     @State private var front: AlbumCard.ID?
     @State private var crateFrame: CGRect = .zero
     @State private var importing = false
+    /// One line under the shelf about the latest import, or about songs a deletion could not take.
     @State private var importNote: String?
     /// Online results by provider name, for the current phrase.
     @State private var online: [(provider: String, rows: [RemoteResultRow])] = []
     /// Search was pressed for the current phrase.
     @State private var immediate = false
+    /// The album or song waiting for the user to confirm its deletion.
+    @State private var pendingRemoval: PendingRemoval?
     @FocusState private var searching: Bool
 
     /// The front sleeve's size: smaller while typing, so the results stay above the keyboard.
@@ -93,6 +97,15 @@ struct ShelfPanel: View {
             case .failure(let error):
                 importNote = "The picker failed: \(error.localizedDescription)"
             }
+        }
+        .confirmationDialog(
+            pendingRemoval?.title ?? "", isPresented: removalAsked, titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { removal in
+            Button(removal.action, role: .destructive) { delete(removal) }
+            Button("Cancel", role: .cancel) {}
+        } message: { removal in
+            Text(removal.message)
         }
     }
 
@@ -414,12 +427,49 @@ struct ShelfPanel: View {
         library.albums.first { $0.title == track.album && library.tracks(of: $0.id).contains { $0.id == track.id } }
     }
 
+    /// A sleeve's or a result's menu: for an album, or for its song `track` when a song row was held.
     @ViewBuilder
     private func upNextMenu(_ album: AlbumCard, from track: TrackRow.ID? = nil) -> some View {
         Button("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") {
             playback.playNext(album, startingAt: track)
         }
         Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(album, startingAt: track) }
+        Divider()
+        Button(track == nil ? "Delete Album…" : "Delete Song…", systemImage: "trash", role: .destructive) {
+            askToDelete(album, song: track)
+        }
+    }
+
+    // MARK: Deleting
+
+    private var removalAsked: Binding<Bool> {
+        Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } })
+    }
+
+    /// Opens the confirmation for `album` (all of it, the songs pointFlac can't play included), or for only its
+    /// `song`, saying what deleting would do.
+    private func askToDelete(_ album: AlbumCard, song: TrackRow.ID?) {
+        let plan = library.removalPlan(album: song == nil ? album.id : nil, tracks: song.map { [$0] } ?? [])
+        guard !plan.tracks.isEmpty else { return }
+        let title = song.flatMap { id in library.tracks(of: album.id).first { $0.id == id }?.title } ?? album.title
+        pendingRemoval = PendingRemoval(title: title, plan: plan)
+    }
+
+    /// The deck lets go of the songs first, so nothing plays a file as it is deleted; then the library removes them,
+    /// and the crate follows. The deck is asked again afterwards: the removal may have waited behind a scan, and the
+    /// record been put back on meanwhile from the crate, which still showed it. Songs still listed afterwards could
+    /// not be taken (a file that would not go, a database failure), and the shelf says so.
+    private func delete(_ removal: PendingRemoval) {
+        let tracks = removal.plan.tracks
+        Task {
+            await playback.willRemove(tracks: Set(tracks))
+            await library.remove(tracks: tracks)
+            await playback.willRemove(tracks: Set(tracks))
+            runSearch()
+            let left = library.removalPlan(album: nil, tracks: tracks)
+            let verb = left.deletes == 0 ? "removed" : "deleted"
+            importNote = left.tracks.isEmpty ? nil : "\(PendingRemoval.songs(left.tracks.count)) could not be \(verb)."
+        }
     }
 
     private var footer: some View {
@@ -440,6 +490,38 @@ struct ShelfPanel: View {
         }
         .padding(.vertical, 18)
         .padding(.horizontal, 16)
+    }
+}
+
+/// An album or a song the user asked to delete, and what that would do (`LibraryBrowsing.removalPlan`).
+private struct PendingRemoval {
+    let title: String
+    let plan: RemovalPlan
+
+    /// One sentence for each kind of song in the selection, so a mixed album says both. Songs pointFlac can't play
+    /// are not on the shelf, so the count names them rather than surprise anyone who counts the sleeve's songs.
+    var message: String {
+        var sentences: [String] = []
+        if plan.deletes > 0 {
+            sentences.append(
+                "Deletes \(Self.songs(plan.deletes)) from this iPhone\(Self.including(plan.unplayableDeletes)).")
+        }
+        if plan.removes > 0 {
+            let files = plan.removes == 1 ? "The file stays in its folder." : "The files stay in their folder."
+            sentences.append(
+                "Removes \(Self.songs(plan.removes)) from pointFlac\(Self.including(plan.unplayableRemoves)). \(files)")
+        }
+        return sentences.joined(separator: " ")
+    }
+
+    /// "Remove" when nothing would leave the iPhone, "Delete" otherwise.
+    var action: String { plan.deletes == 0 ? "Remove" : "Delete" }
+
+    static func songs(_ count: Int) -> String { count == 1 ? "1 song" : "\(count) songs" }
+
+    /// ", including 2 songs pointFlac can't play", or nothing when there are none.
+    private static func including(_ unplayable: Int) -> String {
+        unplayable == 0 ? "" : ", including \(songs(unplayable)) pointFlac can't play"
     }
 }
 

@@ -64,6 +64,9 @@ public enum LibraryError: Error, Equatable, Sendable, CustomStringConvertible {
 /// - `artwork`: one row per distinct stored cover.
 /// - `skipped`: files that were refused, with their size and modification date, so a rescan never reads them again
 ///   until they change.
+/// - `removed` (version 3): files in folders added in place that the user removed from the library. pointFlac never
+///   deletes those files, so without this a rescan would add them straight back. Like `skipped`, an entry holds only
+///   while the file's size and modification date are unchanged.
 final class LibraryStore {
     static let libraryFolderID: Int64 = 1
     /// A scan reads no more than this many files per folder: a bound on a hostile or mistaken folder pick. A folder
@@ -114,6 +117,15 @@ final class LibraryStore {
         """,
         // v2: a track whose iCloud file was evicted stays in the library, marked, instead of being removed.
         "ALTER TABLE tracks ADD COLUMN cloud_pending INTEGER NOT NULL DEFAULT 0;",
+        // v3: tracks the user removed from a folder added in place, whose files stay where they are.
+        """
+        CREATE TABLE removed(
+            folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+            rel_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            PRIMARY KEY(folder_id, rel_path));
+        """,
     ]
 
     /// Probed files per transaction: each batch is committed and published, so a scan killed part-way keeps what it
@@ -132,6 +144,11 @@ final class LibraryStore {
     private var scoped: [Int64: URL] = [:]
     /// For tests: how many files have been read in full (validated, tags, identity, cover).
     private(set) var probes = 0
+    /// Asks iCloud to download an evicted file. A stand-in for tests, which have no iCloud.
+    var startDownload: (URL) -> Void = { try? FileManager.default.startDownloadingUbiquitousItem(at: $0) }
+    /// For tests: thrown once inside the next removal's transaction, after its files are deleted, standing in for a
+    /// database failure.
+    var removalFault: (any Error)?
 
     init(databaseURL: URL, libraryFolder: URL, artworkFolder: URL, maxFileBytes: Int64) throws {
         database = try SQLiteDatabase(url: databaseURL)
@@ -321,15 +338,19 @@ final class LibraryStore {
     /// this pass, `gone`) is that track moved, and keeps its ID. Tracks whose file is gone from this folder are added
     /// to `gone`, unless the listing was incomplete or the file is only evicted to iCloud. A track whose file is now
     /// refused (replaced by something that is not FLAC) is removed at once; one that merely cannot be read now is
-    /// left as it is.
+    /// left as it is. A file refused before (`skipped`), or removed from the library by the user (`removed`), is
+    /// passed over unread until its size or modification date changes.
     ///
     /// Writes are committed every `batchSize` probed files, and `onBatchCommitted` runs after each commit.
     private func scan(folder: Int64, into report: inout ScanReport, gone: inout [String: KnownTrack]) throws {
         guard let root = roots[folder] else { return }
         let name = root.lastPathComponent
+        // Read before the listing, so the listing never asks iCloud for a file the user removed.
+        let removed = try rememberedFiles("removed", in: folder)
         let listing: Listing
         do {
-            listing = try enumerate(root: root, external: folder != Self.libraryFolderID)
+            listing = try enumerate(
+                root: root, external: folder != Self.libraryFolderID, leaveInCloud: Set(removed.keys))
         } catch {
             // The library folder before the first import does not exist yet, and holds nothing: not a fault.
             let empty = folder == Self.libraryFolderID && !FileManager.default.fileExists(atPath: root.path)
@@ -339,12 +360,12 @@ final class LibraryStore {
             return
         }
         if !listing.complete { report.incompleteFolders.append(name) }
-        report.pendingDownloads += listing.cloudPending.count
+        report.pendingDownloads += listing.cloudPending.subtracting(removed.keys).count
         let disk = listing.files
 
         let known = try knownTracks()
         let here = Dictionary(known.filter { $0.folderID == folder }.map { ($0.relativePath, $0) }) { a, _ in a }
-        let skipped = try skippedFiles(in: folder)
+        let skipped = try rememberedFiles("skipped", in: folder)
         let onDisk = Set(disk.map(\.relativePath))
         // Gone from this folder: candidates for a move, else removed at the end of the pass. Only a complete listing
         // proves a file gone, and an evicted iCloud file is not gone.
@@ -372,6 +393,17 @@ final class LibraryStore {
                     report.unchanged += 1
                     continue
                 }
+                if let taken = removed[file.relativePath] {
+                    // The user removed it from the library: left out, unread, while the file is as it was then.
+                    if taken.size == file.size, taken.modified == file.modified {
+                        report.unchanged += 1
+                        continue
+                    }
+                    // Changed since: read again like any new file, so it comes back.
+                    try database.query(
+                        "DELETE FROM removed WHERE folder_id = ? AND rel_path = ?",
+                        [.integer(folder), .text(file.relativePath)])
+                }
                 if probedInBatch >= batchSize {
                     try database.execute("COMMIT")
                     onBatchCommitted?()
@@ -392,9 +424,15 @@ final class LibraryStore {
                 report.cloudChanged.append(track.id)
             }
             if listing.complete {
+                // Files gone from the folder are forgotten: refused and removed alike. An evicted iCloud file is not
+                // gone: forgetting it would bring a removed file back once it downloads again.
+                let present = Self.jsonArray(onDisk.union(listing.cloudPending))
                 try database.query(
                     "DELETE FROM skipped WHERE folder_id = ? AND rel_path NOT IN (SELECT value FROM json_each(?))",
-                    [.integer(folder), .text(Self.jsonArray(onDisk))])
+                    [.integer(folder), .text(present)])
+                try database.query(
+                    "DELETE FROM removed WHERE folder_id = ? AND rel_path NOT IN (SELECT value FROM json_each(?))",
+                    [.integer(folder), .text(present)])
             }
             try database.execute("COMMIT")
         } catch {
@@ -587,10 +625,13 @@ final class LibraryStore {
             }
     }
 
-    private func skippedFiles(in folder: Int64) throws -> [String: (size: Int64, modified: Double)] {
+    /// The files `table` (`skipped` or `removed`) remembers in `folder`, by relative path, with the size and date they
+    /// had then.
+    private func rememberedFiles(_ table: String, in folder: Int64) throws -> [String: (size: Int64, modified: Double)]
+    {
         var result: [String: (size: Int64, modified: Double)] = [:]
         for row in try database.query(
-            "SELECT rel_path, size, mtime FROM skipped WHERE folder_id = ?", [.integer(folder)])
+            "SELECT rel_path, size, mtime FROM \(table) WHERE folder_id = ?", [.integer(folder)])
         {
             guard let path = row[0].string, let size = row[1].int, let modified = row[2].double else { continue }
             result[path] = (size, modified)
@@ -599,12 +640,13 @@ final class LibraryStore {
     }
 
     /// The `.flac` files under `root` (not hidden, not inside hidden folders or packages), with size and date, and the
-    /// iCloud files still to download (whose download is started here). Only names and attributes are read, never file
+    /// iCloud files still to download (whose download is started here, except for the paths in `leaveInCloud`: files
+    /// the user removed, which only need to be known as present). Only names and attributes are read, never file
     /// contents.
     ///
     /// Throws when `root` itself cannot be listed (missing, offline provider, no security scope). Any error below the
     /// root, or reaching `maxFilesPerFolder`, marks the listing incomplete, so the scan removes nothing from it.
-    private func enumerate(root: URL, external: Bool) throws -> Listing {
+    private func enumerate(root: URL, external: Bool, leaveInCloud: Set<String>) throws -> Listing {
         do {
             _ = try FileManager.default.contentsOfDirectory(atPath: root.path)
         } catch {
@@ -638,20 +680,21 @@ final class LibraryStore {
             }
             if name.hasPrefix(".") {
                 // "._Song.flac" AppleDouble files and other hidden names are never music. ".Song.flac.icloud" is an
-                // iCloud placeholder for "Song.flac": start its download, and a later scan reads it.
+                // iCloud placeholder for "Song.flac": start its download, and a later scan reads it. A file the user
+                // removed is left in the cloud.
                 let placeholder = name.dropFirst().dropLast(".icloud".count)
                 if name.hasSuffix(".icloud"), placeholder.lowercased().hasSuffix(".flac"), !placeholder.hasPrefix(".") {
                     let directory = (relative as NSString).deletingLastPathComponent
                     let real = directory.isEmpty ? String(placeholder) : "\(directory)/\(placeholder)"
                     listing.cloudPending.insert(real)
-                    try? FileManager.default.startDownloadingUbiquitousItem(at: root.appending(path: real))
+                    if !leaveInCloud.contains(real) { startDownload(root.appending(path: real)) }
                 }
                 continue
             }
             guard values?.isRegularFile == true, name.lowercased().hasSuffix(".flac") else { continue }
             if external, Self.isNotDownloaded(url) {
                 listing.cloudPending.insert(relative)
-                try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+                if !leaveInCloud.contains(relative) { startDownload(url) }
                 continue
             }
             let size = Int64(values?.fileSize ?? 0)
@@ -677,6 +720,121 @@ final class LibraryStore {
         return status != .current && status != .downloaded
     }
 
+    // MARK: Removing
+
+    /// Takes the tracks `ids` out of the library at the user's request. Unknown IDs are ignored.
+    ///
+    /// The track's folder in the database alone decides what happens to its file:
+    /// - In the library folder the file is the app's own copy (an import or a download). It is deleted, then its row,
+    ///   then each folder the deletion left empty, up to but never including the library folder. A file already gone
+    ///   (deleted in the Files app) only loses its row. A file that cannot be deleted keeps its track, so the library
+    ///   never hides a file that still takes space.
+    /// - In a folder added in place the file is the user's, and pointFlac never deletes it. Only the row goes, and the
+    ///   file is remembered in `removed` with the size and date the library last read, so a rescan skips it until it
+    ///   changes.
+    ///
+    /// Covers no track uses any more go too, rows and files, as after a scan. Files are deleted inside the database
+    /// transaction; should it roll back, the rows of files already deleted stay until a scan finds them gone, which
+    /// `Library.remove` runs at once. Only the transaction throws: once it commits, the removal is reported.
+    func remove(trackIDs ids: [String]) throws -> LibraryRemoval {
+        var removal = LibraryRemoval(deletedFiles: 0, removedFromLibrary: 0)
+        var emptied: Set<URL> = []
+        var kept = 0
+        try database.transaction {
+            for id in Set(ids).sorted() {
+                guard
+                    let row = try database.query(
+                        "SELECT folder_id, rel_path, size, mtime FROM tracks WHERE id = ?", [.text(id)]
+                    ).first,
+                    let folder = row[0].int, let path = row[1].string, let size = row[2].int,
+                    let modified = row[3].double
+                else { continue }
+                if folder == Self.libraryFolderID {
+                    guard let root = roots[folder], let file = Self.ownFile(path, in: root), Self.deleteOwnFile(file)
+                    else {
+                        kept += 1
+                        continue
+                    }
+                    try delete(id)
+                    removal.deletedFiles += 1
+                    emptied.insert(file.deletingLastPathComponent())
+                } else {
+                    try database.query(
+                        "INSERT OR REPLACE INTO removed(folder_id, rel_path, size, mtime) VALUES (?, ?, ?, ?)",
+                        [.integer(folder), .text(path), .integer(size), .real(modified)])
+                    try delete(id)
+                    removal.removedFromLibrary += 1
+                }
+            }
+            if let fault = removalFault {
+                removalFault = nil
+                throw fault
+            }
+            // As `removeGone` does after a scan: the rows first, in the transaction, then the files.
+            try database.query(
+                "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+        }
+        // Committed: nothing below throws, so the removal is always published. Should the covers that stay be
+        // unreadable, their files are left for the next scan's sweep rather than every cover deleted.
+        if let covers = try? database.query("SELECT id FROM artwork") {
+            artwork.removeAll(except: Set(covers.compactMap { $0[0].string }))
+        }
+        if let root = roots[Self.libraryFolderID] {
+            for folder in emptied { Self.removeEmptyFolders(from: folder, below: root) }
+        }
+        if kept > 0 {
+            Library.logger.error("Remove: \(kept, privacy: .public) file(s) could not be deleted; their tracks stay")
+        }
+        return removal
+    }
+
+    /// The library folder's file at `relativePath`, or nil when that path would lead out of the library folder: only
+    /// the app's own files are ever deleted. The last component is left unresolved, so a link is judged by where it
+    /// sits, never by where it points.
+    private static func ownFile(_ relativePath: String, in root: URL) -> URL? {
+        let file = root.appending(path: relativePath)
+        let name = file.lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..",
+            comparablePath(file.deletingLastPathComponent()).hasPrefix(comparablePath(root))
+        else { return nil }
+        return file
+    }
+
+    /// Deletes a file of the library folder. True when it is gone afterwards, deleted now or already; false when
+    /// something is still there: a file that could not be deleted, or anything but a file or a link (a folder that took
+    /// its name). A link is deleted itself, never what it points to.
+    private static func deleteOwnFile(_ url: URL) -> Bool {
+        let manager = FileManager.default
+        let type: FileAttributeType?
+        do {
+            // Not following a final link, unlike `fileExists`.
+            type = try manager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            return true
+        } catch {
+            return false
+        }
+        guard type == .typeRegular || type == .typeSymbolicLink else { return false }
+        do {
+            try manager.removeItem(at: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Removes `folder` if it is empty, then each parent that leaves empty, stopping below the library folder, which
+    /// always stays. `rmdir` only ever removes an empty folder, so a file that arrived meanwhile keeps its folder.
+    private static func removeEmptyFolders(from folder: URL, below root: URL) {
+        let top = comparablePath(root)
+        var current = folder.standardizedFileURL
+        while true {
+            let path = comparablePath(current)
+            guard path.hasPrefix(top), path.count > top.count, rmdir(current.path) == 0 else { return }
+            current = current.deletingLastPathComponent()
+        }
+    }
+
     // MARK: Reading
 
     /// Every track whose folder can be found this launch, as the catalog the UI and search see.
@@ -700,7 +858,8 @@ final class LibraryStore {
                     format: AudioFormat(
                         sampleRate: Int(row[10].int ?? 0), bitsPerSample: Int(row[11].int ?? 0),
                         channels: Int(row[12].int ?? 0)),
-                    totalFrames: row[13].int ?? 0, artworkID: row[15].string, isCloudPending: row[16].int == 1))
+                    totalFrames: row[13].int ?? 0, artworkID: row[15].string, isCloudPending: row[16].int == 1,
+                    isInLibraryFolder: folder == Self.libraryFolderID))
         }
         return LibraryCatalog(tracks: tracks)
     }
