@@ -35,6 +35,9 @@ targets:
         product: PFFlac
       - package: PointFlacKit
         product: PFAudio
+      # The Sound tab edits PFDSP's `SoundSettings` and draws its `SoundResponse`.
+      - package: PointFlacKit
+        product: PFDSP
       - package: PointFlacKit
         product: PFLibrary
       - package: PointFlacKit

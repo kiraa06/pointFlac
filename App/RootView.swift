@@ -45,6 +45,8 @@ struct RootView: View {
             // foreground). Launch already scans in `load()`.
             if old == .background, new != .background { Task { await model.reload() } }
             if new == .background, activeDownloads > 0 { grace.begin() }
+            // Leaving the foreground: the Sound settings' pending save is written now, not half a second later.
+            if new != .active { model.sound.flush() }
             if new == .active {
                 grace.end()
                 #if SOULSEEK
