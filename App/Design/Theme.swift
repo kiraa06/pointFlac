@@ -116,6 +116,8 @@ struct ArtPalette: Hashable {
     let night: Color
     let sun: Color
     let sea: Color
+    /// `base`'s hue, deep enough to draw a line with on a light background (the progress wave in light mode).
+    let line: Color
 
     /// A stable palette from any string (the album's id): the same album always gets the same sleeve.
     init(seed: String) {
@@ -130,5 +132,6 @@ struct ArtPalette: Hashable {
         night = Color(hue: hue(0.6), saturation: 0.72, brightness: 0.27)
         sun = Color(hue: hue(0.1), saturation: 0.66, brightness: 0.97)
         sea = Color(hue: hue(0.45), saturation: 0.8, brightness: 0.71)
+        line = Color(hue: hue(0), saturation: 0.85, brightness: 0.68)
     }
 }

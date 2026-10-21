@@ -171,6 +171,9 @@ struct ProgressRow: View {
 
     private var player: Player { playback.player }
 
+    /// The playing record's colours: the played part of the bar is drawn in them.
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac") }
+
     var body: some View { progress }
 
     private var length: Double { playback.currentTrack?.durationSeconds ?? 0 }
@@ -181,11 +184,10 @@ struct ProgressRow: View {
         VStack(spacing: 6) {
             GeometryReader { proxy in
                 let fraction = length > 0 ? min(max(elapsed / length, 0), 1) : 0
-                ZStack(alignment: .leading) {
-                    Capsule().fill(theme.hairline)
-                    Capsule().fill(theme.ink).frame(width: proxy.size.width * fraction)
-                }
-                .frame(height: 4)
+                WaveProgress(
+                    fraction: fraction, flowing: player.status == .playing,
+                    played: theme.isDark ? palette.base : palette.line, rest: theme.hairline
+                )
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .gesture(
@@ -219,6 +221,55 @@ struct ProgressRow: View {
             .font(Typeface.mono.monospacedDigit())
             .foregroundStyle(theme.inkSecondary)
         }
+    }
+}
+
+/// The progress bar's line: the played part a wave in the record's colour, flowing while the music plays (still while
+/// paused, and under Reduce Motion), easing flat into the playhead; the rest a plain line.
+struct WaveProgress: View {
+    let fraction: Double
+    let flowing: Bool
+    let played: Color
+    let rest: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// One wave every this many points, this tall either side of the line, flowing a wavelength in this many seconds.
+    static let wavelength: CGFloat = 16
+    static let amplitude: CGFloat = 3.5
+    static let secondsPerWave = 1.1
+    static let lineWidth: CGFloat = 3.5
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !flowing || reduceMotion)) { context in
+            Canvas { canvas, size in
+                let mid = size.height / 2
+                let head = size.width * min(max(fraction, 0), 1)
+                var restLine = Path()
+                restLine.move(to: CGPoint(x: head, y: mid))
+                restLine.addLine(to: CGPoint(x: size.width, y: mid))
+                canvas.stroke(restLine, with: .color(rest), style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                guard head > 0 else { return }
+                let seconds = context.date.timeIntervalSinceReferenceDate
+                let phase = reduceMotion ? 0 : 2 * Double.pi * seconds / Self.secondsPerWave
+                var wave = Path()
+                var x: CGFloat = 0
+                while x <= head {
+                    // The wave settles flat over its last half-wavelength, so it meets the playhead on the line.
+                    let taper = min(1, (head - x) / (Self.wavelength / 2))
+                    let y =
+                        mid + Self.amplitude * taper * CGFloat(sin(2 * Double.pi * Double(x / Self.wavelength) - phase))
+                    if x == 0 { wave.move(to: CGPoint(x: x, y: y)) } else { wave.addLine(to: CGPoint(x: x, y: y)) }
+                    x += 1
+                }
+                wave.addLine(to: CGPoint(x: head, y: mid))
+                canvas.stroke(
+                    wave, with: .color(played),
+                    style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .round, lineJoin: .round))
+                let dot = CGRect(x: head - 4, y: mid - 4, width: 8, height: 8)
+                canvas.fill(Path(ellipseIn: dot), with: .color(played))
+            }
+        }
+        .accessibilityHidden(true)
     }
 }
 
