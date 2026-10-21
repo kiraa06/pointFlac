@@ -50,12 +50,21 @@ struct SignalDetailsSheet: View {
         }
     }
 
+    /// One line for the indicator the strip shows, so the sheet never contradicts it.
     private var summary: String {
         switch signal.indicator {
-        case .pure: "Untouched by pointFlac: no processing, and the output runs at the file's rate."
         case .idle: "Nothing is playing."
-        case .pending: "Starting: the output is being set up for this track."
-        default: "pointFlac or the route changes this signal, and the strip says how."
+        case .pending: "Starting: the output is being set up for this track, so nothing about the path is known yet."
+        case .pure: "Untouched by pointFlac: no processing, and the output runs at the file's rate."
+        case .resampled: "The rate changes on the way out. \(rateChange)."
+        case .depthReduced(let from, let to):
+            "pointFlac reduces \(from)-bit to \(to)-bit with TPDF dither, because the output can't take \(from)-bit."
+        case .processing(let count): "pointFlac's processing is on: \(count) block\(count == 1 ? "" : "s")."
+        case .scrubbing: "A finger is on the record: the sound follows the hand."
+        case .bluetoothLossy: "Bluetooth: iOS re-encodes for the headphones, so nothing on this route is lossless."
+        case .airPlay: "AirPlay: the receiver gets a re-encoded stream, whatever pointFlac hands it."
+        case .downmixed(let from, let to): "The output has \(to) channels, so iOS mixes the file's \(from) down."
+        case .otherRoute: "This route is of a kind pointFlac doesn't know. It may alter the audio."
         }
     }
 
@@ -64,8 +73,10 @@ struct SignalDetailsSheet: View {
         return "\(s.formattedDepth) · \(s.formattedRate) · \(s.channels) ch"
     }
 
+    /// "Pure" only when the strip says Pure; otherwise what pointFlac itself does.
     private var processing: String {
-        signal.activeProcessing.isEmpty ? "None (Pure)" : signal.activeProcessing.joined(separator: ", ")
+        if !signal.activeProcessing.isEmpty { return signal.activeProcessing.joined(separator: ", ") }
+        return signal.indicator == .pure ? "None (Pure)" : "None by pointFlac"
     }
 
     private var handed: String {
@@ -79,11 +90,13 @@ struct SignalDetailsSheet: View {
         signal.hardwareRate.map { AudioFormat(sampleRate: $0, bitsPerSample: 0, channels: 0).formattedRate } ?? "—"
     }
 
+    /// The rate change the strip shows, and who makes it: pointFlac before the output, or iOS after it.
     private var rateChange: String {
-        guard let change = signal.plan?.resample else { return "None" }
+        guard case .resampled(let change) = signal.indicator else { return "None" }
         let from = AudioFormat(sampleRate: change.from, bitsPerSample: 0, channels: 0).formattedRate
         let to = AudioFormat(sampleRate: change.to, bitsPerSample: 0, channels: 0).formattedRate
-        return "\(from) → \(to)"
+        let byPointFlac = signal.plan?.resample.map { $0 == change } ?? false
+        return "\(from) → \(to), by \(byPointFlac ? "pointFlac" : "iOS, after pointFlac's output")"
     }
 
     private var depth: String {

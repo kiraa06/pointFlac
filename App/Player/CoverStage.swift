@@ -20,7 +20,7 @@ struct CoverStage: View {
                         .offset(x: side * (playback.isPlaying ? 0.2 : 0.12))
                         .shadow(color: .black.opacity(0.45), radius: 14, y: 8)
                         .animation(.spring(duration: 0.7, bounce: 0.2), value: playback.isPlaying)
-                    ArtworkView(albumID: album.id, artwork: album.artwork)
+                    ArtworkView(albumID: album.id, artwork: album.artwork, pixels: 900)
                         .frame(width: side, height: side)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .shadow(color: .black.opacity(theme.isDark ? 0.6 : 0.22), radius: 24, y: 16)

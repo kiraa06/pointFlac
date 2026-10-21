@@ -197,7 +197,7 @@ struct ProgressRow: View {
                         .onEnded { _ in
                             guard let target = scrubbing else { return }
                             Task {
-                                await player.seek(to: .seconds(target))
+                                await playback.seek(to: target)
                                 scrubbing = nil
                             }
                         })
@@ -208,7 +208,7 @@ struct ProgressRow: View {
             .accessibilityValue("\(ClockFormat.clock(elapsed)) of \(ClockFormat.clock(length))")
             .accessibilityAdjustableAction { direction in
                 let step = direction == .increment ? 10.0 : -10.0
-                Task { await player.seek(to: .seconds(max(0, min(length, elapsed + step)))) }
+                Task { await playback.seek(to: max(0, min(length, elapsed + step))) }
             }
             .accessibilityIdentifier("progressBar")
             HStack {

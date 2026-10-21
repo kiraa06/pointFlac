@@ -19,7 +19,7 @@ final class SnapshotBox: Sendable {
     func replace(with snapshot: LibrarySnapshot) { current.withLock { $0 = snapshot } }
 }
 
-/// Which stored cover each album shows, for `ArtworkCache.loader`.
+/// Which stored cover each album shows, for `ArtworkLoader.source`.
 final class CoverIndex: Sendable {
     private let ids = Mutex<[String: String]>([:])
 
@@ -36,7 +36,7 @@ final class CoverIndex: Sendable {
 /// sees them: the UI refuses an album whose queue items come back short, so it must never be offered one.
 ///
 /// Covers are not put into `AlbumCard.artwork`: that would read every cover at each library change, and the
-/// library's cover cache holds only 32 MB. Instead `ArtworkCache.loader` reads a cover when its sleeve is first drawn.
+/// library's cover cache holds only 32 MB. Instead `ArtworkLoader.source` reads a cover when its sleeve is first drawn.
 @MainActor
 @Observable
 final class RealLibrary: LibraryBrowsing {
@@ -54,7 +54,7 @@ final class RealLibrary: LibraryBrowsing {
 
     init(library: Library) {
         self.library = library
-        ArtworkCache.shared.loader = { [library, covers] albumID in
+        ArtworkLoader.shared.source = { [library, covers] albumID in
             library.artwork(covers.artworkID(of: albumID))
         }
     }

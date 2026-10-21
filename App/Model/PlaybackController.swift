@@ -33,6 +33,11 @@ final class PlaybackController {
 
     let player: Player
     @ObservationIgnored private let library: any LibraryBrowsing
+    /// The transport command in flight, and the number of the latest one asked for.
+    @ObservationIgnored private var transport: Task<Void, Never>?
+    @ObservationIgnored private var transportToken = 0
+    /// The track the controller itself moved to, so a one-track repeat can tell that move from a natural advance.
+    @ObservationIgnored private var intendedIndex: Int?
     private(set) var album: AlbumCard?
     private(set) var tracks: [TrackRow] = []
     private(set) var layout = SideLayout(durations: [])
@@ -86,11 +91,35 @@ final class PlaybackController {
         cuedSide = layout.side(ofTrack: start) ?? 0
     }
 
+    // MARK: Transport, serialized
+
+    /// Runs transport commands one at a time, latest wins: a command waits for the one in flight, and a command that
+    /// was overtaken before it started is dropped. Why: a tonearm drop, a jog and a Next can land within a frame of
+    /// each other, and interleaving their awaits on the player would leave the queue wherever the last await
+    /// resumed.
+    private func perform(_ work: @escaping @MainActor () async -> Void) async {
+        transportToken += 1
+        let token = transportToken
+        let previous = transport
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.transportToken == token else { return }
+            await work()
+        }
+        transport = task
+        await task.value
+    }
+
     /// Plays the cued album from `track` (an album index), `seconds` into it.
     func play(fromTrack track: Int, at seconds: Double = 0) async {
+        await perform { [weak self] in await self?.playNow(fromTrack: track, at: seconds) }
+    }
+
+    private func playNow(fromTrack track: Int, at seconds: Double) async {
         guard tracks.indices.contains(track) else { return }
         let items = library.queueItems(for: tracks.map(\.id))
         guard items.count == tracks.count else { return }
+        if player.currentIndex != track { intendedIndex = track }
         if trackIndex != nil, player.queue.map(\.id) == items.map(\.id), player.currentIndex == track {
             await player.seek(to: .seconds(seconds))
             if !isPlaying { player.resume() }
@@ -134,20 +163,34 @@ final class PlaybackController {
         await play(fromTrack: layout.sides[side].tracks.lowerBound + local, at: offset)
     }
 
+    /// Seeks within the playing track (the progress bar).
+    func seek(to seconds: Double) async {
+        await perform { [weak self] in
+            await self?.player.seek(to: .seconds(seconds))
+        }
+    }
+
     func next() async {
-        if trackIndex == nil, tracks.isEmpty == false, !upNext.isEmpty {
-            await pullNext()
-            return
+        await perform { [weak self] in
+            guard let self else { return }
+            let atEnd = self.trackIndex.map { $0 + 1 >= self.tracks.count } ?? true
+            if atEnd, !self.upNext.isEmpty {
+                await self.pullNextNow()
+                return
+            }
+            self.intendedIndex = self.player.currentIndex.map { $0 + 1 }
+            await self.player.next()
         }
-        if let index = trackIndex, index + 1 >= tracks.count, !upNext.isEmpty {
-            await pullNext()
-            return
-        }
-        await player.next()
     }
 
     func previous() async {
-        await player.previous()
+        await perform { [weak self] in
+            guard let self, let index = self.player.currentIndex else { return }
+            // The player restarts the track past its restart window, or at the first track; else it goes back one.
+            let restarts = self.player.position > .seconds(3) || index == 0
+            self.intendedIndex = restarts ? index : index - 1
+            await self.player.previous()
+        }
     }
 
     func togglePlayPause() {
@@ -187,24 +230,40 @@ final class PlaybackController {
             Task { await play(fromTrack: 0) }
         case .one:
             let last = max(0, tracks.count - 1)
-            Task { await play(fromTrack: player.currentIndex ?? last) }
+            let index = player.currentIndex ?? last
+            Task { await play(fromTrack: index) }
         case .off:
             guard !upNext.isEmpty else { return }
-            Task { await pullNext() }
+            let ended = album?.id
+            Task {
+                await perform { [weak self] in
+                    // Next may have pulled the record already; pull only if this album is still the one that ended.
+                    guard let self, self.album?.id == ended else { return }
+                    await self.pullNextNow()
+                }
+            }
         }
     }
 
-    /// Called when the player moves to another track. Under one-track repeat, a move forward goes back.
+    /// Called when the player moves to another track. Under one-track repeat, only a natural advance (the track played
+    /// out) goes back; a move the controller asked for (Next, Previous, a seek) is left alone.
     func playerTrackChanged(from old: Int?, to new: Int?) {
+        if let new, let side = layout.side(ofTrack: new) { cuedSide = side }
+        if let intended = intendedIndex, new == intended {
+            intendedIndex = nil
+            return
+        }
         guard repeatMode == .one, let old, let new, new == old + 1, isPlaying else { return }
         Task { await play(fromTrack: old) }
     }
 
-    private func pullNext() async {
+    private func pullNextNow() async {
         guard !upNext.isEmpty else { return }
         let entry = upNext.removeFirst()
         autoLoads += 1
-        await load(entry.album, startingAt: entry.startTrack)
+        cue(entry.album, startingAt: entry.startTrack)
+        let start = entry.startTrack.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
+        await playNow(fromTrack: start, at: 0)
     }
 }
 

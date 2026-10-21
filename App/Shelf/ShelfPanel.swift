@@ -99,6 +99,13 @@ struct ShelfPanel: View {
         if front == nil || !crateAlbums.contains(where: { $0.id == front }) {
             front = crateAlbums.first?.id
         }
+        prefetchFront()
+    }
+
+    /// The front record's art, decoded ahead of the tap at sleeve and platter sizes (spec §4.5).
+    private func prefetchFront() {
+        guard let album = crateAlbums.first(where: { $0.id == front }) else { return }
+        ArtworkLoader.shared.prefetch(album.id, data: album.artwork, pixels: [300, 900])
     }
 
     // MARK: Search and chips
@@ -205,6 +212,7 @@ struct ShelfPanel: View {
             .scrollTargetBehavior(.viewAligned)
             .scrollPosition(id: $front, anchor: .center)
             .sensoryFeedback(.selection, trigger: front)
+            .onChange(of: front) { prefetchFront() }
         }
         .frame(height: sleeve + 24)
         .animation(.spring(duration: 0.35), value: sleeve)

@@ -467,7 +467,7 @@ struct RecordDisc: View, Equatable {
 
     var body: some View {
         ZStack {
-            ArtworkView(albumID: albumID, artwork: artwork)
+            ArtworkView(albumID: albumID, artwork: artwork, pixels: 900)
             Canvas { context, size in
                 let c = CGPoint(x: size.width / 2, y: size.height / 2)
                 let r = size.width / 2
