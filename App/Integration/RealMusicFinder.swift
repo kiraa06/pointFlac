@@ -265,7 +265,7 @@ final class RealMusicFinder: MusicFinding {
                 for try await batch in upstream {
                     for track in batch where seen.insert(track.id).inserted { all.append(track) }
                     let rows = map(all)
-                    for (row, tracks) in rows { self?.rowTracks[row.id] = tracks }
+                    self?.register(rows)
                     continuation.yield(rows.map(\.0))
                 }
             } catch {
@@ -277,13 +277,21 @@ final class RealMusicFinder: MusicFinding {
         return stream
     }
 
+    /// What each row's Download queues: the row's tracks, and for each track on its own, the song row inside it.
+    private func register(_ rows: [(RemoteResultRow, [RemoteTrack])]) {
+        for (row, tracks) in rows {
+            rowTracks[row.id] = tracks
+            for track in tracks { rowTracks[Self.rowID(track)] = [track] }
+        }
+    }
+
     private static var empty: AsyncStream<[RemoteResultRow]> {
         AsyncStream { $0.finish() }
     }
 
     #if SOULSEEK
         /// Typed words: one literal Soulseek search, grouped by peer and folder (spec §4.7). Each row is a folder; its
-        /// Download queues every FLAC file in it.
+        /// Download queues every FLAC file in it, and each file inside is a row of its own.
         private func soulseekFolders(_ text: String) -> AsyncStream<[RemoteResultRow]> {
             accumulate(soulseek.search(text)) { tracks in
                 let files = tracks.compactMap(SoulseekProvider.searchResultFile)
@@ -294,9 +302,20 @@ final class RealMusicFinder: MusicFinding {
                     let row = RemoteResultRow(
                         id: "soulseek-folder|\(folder.id)", provider: SoulseekProvider.providerID, title: folder.name,
                         subtitle: "\(folder.peer) · \(slot) · \(folder.files.count) files", format: format,
-                        sizeText: ByteCountFormatter.string(fromByteCount: folder.totalBytes, countStyle: .file))
+                        sizeText: ByteCountFormatter.string(fromByteCount: folder.totalBytes, countStyle: .file),
+                        children: Self.songRows(tracks))
                     return (row, tracks)
                 }
+            }
+        }
+
+        /// One row per file, in file-name order (track numbers lead most names). Its ID is the track's Downloads row
+        /// ID, which `register` maps to that one track, so a queued song also shows as queued in the results.
+        static func songRows(_ tracks: [RemoteTrack]) -> [RemoteResultRow] {
+            tracks.sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }.map { track in
+                RemoteResultRow(
+                    id: rowID(track), provider: track.provider, title: track.title, subtitle: "",
+                    format: track.formatLabel, sizeText: track.sizeLabel)
             }
         }
 
@@ -320,10 +339,11 @@ final class RealMusicFinder: MusicFinding {
                             subtitle: [candidate.peer ?? "", candidate.why, "\(candidate.files.count) files"]
                                 .filter { !$0.isEmpty }.joined(separator: " · "),
                             format: Self.format(bits: candidate.bitsPerSample, rate: candidate.sampleRate),
-                            sizeText: ByteCountFormatter.string(fromByteCount: candidate.totalBytes, countStyle: .file))
+                            sizeText: ByteCountFormatter.string(fromByteCount: candidate.totalBytes, countStyle: .file),
+                            children: Self.songRows(tracks))
                         return (row, tracks)
                     }
-                    for (row, tracks) in rows { self?.rowTracks[row.id] = tracks }
+                    self?.register(rows)
                     continuation.yield(rows.map(\.0))
                 }
                 continuation.finish()

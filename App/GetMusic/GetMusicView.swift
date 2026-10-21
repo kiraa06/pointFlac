@@ -71,9 +71,26 @@ struct GetMusicView: View {
                                 Text(searching ? "Searching…" : "No FLAC results").foregroundStyle(.secondary)
                             }
                         }
+                        let queued = Set(finder.downloads.map(\.id))
                         ForEach(results) { row in
-                            RemoteRowView(row: row, downloaded: finder.downloads.contains { $0.id == row.id }) {
-                                finder.download(row)
+                            if row.children.isEmpty {
+                                RemoteRowView(row: row, downloaded: queued.contains(row.id)) { finder.download(row) }
+                            } else {
+                                // A folder or album: its own button takes every song; open it to take one song.
+                                DisclosureGroup {
+                                    ForEach(row.children) { song in
+                                        RemoteRowView(row: song, downloaded: queued.contains(song.id), isSong: true) {
+                                            finder.download(song)
+                                        }
+                                    }
+                                } label: {
+                                    RemoteRowView(
+                                        row: row, downloaded: row.children.allSatisfy { queued.contains($0.id) }
+                                    ) {
+                                        finder.download(row)
+                                    }
+                                }
+                                .accessibilityIdentifier("folder-\(row.id)")
                             }
                         }
                     } header: {
@@ -208,13 +225,17 @@ private struct SuggestionLine: View {
 private struct RemoteRowView: View {
     let row: RemoteResultRow
     let downloaded: Bool
+    /// A song inside an open folder: lighter type, no subtitle.
+    var isSong = false
     let download: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(row.title).font(.body.weight(.semibold)).lineLimit(2)
-                Text(row.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(row.title).font(isSong ? .subheadline : .body.weight(.semibold)).lineLimit(2)
+                if !row.subtitle.isEmpty {
+                    Text(row.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
                 HStack(spacing: 8) {
                     Text(row.format).font(.caption.monospaced()).foregroundStyle(.tint)
                     Text(row.sizeText).font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -232,7 +253,9 @@ private struct RemoteRowView: View {
             }
             .buttonStyle(.borderless)
             .disabled(downloaded)
-            .accessibilityLabel(downloaded ? "Queued" : "Download \(row.title)")
+            .accessibilityLabel(
+                downloaded ? "Queued" : row.children.isEmpty ? "Download \(row.title)" : "Download all of \(row.title)"
+            )
             .accessibilityIdentifier("download-\(row.id)")
         }
         .padding(.vertical, 2)

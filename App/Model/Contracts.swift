@@ -83,7 +83,7 @@ extension MusicFinding {
     func retryDownload(_ id: DownloadRow.ID) {}
 }
 
-struct RemoteResultRow: Identifiable, Hashable {
+struct RemoteResultRow: Identifiable, Hashable, Sendable {
     let id: String
     let provider: String
     let title: String
@@ -95,10 +95,13 @@ struct RemoteResultRow: Identifiable, Hashable {
     /// Internet Archive's licence for the item (the provider's `detail["licence"]`), shown on the row. Stream D's
     /// addition to contract 2: optional and defaulted, so adapters written to the original shape still compile.
     let licence: String?
+    /// The songs inside a folder or album row, each a row of its own with its own Download (a single file has none).
+    /// The integration's addition to contract 2, defaulted like `licence`.
+    let children: [RemoteResultRow]
 
     init(
         id: String, provider: String, title: String, subtitle: String, format: String, sizeText: String,
-        licence: String? = nil
+        licence: String? = nil, children: [RemoteResultRow] = []
     ) {
         self.id = id
         self.provider = provider
@@ -107,6 +110,7 @@ struct RemoteResultRow: Identifiable, Hashable {
         self.format = format
         self.sizeText = sizeText
         self.licence = licence
+        self.children = children
     }
 }
 
