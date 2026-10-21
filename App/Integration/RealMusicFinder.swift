@@ -128,6 +128,33 @@ final class RealMusicFinder: MusicFinding {
         Task { _ = await manager.retry(job) }
     }
 
+    /// A row stands for every job of its track, so every finished one goes with it: an older job left behind would
+    /// surface as the row again. Jobs still running are the manager's to keep; it refuses to remove them.
+    func removeDownload(_ id: DownloadRow.ID) {
+        removeJobs { Self.rowID($0.track) == id }
+    }
+
+    /// Finished means published; failed means failed or cancelled. The library keeps every published song.
+    func clearDownloads(finished: Bool, failed: Bool) {
+        removeJobs { item in
+            switch item.state {
+            case .published: finished
+            case .failed, .cancelled: failed
+            case .queued, .downloading, .waiting, .validating, .saving: false
+            }
+        }
+    }
+
+    /// Takes the final jobs matching `include` off the manager's list.
+    private func removeJobs(where include: (DownloadItem) -> Bool) {
+        let jobs = observer.items.filter { $0.state.isFinal && include($0) }.map(\.id)
+        guard !jobs.isEmpty else { return }
+        let manager = manager
+        Task {
+            for job in jobs { await manager.remove(job) }
+        }
+    }
+
     /// The manager's job behind a Downloads row: the newest for that track, as `downloads` shows.
     private func latestJob(for rowID: DownloadRow.ID) -> String? {
         observer.items.last { Self.rowID($0.track) == rowID }?.id

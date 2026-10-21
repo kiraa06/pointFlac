@@ -74,6 +74,10 @@ enum SearchFilter: CaseIterable {
     func cancelDownload(_ id: DownloadRow.ID)
     /// Starts a failed or cancelled download again.
     func retryDownload(_ id: DownloadRow.ID)
+    /// Takes a finished, failed or cancelled row off the list. A finished download's song stays in the library.
+    func removeDownload(_ id: DownloadRow.ID)
+    /// Takes every finished download (`finished`), and every failed or cancelled one (`failed`), off the list.
+    func clearDownloads(finished: Bool, failed: Bool)
 
     // Contract 3: typeahead.
     /// Emits library hits at once, then the registry's (MusicBrainz) as they arrive. Each emission is the full list.
@@ -82,11 +86,13 @@ enum SearchFilter: CaseIterable {
     func search(_ suggestion: Suggestion, provider: String) -> AsyncStream<[RemoteResultRow]>
 }
 
-/// Cancel and retry for the Downloads list: the integration's addition to contract 2. Defaulted to no-ops, so the
-/// mock and any other finder written to the original shape still conform.
+/// Cancel, retry, remove and clear for the Downloads list: the integration's additions to contract 2. Defaulted to
+/// no-ops, so the mock and any other finder written to the original shape still conform.
 extension MusicFinding {
     func cancelDownload(_ id: DownloadRow.ID) {}
     func retryDownload(_ id: DownloadRow.ID) {}
+    func removeDownload(_ id: DownloadRow.ID) {}
+    func clearDownloads(finished: Bool, failed: Bool) {}
 }
 
 struct RemoteResultRow: Identifiable, Hashable, Sendable {

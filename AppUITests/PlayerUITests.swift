@@ -184,6 +184,36 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 10)
     }
 
+    /// A finished download can be swiped off the list, and the footer says its song stays in the library. Clear
+    /// shows only while there is something to clear.
+    @MainActor
+    func testFinishedDownloadCanBeRemoved() {
+        let app = launch()
+        app.tabBars.buttons["Get Music"].tap()
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("test\n")
+        let download = app.buttons["download-ia-Test-1"]
+        XCTAssertTrue(download.waitForExistence(timeout: 4))
+        download.tap()
+        app.tabBars.buttons["Downloads"].tap()
+        let row = app.descendants(matching: .any)["downloadRow-ia-Test-1"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        expectation(for: NSPredicate(format: "label CONTAINS 'Done'"), evaluatedWith: row)
+        waitForExpectations(timeout: 12)
+        XCTAssertTrue(app.staticTexts["Removing a finished download keeps the song in your library."].exists)
+        XCTAssertTrue(app.buttons["clearDownloads"].exists)
+
+        row.swipeLeft()
+        // A long swipe runs the only action at once; a short one shows its button.
+        let remove = app.buttons["Remove"]
+        if remove.waitForExistence(timeout: 2) { remove.tap() }
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
+        waitForExpectations(timeout: 3)
+        XCTAssertFalse(app.buttons["clearDownloads"].exists)
+    }
+
     /// Kiran's request: an album can be deleted from the shelf. The fixtures were imported into the app's own library
     /// folder, so the dialog deletes them from the iPhone, and the sleeve leaves the crate while the others stay. The
     /// next launch's preload imports them again, so no other test misses them.
