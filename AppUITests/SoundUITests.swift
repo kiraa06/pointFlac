@@ -36,14 +36,17 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
 
+        // The EQ comes after ReplayGain, the preamp and headphone correction, in chain order.
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         Self.flip(eq)
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
         waitForExpectations(timeout: 2)
 
         let presets = app.buttons["eqPresetMenu"]
-        XCTAssertTrue(presets.waitForExistence(timeout: 2))
+        Self.reveal(presets, in: app)
+        XCTAssertTrue(presets.exists)
         presets.tap()
         let bassBoost = app.buttons["Bass Boost"]
         XCTAssertTrue(bassBoost.waitForExistence(timeout: 2))
@@ -60,12 +63,16 @@ final class SoundUITests: XCTestCase {
         let open = app.buttons["openSoundButton"]
         XCTAssertTrue(open.waitForExistence(timeout: 3))
         open.tap()
-        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        // The tab keeps its place, down at the EQ: back up to Pure.
+        XCTAssertTrue(app.navigationBars["Sound"].waitForExistence(timeout: 3))
+        Self.reveal(pure, in: app, up: true)
+        XCTAssertTrue(pure.exists)
         XCTAssertEqual(pure.value as? String, "0")
         pure.tap()
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
         // Pure bypasses the EQ without switching it off, so turning Pure off again brings it back.
+        Self.reveal(eq, in: app)
         XCTAssertEqual(eq.value as? String, "1")
 
         app.tabBars.buttons["Player"].tap()
@@ -95,14 +102,15 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pure.waitForExistence(timeout: 5))
         pure.tap()
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         Self.flip(eq)
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
         waitForExpectations(timeout: 2)
 
         // Graphic: a scroll that starts on the bank, below the caps, scrolls the list and moves no fader.
         let fader = app.descendants(matching: .any)["graphicBand-0"]
-        if !fader.waitForExistence(timeout: 2) { Self.scroll(app) }
+        Self.reveal(fader, in: app)
         XCTAssertTrue(fader.waitForExistence(timeout: 2))
         Self.scrollClear(fader, in: app)
         XCTAssertEqual(fader.value as? String, "0 decibels")
@@ -179,13 +187,13 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pureAgain.waitForExistence(timeout: 5))
         XCTAssertEqual(pureAgain.value as? String, "0")
         let handleAgain = again.descendants(matching: .any)["eqHandle-0"]
-        if !handleAgain.waitForExistence(timeout: 2) { Self.scroll(again) }
+        Self.reveal(handleAgain, in: again)
         XCTAssertTrue(handleAgain.waitForExistence(timeout: 2))
         XCTAssertEqual(handleAgain.value as? String, moved)
 
         // Swiping the band's row deletes it, handle and all.
         let row = again.descendants(matching: .any)["bandRow-0"]
-        if !row.waitForExistence(timeout: 2) { Self.scroll(again) }
+        Self.reveal(row, in: again)
         XCTAssertTrue(row.waitForExistence(timeout: 2))
         Self.scrollClear(row, in: again)
         let middle = row.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
@@ -202,7 +210,7 @@ final class SoundUITests: XCTestCase {
         let third = relaunch()
         XCTAssertTrue(third.descendants(matching: .any)["pureSwitch"].waitForExistence(timeout: 5))
         let empty = third.buttons["copyGraphicButton"]
-        for _ in 0..<4 where !empty.waitForExistence(timeout: 1) { Self.scroll(third) }
+        Self.reveal(empty, in: third)
         XCTAssertTrue(empty.exists, "the deleted band came back: the flush on leaving the foreground was lost")
     }
 
@@ -219,7 +227,8 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pure.waitForExistence(timeout: 5))
         XCTAssertEqual(pure.value as? String, "1")
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         XCTAssertEqual(eq.value as? String, "0")
     }
 
@@ -231,6 +240,17 @@ final class SoundUITests: XCTestCase {
     private static func scroll(_ app: XCUIApplication, by distance: CGFloat = -180) {
         let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: distance < 0 ? 0.7 : 0.3))
         from.press(forDuration: 0.05, thenDragTo: from.withOffset(CGVector(dx: 0, dy: distance)))
+    }
+
+    /// Scrolls the list down (`up`: up) until `element` is on screen, then clear of the floating tab bar. The list is
+    /// lazy, so a row far away does not exist until it is near.
+    @MainActor
+    private static func reveal(_ element: XCUIElement, in app: XCUIApplication, up: Bool = false) {
+        for _ in 0..<14 {
+            if element.exists, element.isHittable { break }
+            scroll(app, by: up ? 220 : -220)
+        }
+        scrollClear(element, in: app)
     }
 
     /// Scrolls until `element` sits above the floating tab bar.

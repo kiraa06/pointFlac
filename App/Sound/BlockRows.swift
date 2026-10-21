@@ -357,12 +357,19 @@ extension View {
     func pureDimmed() -> some View { modifier(PureDimmed()) }
 }
 
-/// A block's first row: its name, what it is set to, and its switch. The limiter has no switch: it says when it runs.
+/// A block's first row: its name, what it is set to, and its switch. The limiter and the preamp have no switch: the
+/// limiter says when it runs, the preamp the gain it puts ahead of the filters.
 struct BlockHeaderRow: View {
     let block: SoundBlock
     let settings: SoundSettings
     let theme: Theme
+    /// The modes ReplayGain's and crossfade's switches turn on, for their summaries while they are off.
+    var replayGainMode: ReplayGainMode = .track
+    var crossfadeMode: CrossfadeMode = .betweenAlbums
+    /// The automatic headroom the curve needs now (`SoundResponse.autoHeadroomDb`), for the preamp's total.
+    var headroomDb = 0.0
     let set: (Bool) -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         if block.isSwitchable {
@@ -373,19 +380,33 @@ struct BlockHeaderRow: View {
             HStack {
                 label
                 Spacer()
-                Text(block.isActive(in: settings) ? "Running" : "Standby")
-                    .font(Typeface.cellValue)
-                    .foregroundStyle(block.isActive(in: settings) ? theme.processingTint : theme.inkSecondary)
+                Text(status)
+                    .font(Typeface.cellValue.monospacedDigit())
+                    .foregroundStyle(running ? theme.processingTint : theme.inkSecondary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("\(block.rawValue)Status")
         }
     }
 
+    /// Whether the non-switchable block works on the sound now: the limiter in the chain, the preamp with any chain.
+    private var running: Bool {
+        block == .preamp ? !settings.activeBlockNames.isEmpty : block.isActive(in: settings)
+    }
+
+    private var status: String {
+        guard block == .preamp else { return running ? "Running" : "Standby" }
+        return running ? SoundFormat.gain(PreampStage(settings, headroomDb: headroomDb).totalDb) : "Standby"
+    }
+
     private var label: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(block.isActive(in: settings) ? theme.processingTint : theme.hairline)
+                .fill(
+                    (block == .preamp ? running : block.isActive(in: settings)) ? theme.processingTint : theme.hairline
+                )
                 .frame(width: 7, height: 7)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
@@ -393,22 +414,40 @@ struct BlockHeaderRow: View {
                 Text(summary)
                     .font(.caption.monospaced())
                     .foregroundStyle(theme.inkSecondary)
-                    .lineLimit(2)
+                    .lineLimit(typeSize.isAccessibilitySize ? 4 : 2)
             }
         }
     }
 
     private var title: String {
         switch block {
+        case .replayGain: "ReplayGain"
+        case .preamp: "Preamp"
+        case .correction: "Headphone correction"
         case .eq: "Equaliser"
         case .tone: "Tone"
         case .crossfeed: "Crossfeed"
         case .limiter: "Limiter"
+        case .crossfade: "Crossfade"
         }
     }
 
     private var summary: String {
         switch block {
+        case .replayGain:
+            let rg = settings.replayGain
+            let mode = rg.mode == .off ? replayGainMode : rg.mode
+            var parts = [mode.title, SoundFormat.lufs(rg.referenceLufs)]
+            if rg.preampDb != 0 { parts.append("preamp \(SoundFormat.gain(rg.preampDb))") }
+            return parts.joined(separator: " · ")
+        case .preamp:
+            let p = settings.preamp
+            return "\(p.autoHeadroom ? "Auto headroom" : "Manual") · trim \(SoundFormat.gain(p.trimDb))"
+        case .correction:
+            return CorrectionCredit(settings.correction).summary
+        case .crossfade:
+            let c = settings.crossfade
+            return "\((c.mode == .off ? crossfadeMode : c.mode).title) · \(SoundFormat.seconds(c.seconds))"
         case .eq:
             let eq = settings.eq
             if eq.mode == .graphic { return "Graphic · \(SoundStore.presetName(for: eq.graphicGainsDb))" }

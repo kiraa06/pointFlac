@@ -16,6 +16,8 @@ import SwiftUI
 struct SoundView: View {
     let store: SoundStore
     let playback: PlaybackController
+    /// What the ReplayGain block shows of the library's loudness data and scan.
+    let library: RealLibrary
     @Environment(\.colorScheme) private var scheme
     @Environment(\.isMonochrome) private var mono
     @Environment(\.scenePhase) private var scenePhase
@@ -25,6 +27,7 @@ struct SoundView: View {
     @State private var visible = false
     /// Playback has been stopped long enough for the meters to fall back to rest (see `meterIdleDelay`).
     @State private var metersIdle = false
+    @State private var choosingCorrection = false
 
     /// Long enough for the meters to fall from full scale to the floor (60 dB at 24 dB/s, after a 1.5 s hold), and for
     /// a clip LED to go out.
@@ -52,6 +55,10 @@ struct SoundView: View {
             }
             .navigationTitle("Sound")
         }
+        .sheet(isPresented: $choosingCorrection) {
+            CorrectionPicker(store: store, theme: theme)
+                .environment(\.isMonochrome, mono)
+        }
         .onAppear { visible = true }
         .onDisappear { visible = false }
         .onChange(of: CurveInput(s, sampleRate: sampleRate), initial: true) { _, input in
@@ -78,7 +85,7 @@ struct SoundView: View {
             .listRowBackground(glass)
             Section {
                 SignalFlowRow(settings: s, theme: theme) { block in
-                    store.setBlock(block, on: !block.isOn(in: s))
+                    setBlock(block, on: !block.isOn(in: s))
                 }
                 OutputMeter(meters: meters, player: player, theme: screen, polling: polling)
                     .listRowInsets(Self.screenInsets)
@@ -100,12 +107,14 @@ struct SoundView: View {
         .tint(theme.processingTint)
     }
 
-    /// `-PFSoundScrollTo eq|tone|crossfeed|limiter` (DEBUG only) opens scrolled to that block, and
-    /// `-PFSoundSelectBand <n>` with parametric band n selected, for screenshots.
+    /// `-PFSoundScrollTo <block>` (DEBUG only; a `SoundBlock` raw value, such as replayGain or eq) opens scrolled to
+    /// that block, `-PFSoundSelectBand <n>` with parametric band n selected, and `-PFSoundOpenPicker YES` with the
+    /// headphone-correction picker open, for screenshots.
     private func scrollForScreenshots(_ proxy: ScrollViewProxy) {
         #if DEBUG
             let band = UserDefaults.standard.integer(forKey: "PFSoundSelectBand")
             if band > 0 { selectedBand = band - 1 }
+            if UserDefaults.standard.bool(forKey: "PFSoundOpenPicker") { choosingCorrection = true }
             guard let name = UserDefaults.standard.string(forKey: "PFSoundScrollTo"),
                 let block = SoundBlock(rawValue: name)
             else { return }
@@ -118,14 +127,38 @@ struct SoundView: View {
 
     // MARK: Sections
 
+    /// Switches a block. Correction with no headphones chosen opens the picker instead: choosing them switches it on.
+    private func setBlock(_ block: SoundBlock, on: Bool) {
+        if block == .correction, on, !store.hasCorrection {
+            choosingCorrection = true
+            return
+        }
+        store.setBlock(block, on: on)
+    }
+
     @ViewBuilder
     private func section(_ block: SoundBlock, _ s: SoundSettings) -> some View {
         Section {
             Group {
-                BlockHeaderRow(block: block, settings: s, theme: theme) { store.setBlock(block, on: $0) }
+                header(block, s)
                     .pureDimmed()
                     .id(block)
                 switch block {
+                case .replayGain:
+                    ReplayGainRows(
+                        replayGain: s.replayGain, mode: store.lastReplayGainMode, store: store, theme: theme,
+                        player: player, library: library
+                    )
+                    .pureDimmed()
+                case .preamp:
+                    PreampRows(preamp: s.preamp, settings: s, model: curve, store: store, theme: theme)
+                        .pureDimmed()
+                case .correction:
+                    CorrectionRows(correction: s.correction, theme: theme) { choosingCorrection = true }
+                        .pureDimmed()
+                case .crossfade:
+                    CrossfadeRows(crossfade: s.crossfade, mode: store.lastCrossfadeMode, store: store, theme: theme)
+                        .pureDimmed()
                 case .eq:
                     eqRows(s)
                 case .tone:
@@ -145,6 +178,19 @@ struct SoundView: View {
             footerText(footer(block, s))
         }
         .listRowBackground(glass)
+    }
+
+    @ViewBuilder
+    private func header(_ block: SoundBlock, _ s: SoundSettings) -> some View {
+        if block == .preamp {
+            // Its total follows the curve's headroom, which it reads itself.
+            LivePreampHeader(model: curve, settings: s, theme: theme)
+        } else {
+            BlockHeaderRow(
+                block: block, settings: s, theme: theme, replayGainMode: store.lastReplayGainMode,
+                crossfadeMode: store.lastCrossfadeMode
+            ) { setBlock(block, on: $0) }
+        }
     }
 
     /// The insets of the rows drawn on the deck's screen (the graph and the meters), so their panels line up.
@@ -237,6 +283,14 @@ struct SoundView: View {
     /// Short, as a pro tool's notes are.
     private func footer(_ block: SoundBlock, _ s: SoundSettings) -> String {
         switch block {
+        case .replayGain:
+            return "Tags first, then pointFlac's own loudness scan. Album keeps a record's loudness steps."
+        case .preamp:
+            return "Headroom follows the curve, so boosts can't clip. Trim adds gain of your own."
+        case .correction:
+            return "Corrects your headphones toward a target curve. The EQ graph draws it into its curve."
+        case .crossfade:
+            return "Between albums blends only where an Up Next record follows; songs inside a record stay gapless."
         case .eq:
             return s.eq.mode == .parametric
                 ? "Drag a handle; pinch for Q. Swipe a band to delete it. Headroom keeps boosts from clipping."
@@ -263,13 +317,7 @@ struct SoundView: View {
             .foregroundStyle(theme.inkSecondary)
     }
 
-    /// Frosted glass over the record's light, as the deck's plinth is.
-    private var glass: some View {
-        ZStack {
-            Rectangle().fill(.ultraThinMaterial)
-            Rectangle().fill(theme.plinthTop.opacity(theme.isDark ? 0.5 : 0.55))
-        }
-    }
+    private var glass: some View { SoundGlass(theme: theme) }
 
     /// The deck's background: pastel light from the record behind the glass, in greys under Monochrome.
     private var background: some View {
@@ -286,6 +334,18 @@ struct SoundView: View {
         }
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.6), value: playback.album?.id)
+    }
+}
+
+/// Frosted glass over the record's light, as the deck's plinth is: the Sound tab's card background.
+struct SoundGlass: View {
+    let theme: Theme
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.ultraThinMaterial)
+            Rectangle().fill(theme.plinthTop.opacity(theme.isDark ? 0.5 : 0.55))
+        }
     }
 }
 
@@ -397,48 +457,43 @@ private struct BigSwitch: View {
 
 // MARK: Flow
 
-/// The chain as a row of capsules, IN to OUT. Each switchable block's capsule toggles it; the limiter's shows whether
-/// it runs. In Pure one green line runs straight from IN to OUT behind the capsules, which are ghosted, all alike, and
-/// inert. The row scrolls sideways when Part B's blocks make it wider than the screen.
+/// The chain as capsules, IN to OUT, joined by a wire. It wraps when the chain is wider than the row: rows as even as
+/// they can be, each spread across the width, and the wire turning down at a row's end and back to the next row's
+/// start, so the whole chain stays in view at every text size. Each switchable block's capsule toggles it; the
+/// limiter's and the preamp's report what they do. In Pure the wire is one green line from IN to OUT behind the
+/// capsules, which are ghosted, all alike, and inert.
 struct SignalFlowRow: View {
     let settings: SoundSettings
     let theme: Theme
     let toggle: (SoundBlock) -> Void
 
+    /// The radius of the wire's turns between rows; a wrapped row keeps twice it clear at its turning ends.
+    private static let turn: CGFloat = 5
+
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            row(wireWidth: nil)
-            ScrollView(.horizontal) {
-                row(wireWidth: 14)
-                    .padding(.horizontal, 2)
+        let blocks = SoundBlock.allCases
+        WrappingFlowLayout(gap: 5, rowGap: 16, margin: 2 * Self.turn) {
+            terminal("IN").flowItem(0)
+            ForEach(Array(blocks.enumerated()), id: \.element) { index, block in
+                capsule(block).flowItem(index + 1)
             }
-            .scrollIndicators(.hidden)
+            terminal("OUT").flowItem(blocks.count + 1)
+        }
+        .backgroundPreferenceValue(FlowItemBounds.self) { anchors in
+            GeometryReader { proxy in
+                FlowWire(
+                    items: anchors.sorted { $0.key < $1.key }.map { proxy[$0.value] }, turn: Self.turn,
+                    continuous: settings.pure
+                )
+                .stroke(
+                    settings.pure ? theme.ok : theme.inkSecondary.opacity(0.45),
+                    style: StrokeStyle(lineWidth: settings.pure ? 2 : 1.5, lineCap: .round, lineJoin: .round))
+            }
+            .accessibilityHidden(true)
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Signal flow")
-    }
-
-    private func row(wireWidth: CGFloat?) -> some View {
-        HStack(spacing: 0) {
-            terminal("IN")
-            ForEach(SoundBlock.allCases) { block in
-                wire(wireWidth)
-                capsule(block)
-            }
-            wire(wireWidth)
-            terminal("OUT")
-        }
-        .background {
-            if settings.pure {
-                // The bypass: one unbroken line from IN to OUT, passing behind every block.
-                Rectangle()
-                    .fill(theme.ok)
-                    .frame(height: 2)
-                    .padding(.horizontal, 22)
-                    .accessibilityHidden(true)
-            }
-        }
     }
 
     private func terminal(_ text: String) -> some View {
@@ -447,14 +502,6 @@ struct SignalFlowRow: View {
             .tracking(1)
             .foregroundStyle(theme.inkSecondary)
             .fixedSize()
-            .accessibilityHidden(true)
-    }
-
-    private func wire(_ width: CGFloat?) -> some View {
-        Rectangle()
-            .fill(settings.pure ? Color.clear : theme.inkSecondary.opacity(0.45))
-            .frame(minWidth: width ?? 8, idealWidth: width ?? 8, maxWidth: width ?? .infinity)
-            .frame(height: 1.5)
             .accessibilityHidden(true)
     }
 
@@ -472,7 +519,7 @@ struct SignalFlowRow: View {
             .accessibilityAddTraits(.isToggle)
             .modifier(CapsuleAccessibility(block: block, settings: settings))
         } else {
-            // The limiter's capsule only reports: it has no switch, so it is not a button.
+            // The limiter's and the preamp's capsules only report: they have no switch, so they are not buttons.
             capsuleFace(block)
                 .accessibilityElement(children: .ignore)
                 .modifier(CapsuleAccessibility(block: block, settings: settings))
@@ -485,16 +532,15 @@ struct SignalFlowRow: View {
         let tint = theme.processingTint
         let pure = settings.pure
         return HStack(spacing: 4) {
-            Text(block.name.uppercased())
-            if !block.isSwitchable {
+            Text(block.capsuleName.uppercased())
+            if block == .limiter {
                 Text("AUTO").font(.caption2.monospaced().weight(.bold)).textScale(.secondary).opacity(0.75)
             }
         }
         .font(.caption2.monospaced().weight(.semibold))
-        .tracking(0.3)
         .lineLimit(1)
         .fixedSize()
-        .padding(.horizontal, 7)
+        .padding(.horizontal, 6)
         .padding(.vertical, 7)
         .foregroundStyle(pure ? theme.inkSecondary : active ? theme.background : on ? tint : theme.inkSecondary)
         // Under Pure the ghost is opaque, so the bypass line reads as passing behind it.
@@ -513,6 +559,156 @@ struct SignalFlowRow: View {
     }
 }
 
+/// Each flow item's bounds, by its place in the chain, for the wire.
+private struct FlowItemBounds: PreferenceKey {
+    static let defaultValue: [Int: Anchor<CGRect>] = [:]
+
+    static func reduce(value: inout [Int: Anchor<CGRect>], nextValue: () -> [Int: Anchor<CGRect>]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+extension View {
+    /// Reports the view's bounds as flow item `index`.
+    fileprivate func flowItem(_ index: Int) -> some View {
+        anchorPreference(key: FlowItemBounds.self, value: .bounds) { [index: $0] }
+    }
+}
+
+/// Lays the flow's items out in rows: one row when they fit, spread across the width; else the fewest rows that do,
+/// broken as evenly as they can be, all with the spacing that fills the fullest row, so the blocks sit evenly and the
+/// wire's longer runs fall where it travels: before a turn, and into OUT, which ends the last row at the right edge. A
+/// row that wraps keeps `margin` clear at its turning ends: the end of every row but the last, and the start of every
+/// row but the first. Items keep their ideal sizes, centred in their row.
+struct WrappingFlowLayout: Layout {
+    /// The least space between two items: the wire's shortest run.
+    var gap: CGFloat
+    var rowGap: CGFloat
+    var margin: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let natural = span(Array(sizes.indices), sizes)
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? natural
+        let rows = rows(sizes, width: width)
+        let heights = rows.map { row in row.map { sizes[$0].height }.max() ?? 0 }
+        return CGSize(width: width, height: heights.reduce(0, +) + rowGap * CGFloat(max(rows.count - 1, 0)))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let rows = rows(sizes, width: bounds.width)
+        func lead(_ r: Int) -> CGFloat { r == 0 ? 0 : margin }
+        func trail(_ r: Int) -> CGFloat { r == rows.count - 1 ? 0 : margin }
+        // The spacing that fills the fullest row exactly.
+        let fills = rows.enumerated().compactMap { r, row -> CGFloat? in
+            guard row.count > 1 else { return nil }
+            let used = row.reduce(0) { $0 + sizes[$1].width }
+            return (bounds.width - lead(r) - trail(r) - used) / CGFloat(row.count - 1)
+        }
+        let space = max(gap, fills.min() ?? gap)
+        var y = bounds.minY
+        for (r, row) in rows.enumerated() {
+            let height = row.map { sizes[$0].height }.max() ?? 0
+            var x = bounds.minX + lead(r)
+            for i in row {
+                // The flow's last item, OUT, ends the last row at the right-hand edge.
+                if i == sizes.count - 1, row.count > 1 { x = bounds.maxX - sizes[i].width }
+                subviews[i].place(
+                    at: CGPoint(x: x, y: y + height / 2), anchor: .leading, proposal: ProposedViewSize(sizes[i]))
+                x += sizes[i].width + space
+            }
+            y += height + rowGap
+        }
+    }
+
+    /// The width of `items` side by side, `gap` apart.
+    private func span(_ items: [Int], _ sizes: [CGSize]) -> CGFloat {
+        items.reduce(0) { $0 + sizes[$1].width } + gap * CGFloat(max(items.count - 1, 0))
+    }
+
+    /// One row if everything fits; else the rows that the narrowest limit needing no more rows than `width` does
+    /// gives, which comes out as even as the items allow.
+    private func rows(_ sizes: [CGSize], width: CGFloat) -> [[Int]] {
+        guard !sizes.isEmpty else { return [] }
+        if span(Array(sizes.indices), sizes) <= width { return [Array(sizes.indices)] }
+        let fewest = breakRows(sizes, limit: width).count
+        var low = sizes.map(\.width).max() ?? 0
+        var high = width
+        for _ in 0..<20 {
+            let mid = (low + high) / 2
+            if breakRows(sizes, limit: mid).count <= fewest { high = mid } else { low = mid }
+        }
+        return breakRows(sizes, limit: high)
+    }
+
+    /// Fills rows in order within `limit`, less the margins a wrapped row keeps: a row that holds everything left is
+    /// the last, and needs none at its end.
+    private func breakRows(_ sizes: [CGSize], limit: CGFloat) -> [[Int]] {
+        var rows: [[Int]] = []
+        var row: [Int] = []
+        for i in sizes.indices {
+            let lead = rows.isEmpty ? 0 : margin
+            let start = row.first ?? i
+            let rest = span(Array(start..<sizes.count), sizes)
+            let trail = lead + rest <= limit ? 0 : margin
+            if row.isEmpty || lead + span(row + [i], sizes) + trail <= limit {
+                row.append(i)
+            } else {
+                rows.append(row)
+                row = [i]
+            }
+        }
+        if !row.isEmpty { rows.append(row) }
+        return rows
+    }
+}
+
+/// The wire through the flow's items, in order: straight between items on one row; from a row's end, round its right
+/// edge, back along the gap below it, and round the left edge into the next row. It stops at each item's edges, and
+/// short of the IN and OUT words, unless `continuous` (Pure's bypass), when it runs on behind the capsules.
+private struct FlowWire: Shape {
+    var items: [CGRect]
+    var turn: CGFloat
+    var continuous: Bool
+    /// The space kept between the wire and the IN and OUT words.
+    private let terminalPad: CGFloat = 4
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        guard items.count > 1 else { return p }
+        let last = items.count - 1
+        p.move(to: CGPoint(x: items[0].maxX + terminalPad, y: items[0].midY))
+        for i in 1...last {
+            let a = items[i - 1]
+            let b = items[i]
+            if b.midY - a.midY > 1 {
+                // The return: right, down, back left along the gap between the rows, down, and on into the row.
+                let right = rect.maxX - 0.75
+                let left = rect.minX + 0.75
+                let mid = (a.maxY + b.minY) / 2
+                let r = max(min(turn, (mid - a.midY) / 2, (b.midY - mid) / 2), 0)
+                p.addLine(to: CGPoint(x: right - r, y: a.midY))
+                p.addQuadCurve(to: CGPoint(x: right, y: a.midY + r), control: CGPoint(x: right, y: a.midY))
+                p.addLine(to: CGPoint(x: right, y: mid - r))
+                p.addQuadCurve(to: CGPoint(x: right - r, y: mid), control: CGPoint(x: right, y: mid))
+                p.addLine(to: CGPoint(x: left + r, y: mid))
+                p.addQuadCurve(to: CGPoint(x: left, y: mid + r), control: CGPoint(x: left, y: mid))
+                p.addLine(to: CGPoint(x: left, y: b.midY - r))
+                p.addQuadCurve(to: CGPoint(x: left + r, y: b.midY), control: CGPoint(x: left, y: b.midY))
+            }
+            p.addLine(to: CGPoint(x: i == last ? b.minX - terminalPad : b.minX, y: b.midY))
+            guard i < last else { break }
+            if continuous {
+                p.addLine(to: CGPoint(x: b.maxX, y: b.midY))
+            } else {
+                p.move(to: CGPoint(x: b.maxX, y: b.midY))
+            }
+        }
+        return p
+    }
+}
+
 /// The flow capsules' press: a slight dim while held, and no dimming of its own when disabled.
 private struct CapsuleButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -526,9 +722,7 @@ private struct CapsuleAccessibility: ViewModifier {
     let settings: SoundSettings
 
     func body(content: Content) -> some View {
-        let state =
-            block.isSwitchable
-            ? (block.isOn(in: settings) ? "On" : "Off") : (block.isActive(in: settings) ? "Running" : "Standby")
+        let state = block.spokenState(in: settings)
         content
             .accessibilityLabel(block.name)
             .accessibilityValue(state + (settings.pure ? ", bypassed by Pure" : ""))

@@ -32,6 +32,11 @@ final class SoundStore {
     @ObservationIgnored private let player: Player
     @ObservationIgnored private let fileURL: URL
     @ObservationIgnored private let gate = FrameGate()
+    /// The ReplayGain and crossfade modes their switches turn back on: the last one chosen, else Track and Between
+    /// albums. Turning a block off sets its mode to Off, so the mode it had is kept here (for this launch).
+    private(set) var lastReplayGainMode: ReplayGainMode = .track
+    private(set) var lastCrossfadeMode: CrossfadeMode = .betweenAlbums
+
     /// What the player was last given.
     @ObservationIgnored private var applied: SoundSettings
     @ObservationIgnored private var saveTask: Task<Void, Never>?
@@ -51,6 +56,8 @@ final class SoundStore {
         settings = loaded
         applied = loaded
         bandIDs = loaded.eq.bands.map { _ in UUID() }
+        if loaded.replayGain.mode != .off { lastReplayGainMode = loaded.replayGain.mode }
+        if loaded.crossfade.mode != .off { lastCrossfadeMode = loaded.crossfade.mode }
         player.setSound(loaded)
         gate.action = { [weak self] in self?.applyNow() }
     }
@@ -103,7 +110,35 @@ final class SoundStore {
     }
 
     func setBlock(_ block: SoundBlock, on: Bool) {
-        update { block.set(on, in: &$0) }
+        switch block {
+        case .replayGain: setReplayGainMode(on ? lastReplayGainMode : .off)
+        case .crossfade: setCrossfadeMode(on ? lastCrossfadeMode : .off)
+        default: update { block.set(on, in: &$0) }
+        }
+    }
+
+    /// Off, or the mode to level by; a mode other than Off is the one the switch turns back on.
+    func setReplayGainMode(_ mode: ReplayGainMode) {
+        if mode != .off { lastReplayGainMode = mode }
+        update { $0.replayGain.mode = mode }
+    }
+
+    func setCrossfadeMode(_ mode: CrossfadeMode) {
+        if mode != .off { lastCrossfadeMode = mode }
+        update { $0.crossfade.mode = mode }
+    }
+
+    /// Whether a headphone correction has been chosen: only then has its switch anything to play.
+    var hasCorrection: Bool { !settings.correction.bands.isEmpty }
+
+    /// Plays `correction` (an OPRA preset or an imported AutoEq file) in place of any earlier one, switched on:
+    /// choosing headphones means wanting to hear them corrected. Clamped like every edit, so a preset's band below
+    /// 20 Hz plays at 20 Hz.
+    func applyCorrection(_ correction: CorrectionSettings) {
+        update {
+            $0.correction = correction
+            $0.correction.enabled = true
+        }
     }
 
     /// Loads an `EQPresets` curve into the graphic EQ and switches the EQ on: choosing a preset means wanting to hear
@@ -296,33 +331,46 @@ private final class FrameProxy: NSObject {
     }
 }
 
-/// The blocks the Sound tab shows, in chain order (`SoundSettings.activeBlockNames`). Part B's blocks slot in where
-/// the chain has them: ReplayGain and the preamp ahead of the EQ, headphone correction just before it, crossfade
-/// after the limiter. Each case brings its capsule in the flow row and its section in the list.
+/// The blocks the Sound tab shows, in chain order (`SoundSettings.activeBlockNames`): ReplayGain and the preamp, then
+/// headphone correction, the EQ, tone and crossfeed, the limiter, and crossfade last. Each case brings its capsule in
+/// the flow row and its section in the list.
 enum SoundBlock: String, CaseIterable, Identifiable {
-    case eq, tone, crossfeed, limiter
+    case replayGain, preamp, correction, eq, tone, crossfeed, limiter, crossfade
 
     var id: Self { self }
 
     /// The chain's own name, as `activeBlockNames` and the signal details list it.
     var name: String {
         switch self {
+        case .replayGain: "ReplayGain"
+        case .preamp: "Preamp"
+        case .correction: "Headphone correction"
         case .eq: "EQ"
         case .tone: "Tone"
         case .crossfeed: "Crossfeed"
         case .limiter: "Limiter"
+        case .crossfade: "Crossfade"
         }
     }
 
-    /// The limiter has no switch: it joins the chain whenever another block is on.
-    var isSwitchable: Bool { self != .limiter }
+    /// The flow capsule's word: the name, short enough for the row.
+    var capsuleName: String { self == .correction ? "Correction" : name }
 
-    /// The block's own state, whatever Pure says. The limiter's is whether any other block is on.
+    /// The limiter and the preamp have no switch: the limiter joins the chain whenever another block is on, and the
+    /// preamp whenever its trim is not 0 dB (its automatic headroom runs with any chain).
+    var isSwitchable: Bool { self != .limiter && self != .preamp }
+
+    /// The block's own state, whatever Pure says. The limiter's is whether any other block is on; the preamp's,
+    /// whether it trims.
     func isOn(in s: SoundSettings) -> Bool {
         switch self {
+        case .replayGain: return s.replayGain.mode != .off
+        case .preamp: return s.preamp.trimDb != 0
+        case .correction: return s.correction.enabled
         case .eq: return s.eq.enabled
         case .tone: return s.tone.enabled
         case .crossfeed: return s.crossfeed.enabled
+        case .crossfade: return s.crossfade.mode != .off
         case .limiter:
             var unbypassed = s
             unbypassed.pure = false
@@ -335,12 +383,27 @@ enum SoundBlock: String, CaseIterable, Identifiable {
         s.activeBlockNames.contains(name)
     }
 
+    /// A switchable block's state for VoiceOver, else what the block is doing: "Running" or "Standby" for the limiter,
+    /// the trim for the preamp.
+    func spokenState(in s: SoundSettings) -> String {
+        switch self {
+        case .limiter: return isActive(in: s) ? "Running" : "Standby"
+        case .preamp: return isOn(in: s) ? "Trim \(SoundFormat.gainSpoken(s.preamp.trimDb))" : "No trim"
+        default: return isOn(in: s) ? "On" : "Off"
+        }
+    }
+
+    /// Switches the block, with a mode for the blocks that have one (`SoundStore.setBlock` brings back the last mode
+    /// chosen instead).
     func set(_ on: Bool, in s: inout SoundSettings) {
         switch self {
+        case .replayGain: s.replayGain.mode = on ? (s.replayGain.mode == .off ? .track : s.replayGain.mode) : .off
+        case .correction: s.correction.enabled = on
         case .eq: s.eq.enabled = on
         case .tone: s.tone.enabled = on
         case .crossfeed: s.crossfeed.enabled = on
-        case .limiter: break
+        case .crossfade: s.crossfade.mode = on ? (s.crossfade.mode == .off ? .betweenAlbums : s.crossfade.mode) : .off
+        case .preamp, .limiter: break
         }
     }
 }
@@ -377,6 +440,9 @@ enum SoundRanges {
     static let treble = range({ $0.tone.trebleDb = $1 }, \.tone.trebleDb)
     static let tilt = range({ $0.tone.tiltDb = $1 }, \.tone.tiltDb)
     static let ceiling = range({ $0.limiter.ceilingDbTP = $1 }, \.limiter.ceilingDbTP)
+    static let replayGainPreamp = range({ $0.replayGain.preampDb = $1 }, \.replayGain.preampDb)
+    static let trim = range({ $0.preamp.trimDb = $1 }, \.preamp.trimDb)
+    static let crossfadeSeconds = range({ $0.crossfade.seconds = $1 }, \.crossfade.seconds)
     /// The most parametric bands `clamped()` keeps.
     static let maxBands: Int = {
         var s = SoundSettings()
