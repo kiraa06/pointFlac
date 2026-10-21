@@ -145,14 +145,16 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 6)
     }
 
-    /// The SIGNAL cell shows what is delivered (Hi-Res or Lossless text) and the strip says so aloud.
+    /// The SIGNAL cell shows what is delivered (Hi-Res, Lossless or iOS speaker tuning) and the strip says so aloud.
     @MainActor
     func testSignalCellSpeaksTheDeliveredResolution() {
         let app = launch(demoPlay: true)
         let strip = app.descendants(matching: .any)["signalStrip"]
         XCTAssertTrue(strip.waitForExistence(timeout: 8))
         let spoken = NSPredicate(
-            format: "label CONTAINS 'Signal: Hi-Res output' OR label CONTAINS 'Signal: Lossless output'")
+            format:
+                "label CONTAINS 'Signal: ' AND (label CONTAINS 'iOS speaker tuning' OR "
+                + "label CONTAINS 'Hi-Res output' OR label CONTAINS 'Lossless output')")
         expectation(for: spoken, evaluatedWith: strip)
         waitForExpectations(timeout: 8)
         XCTAssertFalse(strip.label.localizedCaseInsensitiveContains("bit-perfect"))

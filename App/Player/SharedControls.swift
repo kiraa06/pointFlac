@@ -311,7 +311,7 @@ struct SignalCells: View {
     }
 
     /// The SIGNAL cell's text when the delivered resolution is known: plain words in the cell's own font, tinted by
-    /// meaning (Hi-Res gold, Lossless neutral, Pure green), joined by a quiet " · ". One Text, so it baselines with
+    /// meaning (Hi-Res gold, Lossless neutral, Pure green, speaker tuning quiet), joined by a quiet " · ". One Text, so it baselines with
     /// the other cells.
     private var resolutionText: Text {
         let badges = SignalStrip.signalBadges(signal)
@@ -329,6 +329,7 @@ struct SignalCells: View {
         case .pure: theme.ok
         case .hiRes: theme.hiRes
         case .lossless: theme.ink
+        case .speakerTuning: theme.inkSecondary
         }
     }
 

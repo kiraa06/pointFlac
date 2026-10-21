@@ -228,30 +228,48 @@ private let allStates: [SignalState] = [
 }
 
 @Test func resolutionTable() {
-    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000)) == ["HI-RES 24/96", "PURE"])
-    #expect(SignalStrip.badges(state(192_000, 24, hardware: 48_000, port: .builtIn)) == ["LOSSLESS 24/48"])
+    // USB and wired: Hi-Res iff the file is >= 24-bit and the hardware rate is above 48 kHz.
+    let rows: [(rate: Int, bits: Int, hiRes: Bool)] = [
+        (44_100, 16, false), (44_100, 24, false), (48_000, 16, false), (48_000, 24, false),
+        (96_000, 16, false), (96_000, 24, true), (192_000, 16, false), (192_000, 24, true),
+        (88_200, 24, true),
+    ]
+    for port in [OutputPort.usb("DAC"), .wired("EarPods")] {
+        for row in rows {
+            let signal = state(row.rate, row.bits, hardware: row.rate, port: port)
+            #expect(SignalStrip.badges(signal) == [row.hiRes ? "HI-RES" : "LOSSLESS", "PURE"], "\(row) \(port)")
+        }
+    }
+    // The hardware rate decides, not the file: 96 kHz played at 48 kHz is Lossless, and no longer Pure.
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 48_000)) == ["LOSSLESS"])
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == ["HI-RES"])
+    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000)) == ["HI-RES"])
+    // Built-in speaker: never a Lossless or Hi-Res claim, whatever the rates.
+    for row in rows {
+        let signal = state(row.rate, row.bits, hardware: row.rate, port: .builtIn)
+        #expect(SignalStrip.badges(signal) == ["PURE", "IOS SPEAKER TUNING"], "\(row)")
+        #expect(SignalStrip.signalBadges(signal).map(\.displayText) == ["Pure", "iOS speaker tuning"])
+    }
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 48_000, port: .builtIn)) == ["IOS SPEAKER TUNING"])
     #expect(
-        SignalStrip.badges(state(44_100, 16, hardware: 44_100, port: .wired("EarPods"))) == [
-            "LOSSLESS 16/44.1", "PURE",
+        SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .builtIn, processing: ["EQ"])) == [
+            "IOS SPEAKER TUNING"
         ])
+    // Bluetooth, AirPlay, other route, idle, pending: no runs.
     #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"))).isEmpty)
-    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == ["HI-RES 24/96"])
-    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000)) == ["HI-RES 24/192"])
-    // Int32 client delivers 32 bits.
-    #expect(
-        state(192_000, 32, hardware: 192_000, int32: true).resolution == .hiRes(bits: 32, rate: 192_000))
-    #expect(state(96_000, 24, hardware: 96_000, port: .airPlay("TV")).resolution == .lossy)
-    #expect(SignalState().resolution == nil)
-    #expect(SignalStrip.badges(SignalState()).isEmpty)
-    #expect(SignalStrip.badges(state(88_200, 24, hardware: 88_200)) == ["HI-RES 24/88.2", "PURE"])
-    #expect(SignalStrip.badges(state(96_000, 16, hardware: 96_000)) == ["LOSSLESS 16/96", "PURE"])
-    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000, int32: true)) == ["HI-RES 32/192", "PURE"])
-    // HDMI/CarPlay: no claim; the strip already says the output may alter the audio.
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .airPlay("TV"))).isEmpty)
     #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .other("HDMI"))).isEmpty)
-    // Downmixed: PCM is still delivered, so the resolution text stays, and Pure does not.
+    #expect(SignalStrip.badges(SignalState()).isEmpty)
+    #expect(SignalStrip.badges(SignalState(source: fmt(96_000, 24), port: .usb("DAC"))).isEmpty)
+    #expect(SignalStrip.badges(SignalState(source: fmt(96_000, 24), port: .builtIn)).isEmpty)
+    #expect(SignalState().resolution == nil)
+    #expect(state(96_000, 24, hardware: 96_000, port: .builtIn).resolution == DeliveredResolution.none)
+    // Downmixed: PCM is still delivered, so the run stays, and Pure does not.
     #expect(
         SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .wired("Mono"), hardwareChannels: 1))
-            == ["HI-RES 24/96"])
+            == ["HI-RES"])
+    // The USB volume warning stays beside the runs.
+    #expect(SignalStrip.text(state(96_000, 24, hardware: 96_000, volume: 0.8)).hasSuffix("● Volume 80%"))
 }
 
 @Test func titleNoteTable() {
@@ -272,10 +290,11 @@ private let allStates: [SignalState] = [
 }
 
 @Test func badgeDisplayText() {
-    #expect(
-        SignalStrip.signalBadges(state(96_000, 24, hardware: 96_000)).map(\.displayText) == ["Hi-Res 24/96", "Pure"])
-    #expect(SignalBadge.hiRes(bits: 24, rate: 352_800).displayText == "Hi-Res 24/352.8")
-    #expect(SignalBadge.lossless(bits: 16, rate: 44_100).displayText == "Lossless 16/44.1")
+    let runs = SignalStrip.signalBadges(state(96_000, 24, hardware: 96_000))
+    #expect(runs.map(\.displayText) == ["Hi-Res", "Pure"])
+    #expect(runs.map(\.accessibilityLabel) == ["Hi-Res output", "Pure"])
+    #expect(SignalBadge.lossless.displayText == "Lossless")
+    #expect(SignalBadge.speakerTuning.accessibilityLabel == "iOS speaker tuning")
 }
 
 @Test func cellKeepsItsWordsWhenThereIsNoResolutionToShow() {

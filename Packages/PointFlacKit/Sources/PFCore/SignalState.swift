@@ -19,12 +19,14 @@ public enum SignalIndicator: Equatable, Sendable {
     case otherRoute
 }
 
-/// What the hardware is handed, as Apple Music draws the line: Hi-Res is at least 24 bits at a rate above 48 kHz,
-/// Lossless is anything at or below it, and a lossy route is neither.
+/// The claim the strip can prove for a route where iOS does no tuning of its own (USB, wired). pointFlac always
+/// hands iOS 32-bit float, which holds 16- and 24-bit samples exactly, at the hardware rate iOS reports. Hi-Res: a file
+/// of at least 24 bits and a hardware rate above 48 kHz. Lossless: otherwise. `none` on every other route: the
+/// built-in speaker is tuned by iOS, and Bluetooth, AirPlay and unknown routes re-encode or may alter the audio.
 public enum DeliveredResolution: Equatable, Sendable {
-    case hiRes(bits: Int, rate: Int)
-    case lossless(bits: Int, rate: Int)
-    case lossy
+    case hiRes
+    case lossless
+    case none
 }
 
 /// Everything the signal strip needs to describe, honestly, what happens to the audio.
@@ -105,29 +107,18 @@ public struct SignalState: Sendable, Equatable {
         return nil
     }
 
-    /// What reaches the output, never just what the file holds: nil with no plan, `.lossy` over Bluetooth or AirPlay,
-    /// otherwise the delivered depth (32 on an Int32 client, 24 when pointFlac reduces to 24, else the source's depth
-    /// capped at 24) and rate (the hardware's, else the negotiated client rate). Hi-Res is at least 24 bits above
-    /// 48 kHz (ruling R4-3).
+    /// What pointFlac can prove about the hand-off: nil with no plan or source; `.none` unless the route is USB or
+    /// wired. There, Hi-Res when the file is at least 24-bit and the hardware rate (iOS's own report, else the
+    /// negotiated client rate) is above 48 kHz, else Lossless. The converter's bit depth is not reported by iOS, so
+    /// no bit or rate numbers are claimed.
     public var resolution: DeliveredResolution? {
-        guard let plan else { return nil }
+        guard let plan, let source else { return nil }
         switch port {
-        case .bluetooth, .airPlay: return .lossy
-        // A route pointFlac knows nothing about (HDMI, CarPlay): the strip says it may alter the audio, so no
-        // Hi-Res or Lossless claim is made for it either.
-        case .other: return nil
-        default: break
-        }
-        let bits: Int
-        if plan.client == .int32 {
-            bits = 32
-        } else if plan.reduceTo24 {
-            bits = 24
-        } else {
-            bits = min(source?.bitsPerSample ?? 24, 24)
+        case .usb, .wired: break
+        default: return DeliveredResolution.none
         }
         let rate = hardwareRate ?? plan.clientSampleRate
-        return bits >= 24 && rate > 48_000 ? .hiRes(bits: bits, rate: rate) : .lossless(bits: bits, rate: rate)
+        return source.bitsPerSample >= 24 && rate > 48_000 ? .hiRes : .lossless
     }
 
     /// Set only for a USB port with the system volume below full scale.

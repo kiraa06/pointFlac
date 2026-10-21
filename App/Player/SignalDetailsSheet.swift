@@ -24,9 +24,17 @@ struct SignalDetailsSheet: View {
                 }
                 Section {
                     Text(
-                        "Hi-Res means the output receives at least 24 bits at a rate above 48 kHz. Lossless is "
-                            + "anything up to 48 kHz, kept intact. Both describe what reaches the output, not just "
-                            + "the file: a resampled file is Lossless, and Bluetooth and AirPlay are neither.")
+                        "Hi-Res means the file's 24 bits or more leave pointFlac intact at a hardware rate above "
+                            + "48 kHz, on a route iOS doesn't tune (USB or wired). Lossless is the same hand-off at "
+                            + "48 kHz or below. The built-in speaker is tuned by iOS, and Bluetooth and AirPlay "
+                            + "re-encode, so none of them gets either claim.")
+                }
+                if !outputFacts.isEmpty {
+                    Section("Output") {
+                        ForEach(outputFacts, id: \.self) { fact in
+                            Text(fact).font(.callout)
+                        }
+                    }
                 }
                 Section("Path") {
                     row("Source", source, "The file as decoded: depth, rate and channels.")
@@ -79,6 +87,36 @@ struct SignalDetailsSheet: View {
         case .downmixed(let from, let to): "The output has \(to) channels, so iOS mixes the file's \(from) down."
         case .otherRoute: "This route is of a kind pointFlac doesn't know. It may alter the audio."
         }
+    }
+
+    /// Only what pointFlac can state as fact: what the file is, what it sends iOS, what iOS reports, and what it can't
+    /// see. Nothing here claims the converter's bit depth, which iOS does not report.
+    private var outputFacts: [String] {
+        guard let source = signal.source, let plan = signal.plan else { return [] }
+        var facts = ["File: FLAC \(source.formattedDepth) \(source.formattedRate)"]
+        var changes: [String] = []
+        if let change = plan.resample, change.from != change.to {
+            changes.append("resampled from \(AudioFormat.formatRate(change.from))")
+        }
+        if plan.reduceTo24 { changes.append("dithered from \(source.bitsPerSample)-bit to 24-bit") }
+        let format = plan.client == .float32 ? "32-bit float" : "32-bit integer"
+        let note = changes.isEmpty ? "unchanged" : changes.joined(separator: "; ")
+        facts.append("pointFlac sends iOS: \(format) at \(AudioFormat.formatRate(plan.clientSampleRate)) (\(note))")
+        if let rate = signal.hardwareRate {
+            facts.append("Hardware rate: \(AudioFormat.formatRate(rate)) (reported by iOS)")
+        }
+        facts.append("Converter bit depth: not reported by iOS")
+        switch signal.port {
+        case .builtIn:
+            facts.append("After pointFlac: iOS speaker tuning, which apps can't inspect or turn off")
+        case .usb, .wired:
+            facts.append(
+                "After pointFlac: iOS converts to the DAC's format. Below full volume it scales the samples.")
+        default: break
+        }
+        facts.append(
+            "iOS audio settings such as Headphone Accommodations can also change the sound; pointFlac can't see them.")
+        return facts
     }
 
     private var source: String {

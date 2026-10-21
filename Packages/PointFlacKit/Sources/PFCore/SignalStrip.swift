@@ -18,20 +18,29 @@ public enum SignalStrip {
         return text
     }
 
-    /// The SIGNAL cell's resolution runs, typed: the delivered resolution (never for a lossy or unknown route), then Pure
-    /// only when the indicator is `.pure`.
+    /// The SIGNAL cell's runs, typed. USB and wired: Hi-Res or Lossless, then Pure when the indicator is `.pure`.
+    /// The built-in speaker: Pure when it is, then "iOS speaker tuning", never a Lossless or Hi-Res claim. Every
+    /// other route has no runs, and the cell keeps the indicator words.
     public static func signalBadges(_ s: SignalState) -> [SignalBadge] {
         var badges: [SignalBadge] = []
-        switch s.resolution {
-        case .hiRes(let bits, let rate): badges.append(.hiRes(bits: bits, rate: rate))
-        case .lossless(let bits, let rate): badges.append(.lossless(bits: bits, rate: rate))
-        case .lossy, nil: break
+        switch s.port {
+        case .usb, .wired:
+            switch s.resolution {
+            case .hiRes: badges = [.hiRes]
+            case .lossless: badges = [.lossless]
+            default: break
+            }
+            if !badges.isEmpty, s.indicator == .pure { badges.append(.pure) }
+        case .builtIn:
+            guard s.plan != nil, s.source != nil else { break }
+            if s.indicator == .pure { badges.append(.pure) }
+            badges.append(.speakerTuning)
+        default: break
         }
-        if s.indicator == .pure { badges.append(.pure) }
         return badges
     }
 
-    /// The same runs as upper-case text, e.g. `["HI-RES 24/96", "PURE"]` (the brief's interface; the cell itself shows
+    /// The same runs as upper-case text, e.g. `["HI-RES", "PURE"]` (the brief's interface; the cell itself shows
     /// `SignalBadge.displayText`).
     public static func badges(_ s: SignalState) -> [String] { signalBadges(s).map(\.text) }
 
@@ -91,34 +100,38 @@ public enum SignalStrip {
     }
 }
 
-/// One run of the SIGNAL cell's resolution text: what it says, and what it means to a screen reader.
+/// One run of the SIGNAL cell's text: what it says, and what it means to a screen reader.
 public enum SignalBadge: Hashable, Sendable {
-    case hiRes(bits: Int, rate: Int)
-    case lossless(bits: Int, rate: Int)
+    case hiRes
+    case lossless
     case pure
+    case speakerTuning
 
     public var text: String {
         switch self {
-        case .hiRes(let bits, let rate): "HI-RES \(bits)/\(SignalStrip.shortRate(rate))"
-        case .lossless(let bits, let rate): "LOSSLESS \(bits)/\(SignalStrip.shortRate(rate))"
+        case .hiRes: "HI-RES"
+        case .lossless: "LOSSLESS"
         case .pure: "PURE"
+        case .speakerTuning: "IOS SPEAKER TUNING"
         }
     }
 
-    /// Mixed case, for the SIGNAL cell's plain text: `Hi-Res 24/96`, `Lossless 16/44.1`, `Pure`.
+    /// Mixed case, for the cell's plain text.
     public var displayText: String {
         switch self {
-        case .hiRes(let bits, let rate): "Hi-Res \(bits)/\(SignalStrip.shortRate(rate))"
-        case .lossless(let bits, let rate): "Lossless \(bits)/\(SignalStrip.shortRate(rate))"
+        case .hiRes: "Hi-Res"
+        case .lossless: "Lossless"
         case .pure: "Pure"
+        case .speakerTuning: "iOS speaker tuning"
         }
     }
 
     public var accessibilityLabel: String {
         switch self {
-        case .hiRes(let bits, let rate): "Hi-Res output, \(bits)-bit \(AudioFormat.formatRate(rate))"
-        case .lossless(let bits, let rate): "Lossless output, \(bits)-bit \(AudioFormat.formatRate(rate))"
-        case .pure: "Pure: untouched by pointFlac"
+        case .hiRes: "Hi-Res output"
+        case .lossless: "Lossless output"
+        case .pure: "Pure"
+        case .speakerTuning: "iOS speaker tuning"
         }
     }
 }
