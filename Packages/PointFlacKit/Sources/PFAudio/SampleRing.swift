@@ -91,8 +91,11 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         guard let base = dst.baseAddress, !dst.isEmpty else { return 0 }
         let t = tail.load(ordering: .acquiring)
         let h = head.load(ordering: .acquiring)
-        assert(h - t >= 0 && h - t <= capacity, "SampleRing index invariant violated")
-        let count = min(dst.count, max(h - t, 0))
+        // Locals only: an assertion that read `capacity` would capture, and so retain, the ring in a debug build.
+        let used = h - t
+        let limit = capacity
+        assert(used >= 0 && used <= limit, "SampleRing index invariant violated")
+        let count = min(dst.count, max(used, 0))
         guard count > 0 else { return 0 }
         let start = t & mask
         let first = min(count, capacity - start)
@@ -102,6 +105,17 @@ public final class SampleRing<Element: BitwiseCopyable>: @unchecked Sendable {
         }
         tail.store(t + count, ordering: .releasing)
         return count
+    }
+
+    /// Consumer only; real-time safe. Drops up to `count` readable elements, the ones `read(into:)` would copy next,
+    /// without copying them, and returns how many it dropped.
+    public func skip(_ count: Int) -> Int {
+        let t = tail.load(ordering: .acquiring)
+        let h = head.load(ordering: .acquiring)
+        let n = min(count, max(h - t, 0))
+        guard n > 0 else { return 0 }
+        tail.store(t + n, ordering: .releasing)
+        return n
     }
 
     /// Consumer only; real-time safe. Drops everything currently readable by advancing `tail` to `head`.
