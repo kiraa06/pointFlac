@@ -100,9 +100,12 @@ struct SoundView: View {
         .tint(theme.processingTint)
     }
 
-    /// `-PFSoundScrollTo eq|tone|crossfeed|limiter` (DEBUG only) opens scrolled to that block, for screenshots.
+    /// `-PFSoundScrollTo eq|tone|crossfeed|limiter` (DEBUG only) opens scrolled to that block, and
+    /// `-PFSoundSelectBand <n>` with parametric band n selected, for screenshots.
     private func scrollForScreenshots(_ proxy: ScrollViewProxy) {
         #if DEBUG
+            let band = UserDefaults.standard.integer(forKey: "PFSoundSelectBand")
+            if band > 0 { selectedBand = band - 1 }
             guard let name = UserDefaults.standard.string(forKey: "PFSoundScrollTo"),
                 let block = SoundBlock(rawValue: name)
             else { return }
