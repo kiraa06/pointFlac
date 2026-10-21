@@ -19,6 +19,8 @@ final class LaunchTests: XCTestCase {
         // Settings → Licences, since Plan 3 (the player is home now).
         app.tabBars.buttons["Settings"].tap()
         let link = app.buttons["licencesLink"]
+        // About sits below Privacy and Soulseek, so it may be off screen.
+        if !link.waitForExistence(timeout: 3) { app.swipeUp() }
         XCTAssertTrue(link.waitForExistence(timeout: 5))
         link.tap()
         let notices = app.staticTexts["licenceNotices"]

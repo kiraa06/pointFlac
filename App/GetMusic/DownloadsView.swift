@@ -32,6 +32,16 @@ struct DownloadsView: View {
                     .padding(.vertical, 4)
                     .accessibilityElement(children: .combine)
                     .accessibilityIdentifier("downloadRow-\(row.id)")
+                    .swipeActions {
+                        if row.state.hasPrefix("Failed") || row.state.hasPrefix("Cancelled") {
+                            Button("Retry", systemImage: "arrow.clockwise") { finder.retryDownload(row.id) }
+                                .tint(.blue)
+                        } else if !row.state.hasPrefix("Done") {
+                            Button("Cancel", systemImage: "xmark", role: .destructive) {
+                                finder.cancelDownload(row.id)
+                            }
+                        }
+                    }
                 }
             }
             .navigationTitle("Downloads")

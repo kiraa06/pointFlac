@@ -107,6 +107,23 @@ final class RealMusicFinder: MusicFinding {
         }
     }
 
+    func cancelDownload(_ id: DownloadRow.ID) {
+        guard let job = latestJob(for: id) else { return }
+        let manager = manager
+        Task { _ = await manager.cancel(job) }
+    }
+
+    func retryDownload(_ id: DownloadRow.ID) {
+        guard let job = latestJob(for: id) else { return }
+        let manager = manager
+        Task { _ = await manager.retry(job) }
+    }
+
+    /// The manager's job behind a Downloads row: the newest for that track, as `downloads` shows.
+    private func latestJob(for rowID: DownloadRow.ID) -> String? {
+        observer.items.last { Self.rowID($0.track) == rowID }?.id
+    }
+
     /// The UI's words for each state (contract 2): "Queued", "Downloading", "Validating", "Saving", "Done", "Failed: …".
     static func label(_ state: DownloadState) -> String {
         switch state {
@@ -139,6 +156,8 @@ final class RealMusicFinder: MusicFinding {
             let task = Task { @MainActor [weak self] in
                 for await batch in upstream {
                     guard let self else { break }
+                    // Bounded: only recent rows can still be on screen to be picked.
+                    if self.picked.count > 2_000 { self.picked.removeAll(keepingCapacity: true) }
                     for suggestion in batch { self.picked[suggestion.id] = suggestion }
                     continuation.yield(batch.map(Self.suggestion))
                 }

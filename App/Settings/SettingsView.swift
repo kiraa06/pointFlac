@@ -43,16 +43,27 @@ struct SettingsView: View {
                 .onChange(of: lookupNames) { model.lookupsChanged() }
                 .onChange(of: lookupArtwork) { model.lookupsChanged() }
                 #if SOULSEEK
-                    SoulseekSettingsSection(account: model.soulseek)
-                #endif
-                Section("Diagnostics") {
-                    NavigationLink {
-                        DebugLibraryView(model: model)
-                    } label: {
-                        Label("Diagnostics", systemImage: "waveform.path.ecg")
+                    Section {
+                        NavigationLink {
+                            Form { SoulseekSettingsSection(account: model.soulseek) }
+                                .navigationTitle("Soulseek")
+                        } label: {
+                            LabeledContent("Soulseek", value: model.soulseek.isSignedIn ? "Signed in" : "Signed out")
+                        }
+                        .accessibilityIdentifier("soulseekLink")
                     }
-                    .accessibilityIdentifier("diagnosticsLink")
-                }
+                #endif
+                #if DEBUG
+                    // Plan 1's debug harness, for the UI tests and the S1 listening checks; never in Release.
+                    Section("Diagnostics") {
+                        NavigationLink {
+                            DebugLibraryView(model: model)
+                        } label: {
+                            Label("Diagnostics", systemImage: "waveform.path.ecg")
+                        }
+                        .accessibilityIdentifier("diagnosticsLink")
+                    }
+                #endif
                 Section("About") {
                     NavigationLink("Licences") { LicencesView() }
                         .accessibilityIdentifier("licencesLink")

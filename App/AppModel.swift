@@ -28,16 +28,16 @@ final class AppModel {
     /// Should that fail, the player's status says "Audio output unavailable: …", and the library still works.
     let player: Player
 
-    /// What the Shelf browses and searches.
-    @ObservationIgnored private(set) var library: any LibraryBrowsing
-    /// Get Music and Downloads.
-    @ObservationIgnored private(set) var finder: any MusicFinding
-    /// The record on the deck, its sides, Up Next and repeat.
-    @ObservationIgnored private(set) var playback: PlaybackController
+    /// What the Shelf browses and searches. Set once, before the UI mounts (so not observed).
+    @ObservationIgnored let library: any LibraryBrowsing
+    /// Get Music and Downloads. Set once, before the UI mounts.
+    @ObservationIgnored let finder: any MusicFinding
+    /// The record on the deck, its sides, Up Next and repeat. Set once, before the UI mounts.
+    @ObservationIgnored let playback: PlaybackController
     /// The real library behind `library`.
     let realLibrary: RealLibrary
     /// The real finder, unless a DEBUG launch asked for the mock.
-    @ObservationIgnored private(set) var realFinder: RealMusicFinder?
+    @ObservationIgnored let realFinder: RealMusicFinder?
     #if SOULSEEK
         /// The one Soulseek session (Settings → Soulseek).
         let soulseek: SoulseekAccount
@@ -56,14 +56,13 @@ final class AppModel {
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         UserDefaults.standard.register(defaults: [Self.lookupNamesKey: true, Self.lookupArtworkKey: false])
-        realLibrary = RealLibrary(library: Self.openLibrary())
+        let realLibrary = RealLibrary(library: Self.openLibrary())
+        self.realLibrary = realLibrary
         #if DEBUG
             preloadFixtures = arguments.contains("-PFPreloadFixtures")
             demoPlay = arguments.contains("-PFDemoPlay")
             let mute = arguments.contains("-PFMuteOutput")
             let useMock = preloadFixtures || arguments.contains("-PFMockFinder")
-        #else
-            let useMock = false
         #endif
         player = Player(
             session: SystemAudioSession(),
@@ -82,19 +81,33 @@ final class AppModel {
         let names = UserDefaults.standard.bool(forKey: Self.lookupNamesKey)
         let artwork = UserDefaults.standard.bool(forKey: Self.lookupArtworkKey)
         #if SOULSEEK
-            soulseek = SoulseekAccount()
-            let real =
-                useMock
-                ? nil
-                : RealMusicFinder(
+            let soulseek = SoulseekAccount()
+            self.soulseek = soulseek
+            let makeReal = {
+                RealMusicFinder(
                     library: realLibrary, soulseek: soulseek.client, registryEnabled: names, artworkEnabled: artwork)
+            }
         #else
-            let real =
-                useMock ? nil : RealMusicFinder(library: realLibrary, registryEnabled: names, artworkEnabled: artwork)
+            let makeReal = {
+                RealMusicFinder(library: realLibrary, registryEnabled: names, artworkEnabled: artwork)
+            }
         #endif
-        realFinder = real
         library = realLibrary
-        finder = real ?? MockMusicFinder(library: realLibrary)
+        #if DEBUG
+            // The demo finder exists only in Debug builds, and only under the UI tests' launch arguments.
+            if useMock {
+                realFinder = nil
+                finder = MockMusicFinder(library: realLibrary)
+            } else {
+                let real = makeReal()
+                realFinder = real
+                finder = real
+            }
+        #else
+            let real = makeReal()
+            realFinder = real
+            finder = real
+        #endif
         playback = PlaybackController(player: player, library: realLibrary)
     }
 
@@ -116,13 +129,6 @@ final class AppModel {
             }
         }
         fatalError("pointFlac could not open a library database in Application Support or the temporary folder")
-    }
-
-    /// Swaps in other implementations of the UI's contracts.
-    func use(library: any LibraryBrowsing, finder: any MusicFinding) {
-        self.library = library
-        self.finder = finder
-        playback = PlaybackController(player: player, library: library)
     }
 
     /// The privacy switches changed in Settings: applied at once.

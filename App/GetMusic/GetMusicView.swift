@@ -120,10 +120,16 @@ struct GetMusicView: View {
                 }
             }
             .task(id: query) {
-                // A new phrase cancels the old suggestions: this task restarts on every keystroke.
-                suggestions = []
-                guard !query.isEmpty else { return }
+                // A new phrase cancels the old consumer: this task restarts on every keystroke. The previous rows stay
+                // until new ones arrive (no flicker), and a short pause lets fast typing skip phrases nobody reads.
+                guard !query.isEmpty else {
+                    suggestions = []
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
                 for await batch in finder.suggestions(query) {
+                    guard !Task.isCancelled else { return }
                     suggestions = batch
                 }
             }
@@ -210,7 +216,7 @@ private struct RemoteRowView: View {
                 Text(row.title).font(.body.weight(.semibold)).lineLimit(2)
                 Text(row.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 HStack(spacing: 8) {
-                    Text(row.format).font(.caption.monospaced()).foregroundStyle(.green)
+                    Text(row.format).font(.caption.monospaced()).foregroundStyle(.tint)
                     Text(row.sizeText).font(.caption.monospaced()).foregroundStyle(.secondary)
                 }
                 if let licence = row.licence {

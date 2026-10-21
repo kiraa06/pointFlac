@@ -60,6 +60,8 @@ final class PlaybackSmokeTests: XCTestCase {
         app.launch()
         app.tabBars.buttons["Settings"].tap()
         let diagnostics = app.buttons["diagnosticsLink"]
+        // Diagnostics sits below Privacy and Soulseek, so it may be off screen.
+        if !diagnostics.waitForExistence(timeout: 3) { app.swipeUp() }
         XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
         diagnostics.tap()
         return app

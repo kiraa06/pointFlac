@@ -17,6 +17,8 @@ final class PlayerUITests: XCTestCase {
         app.tabBars.buttons["Downloads"].tap()
         XCTAssertTrue(app.navigationBars["Downloads"].waitForExistence(timeout: 3))
         app.tabBars.buttons["Settings"].tap()
+        // Diagnostics sits below Privacy and Soulseek, so it may be off screen.
+        if !app.buttons["diagnosticsLink"].waitForExistence(timeout: 3) { app.swipeUp() }
         XCTAssertTrue(app.buttons["diagnosticsLink"].waitForExistence(timeout: 3))
         app.tabBars.buttons["Player"].tap()
         XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
