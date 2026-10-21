@@ -5,9 +5,11 @@ import Foundation
 /// system gesture, an alert: `onEnded` never runs, and the view learns of it only from a `@GestureState` flag
 /// resetting), the app leaves the foreground, or the graph goes away.
 ///
-/// One finger on a handle drags that band. A pinch shapes the Q of one band: the one being dragged when there is one,
-/// else the band the view picks (the selected one, else the nearest). A pinch that takes over a drag hands back the
-/// band as the drag found it, to undo the first finger's stray move, and holds the drag inert until its finger lifts.
+/// One finger on a handle drags that band, and only that finger: while it does, a finger on another handle neither
+/// steers the band nor ends its drag (it is the second finger of a pinch, or a stray touch). A pinch shapes the Q of
+/// one band: the one being dragged when there is one, else the band the view picks (the selected one, else the
+/// nearest). A pinch that takes over a drag hands back the band as the drag found it, to undo the first finger's stray
+/// move, and holds the drag inert until that drag's own finger lifts.
 public struct BandGestureSession<Band: Sendable>: Sendable {
     public struct Drag: Sendable {
         public let index: Int
@@ -32,16 +34,19 @@ public struct BandGestureSession<Band: Sendable>: Sendable {
     public init() {}
 
     /// A drag on the handle of band `index` moved. Its first call starts the drag, from `band` and the grab offset;
-    /// later calls keep that start, whichever handle reports them. Returns the drag to apply, or nil while a pinch
-    /// holds it inert.
+    /// later calls from the same handle keep that start. Returns the drag to apply, or nil while a pinch holds it inert
+    /// or while another handle's drag is running.
     public mutating func dragChanged(index: Int, band: Band, grabX: Double, grabY: Double) -> Drag? {
+        if let drag, drag.index != index { return nil }
         guard !pinched else { return nil }
         if drag == nil { drag = Drag(index: index, origin: band, grabX: grabX, grabY: grabY) }
         return drag
     }
 
-    /// The drag's finger lifted, or the system cancelled the drag.
-    public mutating func dragStopped() {
+    /// The drag on the handle of band `index` stopped: its finger lifted, or the system cancelled it. A stop from any
+    /// other handle leaves the running drag alone.
+    public mutating func dragStopped(index: Int) {
+        if let drag, drag.index != index { return }
         drag = nil
         pinched = false
     }

@@ -18,13 +18,29 @@ struct BandGestureSessionTests {
     func dragKeepsItsStart() {
         var s = BandGestureSession<Band>()
         let first = s.dragChanged(index: 1, band: bands[1], grabX: 3, grabY: -2)
-        // Later events, whatever handle reports them, keep the first band and grab.
-        let later = s.dragChanged(index: 2, band: bands[2], grabX: 9, grabY: 9)
+        // Later events from the same handle (with whatever the band has become) keep the first band and grab.
+        let later = s.dragChanged(index: 1, band: Band(id: 1, hz: 1500), grabX: 9, grabY: 9)
         #expect(first?.index == 1)
         #expect(later?.index == 1)
         #expect(later?.origin == bands[1])
         #expect(later?.grabX == 3 && later?.grabY == -2)
-        s.dragStopped()
+        s.dragStopped(index: 1)
+        #expect(s.isIdle)
+    }
+
+    @Test("a finger on another handle neither steers nor ends the running drag")
+    func secondHandleNeitherSteersNorStops() {
+        var s = BandGestureSession<Band>()
+        _ = s.dragChanged(index: 1, band: bands[1], grabX: 3, grabY: -2)
+        // Handle 2's touch-down and moves: nothing to apply, and band 1's drag is untouched.
+        #expect(s.dragChanged(index: 2, band: bands[2], grabX: 0, grabY: 0) == nil)
+        // Handle 2's finger lifts (or is cancelled): band 1's drag runs on under its own finger.
+        s.dragStopped(index: 2)
+        let still = s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0)
+        #expect(still?.index == 1)
+        #expect(still?.origin == bands[1])
+        #expect(still?.grabX == 3)
+        s.dragStopped(index: 1)
         #expect(s.isIdle)
     }
 
@@ -32,8 +48,8 @@ struct BandGestureSessionTests {
     func cancelledDragStartsAfresh() {
         var s = BandGestureSession<Band>()
         _ = s.dragChanged(index: 1, band: bands[1], grabX: 3, grabY: -2)
-        // The system cancels the drag: no onEnded, only the gesture flag resetting, which stops the drag.
-        s.dragStopped()
+        // The system cancels the drag: no onEnded, only the handle's gesture flag resetting, which stops the drag.
+        s.dragStopped(index: 1)
         let next = s.dragChanged(index: 0, band: bands[0], grabX: 1, grabY: 1)
         #expect(next?.index == 0)
         #expect(next?.origin == bands[0])
@@ -51,6 +67,25 @@ struct BandGestureSessionTests {
         #expect(s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0) == nil)
     }
 
+    @Test("a pinch begun with its fingers on two handles shapes the first, and lifting the second changes nothing")
+    func pinchOnTwoHandles() {
+        var s = BandGestureSession<Band>()
+        // Finger 1 lands on handle 1 and starts its drag; finger 2 lands on handle 2, which must not move band 1.
+        _ = s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0)
+        #expect(s.dragChanged(index: 2, band: bands[2], grabX: 0, grabY: 0) == nil)
+        // The pinch is recognised: it shapes band 1 (the dragged band), not band 2 or the view's choice.
+        let p = s.pinchChanged(choose: { 2 }, q: { qs[$0] })
+        #expect(p?.pinch == .init(index: 1, q: 1.0))
+        #expect(p?.restore == bands[1])
+        // Finger 2 lifts: its drag stop is ignored and the pinch ends; band 1 stays still under finger 1.
+        s.dragStopped(index: 2)
+        s.pinchStopped()
+        #expect(s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0) == nil)
+        // Only finger 1 lifting ends it all.
+        s.dragStopped(index: 1)
+        #expect(s.isIdle)
+    }
+
     @Test("lifting the pinch first leaves the drag inert until its finger lifts")
     func pinchLiftsFirst() {
         var s = BandGestureSession<Band>()
@@ -58,7 +93,7 @@ struct BandGestureSessionTests {
         _ = s.pinchChanged(choose: { nil }, q: { qs[$0] })
         s.pinchStopped()
         #expect(s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0) == nil)
-        s.dragStopped()
+        s.dragStopped(index: 1)
         #expect(s.isIdle)
     }
 
@@ -67,7 +102,7 @@ struct BandGestureSessionTests {
         var s = BandGestureSession<Band>()
         _ = s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0)
         _ = s.pinchChanged(choose: { nil }, q: { qs[$0] })
-        s.dragStopped()
+        s.dragStopped(index: 1)
         // The pinch carries on alone, on the same band, with nothing to put back.
         let p = s.pinchChanged(choose: { 2 }, q: { qs[$0] })
         #expect(p?.pinch.index == 1)
