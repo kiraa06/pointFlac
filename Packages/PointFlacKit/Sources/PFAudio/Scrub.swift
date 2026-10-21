@@ -345,8 +345,10 @@ struct ScrubRenderState {
     var voiceClientRate = 0
     var generation: UInt64 = 0
     var handSequence: UInt64 = 0
-    /// Where the voice started, the anchor of the hand's offsets.
+    /// Where the voice started: the hand's offsets count from here, less `handBase`.
     var start: Double = 0
+    /// The hand's offset when the voice started (a playing record's; 0 for a paused one).
+    var handBase: Double = 0
     var released = false
     /// Frames of fade-out left (`.fade`), or −1.
     var fadeLeft = -1

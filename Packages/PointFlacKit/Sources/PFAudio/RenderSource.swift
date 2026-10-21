@@ -232,6 +232,16 @@ public final class RenderSource: @unchecked Sendable {
                 state.pointee.voice = ScrubVoice(
                     channels: channels, sourceRate: Double(window.sourceRate), outputRate: Double(clientRate),
                     at: start, speed: speed)
+                // A playing record's ring played on while the needle's music decoded (a few milliseconds), and the
+                // hand may have moved meanwhile: from here the voice follows the hand's movement since now, so that
+                // gap is neither counted twice (a rush forward) nor pulled back to the grab point (an audible zip).
+                // A paused record played nothing meanwhile, so its offsets count from the grab point.
+                if let hand = tap.readHand(after: 0) {
+                    state.pointee.handSequence = hand.sequence
+                    state.pointee.handBase = ringAllowed ? hand.offset : 0
+                    state.pointee.voice?.hand(
+                        target: max(0, start + hand.offset - state.pointee.handBase), speed: hand.speed)
+                }
                 tap.voicePositionBits.store(start.bitPattern, ordering: .releasing)
                 tap.voiceSpeedBits.store(speed.bitPattern, ordering: .releasing)
                 tap.voiceStarted.store(generation, ordering: .releasing)
@@ -259,10 +269,7 @@ public final class RenderSource: @unchecked Sendable {
         case .hand:
             if let hand = tap.readHand(after: state.pointee.handSequence) {
                 state.pointee.handSequence = hand.sequence
-                // Offsets count from where the voice took over. A playing record's ring plays on for the few
-                // milliseconds the needle's music takes to decode, so the record slips that much under the finger:
-                // pulling the needle back to where the hand took hold would zip audibly.
-                var target = max(0, state.pointee.start + hand.offset)
+                var target = max(0, state.pointee.start + hand.offset - state.pointee.handBase)
                 if window.totalFrames > 0 { target = min(target, Double(window.totalFrames)) }
                 voice.hand(target: target, speed: hand.speed)
             }

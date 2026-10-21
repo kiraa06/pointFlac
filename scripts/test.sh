@@ -40,7 +40,9 @@ swift test --package-path Packages/PointFlacKit
 
 echo "== 4/7 thread sanitizer: pipeline, player, ring (host) =="
 # TSan cannot see the ring's memmove copies (ruling R9), so stage 5 stresses their ordering in a release build.
-swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'PlaybackPipelineTests|PlayerTests|SampleRingTests|ScrubTests|ScrubWindowTests'
+swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'PlaybackPipelineTests|PlayerTests|SampleRingTests'
+# The scrub suites on their own: their decoder threads would otherwise share the CPU with the pipeline's latency checks.
+swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'ScrubTests|ScrubWindowTests'
 
 echo "== 5/7 SampleRing ordering stress (release build) =="
 swift test -c release -Xswiftc -enable-testing --package-path Packages/PointFlacKit --filter SampleRingOrderingTests

@@ -92,6 +92,19 @@ private final class ScrubRig {
         return true
     }
 
+    /// Pulls until the scrub voice has taken over from the ring (its music decoded around the needle): under the
+    /// thread sanitizer that can take a while, and measurements must start from it.
+    func voiceTookOver() async -> Bool {
+        guard let tap = player.pipeline?.scrubTap else { return false }
+        let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(10))
+        while tap.voiceStarted.load(ordering: .acquiring) != tap.generation.load(ordering: .acquiring) {
+            guard ContinuousClock.now < deadline else { return false }
+            // Paced, as a render thread would ask: unpaced, the ring would outrun the decoder for ever.
+            await pull(512)
+        }
+        return true
+    }
+
     /// Waits (pulling) for a settling let-go to finish.
     func settle(_ task: Task<Void, Never>) async -> Bool {
         var done = false
@@ -188,6 +201,7 @@ struct ScrubTests {
         rig.player.beginScrub()
         #expect(rig.player.signal.scrubbing)
         #expect(rig.player.signal.indicator == .scrubbing)
+        #expect(await rig.voiceTookOver())
         await rig.pull(22_050)
         #expect(rms(rig.lastLeft(4_410)) < 1e-3)
         // The brake is a slowdown, not a cut: no click where the hand landed.
@@ -302,6 +316,7 @@ struct ScrubTests {
         await rig.pull(4_410)
         rig.player.beginScrub()
         #expect(rig.player.isScrubbing)
+        #expect(await rig.voiceTookOver())
         await rig.pull(22_050)
         #expect(rms(rig.lastLeft(4_410)) < 1e-3)
         #expect(largestStep(rig.lastLeft(30_000)) < toneSlope * 1.5)
