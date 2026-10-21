@@ -10,6 +10,13 @@ let package = Package(
         .library(name: "PFDSP", targets: ["PFDSP"]),
         .library(name: "PFAudio", targets: ["PFAudio"]),
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
+        .library(name: "PFSearch", targets: ["PFSearch"]),
+        .library(name: "PFFind", targets: ["PFFind"]),
+        // Optional module: only the Soulseek build variant links this product (spec §5.6 "Build flag").
+        .library(name: "PFSoulseek", targets: ["PFSoulseek"]),
+        .library(name: "PFDownloads", targets: ["PFDownloads"]),
+        .library(name: "PFArchive", targets: ["PFArchive"]),
+        .library(name: "PFDesign", targets: ["PFDesign"]),
     ],
     targets: [
         .target(
@@ -54,10 +61,54 @@ let package = Package(
             dependencies: ["PFCore", "PFFlac"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // Stream D: the player UI's maths (sides, spin, tonearm, jog, the hand-off timeline). Foundation only.
+        .target(
+            name: "PFDesign",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFDesignTests",
+            dependencies: ["PFDesign"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFSearch",
+            dependencies: ["PFCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                // Search runs on every keystroke inside one 120 Hz frame (spec §8), so it is optimised in Debug builds
+                // too: an unoptimised index loop is several times slower, and a Debug app or a `swift test` run would
+                // then misstate the budget. Release builds are optimised anyway.
+                .unsafeFlags(["-O"], .when(configuration: .debug)),
+            ]
+        ),
+        .target(
+            name: "PFFind",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFDownloads",
+            dependencies: ["PFCore", "PFFlac"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFArchive",
+            dependencies: ["PFDownloads"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .target(
             name: "PFTestSupport",
             dependencies: ["PFAudio"],
             resources: [.copy("Resources/Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "PFSoulseek",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFSoulseekTests",
+            dependencies: ["PFSoulseek"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
@@ -82,7 +133,30 @@ let package = Package(
         ),
         .testTarget(
             name: "PFLibraryTests",
-            dependencies: ["PFLibrary", "PFTestSupport"],
+            // PFSearch and PFAudio only for the end-to-end test of the path the app adapter takes.
+            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFSearchTests",
+            dependencies: ["PFSearch", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFFindTests",
+            dependencies: ["PFFind"],
+            resources: [.copy("Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFDownloadsTests",
+            dependencies: ["PFDownloads", "PFTestSupport"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFArchiveTests",
+            dependencies: ["PFArchive", "PFDownloads", "PFTestSupport"],
+            resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

@@ -612,6 +612,7 @@ Further rules:
   - **[call]** Crash logs come only from Apple's on-device diagnostics, which the user can share manually.
 - Network traffic goes only to: archive.org, the Soulseek server and its peers (module builds only), and artwork lookups.
   - **[call]** Artwork lookups use MusicBrainz and Cover Art Archive, are opt-in, and send only artist and album names.
+  - **[call, ruling R26]** MusicBrainz name lookups for search suggestions are on by default and disclosed: Get Music notes under its search field that what you type is sent to musicbrainz.org, and Settings → "Look up names online (MusicBrainz)" turns them off at once.
 - Secrets live only in the Keychain (Soulseek credentials), as `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so they are never synced or backed up.
 - All networking uses TLS where the service supports it. Soulseek's lack of encryption is disclosed in the UI.
 - All untrusted input has explicit limits:

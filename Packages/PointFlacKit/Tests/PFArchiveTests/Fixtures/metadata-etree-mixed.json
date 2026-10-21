@@ -1,0 +1,82 @@
+{
+ "created": 1700000000,
+ "metadata": {
+  "identifier": "gd1977-05-08.sbd.example",
+  "title": "Grateful Dead Live at Barton Hall on 1977-05-08",
+  "creator": "Grateful Dead",
+  "collection": [
+   "GratefulDead",
+   "etree",
+   "stream_only"
+  ],
+  "mediatype": "etree"
+ },
+ "files": [
+  {
+   "name": "gd77-05-08d1t01.flac",
+   "source": "original",
+   "format": "Flac",
+   "size": "31337401",
+   "md5": "0123456789abcdef0123456789abcdef",
+   "title": "Minglewood Blues",
+   "track": "1",
+   "length": "345.2"
+  },
+  {
+   "name": "disc2/gd77-05-08d2t02 Scarlet.flac",
+   "source": "original",
+   "format": "24bit Flac",
+   "size": "61337401",
+   "md5": "fedcba9876543210fedcba9876543210",
+   "title": "Scarlet Begonias",
+   "track": "2/12"
+  },
+  {
+   "name": "gd77-05-08.flac.zip",
+   "source": "original",
+   "format": "Flac",
+   "size": "92674802",
+   "md5": "11111111111111111111111111111111"
+  },
+  {
+   "name": "../escape.flac",
+   "source": "original",
+   "format": "Flac",
+   "size": "1000",
+   "md5": "22222222222222222222222222222222"
+  },
+  {
+   "name": "gd77-05-08d1t03-nomd5.flac",
+   "source": "original",
+   "format": "Flac",
+   "size": "1000"
+  },
+  {
+   "name": "gd77-05-08d1t04-derived.flac",
+   "source": "derivative",
+   "format": "Flac",
+   "size": "1000",
+   "md5": "33333333333333333333333333333333"
+  },
+  {
+   "name": "gd77-05-08d1t05.mp3",
+   "source": "original",
+   "format": "VBR MP3",
+   "size": "1000",
+   "md5": "44444444444444444444444444444444"
+  },
+  {
+   "name": "gd77-05-08d1t06-nosize.flac",
+   "source": "original",
+   "format": "Flac",
+   "md5": "55555555555555555555555555555555"
+  },
+  {
+   "name": "gd77-05-08.ffp",
+   "source": "original",
+   "format": "Flac FingerPrint",
+   "size": "283",
+   "md5": "66666666666666666666666666666666"
+  }
+ ]
+}

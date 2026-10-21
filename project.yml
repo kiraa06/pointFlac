@@ -6,8 +6,8 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
-    MARKETING_VERSION: 0.1.0
-    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.2.0
+    CURRENT_PROJECT_VERSION: 2
 packages:
   PointFlacKit:
     path: Packages/PointFlacKit
@@ -23,6 +23,7 @@ targets:
       - path: App
         excludes:
           - Debug/Fixtures
+          - Debug/make-demo-fixtures.sh
       # The debug fixtures, as a folder reference: they land in the app bundle under Fixtures/.
       - path: App/Debug/Fixtures
         type: folder
@@ -36,10 +37,27 @@ targets:
         product: PFAudio
       - package: PointFlacKit
         product: PFLibrary
+      - package: PointFlacKit
+        product: PFDesign
+      - package: PointFlacKit
+        product: PFSearch
+      - package: PointFlacKit
+        product: PFFind
+      - package: PointFlacKit
+        product: PFDownloads
+      - package: PointFlacKit
+        product: PFArchive
+      # The App Store variant drops this product and the SOULSEEK flag below (spec §5.6 "Build flag"): builds without
+      # the flag compile no Soulseek code.
+      - package: PointFlacKit
+        product: PFSoulseek
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The sideloaded soft-launch build includes Soulseek, in Debug and Release. The App Store variant removes
+        # SOULSEEK here and the PFSoulseek dependency above.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) SOULSEEK
       configs:
         # Ruling R4: the fixtures ship only in Debug builds. XcodeGen has no per-configuration sources, so Release
         # drops the folder by name, and the app reads it only under #if DEBUG.
@@ -52,19 +70,22 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UIBackgroundModes: [audio]
+        # Soulseek peers are reached directly; iOS asks before any local-network connection (spec §5.6).
+        NSLocalNetworkUsageDescription: >-
+          pointFlac connects to other Soulseek users' computers to download FLAC files you choose. It never shares
+          or uploads anything.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
-        # Xcode's template defaults. iPad multitasking needs every orientation; without them device builds warn.
+        # Portrait only for the soft launch: the Deck's layout is phone-portrait (UI review: landscape overflows and the
+        # tonearm geometry degenerates on wide plinths). UIRequiresFullScreen opts out of iPad multitasking, which
+        # would otherwise require every orientation. Revisit with the iPad layouts.
+        UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
   PointFlacUITests:
     type: bundle.ui-testing
     platform: iOS

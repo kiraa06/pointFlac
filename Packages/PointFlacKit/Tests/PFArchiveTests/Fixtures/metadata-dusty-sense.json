@@ -1,0 +1,126 @@
+{
+ "created": 1792535888,
+ "d1": "ia600607.us.archive.org",
+ "dir": "/11/items/dusty-sense",
+ "files": [
+  {
+   "name": "__ia_thumb.jpg",
+   "source": "original",
+   "mtime": "1673141779",
+   "size": "14380",
+   "md5": "4a16f52a85bedc1a6b8919cb6d0b3f77",
+   "crc32": "1137fa62",
+   "sha1": "a4b9fcb325c68bf58efb4bacd864cafe3a4e984c",
+   "format": "Item Tile",
+   "rotation": "0"
+  },
+  {
+   "name": "dusty-sense.flac",
+   "source": "original",
+   "mtime": "1673133358",
+   "size": "3553564",
+   "md5": "625d98745d9994f019e3558b4f84cab5",
+   "crc32": "992800b1",
+   "sha1": "cb4e8a7bf261dacc9b53f60869336cf1e62c56de",
+   "format": "24bit Flac",
+   "length": "27.84",
+   "viruscheck": "1673133706",
+   "track": "01"
+  },
+  {
+   "name": "dusty-sense.mp3",
+   "source": "derivative",
+   "bitrate": "147",
+   "length": "00:27",
+   "format": "VBR MP3",
+   "original": "dusty-sense.flac",
+   "mtime": "1673133732",
+   "size": "512572",
+   "md5": "bbdbb763ad0971e7a93ced4a1ee8944e",
+   "crc32": "75afc685",
+   "sha1": "181cba0680c74cd7021ce1fec6ba57f0babd7e83"
+  },
+  {
+   "name": "dusty-sense.png",
+   "source": "derivative",
+   "format": "PNG",
+   "original": "dusty-sense.flac",
+   "mtime": "1673133751",
+   "size": "33555",
+   "md5": "f8846d4b9bbe68d65194a8aca44db2c5",
+   "crc32": "df7cbb66",
+   "sha1": "d841dfef93a771394f6f4c42d5e55287ba26d9e7"
+  },
+  {
+   "name": "dusty-sense_archive.torrent",
+   "source": "metadata",
+   "btih": "3400180ca4ba4d100f3eddee34579ae3620fb958",
+   "mtime": "1673141780",
+   "size": "2626",
+   "md5": "d66bd062ee8c3a243c31347f51b94a1f",
+   "crc32": "79727321",
+   "sha1": "fccda871ac3f94a5f9c5cea7a8f8c388a4d0c26f",
+   "format": "Archive BitTorrent"
+  },
+  {
+   "name": "dusty-sense_files.xml",
+   "source": "original",
+   "format": "Metadata",
+   "md5": "02ffd6340078bfd90bf617eb40395f11",
+   "summation": "md5"
+  },
+  {
+   "name": "dusty-sense_meta.sqlite",
+   "source": "original",
+   "mtime": "1673141776",
+   "size": "20480",
+   "md5": "0d463c31453727acd23427bacd2e5459",
+   "crc32": "01b1a278",
+   "sha1": "6fd9f8fafda3334fb120466fa26ab2147d54a663",
+   "format": "Metadata"
+  },
+  {
+   "name": "dusty-sense_meta.xml",
+   "source": "original",
+   "mtime": "1673133768",
+   "size": "737",
+   "md5": "d0171bb6b3e05194f143fb0a8beb7e96",
+   "crc32": "2cced2b4",
+   "sha1": "0caffd98ec614e474b9ccd3c0b17df759b2608f9",
+   "format": "Metadata"
+  },
+  {
+   "name": "dusty-sense_spectrogram.png",
+   "source": "derivative",
+   "format": "Spectrogram",
+   "original": "dusty-sense.flac",
+   "mtime": "1673133761",
+   "size": "219084",
+   "md5": "ee5135577751c64c4aa4a05ca50202a8",
+   "crc32": "fca0cc20",
+   "sha1": "616719817e7f2cd0f6b72cb90b2ee93e1f387324"
+  },
+  {
+   "name": "honkin.png",
+   "source": "original",
+   "mtime": "1673141773",
+   "size": "79399",
+   "md5": "e40bbec4836e8b6d1d26479041849c2e",
+   "crc32": "eaeb0789",
+   "sha1": "a77de5aa98d0d44061bcf409ba4e9796d1f35469",
+   "format": "PNG"
+  }
+ ],
+ "files_count": 10,
+ "metadata": {
+  "identifier": "dusty-sense",
+  "mediatype": "audio",
+  "collection": [
+   "opensource_audio",
+   "community"
+  ],
+  "licenseurl": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "title": "dusty-sense"
+ },
+ "server": "ia600607.us.archive.org"
+}

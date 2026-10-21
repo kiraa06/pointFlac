@@ -4,9 +4,15 @@ import SwiftUI
 struct PointFlacApp: App {
     @State private var model = AppModel()
 
+    init() {
+        #if DEBUG
+            NetProbe.runIfRequested()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
-            DebugLibraryView(model: model)
+            RootView(model: model)
         }
     }
 }

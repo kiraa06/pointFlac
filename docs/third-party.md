@@ -22,3 +22,35 @@
 - Notice: `App/ThirdPartyNotices.txt` (the libFLAC BSD-3 notice with the Xiph copyright, and pointFlac's MIT licence)
   ships in the app bundle in every configuration, Release included. The debug UI shows it under "Licences".
   `scripts/make-ipa.sh` fails if a Release app lacks it.
+
+## SQLite (system library, not vendored)
+
+- Used by: `PFLibrary` (`SQLiteDatabase.swift`), through the SDK's `SQLite3` module, linked as `libsqlite3`.
+- Source: ships with iOS and macOS; nothing is copied into this repository or the app bundle.
+- Licence: public domain (https://sqlite.org/copyright.html). No notice is required.
+- Why not GRDB (MIT): see `docs/superpowers/plans/2026-10-21-plan-2-library-search.md`. Moving to GRDB later changes
+  one file; it would then need an entry here and its MIT notice in `App/ThirdPartyNotices.txt`.
+
+## Apple system frameworks used by the library
+
+`CryptoKit` (content identity), `ImageIO` and `UniformTypeIdentifiers` (cover downsampling) are OS frameworks under
+Apple's SDK terms; nothing is vendored.
+
+## Online services used by `PFFind` (no code linked)
+
+- **MusicBrainz web service** (`https://musicbrainz.org/ws/2/`): artist, album and track names for typeahead and
+  for planning searches. Core data is CC0 (public domain). Rules followed: a meaningful User-Agent
+  (`pointFlac/0.2 ( https://github.com/kiraa06/pointFlac )`) and at most one request per second, process-wide.
+  The test fixtures in `Packages/PointFlacKit/Tests/PFFindTests/Fixtures/` are recorded MusicBrainz responses (CC0).
+- **Cover Art Archive** (`https://coverartarchive.org/`): album thumbnails, opt-in only (spec §5.8). Images belong
+  to their rights holders; pointFlac only displays and caches them.
+- Neither is contacted when the person turns registry lookups off; typeahead then shows library rows only.
+
+## Soulseek module (`PFSoulseek`): no third-party code
+
+- `PFSoulseek` is pointFlac's own MIT code. It links only Apple system frameworks (Foundation, Network, Compression,
+  CryptoKit, Synchronization, os).
+- SeeleseekCore (MIT, `github.com/bretth18/seeleseek`) was evaluated as the first-choice core and not adopted; no code
+  was copied from it. The reasons are in `docs/spikes/S4-soulseek-core.md`. The soulseek-rs fallback was not needed.
+- No code from GPL/AGPL Soulseek clients (Nicotine+, Soulseek.NET, slskd, Seeker) is used. Protocol behaviour follows
+  the live probe of 2026-10-21 and the publicly documented protocol, which is reading material only (§3.3).
