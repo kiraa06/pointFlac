@@ -120,14 +120,7 @@ public final class SoundChain: @unchecked Sendable {
         }
 
         let headroom = SoundResponse.autoHeadroomDb(s, sampleRate: sampleRate)
-        var preamp = 0.0
-        if !s.pure {
-            let correction = s.correction.enabled ? s.correction.preampDb : 0
-            preamp = correction + (s.preamp.autoHeadroom ? headroom : 0) + s.preamp.trimDb
-            // −headroom is how far the curve, correction preamp included, peaks above 0 dB (0 if it doesn't).
-            let loudest = -headroom + preamp - correction
-            if loudest > TruePeakLimiter.maxDriveDb { preamp -= loudest - TruePeakLimiter.maxDriveDb }
-        }
+        let preamp = s.pure ? 0 : Self.preampStaging(s, headroomDb: headroom).totalDb
         preampDb = preamp.isFinite ? preamp : 0
         gain = pow(10, preampDb / 20)
 
@@ -166,6 +159,22 @@ public final class SoundChain: @unchecked Sendable {
         #if DEBUG
             Self.live.subtract(1, ordering: .relaxed)
         #endif
+    }
+
+    /// The gain ahead of the filters, part by part, as a chain compiled from `s` applies it (see "Compiling"), given
+    /// the automatic headroom the curve needs (`SoundResponse.autoHeadroomDb`). Pure is not part of it: a Pure chain
+    /// applies none. For the Sound tab's gain staging, so it shows what plays.
+    public static func preampStaging(_ s: SoundSettings, headroomDb: Double) -> PreampStaging {
+        let correction = s.correction.enabled ? s.correction.preampDb : 0
+        var total = correction + (s.preamp.autoHeadroom ? headroomDb : 0) + s.preamp.trimDb
+        // −headroom is how far the curve, correction preamp included, peaks above 0 dB (0 if it doesn't).
+        let loudest = -headroomDb + total - correction
+        let capped = loudest > TruePeakLimiter.maxDriveDb
+        if capped { total -= loudest - TruePeakLimiter.maxDriveDb }
+        return PreampStaging(
+            correctionDb: s.correction.enabled ? correction : nil,
+            headroomDb: s.preamp.autoHeadroom ? headroomDb : nil, trimDb: s.preamp.trimDb, totalDb: total,
+            capped: capped)
     }
 
     /// `s` clamped, with what clamping lets through as NaN taken out (see "Compiling").
@@ -827,4 +836,17 @@ public final class ChainRunner: @unchecked Sendable {
     private static func withChain<Result>(_ chain: UnsafeMutableRawPointer, _ body: (SoundChain) -> Result) -> Result {
         Unmanaged<SoundChain>.fromOpaque(chain)._withUnsafeGuaranteedRef(body)
     }
+}
+
+/// The gain ahead of a chain's filters, part by part (`SoundChain.preampStaging`).
+public struct PreampStaging: Equatable, Sendable {
+    /// The correction's own preamp; nil while correction is off.
+    public var correctionDb: Double?
+    /// The automatic headroom; nil while it is switched off.
+    public var headroomDb: Double?
+    public var trimDb: Double
+    /// The sum, capped so the loudest frequency drives the limiter at most `TruePeakLimiter.maxDriveDb`.
+    public var totalDb: Double
+    /// The cap lowered the sum: only stacked boosts with automatic headroom off reach it.
+    public var capped: Bool
 }
