@@ -123,8 +123,8 @@ struct ReplayGainRows: View {
 
 /// The reference (fixed at ReplayGain 2.0's −18 LUFS, ruling R4-7), the gain the current track gets, and where it
 /// comes from. Both come from `Player.replayGain(for:settings:)`, the rule that makes the gain, so they are exactly what
-/// plays. A queue item keeps the loudness it was queued with; when the library has measured the track since, "From"
-/// says the measurement applies from the next play.
+/// plays. A queue item keeps the loudness it was queued with, and nothing refreshes it; when the library has measured
+/// the track since, "From" says the measurement applies when the track is queued again.
 private struct ReplayGainReadout: View {
     let replayGain: ReplayGainSettings
     let pure: Bool
@@ -147,7 +147,8 @@ private struct ReplayGainReadout: View {
                 ReadoutCell(
                     label: "This track", value: !on ? "Off" : now.map { SoundFormat.gain($0.gainDb) } ?? "—",
                     active: on && !pure && (now?.gainDb ?? 0) != 0),
-                ReadoutCell(label: "From", value: !on ? "—" : later != nil ? "Next play" : now?.basis.title ?? "—"),
+                ReadoutCell(
+                    label: "From", value: !on ? "—" : later != nil ? "When requeued" : now?.basis.title ?? "—"),
             ], theme: theme
         )
         .accessibilityElement(children: .ignore)
@@ -157,7 +158,7 @@ private struct ReplayGainReadout: View {
     }
 
     /// What the library knows of the playing track now, if the queue item knew nothing of it and the library does:
-    /// the basis the next play will have.
+    /// the basis the track will have when it is queued again.
     private func nextPlayBasis(now: ReplayGainBasis?) -> ReplayGainBasis? {
         guard now == ReplayGainBasis.none, let item, let track = library.snapshot.track(item.id) else { return nil }
         let basis = Player.replayGain(for: QueueItem(track: track), settings: replayGain).basis
@@ -169,7 +170,7 @@ private struct ReplayGainReadout: View {
         guard let now else { return "Nothing playing" }
         var text = "This track \(SoundFormat.gainSpoken(now.gainDb))"
         if pure { text += ", bypassed by Pure" }
-        if let later { return text + ", \(later.title.lowercased()) applies from the next play" }
+        if let later { return text + ", \(later.title.lowercased()) applies when it is queued again" }
         return text + ", from \(now.basis.title.lowercased())"
     }
 }
