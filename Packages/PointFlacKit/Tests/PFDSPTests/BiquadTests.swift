@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import PFDSP
@@ -47,6 +48,39 @@ struct BiquadTests {
             #expect(abs(lowPass.magnitudeDb(atHz: 1_000, sampleRate: rate) + 3.01) < 0.05, "low-pass at \(rate) Hz")
             #expect(abs(highPass.magnitudeDb(atHz: 1_000, sampleRate: rate) + 3.01) < 0.05, "high-pass at \(rate) Hz")
             #expect(lowPass.magnitudeDb(atHz: 20_000, sampleRate: rate) < -40, "low-pass at \(rate) Hz")
+        }
+    }
+
+    @Test("A low-pass at a few hertz keeps unity at DC and its level Q at the cutoff, even at 384 kHz")
+    func lowPassHoldsAtVeryLowFrequencies() {
+        for rate in [96_000.0, 192_000, 384_000] {
+            for hz in [1.0, 2, 5, 7, 10] {
+                for q in [0.1, 0.7071, 4, 20] {
+                    let c = BiquadCoefficients.design(.lowPass, frequency: hz, gainDb: 0, q: q, sampleRate: rate)
+                    let settings = "\(hz) Hz, Q \(q) at \(rate) Hz"
+                    #expect(abs(c.magnitudeDb(atHz: 0, sampleRate: rate)) < 0.01, "DC: \(settings)")
+                    let atCutoff = c.magnitudeDb(atHz: hz, sampleRate: rate)
+                    #expect(abs(atCutoff - 20 * log10(q)) < 0.01, "cutoff: \(settings)")
+                }
+            }
+        }
+    }
+
+    @Test("Either side of where the low-pass moves its zeros to Nyquist, it matches the analog")
+    func lowPassMatchesAcrossItsNyquistZeroSwitch() {
+        for rate in [44_100.0, 48_000, 96_000] {
+            // −100 dB at Nyquist falls at a cutoff of 0.00158 × the rate: one cutoff just below, one just above.
+            for hz in [0.0015 * rate, 0.0017 * rate] {
+                for q in [0.1, 0.7071, 4, 20] {
+                    let c = BiquadCoefficients.design(.lowPass, frequency: hz, gainDb: 0, q: q, sampleRate: rate)
+                    for probe in [0, hz / 2, hz, 2 * hz] {
+                        let analog = BiquadCoefficients.analogMagnitudeDb(
+                            .lowPass, frequency: hz, gainDb: 0, q: q, atHz: probe)
+                        let error = abs(c.magnitudeDb(atHz: probe, sampleRate: rate) - analog)
+                        #expect(error < 1e-3, "\(hz) Hz, Q \(q) at \(rate) Hz, probed at \(probe) Hz")
+                    }
+                }
+            }
         }
     }
 

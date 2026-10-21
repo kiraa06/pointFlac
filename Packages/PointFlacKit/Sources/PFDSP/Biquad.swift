@@ -47,7 +47,8 @@ extension BiquadCoefficients {
     /// below Nyquist, so responses cramp near Nyquist: a 16 kHz shelf at 44.1 kHz is off by decibels. A matched design
     /// keeps the analog prototype's poles, mapped by impulse invariance (z = e^{sT}), and chooses the zeros so that the
     /// digital magnitude equals the analog one at a few frequencies:
-    /// - low-pass and shelves: at DC, at Nyquist and at `frequency` (the paper's squared-magnitude matching, §4);
+    /// - low-pass and shelves: at DC, at Nyquist and at `frequency` (the paper's squared-magnitude matching, §4); a
+    ///   low-pass whose analog level at Nyquist is below −100 dB instead has a double zero at Nyquist;
     /// - peak: unity at DC, and the gain at `frequency` with an extremum there (§4.4, eqs. 44–45);
     /// - high-pass: a double zero at DC, which the analog 12 dB per octave needs, and Q at `frequency` (§4.2, eq. 36);
     /// - notch: its zeros exactly on the unit circle at `frequency`, and unity at DC.
@@ -137,6 +138,14 @@ extension BiquadCoefficients {
             let bb2 = (targetAtW0 - r2 * phi1 - aa0) / (4 * phi1 * phi1)
             let bb1 = r2 + aa0 + 4 * (phi1 - phi0) * bb2
             return withNumerator(bb0: aa0, bb1: bb1, bb2: bb2, a1: a1, a2: a2)
+        case .lowPass where analogPowerGain(type, sqrtGain: sqrtGain, q: q, ratio: .pi / w0) < 1e-10:
+            // Below −100 dB at Nyquist (ω₀ under 1/316 of Nyquist) there is nothing left to match there, and the fit
+            // below turns ill-conditioned as ω₀ falls: its B₂ is the small difference of B₀φ₀ and the target, both
+            // about ω₀⁴, and the rounding of 1 + a1 + a2 swamps it below about 10 Hz at 384 kHz (+73 dB at DC for
+            // 1 Hz, Q 4). So a double zero at Nyquist instead, as the high-pass has at DC: b = (1 + a1 + a2)/4 ·
+            // (1, 2, 1), unity at DC, and within 2·10⁻⁴ dB of Q at ω₀ wherever this case applies.
+            let b0 = (1 + a1 + a2) / 4
+            return BiquadCoefficients(b0: b0, b1: 2 * b0, b2: b0, a1: a1, a2: a2)
         case .lowPass, .lowShelf, .highShelf:
             // B₀ and B₁ are the numerator's squared magnitudes at DC and Nyquist (the analog's there times the
             // denominator's), and B₂ then follows from the match at ω₀.
@@ -160,7 +169,10 @@ extension BiquadCoefficients {
     private static func withNumerator(
         bb0: Double, bb1: Double, bb2: Double, a1: Double, a2: Double
     ) -> BiquadCoefficients {
-        // A realisable response has B₁ ≥ 0 and W² + B₂ = (b0 − b2)² ≥ 0; the clamps only stop rounding from making NaN.
+        // A realisable response has B₁ ≥ 0 and W² + B₂ = (b0 − b2)² ≥ 0. The clamps are no fallback: if one took
+        // effect, the zeros would be on or outside the unit circle and the response wrong, so an ill-conditioned fit
+        // needs its own numerator, as the low-pass has at low frequencies. With that, neither fired in a sweep of
+        // 342 000 designs across the settings range; they only keep a rounding slip from turning into NaN.
         let root0 = bb0.squareRoot()
         let root1 = max(bb1, 0).squareRoot()
         let w = (root0 + root1) / 2
