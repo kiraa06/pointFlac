@@ -1,3 +1,4 @@
+import Foundation
 import PFDSP
 import Synchronization
 
@@ -34,9 +35,25 @@ import Synchronization
 /// ## Seek holds
 /// A flush needs the decode thread, which may take a few milliseconds to notice a seek, and the audio before the seek
 /// must not keep playing meanwhile. So `seek(toFrame:)` first places a hold (`seeksRequested` += 1). While
-/// `seeksRequested != seeksServed`, `render` outputs silence without touching the ring. The decode thread flushes
-/// and only then releases the holds up to the ticket it read together with the seek request, under the same lock.
-/// A hold placed after that ticket (a newer seek) stays in force until that seek is served too.
+/// `seeksRequested != seeksServed`, `render` outputs silence, after the fade-out below. The decode thread flushes and
+/// only then releases the holds up to the ticket it read together with the seek request, under the same lock. A hold
+/// placed after that ticket (a newer seek) stays in force until that seek is served too.
+///
+/// ## A seek's fade-out
+/// Cutting the music straight to silence would click. So when a hold or a flush finds the ring's music playing (the
+/// last frame handed out was a full-level ring frame), `render` first plays the ring's next `crossfadeSeconds` (6 ms,
+/// `fadeFrames(atRate:)` at the client rate) faded out on a raised cosine (`seekFadeGain`), then the hold's silence.
+/// The decode thread fades the new position's first 6 ms in (`PlaybackPipeline.seek(toFrame:)`), so every seek is a
+/// short dip. Once per gap: a newer seek during the fade neither restarts nor repeats it, and with nothing playing
+/// (the start, an underrun, the end of the stream, a scrub voice) there is nothing to fade. If the ring runs dry
+/// first, the fade ends there.
+/// - The fade's frames are the old position's on their way out. They are real frames for the output (not silence),
+///   but they never advance `renderedFrames`: from the hold on it stands still, as it always has, so the position
+///   (which reports the seek's target meanwhile), the timeline's new segment, its markers, first-frame intervals and a
+///   scrub's anchor all count the new position from its first frame after the hold, exactly.
+/// - A flush is acknowledged only once the fade is done, so it never drops what the fade plays. That is the latency the
+///   fade adds to a seek: the jump comes about 6 ms later (plus up to one callback), then the fade-in's 6 ms.
+/// - Outside the fade windows nothing changes: Pure stays bit-exact, and a gapless join (no hold, no flush) never fades.
 ///
 /// ## The Sound chain
 /// Whatever `render` produces, from the ring or the scrub voice, silence included, then runs through the pipeline's
@@ -91,17 +108,40 @@ public final class RenderSource: @unchecked Sendable {
     /// work that could ring out into them. The output reads it right after `render`, on the same thread. Unchecked: a
     /// debug build's exclusivity check would allocate on the render thread's first call.
     @exclusivity(unchecked) private(set) var lastBlockIsSilent = true
+    /// Render thread only (and the producer while the output is stopped): whether the last frame handed out was the
+    /// ring's music at full level, so that a hold cutting it off now would step (see "A seek's fade-out").
+    @exclusivity(unchecked) private var ringAudible = false
+    /// Render thread only (and the producer while the output is stopped): frames of the seek's fade-out still to play;
+    /// 0 when none is under way.
+    @exclusivity(unchecked) private var seekFadeLeft = 0
     /// The client rate and sample format, which the scrub voice needs and the ring does not.
     private let clientRate: Int
     private let floatClient: Bool
     /// The voice's frames before they become client words. Preallocated for `scratchFrames`.
     private let scratch: UnsafeMutablePointer<Float>
     private static let scratchFrames = 4096
-    /// The cross-fade from the voice to the ring at the handover, and the fade-out of a let-go stopped record.
+    /// The seek's fade-out at the client rate: its length (`fadeFrames(atRate:)`, 0 with no client rate), and its
+    /// gain for each frame (`seekFadeGain`), computed here, off the render thread.
+    private let seekFadeFrames: Int
+    private let seekFadeGains: UnsafeMutablePointer<Float>
+    /// 6 ms: the scrub's cross-fade from the voice to the ring at the hand-over, and a seek's fade-out and fade-in.
     static let crossfadeSeconds = 0.006
     /// Frames decoded past the needle before the voice takes over from the ring.
     static let startAhead: Int64 = 2048
+    /// The fade-out of a let-go stopped record.
     static let fadeOutSeconds = 0.012
+
+    /// The frames `crossfadeSeconds` lasts at `rate`: the length of a seek's fade-out at the client rate, and of its
+    /// fade-in at the source rate (288 at 48 kHz).
+    static func fadeFrames(atRate rate: Int) -> Int {
+        max(1, Int((crossfadeSeconds * Double(rate)).rounded()))
+    }
+
+    /// Frame `k` of a seek's fade-out over `frames` frames: a raised cosine, ½ + ½ cos(π k / `frames`), from exactly 1
+    /// at `k` = 0 down towards 0, which the hold's silence then continues. Its slope is zero at both ends.
+    static func seekFadeGain(_ k: Int, of frames: Int) -> Float {
+        Float(0.5 + 0.5 * cos(Double.pi * Double(k) / Double(frames)))
+    }
 
     /// - Parameters:
     ///   - capacityFrames: ring size in frames (rounded up to a power of two in samples).
@@ -129,6 +169,10 @@ public final class RenderSource: @unchecked Sendable {
         underruns = Atomic(previous?.underrunFrames ?? 0)
         seeksRequested = Atomic(previous?.seeksRequested.load(ordering: .acquiring) ?? 0)
         seeksServed = Atomic(previous?.seeksServed.load(ordering: .acquiring) ?? 0)
+        let fade = clientRate > 0 ? Self.fadeFrames(atRate: clientRate) : 0
+        seekFadeFrames = fade
+        seekFadeGains = .allocate(capacity: max(fade, 1))
+        for k in 0..<fade { seekFadeGains[k] = Self.seekFadeGain(k, of: fade) }
         // Built here, off the render thread, so the voice's first use never builds it there.
         if scrub != nil { _ = ScrubKernel() }
         // Warms the Int32-to-Double conversion's witness table off the render thread: its first use calls into the
@@ -138,6 +182,7 @@ public final class RenderSource: @unchecked Sendable {
 
     deinit {
         scratch.deallocate()
+        seekFadeGains.deallocate()
     }
 
     /// Real frames rendered so far: underrun and hold silence is not counted. `position` and the track events derive
@@ -184,18 +229,17 @@ public final class RenderSource: @unchecked Sendable {
         if let unretainedScrub, scrubWindowIsOpen(unretainedScrub),
             let scrubbed = renderScrubbed(unretainedScrub, into: words, frames: frames)
         {
+            // The voice, or a paused record's silence, took over from the ring: a fade under way is over.
+            seekFadeLeft = 0
             return scrubbed
         }
+        // Each load its own statement: an `||` whose right side read this source's atomics would capture, and so
+        // retain, the source in a debug build.
         let flush = flushRequested.load(ordering: .acquiring)
-        if flush != flushAcknowledged.load(ordering: .relaxed) {
-            unretainedRing._withUnsafeGuaranteedRef { $0.discardReadable() }
-            flushAcknowledged.store(flush, ordering: .releasing)
-            words.update(repeating: 0, count: count)
-            return 0
-        }
-        if seeksRequested.load(ordering: .acquiring) != seeksServed.load(ordering: .acquiring) {
-            words.update(repeating: 0, count: count)
-            return 0
+        let flushing = flush != flushAcknowledged.load(ordering: .relaxed)
+        let held = seeksRequested.load(ordering: .acquiring) != seeksServed.load(ordering: .acquiring)
+        if flushing || held {
+            return renderSeekGap(into: words, frames: frames, flushing: flushing, flush: flush)
         }
         let got = unretainedRing._withUnsafeGuaranteedRef {
             $0.read(into: UnsafeMutableBufferPointer(start: words, count: count))
@@ -203,6 +247,8 @@ public final class RenderSource: @unchecked Sendable {
         if got < count {
             (words + got).update(repeating: 0, count: count - got)
         }
+        // The block ends on the ring's music, so a seek now would cut it off.
+        ringAudible = got == count
         let real = got / channels
         let before = rendered.load(ordering: .relaxed)
         if real > 0 {
@@ -214,7 +260,58 @@ public final class RenderSource: @unchecked Sendable {
         return real
     }
 
-    // MARK: The Sound chain (render thread)
+    /// A seek's gap, from its hold (or the flush that follows it) until the decode thread serves it: the fade-out of
+    /// what was playing, then silence (see "A seek's fade-out"). Returns the fade's frames, a prefix of the block; they
+    /// are not counted as rendered. The flush is acknowledged once no fade is left to play.
+    private func renderSeekGap(
+        into words: UnsafeMutablePointer<UInt32>, frames: Int, flushing: Bool, flush: UInt64
+    ) -> Int {
+        if ringAudible {
+            ringAudible = false
+            seekFadeLeft = seekFadeFrames
+        }
+        var faded = 0
+        if seekFadeLeft > 0 {
+            let wanted = (frames < seekFadeLeft ? frames : seekFadeLeft) * channels
+            let got = unretainedRing._withUnsafeGuaranteedRef {
+                $0.read(into: UnsafeMutableBufferPointer(start: words, count: wanted))
+            }
+            faded = got / channels
+            fadeOutForSeek(words, frames: faded)
+            // Past what the ring held there is nothing more to fade.
+            seekFadeLeft = got < wanted ? 0 : seekFadeLeft - faded
+        }
+        if flushing, seekFadeLeft == 0 {
+            unretainedRing._withUnsafeGuaranteedRef { $0.discardReadable() }
+            flushAcknowledged.store(flush, ordering: .releasing)
+        }
+        (words + faded * channels).update(repeating: 0, count: (frames - faded) * channels)
+        return faded
+    }
+
+    /// Scales the first `frames` frames of `words`, the fade's next frames from the ring, by the fade's gains from
+    /// where it has got to. A Float32 word is multiplied in Float32; an Int32 one in Double, rounded half away from
+    /// zero. The first frame's gain is exactly 1.
+    private func fadeOutForSeek(_ words: UnsafeMutablePointer<UInt32>, frames: Int) {
+        var frame = 0
+        var k = seekFadeFrames - seekFadeLeft
+        while frame < frames {
+            let gain = seekFadeGains[k]
+            let out = words + frame * channels
+            var c = 0
+            while c < channels {
+                if floatClient {
+                    out[c] = (Float(bitPattern: out[c]) * gain).bitPattern
+                } else {
+                    let x = Double(Int(Int32(bitPattern: out[c]))) * Double(gain)
+                    out[c] = UInt32(bitPattern: Int32(round(x)))
+                }
+                c += 1
+            }
+            frame += 1
+            k += 1
+        }
+    }
 
     // MARK: Scrubbing (render thread)
 
@@ -247,6 +344,7 @@ public final class RenderSource: @unchecked Sendable {
         func withoutVoice() -> Int? {
             if ringAllowed { return nil }
             words.update(repeating: 0, count: frames * channels)
+            ringAudible = false
             return frames
         }
         let window = Unmanaged<ScrubWindow>.fromOpaque(rawWindow)
@@ -305,7 +403,7 @@ public final class RenderSource: @unchecked Sendable {
                 tap.voiceStarted.store(generation, ordering: .releasing)
             }
             guard var voice = state.pointee.voice else { return withoutVoice() }
-            renderVoice(
+            ringAudible = renderVoice(
                 &voice, state: state, tap: tap, phase: settled ? phase : nil, window: window, into: words,
                 frames: frames)
             state.pointee.voice = state.pointee.crossfade == Int.max ? nil : voice
@@ -313,10 +411,11 @@ public final class RenderSource: @unchecked Sendable {
         }
     }
 
+    /// Returns whether the block ends on the ring's music at full level, the cross-fade to it done.
     private func renderVoice(
         _ voice: inout ScrubVoice, state: UnsafeMutablePointer<ScrubRenderState>, tap: ScrubTap,
         phase: ScrubTap.Phase?, window: ScrubWindow, into words: UnsafeMutablePointer<UInt32>, frames: Int
-    ) {
+    ) -> Bool {
         // A seek (the handover's) needs its flush acknowledged even though the ring is not being played.
         let flush = flushRequested.load(ordering: .acquiring)
         if flush != flushAcknowledged.load(ordering: .relaxed) {
@@ -369,6 +468,7 @@ public final class RenderSource: @unchecked Sendable {
         let valid = window.valid
         var done = 0
         let crossfadeFrames = max(1, Int(Self.crossfadeSeconds * Double(clientRate)))
+        var endsOnRing = false
         while done < frames {
             let n = min(Self.scratchFrames, frames - done)
             voice.render(
@@ -397,6 +497,7 @@ public final class RenderSource: @unchecked Sendable {
                     }
                 }
                 state.pointee.crossfade += fromRing
+                endsOnRing = got == wanted && state.pointee.crossfade >= crossfadeFrames
             }
             done += n
         }
@@ -408,6 +509,7 @@ public final class RenderSource: @unchecked Sendable {
             state.pointee.crossfade = Int.max
             tap.handedOver.store(state.pointee.generation, ordering: .releasing)
         }
+        return endsOnRing
     }
 
     /// Drops `count` frames from the ring, counting them as rendered so positions stay right.
@@ -483,10 +585,13 @@ public final class RenderSource: @unchecked Sendable {
         flushAcknowledged.load(ordering: .acquiring) >= generation
     }
 
-    /// Empties the ring outright. Only while the output is stopped, when no `render` call can run.
+    /// Empties the ring outright. Only while the output is stopped, when no `render` call can run: nothing is playing
+    /// then, so nothing is left to fade out either.
     func flushWhileStopped() {
         ring.reset()
         flushAcknowledged.store(flushRequested.load(ordering: .relaxed), ordering: .releasing)
+        ringAudible = false
+        seekFadeLeft = 0
     }
 
     // MARK: Seek holds

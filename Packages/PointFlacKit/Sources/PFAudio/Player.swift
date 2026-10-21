@@ -704,8 +704,9 @@ public final class Player {
             position = item.duration(ofFrames: target)
             nowPlaying.show(item, elapsed: position, playing: true)
             run.engine.seeksInFlight += 1
+            // The hand-over's seek, which does not fade in: the render thread cross-fades into the ring there.
             await run.engine.enqueue { pipeline in
-                await pipeline.seek(toFrame: target, firstFrame: FirstFrameInterval(.seek))
+                await pipeline.handOver(toFrame: target, firstFrame: FirstFrameInterval(.seek))
             }.value
             run.engine.seeksInFlight -= 1
             // Only now, with the seek's hold in place: before it, the ring still holds the audio from before the

@@ -311,6 +311,155 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
     OutputPlan(client: .float32, clientSampleRate: rate, resample: resample, reduceTo24: reduceTo24)
 }
 
+/// What a seek puts in a Float32 client's real-frame capture after the frames pulled before it. First the ring's next
+/// 6 ms, the old position's, fading out on the raised cosine (`RenderSource.seekFadeGain`); the hold's silence is not
+/// captured; then the new position's audio, whose first 6 ms fade in linearly (frame k × k / their length), and from
+/// there exactly as decoded. `old` and `new` are interleaved samples from those two points on.
+private func seekDip(
+    old: some Collection<Float>, new: some Collection<Float>, channels: Int, rate: Int
+) -> [Float] {
+    let fade = RenderSource.fadeFrames(atRate: rate)
+    var out: [Float] = []
+    for (i, x) in old.prefix(fade * channels).enumerated() {
+        out.append(x * RenderSource.seekFadeGain(i / channels, of: fade))
+    }
+    for (i, x) in new.enumerated() {
+        let k = i / channels
+        out.append(k < fade ? x * (Float(k) / Float(fade)) : x)
+    }
+    return out
+}
+
+/// SoundChainTests' click measure: the largest step between neighbouring samples of a tone at `hz`, over the tone's
+/// own steepest step at the level around it (`local`: the loudest sample in that period and its neighbours) and at
+/// its loudest (`global`). A clean tone, or a smooth change of its level, stays near 1; a cut to silence mid-wave
+/// reaches 1 / (2π · hz / rate).
+private func largestStepRatios(_ x: [Float], channels: Int, hz: Double, rate: Double) -> (local: Double, global: Double)
+{
+    let omega = 2 * .pi * hz / rate
+    let period = Int((rate / hz).rounded(.up))
+    let frames = x.count / channels
+    var local = 0.0
+    var global = 0.0
+    for channel in 0..<channels {
+        let y = (0..<frames).map { Double(x[$0 * channels + channel]) }
+        let loudest = y.map(\.magnitude).max() ?? 0
+        let chunks = (frames + period - 1) / period
+        var chunkPeak = [Double](repeating: 0, count: chunks)
+        for n in 0..<frames { chunkPeak[n / period] = max(chunkPeak[n / period], y[n].magnitude) }
+        for n in 1..<frames {
+            let step = abs(y[n] - y[n - 1])
+            let c = n / period
+            let around = max(chunkPeak[max(c - 1, 0)], chunkPeak[c], chunkPeak[min(c + 1, chunks - 1)])
+            if around > 1e-6 { local = max(local, step / (omega * around)) }
+            global = max(global, step / (omega * loudest))
+        }
+    }
+    return (local, global)
+}
+
+/// A full-scale 1 kHz sine, 24-bit stereo at 48 kHz, ten seconds long: the steadiest loud signal, on which a click
+/// stands out at once.
+private final class FullScaleSineDecoder: PCMDecoding {
+    static let rate = 48_000
+    static let hz = 1_000.0
+    static let frames: Int64 = 480_000
+    static let item = PlaybackItem(
+        id: "sine", url: URL(fileURLWithPath: "/dev/null"),
+        format: AudioFormat(sampleRate: rate, bitsPerSample: 24, channels: 2), totalFrames: frames)
+
+    static func value(_ frame: Int64) -> Int32 {
+        Int32((8_388_607 * sin(2 * .pi * hz * Double(frame) / Double(rate))).rounded())
+    }
+
+    /// Frame `frame` as the Float32 client receives it: v / 2^23.
+    static func float(_ frame: Int64) -> Float {
+        Float(value(frame)) * 0x1p-23
+    }
+
+    let format = FullScaleSineDecoder.item.format
+    var totalFrames: Int64 { Self.frames }
+    private var position: Int64 = 0
+
+    func read(into buffer: UnsafeMutableBufferPointer<Int32>, maxFrames: Int) throws -> Int {
+        let n = Int(min(Int64(min(maxFrames, buffer.count / 2)), Self.frames - position))
+        for i in 0..<n {
+            let v = Self.value(position + Int64(i))
+            buffer[2 * i] = v
+            buffer[2 * i + 1] = v
+        }
+        position += Int64(n)
+        return n
+    }
+
+    func seek(toFrame frame: Int64) throws {
+        position = min(max(frame, 0), Self.frames)
+    }
+}
+
+/// An output that keeps every frame it renders, silence included (`FakeOutput` keeps only real ones), with each
+/// call's first frame and its real frames: all the listener hears across a seek's gap. Float32 clients only.
+private final class RecordingOutput: AudioOutput, Sendable {
+    struct Call: Sendable {
+        var start: Int
+        var real: Int
+    }
+
+    private struct State {
+        var source: RenderSource?
+        var channels = 0
+        var started = false
+        var buffer: UnsafeMutableRawPointer?
+        var stream: [Float] = []
+        var calls: [Call] = []
+    }
+
+    private let state = Mutex(State())
+
+    deinit {
+        state.withLock { $0.buffer?.deallocate() }
+    }
+
+    var source: RenderSource? {
+        get { state.withLock { $0.source } }
+        set { state.withLock { $0.source = newValue } }
+    }
+
+    /// Every frame rendered, interleaved.
+    var stream: [Float] { state.withLock { $0.stream } }
+    var calls: [Call] { state.withLock { $0.calls } }
+
+    func configure(_ plan: OutputPlan, channels: Int) throws {
+        precondition(plan.client == .float32, "RecordingOutput records Float32 clients")
+        state.withLock { s in
+            s.buffer?.deallocate()
+            s.buffer = UnsafeMutableRawPointer.allocate(byteCount: 4096 * channels * 4, alignment: 16)
+            s.channels = channels
+        }
+    }
+
+    func start() throws {
+        state.withLock { $0.started = true }
+    }
+
+    func stop() {
+        state.withLock { $0.started = false }
+    }
+
+    /// One render callback of `frames` (at most 4096) frames. Returns its real frames.
+    @discardableResult
+    func pull(frames: Int) -> Int {
+        state.withLock { s in
+            guard s.started, let source = s.source, let buffer = s.buffer else { return 0 }
+            let real = source.render(into: buffer, frames: frames)
+            let samples = buffer.bindMemory(to: Float.self, capacity: frames * s.channels)
+            s.calls.append(Call(start: s.stream.count / s.channels, real: real))
+            s.stream.append(contentsOf: UnsafeBufferPointer(start: samples, count: frames * s.channels))
+            return real
+        }
+    }
+}
+
 // MARK: - Tests
 
 // Serialized: every test runs a decode thread and a pull loop, and `seekCompletesWithin50ms` measures wall-clock
@@ -457,11 +606,14 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(mismatch(rig.output.capturedFloat, floats(raw.prefix(2000) + raw, bits: 16)) == nil)
     }
 
+    /// Fifty seeks before the render thread runs again are one dip: one fade-out of what was playing, and the newest
+    /// target's audio fading in.
     @Test func seekSpamLatestWins() async {
         let raw = Fixtures.rawSamples(Fixtures.named("s24-96000"))
         let rig = Rig()
         await rig.play([item("s24-96000")])
         #expect(await rig.pump { rig.pulledFrames >= 1024 })
+        let played = rig.pulledFrames
         for i in 0..<49 {
             await rig.pipeline.seek(toFrame: Int64(i * 613 % 4096))
         }
@@ -470,7 +622,9 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(position.index == 0 && position.frame == 3000)
         let mark = rig.output.capturedFloat.count
         await rig.playToEnd()
-        #expect(mismatch(Array(rig.output.capturedFloat[mark...]), floats(raw[6000...], bits: 24)) == nil)
+        let source = floats(raw, bits: 24)
+        let want = seekDip(old: source[(2 * played)...], new: source[6000...], channels: 2, rate: 96_000)
+        #expect(mismatch(Array(rig.output.capturedFloat[mark...]), want) == nil)
         #expect(rig.pipeline.position.frame == 4096)
         // The end markers queued before the seeks were never rendered, so they are dropped, not fired twice.
         #expect(
@@ -487,30 +641,157 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(rig.output.capturedFloat.count == 16384 * 2)
     }
 
+    /// An Int32 client (a 32-bit source through passthrough) dips the same way. The fade-out scales its words in
+    /// Double, rounded half away from zero, and so does the fade-in; every word outside the two fades is the source's
+    /// own, all 32 bits of it.
+    @Test func aSeekDipsOnAnInt32ClientToo() async {
+        let f = Fixtures.named("s32-48000")
+        let raw = Fixtures.rawSamples(f)
+        let fade = RenderSource.fadeFrames(atRate: f.sampleRate)
+        let rig = Rig(int32Passthrough: true)
+        await rig.play([item("s32-48000")])
+        #expect(await rig.pump { rig.pulledFrames >= 1024 })
+        let played = rig.pulledFrames
+        let mark = rig.output.capturedInt32.count
+        await rig.pipeline.seek(toFrame: 2000)
+        await rig.playToEnd()
+        #expect(rig.output.plans.map(\.client) == [.int32])
+        func scaled(_ x: Int32, by gain: Float) -> Int32 { Int32((Double(x) * Double(gain)).rounded()) }
+        let channels = f.channels
+        var want: [Int32] = []
+        for i in 0..<(fade * channels) {
+            want.append(scaled(raw[played * channels + i], by: RenderSource.seekFadeGain(i / channels, of: fade)))
+        }
+        for (i, x) in raw[(2000 * channels)...].enumerated() {
+            let k = i / channels
+            want.append(k < fade ? scaled(x, by: Float(k) / Float(fade)) : x)
+        }
+        #expect(mismatch(Array(rig.output.capturedInt32[mark...]), want) == nil)
+    }
+
+    /// The seek's latency runs to the new position's first frame. The fade-out of what was playing comes first (it is
+    /// already in the ring); then the new audio, fading in.
     @Test func seekCompletesWithin50ms() async {
         let raw = Fixtures.rawSamples(Fixtures.named("s24-96000"))
+        let fade = RenderSource.fadeFrames(atRate: 96_000)
         let rig = Rig()
         await rig.play([item("s24-96000")])
         #expect(await rig.pump { rig.pulledFrames >= 1024 })
+        let played = rig.pulledFrames
         let mark = rig.output.capturedFloat.count
         let clock = ContinuousClock()
         let start = clock.now
         await rig.pipeline.seek(toFrame: 2000)
         var latency: Duration?
+        var fading = 0
         // A render thread pulling about once a millisecond.
         while clock.now - start < .seconds(2) {
-            if rig.pull() > 0 {
+            let n = rig.pull()
+            if n > 0, fading < fade {
+                fading += n
+            } else if n > 0 {
                 latency = clock.now - start
                 break
             }
             try? await Task.sleep(for: .milliseconds(1))
         }
+        #expect(fading == fade, "the fade-out came first, all of it")
         let budget = LatencyBudget.scaled(.milliseconds(50))
         #expect(
             latency != nil && latency! < budget,
             "seek latency \(String(describing: latency)), \(LatencyBudget.describe(.milliseconds(50)))")
         let fresh = Array(rig.output.capturedFloat[mark...])
-        #expect(!fresh.isEmpty && mismatch(fresh, floats(raw[4000..<(4000 + fresh.count)], bits: 24)) == nil)
+        let source = floats(raw, bits: 24)
+        let new = source[4000..<(4000 + max(fresh.count - 2 * fade, 0))]
+        let want = seekDip(old: source[(2 * played)...], new: new, channels: 2, rate: 96_000)
+        #expect(fresh.count > 2 * fade && mismatch(fresh, want) == nil)
+    }
+
+    /// Render-polish brief, part 1: a seek on a full-scale sine is a short dip, never a click. Every frame the output
+    /// is handed, silence included: the music before the seek, bit-exact; the ring's next 6 ms fading out on the
+    /// raised cosine; the hold's silence; the new position's first 6 ms fading in linearly; then the source again,
+    /// bit-exact. The largest step anywhere stays below 1.5 × the tone's own slope (SoundChainTests' click bound),
+    /// locally and against the loudest level, where a cut to silence mid-wave reaches up to 7.6 ×. The fade-out's frames
+    /// belong to the old position: the new one counts from its first frame after the hold.
+    @Test func aSeekDipsWithoutAClick() async {
+        let output = RecordingOutput()
+        let pipeline = PlaybackPipeline(
+            output: output, capabilities: OutputCapabilities(int32Passthrough: false), negotiateRate: { $0 },
+            makeDecoder: { _ in FullScaleSineDecoder() })
+        defer { pipeline.stop() }
+        let rate = FullScaleSineDecoder.rate
+        let fade = RenderSource.fadeFrames(atRate: rate)
+        /// Pulls until `count` more real frames have been rendered, in calls of at most 512 frames.
+        func pullReal(_ count: Int) async -> Bool {
+            var left = count
+            let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(10))
+            while left > 0 {
+                guard ContinuousClock.now < deadline else { return false }
+                let n = output.pull(frames: min(512, left))
+                left -= n
+                if n == 0 { try? await Task.sleep(for: .microseconds(200)) }
+            }
+            return true
+        }
+        await pipeline.start([FullScaleSineDecoder.item], at: 0, fromFrame: 0)
+        // Let the decode thread fill the ring first, so every call before the seek is all music.
+        try? await Task.sleep(for: .milliseconds(100))
+        let before = 4096
+        #expect(await pullReal(before))
+        // Whatever silence the start-up rendered, before the first real frame.
+        let opening = output.calls.first { $0.real > 0 }?.start ?? 0
+        let seekedAt = output.calls.count
+        let played = output.calls.flatMap { $0.start..<($0.start + $0.real) }
+        #expect(played == Array(opening..<(opening + before)), "the music before the seek played unbroken")
+        let target: Int64 = 100_000
+        await pipeline.seek(toFrame: target)
+        let after = 4096
+        #expect(await pullReal(fade + after))
+        #expect(pipeline.position == (0, target + Int64(after)), "the new position counts from after the hold")
+
+        let stream = output.stream
+        func left(_ frame: Int) -> Float { stream[2 * frame] }
+        func right(_ frame: Int) -> Float { stream[2 * frame + 1] }
+        // Where each real frame since the seek landed in the stream: a call's real frames are a prefix of it.
+        let real = output.calls[seekedAt...].flatMap { $0.start..<($0.start + $0.real) }
+        #expect(real.count == fade + after)
+        guard real.count == fade + after else { return }
+        let fadeOut = Array(real.prefix(fade))
+        let resumed = real[fade]
+        #expect(fadeOut == Array((opening + before)..<(opening + before + fade)), "the fade-out follows on at once")
+        #expect(Array(real[fade...]) == Array(resumed..<(resumed + after)), "the new position plays on unbroken")
+
+        // Before the seek: the source, bit-exact.
+        let exactBefore = (0..<before).allSatisfy { n in
+            let want = FullScaleSineDecoder.float(Int64(n))
+            return left(opening + n).bitPattern == want.bitPattern && right(opening + n).bitPattern == want.bitPattern
+        }
+        #expect(exactBefore, "bit-exact before the seek")
+        // The fade-out: the ring's next frames on the raised cosine.
+        let outShape = (0..<fade).allSatisfy { k in
+            let want = FullScaleSineDecoder.float(Int64(before + k)) * RenderSource.seekFadeGain(k, of: fade)
+            return left(fadeOut[k]).bitPattern == want.bitPattern && right(fadeOut[k]).bitPattern == want.bitPattern
+        }
+        #expect(outShape, "the fade-out's shape")
+        // The hold: silence, to the bit, and at least the rest of the fade's call.
+        let gap = (fadeOut[fade - 1] + 1)..<resumed
+        #expect(!gap.isEmpty && gap.allSatisfy { left($0).bitPattern == 0 && right($0).bitPattern == 0 })
+        // The fade-in, from silence, then the new position exactly.
+        let inShape = (0..<fade).allSatisfy { k in
+            let want = FullScaleSineDecoder.float(target + Int64(k)) * (Float(k) / Float(fade))
+            return left(resumed + k).bitPattern == want.bitPattern && right(resumed + k).bitPattern == want.bitPattern
+        }
+        #expect(inShape, "the fade-in's shape")
+        let exact = (fade..<after).allSatisfy { k in
+            let want = FullScaleSineDecoder.float(target + Int64(k))
+            return left(resumed + k).bitPattern == want.bitPattern && right(resumed + k).bitPattern == want.bitPattern
+        }
+        #expect(exact, "bit-exact after the fade-in")
+        // No click anywhere: the whole stream, the gap included, against the tone's own slope.
+        let heard = Array(stream[(2 * opening)..<(2 * (resumed + after))])
+        let ratios = largestStepRatios(heard, channels: 2, hz: FullScaleSineDecoder.hz, rate: Double(rate))
+        #expect(ratios.local < 1.5, "largest step \(ratios.local) × the local slope")
+        #expect(ratios.global < 1.5, "largest step \(ratios.global) × the loudest slope")
     }
 
     @Test func eventsFireOnRenderedBoundary() async {
@@ -593,32 +874,73 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(rig.log.events == expected)
     }
 
-    /// The realistic seek: mid-playback of a long track, with the decode thread blocked writing into a full ring.
+    /// A seek asked for in the last 6 ms of an item, with the next one already joined behind it in the ring, seeks in
+    /// the item it was asked in. Its fade-out plays on across the join (the first frames of the next item, fading
+    /// out), but those frames are the old position's on their way out and are not counted: no boundary is crossed, and
+    /// the next item still follows whole, from its start, with its events in order.
+    @Test func aSeekJustBeforeAGaplessJoinStaysInItsItem() async {
+        let raw = Fixtures.rawSamples(Fixtures.named("s24-48000"))
+        let fade = RenderSource.fadeFrames(atRate: 48_000)
+        let rig = Rig()
+        await rig.play([item("s24-48000", id: "a"), item("s24-48000", id: "b")])
+        // Both tracks fit in the ring.
+        try? await Task.sleep(for: .milliseconds(100))
+        let short = 100
+        #expect(short < fade)
+        #expect(await rig.pull(upTo: 4096 - short))
+        let mark = rig.output.capturedFloat.count
+        await rig.pipeline.seek(toFrame: 1000)
+        #expect(await rig.pull(upTo: 4096 - short + fade + 512))
+        #expect(rig.pipeline.position == (0, 1512), "the seek stayed in the first item")
+        await rig.playToEnd()
+        let source = floats(raw, bits: 24)
+        // The fade-out: the first item's last 100 frames, then the second's first 188, fading out.
+        let across = source[(2 * (4096 - short))...] + source[0..<(2 * (fade - short))]
+        let want = seekDip(old: across, new: source[2000...], channels: 2, rate: 48_000) + source
+        #expect(mismatch(Array(rig.output.capturedFloat[mark...]), want) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), started(0, "s24-48000"), .trackEnded(0), started(1, "s24-48000"),
+                .trackEnded(1), .queueEnded,
+            ])
+    }
+
+    /// The realistic seek: mid-playback of a long track, with the decode thread blocked writing into a full ring. Its
+    /// latency runs to the new position's first frame, after the fade-out of what was playing.
     @Test func seekWhileDecodingCompletesWithin50ms() async {
+        let fade = RenderSource.fadeFrames(atRate: 44_100)
         let rig = Rig(makeDecoder: { _ in PatternDecoder() })
         await rig.play([PatternDecoder.item])
         #expect(await rig.pump { rig.pulledFrames >= 8192 })
         // Let the decode thread refill the half-second ring and block on it.
         try? await Task.sleep(for: .milliseconds(20))
+        let played = Int64(rig.pulledFrames)
         let mark = rig.output.capturedFloat.count
         let clock = ContinuousClock()
         let start = clock.now
         await rig.pipeline.seek(toFrame: 300_000)
         var latency: Duration?
+        var fading = 0
         while clock.now - start < .seconds(2) {
-            if rig.pull() > 0 {
+            let n = rig.pull()
+            if n > 0, fading < fade {
+                fading += n
+            } else if n > 0 {
                 latency = clock.now - start
                 break
             }
             try? await Task.sleep(for: .milliseconds(1))
         }
+        #expect(fading == fade, "the fade-out came first, all of it")
         let budget = LatencyBudget.scaled(.milliseconds(50))
         #expect(
             latency != nil && latency! < budget,
             "seek latency \(String(describing: latency)), \(LatencyBudget.describe(.milliseconds(50)))")
         let fresh = Array(rig.output.capturedFloat[mark...])
-        let expected = floats(PatternDecoder.samples(from: 300_000, count: fresh.count / 2), bits: 16)
-        #expect(!fresh.isEmpty && mismatch(fresh, expected) == nil)
+        let old = floats(PatternDecoder.samples(from: played, count: fade), bits: 16)
+        let new = floats(PatternDecoder.samples(from: 300_000, count: max(fresh.count / 2 - fade, 0)), bits: 16)
+        #expect(
+            fresh.count > 2 * fade && mismatch(fresh, seekDip(old: old, new: new, channels: 2, rate: 44_100)) == nil)
     }
 
     /// `negotiateRate` returning no usable rate fails that item; the pipeline never assumes the source rate.
@@ -661,8 +983,8 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
     }
 
     /// Final review I6 (measurement): the start and seek intervals end at the first real frame the decode thread sees
-    /// rendered, never on hold or underrun silence. One that never gets a frame (superseded, or the pipeline stopped)
-    /// ends as abandoned.
+    /// rendered, never on hold or underrun silence, nor on a seek's fade-out of the old position. One that never gets
+    /// a frame (superseded, or the pipeline stopped) ends as abandoned.
     @Test func firstFrameIntervalsEndOnRenderedAudio() async {
         let rig = Rig()
         let started = FirstFrameInterval(.play)
@@ -680,7 +1002,12 @@ private func floatPlan(_ rate: Int, resample: RateChange? = nil, reduceTo24: Boo
         #expect(superseded.outcome == .abandoned)
         try? await Task.sleep(for: .milliseconds(30))
         #expect(seek.outcome == nil, "ended before the seek was served")
-        #expect(await rig.pump { rig.pulledFrames > 512 })
+        // The fade-out's frames are the old position's: they end nothing.
+        let fade = RenderSource.fadeFrames(atRate: 96_000)
+        #expect(await rig.pull(upTo: 512 + fade))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(seek.outcome == nil, "ended on the fade-out")
+        #expect(await rig.pump { rig.pulledFrames > 512 + fade })
         #expect(await wait(upTo: .seconds(2)) { seek.outcome != nil })
         #expect(seek.outcome == .rendered)
 

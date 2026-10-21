@@ -61,12 +61,12 @@ final class DecodeSession: @unchecked Sendable {
     private var dither: TPDFDither
     /// The current item's ReplayGain, linear: exactly 1 for a gain of 0 dB, which then multiplies nothing.
     private var gain = 1.0
-    /// The re-cue's fade-in (`PlaybackPipeline.recue`): its length in source frames, and the frames of it still to
-    /// write. 0 left is no fade.
+    /// A seek's fade-in (every seek's but a scrub's hand-over, `PlaybackPipeline.seek(toFrame:)`): its length in
+    /// source frames, and the frames of it still to write. 0 left is no fade.
     private var fadeInFrames = 0
     private var fadeInLeft = 0
-    /// The seek being entered is a re-cue's: its audio fades in.
-    private var enteringRecue = false
+    /// The seek being entered fades in.
+    private var enteringFadeIn = false
     private var converter: SampleRateConverter?
     /// `written` when `converter` was created, and the source frames fed to it since.
     private var converterBase: Int64 = 0
@@ -181,14 +181,14 @@ final class DecodeSession: @unchecked Sendable {
         decoder = next
         index = target
         format = nextFormat
-        // Only into a Float32 client: an Int32 one carries the source's words untouched.
-        if entry == .seek, enteringRecue, plan.client == .float32 {
-            fadeInFrames = max(1, Int((RenderSource.crossfadeSeconds * Double(nextFormat.sampleRate)).rounded()))
+        // A seek's discontinuity only: a start or a gapless join never fades.
+        if entry == .seek, enteringFadeIn {
+            fadeInFrames = RenderSource.fadeFrames(atRate: nextFormat.sampleRate)
             fadeInLeft = fadeInFrames
         } else {
             fadeInLeft = 0
         }
-        enteringRecue = false
+        enteringFadeIn = false
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
         // The item is entered here: its gain is taken and its segment published in one critical section, the lock
@@ -433,7 +433,7 @@ final class DecodeSession: @unchecked Sendable {
             let count = frames * channels
             Self.convert(
                 samples, count: count, bits: format.bitsPerSample, plan: plan, gain: gain, dither: &dither, into: words)
-            if fadeInLeft > 0 { fadeIn(frames: frames, channels: channels) }
+            if fadeInLeft > 0 { fadeIn(frames: frames, channels: channels, client: plan.client) }
             let interrupted: Step?
             if let converter {
                 resampled.removeAll(keepingCapacity: true)
@@ -505,16 +505,23 @@ final class DecodeSession: @unchecked Sendable {
         }
     }
 
-    /// Ramps the start of a re-cue's audio up from silence, linearly over `fadeInFrames`, in the converted Float32
-    /// words: frame k of the ramp is scaled by k / `fadeInFrames`. Past the ramp, nothing is touched.
-    private func fadeIn(frames: Int, channels: Int) {
+    /// Ramps the start of a seek's audio up from silence, linearly over `fadeInFrames`, in the converted words:
+    /// frame k of the ramp is scaled by k / `fadeInFrames`, a Float32 word in Float32, an Int32 one in Double, rounded
+    /// half away from zero. Past the ramp, nothing is touched.
+    private func fadeIn(frames: Int, channels: Int, client: OutputPlan.Client) {
         let n = min(frames, fadeInLeft)
         let done = fadeInFrames - fadeInLeft
         for f in 0..<n {
             let weight = Float(done + f) / Float(fadeInFrames)
             for c in 0..<channels {
                 let i = f * channels + c
-                words[i] = (Float(bitPattern: words[i]) * weight).bitPattern
+                switch client {
+                case .float32:
+                    words[i] = (Float(bitPattern: words[i]) * weight).bitPattern
+                case .int32:
+                    let x = Double(Int32(bitPattern: words[i])) * Double(weight)
+                    words[i] = UInt32(bitPattern: Int32(x.rounded()))
+                }
             }
         }
         fadeInLeft -= n
@@ -604,7 +611,7 @@ final class DecodeSession: @unchecked Sendable {
             return .play
         }
         let (target, ticket) = (request.target, request.ticket)
-        enteringRecue = request.fadeIn
+        enteringFadeIn = request.fadeIn
         // Nothing renders from the ring now until the new position's audio, so the next real frame past `written` is
         // the first one at the target. An earlier seek still waiting for its frame is superseded.
         firstFrames.removeAll { watch in
@@ -665,7 +672,7 @@ private struct SeekRequest: Sendable {
     var target: Int64
     var ticket: UInt64
     var interval: FirstFrameInterval?
-    /// A re-cue's: the audio from `target` fades in.
+    /// The audio from `target` fades in: every seek's but a scrub's hand-over.
     var fadeIn: Bool
 }
 

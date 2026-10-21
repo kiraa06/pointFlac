@@ -216,6 +216,14 @@ private func mismatch(_ got: [Float], _ want: [Float]) -> String? {
     return "first difference at sample \(i): \(got[i]) ≠ \(want[i])"
 }
 
+/// A seek in a stereo Float32 capture: the 6 ms of `old` that were playing, faded out on the raised cosine
+/// (`RenderSource.seekFadeGain`; none when nothing was playing), then `new`, its first 6 ms faded in linearly.
+private func seekDip(old: [Float], new: [Float], rate: Int) -> [Float] {
+    let fade = RenderSource.fadeFrames(atRate: rate)
+    let out = old.prefix(2 * fade).enumerated().map { $0.element * RenderSource.seekFadeGain($0.offset / 2, of: fade) }
+    return out + new.enumerated().map { i, x in i / 2 < fade ? x * (Float(i / 2) / Float(fade)) : x }
+}
+
 /// The strip knows nothing about a path: no source, plan or hardware side.
 private func assertNoPath(_ signal: SignalState, sourceLocation: SourceLocation = #_sourceLocation) {
     #expect(signal.source == nil, sourceLocation: sourceLocation)
@@ -437,19 +445,26 @@ private final class Rig {
         let rig = Rig()
         await rig.player.play([patternItem("a"), patternItem("b")], startingAt: 1)
         #expect(await eventually { rig.player.status == .playing }, waited)
+        // Nothing has played yet, so nothing fades out; the new position fades in.
         await rig.player.seek(to: .seconds(4))
         #expect(rig.player.position == .seconds(4))
         #expect(await rig.pull(upTo: 4410))
         #expect(await eventually { rig.player.position == .milliseconds(4100) }, waited)
         let afterSeek = floats(PatternDecoder.samples(from: 176_400, count: 4410), bits: 16)
-        #expect(mismatch(rig.output.capturedFloat, afterSeek) == nil)
+        #expect(mismatch(rig.output.capturedFloat, seekDip(old: [], new: afterSeek, rate: 44_100)) == nil)
 
+        // The restart is a seek too: what was playing fades out, then the track's start fades in. (Waiting first, so
+        // that the decode thread has run ahead: the ring then holds the 6 ms the fade-out plays.)
+        try? await Task.sleep(for: .milliseconds(50))
         await rig.player.previous()
         #expect(rig.player.currentIndex == 1)
         #expect(rig.player.position == .zero)
-        #expect(await rig.pull(upTo: 4410 + 512))
+        let fade = RenderSource.fadeFrames(atRate: 44_100)
+        #expect(await rig.pull(upTo: 4410 + fade + 512))
         let restarted = Array(rig.output.capturedFloat[(4410 * 2)...])
-        #expect(mismatch(restarted, floats(PatternDecoder.samples(from: 0, count: 512), bits: 16)) == nil)
+        let old = floats(PatternDecoder.samples(from: 176_400 + 4410, count: fade), bits: 16)
+        let start = floats(PatternDecoder.samples(from: 0, count: 512), bits: 16)
+        #expect(mismatch(restarted, seekDip(old: old, new: start, rate: 44_100)) == nil)
 
         // Within the restart window, previous goes back a track instead.
         await rig.player.previous()
@@ -1000,10 +1015,15 @@ private final class Rig {
         #expect(await rig.pull(upTo: 4410))
         // 4410 frames are 100 ms at 44.1 kHz; at the stale 48 kHz they would read as 91.875 ms.
         #expect(await eventually { rig.player.position == .milliseconds(100) }, waited)
+        // Waiting, so that the decode thread has run ahead: the ring holds the 6 ms the seek's fade-out plays.
+        try? await Task.sleep(for: .milliseconds(50))
         await rig.player.seek(to: .seconds(1))
-        #expect(await rig.pull(upTo: 4410 + 512))
+        let fade = RenderSource.fadeFrames(atRate: 44_100)
+        #expect(await rig.pull(upTo: 4410 + fade + 512))
         let afterSeek = Array(rig.output.capturedFloat[(4410 * 2)...])
-        #expect(mismatch(afterSeek, floats(PatternDecoder.samples(from: 44_100, count: 512), bits: 16)) == nil)
+        let old = floats(PatternDecoder.samples(from: 4410, count: fade), bits: 16)
+        let new = floats(PatternDecoder.samples(from: 44_100, count: 512), bits: 16)
+        #expect(mismatch(afterSeek, seekDip(old: old, new: new, rate: 44_100)) == nil)
     }
 
     /// Ledger M5: the decoder's length is authoritative too. A file replaced since import with a longer or shorter one

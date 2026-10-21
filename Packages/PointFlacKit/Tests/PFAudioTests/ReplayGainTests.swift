@@ -107,6 +107,30 @@ private func mismatch(_ got: [Float], _ want: [Float]) -> String? {
     return "first difference at sample \(i): \(got[i]) ≠ \(want[i])"
 }
 
+/// A seek's (or a re-cue's) fade-out and fade-in at 48 kHz: 6 ms, 288 frames.
+private let seekFade = RenderSource.fadeFrames(atRate: 48_000)
+
+/// Waits without pulling while the decode thread runs ahead, so that the ring holds the 6 ms a seek's fade-out plays:
+/// pulled flat out from the start, the render thread can catch up with it, and a seek then finds the ring empty and
+/// has nothing to fade (`SeekFadeOutTests.theFadeEndsWhereTheRingRunsDry`).
+private func letTheRingFill() async {
+    try? await Task.sleep(for: .milliseconds(50))
+}
+
+/// What a seek puts in a stereo capture at 48 kHz after the frames pulled before it: `old(k, channel)` for the
+/// `seekFade` frames that were playing, faded out on the raised cosine (`RenderSource.seekFadeGain`); then `frames`
+/// frames of `new(k, channel)`, the first `seekFade` faded in linearly (k / `seekFade`).
+private func dip(old: (Int, Int) -> Float, new: (Int, Int) -> Float, frames: Int) -> [Float] {
+    var out: [Float] = []
+    for k in 0..<seekFade {
+        for c in 0..<2 { out.append(old(k, c) * RenderSource.seekFadeGain(k, of: seekFade)) }
+    }
+    for k in 0..<frames {
+        for c in 0..<2 { out.append(k < seekFade ? new(k, c) * (Float(k) / Float(seekFade)) : new(k, c)) }
+    }
+    return out
+}
+
 /// Waits until every call queued on the player's engine has run, a switch's re-cue check among them.
 @MainActor
 private func drained(_ player: Player) async {
@@ -408,19 +432,22 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
     }
 
     /// A seek applies a gain change at once, from the first frame at the new position. What played before the seek
-    /// kept the gain it was decoded with.
+    /// kept the gain it was decoded with, its fade-out included.
     @Test func aSeekAppliesTheChange() async {
         let rig = PipelineRig()
         await rig.pipeline.start([playback("hash-a", gainDb: halfDb)], at: 0, fromFrame: 0)
         #expect(await rig.puller.pull(upTo: 4096))
         rig.pipeline.setGains(["hash-a": 0])
         #expect(await rig.puller.pull(upTo: 8192))
+        await letTheRingFill()
         await rig.pipeline.seek(toFrame: 40_000)
         let after = Int(HashDecoder.frames) - 40_000
-        #expect(await rig.puller.pull(upTo: 8192 + after))
+        #expect(await rig.puller.pull(upTo: 8192 + seekFade + after))
         var want: [Float] = []
         for n in 0..<Int64(8192) { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c, gain: 0.5)) } }
-        for n in Int64(40_000)..<HashDecoder.frames { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
+        want += dip(
+            old: { HashDecoder.float(8192 + Int64($0), channel: $1, gain: 0.5) },
+            new: { HashDecoder.float(40_000 + Int64($0), channel: $1) }, frames: after)
         #expect(mismatch(rig.output.capturedFloat, want) == nil)
         #expect(rig.pipeline.renderingGain?.gainDb == 0)
     }
@@ -450,13 +477,15 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
             }.max() ?? 1
         #expect(worstBefore < 1e-6, "the playing item changed level before the seek: \(worstBefore)")
 
+        await letTheRingFill()
         await rig.player.seek(to: .milliseconds(500))
         let target = 24_000
-        #expect(await rig.puller.pull(upTo: 16_384 + 8_192))
-        let after = Array(rig.output.capturedFloat[(2 * 16_384)...])
-        // The first `latency` frames after the seek are what the look-ahead held from before it.
+        #expect(await rig.puller.pull(upTo: 16_384 + seekFade + 8_192))
+        // First the fade-out of what was playing, then the new position: its first `latency` frames are what the
+        // look-ahead held from the gap, and its first `seekFade` fade in.
+        let after = Array(rig.output.capturedFloat[(2 * (16_384 + seekFade))...])
         let worstAfter =
-            (0..<(8_192 - latency)).map { n in
+            (seekFade..<(8_192 - latency)).map { n in
                 abs(after[2 * (n + latency)] - HashDecoder.float(Int64(target + n), channel: 0, gain: 0.5))
             }.max() ?? 1
         #expect(worstAfter < 1e-6, "the seek did not apply the new gain: \(worstAfter)")
@@ -465,26 +494,27 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
 
     // MARK: Switches heard at once (ruling R4-T12a)
 
-    /// Pure set while an item plays at a gain re-cues it where it is: within one buffer of the re-cue, the capture is
-    /// the ungained source, to the bit, from the frame playback had reached. (That buffer holds the re-cue's fade-in
-    /// and the chain's fade out to Pure.)
+    /// Pure set while an item plays at a gain re-cues it where it is: within one buffer of the re-cue's audio, the
+    /// capture is the ungained source, to the bit, from the frame playback had reached. (Before it, the fade-out of
+    /// what was playing; that buffer holds the re-cue's fade-in and the chain's fade out to Pure.)
     @Test func pureTakesEffectAtOnce() async {
         let rig = PlayerRig()
         rig.player.setSound(sound(.track))
         await rig.player.play([hashItem("hash-p", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
+        await letTheRingFill()
         rig.player.setSound(SoundSettings())
         // The re-cue reaches the pipeline through the engine's queue; nothing renders meanwhile.
         await drained(rig.player)
         #expect(rig.player.recueCount == 1)
-        #expect(await rig.puller.pull(upTo: 4096 + 8192))
+        #expect(await rig.puller.pull(upTo: 4096 + seekFade + 8192))
         let captured = rig.output.capturedFloat
         var got: [Float] = []
         var want: [Float] = []
         for n in Int64(512)..<8192 {
             for c in 0..<2 {
-                got.append(captured[2 * (4096 + Int(n)) + c])
+                got.append(captured[2 * (4096 + seekFade + Int(n)) + c])
                 want.append(HashDecoder.float(4096 + n, channel: c))
             }
         }
@@ -503,17 +533,20 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         await rig.player.play([hashItem("hash-o", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
+        await letTheRingFill()
         let settings = sound(.track)
         rig.player.setSound(settings)
         await drained(rig.player)
         #expect(rig.player.recueCount == 1)
-        #expect(await rig.puller.pull(upTo: 4096 + 8192))
+        #expect(await rig.puller.pull(upTo: 4096 + seekFade + 8192))
         let latency = SoundChain(settings, sampleRate: 48_000, channels: 2).latencyFrames
         let captured = rig.output.capturedFloat
-        // Past the fade-in, the chain's priming and its fade in: the halved source, delayed by the look-ahead.
+        // Past the fade-out of what was playing, the fade-in, the chain's priming and its fade in: the halved source,
+        // delayed by the look-ahead.
+        let base = 4096 + seekFade
         let worst =
             (1024..<8192).map { k in
-                abs(captured[2 * (4096 + k)] - HashDecoder.float(Int64(4096 + k - latency), channel: 0, gain: 0.5))
+                abs(captured[2 * (base + k)] - HashDecoder.float(Int64(4096 + k - latency), channel: 0, gain: 0.5))
             }.max() ?? 1
         #expect(worst < 1e-6, "not halved after the re-cue: \(worst)")
         #expect(rig.player.pipeline?.renderingGain?.gainDb == halfDb)
@@ -557,20 +590,26 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         rig.player.pause()
     }
 
-    /// A re-cue's audio fades in from silence over `RenderSource.crossfadeSeconds` (288 frames at 48 kHz), linearly,
-    /// so it never starts with a step; past the ramp every sample is the source's at its new gain, exactly. A seek
-    /// (`aSeekAppliesTheChange`) has no ramp.
+    /// A re-cue is a seek: what was playing fades out over `RenderSource.crossfadeSeconds` (288 frames at 48 kHz) on
+    /// the raised cosine, and the re-cued audio fades in from silence over as long, linearly, so it never starts with
+    /// a step; past the ramp every sample is the source's at its new gain, exactly. A seek (`aSeekAppliesTheChange`)
+    /// dips the same way.
     @Test func recueFadesIn() async {
         let rig = PipelineRig()
         await rig.pipeline.start([playback("hash-r", gainDb: halfDb)], at: 0, fromFrame: 0)
         #expect(await rig.puller.pull(upTo: 4096))
+        await letTheRingFill()
         rig.pipeline.setGains(["hash-r": 0])
         await rig.pipeline.recue(toFrame: 4096, firstFrame: FirstFrameInterval(.seek))
-        #expect(await rig.puller.pull(upTo: 8192))
+        #expect(await rig.puller.pull(upTo: 8192 + seekFade))
         let ramp = Int((RenderSource.crossfadeSeconds * 48_000).rounded())
-        #expect(ramp == 288)
+        #expect(ramp == 288 && seekFade == ramp)
         var want: [Float] = []
         for n in Int64(0)..<4096 { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c, gain: 0.5)) } }
+        for k in 0..<ramp {
+            let gain = RenderSource.seekFadeGain(k, of: ramp)
+            for c in 0..<2 { want.append(HashDecoder.float(Int64(4096 + k), channel: c, gain: 0.5) * gain) }
+        }
         for k in 0..<4096 {
             let weight: Float = k < ramp ? Float(k) / Float(ramp) : 1
             for c in 0..<2 {
@@ -627,11 +666,12 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         await drained(rig.player)
         #expect(rig.player.recueCount == 1)
         #expect(await rig.puller.pump { rig.player.status == .ended })
+        // Both items, and the fade-out of what was playing at the re-cue, which then replays from where it began.
         let captured = rig.output.capturedFloat
-        #expect(captured.count == 2 * 2 * frames)
+        #expect(captured.count == 2 * (2 * frames + seekFade))
         var want: [Float] = []
         for n in Int64(0)..<HashDecoder.frames { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
-        #expect(mismatch(Array(captured[(2 * frames)...]), want) == nil)
+        #expect(mismatch(Array(captured[(2 * (frames + seekFade))...]), want) == nil)
     }
 
     /// Ruling R4-T12b across a boundary that is not gapless (re-review N1): a 48 kHz item at 0 dB, then a halved
@@ -741,6 +781,7 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         await rig.player.play([hashItem("hash-c", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 8192))
+        await letTheRingFill()
         #expect(rig.player.beginScrub())
         rig.player.setSound(SoundSettings())
         await drained(rig.player)
@@ -749,14 +790,15 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(!rig.player.isScrubbing)
         await drained(rig.player)
         #expect(rig.player.recueCount == 1)
-        #expect(await rig.puller.pull(upTo: 8192 + 4096))
+        #expect(await rig.puller.pull(upTo: 8192 + seekFade + 4096))
         #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        // After the fade-out of what was playing: no voice ever started, so that was the ring.
         let captured = rig.output.capturedFloat
         var got: [Float] = []
         var want: [Float] = []
         for n in Int64(512)..<4096 {
             for c in 0..<2 {
-                got.append(captured[2 * (8192 + Int(n)) + c])
+                got.append(captured[2 * (8192 + seekFade + Int(n)) + c])
                 want.append(HashDecoder.float(8192 + n, channel: c))
             }
         }
