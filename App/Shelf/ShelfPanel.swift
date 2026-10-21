@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 
 /// The Shelf (spec §4.6): search at the top, the filter chips, the crate, and the results under it. Local results
 /// update on every keystroke; the search runs in `onChange`, never in `body`, and the field shows how long it took.
-/// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next and Add to Up Next.
+/// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next, Add to Up Next and
+/// Delete, which asks first and says whether the songs leave this iPhone or only pointFlac.
 struct ShelfPanel: View {
     let library: any LibraryBrowsing
     /// For the online results that stream in under the local ones (spec §4.6).
@@ -29,6 +30,8 @@ struct ShelfPanel: View {
     @State private var online: [(provider: String, rows: [RemoteResultRow])] = []
     /// Search was pressed for the current phrase.
     @State private var immediate = false
+    /// The album or song waiting for the user to confirm its deletion.
+    @State private var pendingRemoval: PendingRemoval?
     @FocusState private var searching: Bool
 
     /// The front sleeve's size: smaller while typing, so the results stay above the keyboard.
@@ -93,6 +96,15 @@ struct ShelfPanel: View {
             case .failure(let error):
                 importNote = "The picker failed: \(error.localizedDescription)"
             }
+        }
+        .confirmationDialog(
+            pendingRemoval?.title ?? "", isPresented: removalAsked, titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { removal in
+            Button(removal.action, role: .destructive) { delete(removal) }
+            Button("Cancel", role: .cancel) {}
+        } message: { removal in
+            Text(removal.message)
         }
     }
 
@@ -411,12 +423,43 @@ struct ShelfPanel: View {
         library.albums.first { $0.title == track.album && library.tracks(of: $0.id).contains { $0.id == track.id } }
     }
 
+    /// A sleeve's or a result's menu: for an album, or for its song `track` when a song row was held.
     @ViewBuilder
     private func upNextMenu(_ album: AlbumCard, from track: TrackRow.ID? = nil) -> some View {
         Button("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") {
             playback.playNext(album, startingAt: track)
         }
         Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(album, startingAt: track) }
+        Divider()
+        Button(track == nil ? "Delete Album…" : "Delete Song…", systemImage: "trash", role: .destructive) {
+            askToDelete(album, song: track)
+        }
+    }
+
+    // MARK: Deleting
+
+    private var removalAsked: Binding<Bool> {
+        Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } })
+    }
+
+    /// Opens the confirmation for `album`, or for only its `song`, saying what deleting would do.
+    private func askToDelete(_ album: AlbumCard, song: TrackRow.ID?) {
+        let listed = library.tracks(of: album.id)
+        let ids = song.map { [$0] } ?? listed.map(\.id)
+        let plan = library.removalPlan(album: song == nil ? album.id : nil, tracks: song.map { [$0] } ?? [])
+        guard plan.deletes + plan.removes > 0 else { return }
+        let title = song.flatMap { id in listed.first { $0.id == id }?.title } ?? album.title
+        pendingRemoval = PendingRemoval(title: title, tracks: ids, deletes: plan.deletes, removes: plan.removes)
+    }
+
+    /// The deck lets go of the songs first, so nothing plays a file as it is deleted; then the library removes them,
+    /// and the crate follows.
+    private func delete(_ removal: PendingRemoval) {
+        Task {
+            await playback.willRemove(tracks: Set(removal.tracks))
+            await library.remove(tracks: removal.tracks)
+            runSearch()
+        }
     }
 
     private var footer: some View {
@@ -438,6 +481,32 @@ struct ShelfPanel: View {
         .padding(.vertical, 18)
         .padding(.horizontal, 16)
     }
+}
+
+/// An album or a song the user asked to delete, and what that would do (`LibraryBrowsing.removalPlan`).
+private struct PendingRemoval {
+    let title: String
+    let tracks: [TrackRow.ID]
+    /// Songs that are the app's own copies, deleted from the iPhone.
+    let deletes: Int
+    /// Songs in folders added in place, which only leave pointFlac.
+    let removes: Int
+
+    /// One sentence for each kind of song in the selection, so a mixed album says both.
+    var message: String {
+        var sentences: [String] = []
+        if deletes > 0 { sentences.append("Deletes \(Self.songs(deletes)) from this iPhone.") }
+        if removes > 0 {
+            let files = removes == 1 ? "The file stays in its folder." : "The files stay in their folder."
+            sentences.append("Removes \(Self.songs(removes)) from pointFlac. \(files)")
+        }
+        return sentences.joined(separator: " ")
+    }
+
+    /// "Remove" when nothing would leave the iPhone, "Delete" otherwise.
+    var action: String { deletes == 0 ? "Remove" : "Delete" }
+
+    private static func songs(_ count: Int) -> String { count == 1 ? "1 song" : "\(count) songs" }
 }
 
 /// A sleeve in the crate: the cover, with a thin edge highlight.

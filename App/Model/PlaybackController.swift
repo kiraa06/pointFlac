@@ -249,6 +249,36 @@ final class PlaybackController {
         upNext.move(fromOffsets: source, toOffset: destination)
     }
 
+    // MARK: Deleting
+
+    /// Called before `removed` leave the library (Delete Album, Delete Song), so nothing ever tries to play a file
+    /// that is gone. When the record on the platter, or the queue the player holds, has any of them, playback stops
+    /// and the platter is left empty: the deck shows no record. An Up Next entry goes when its album goes entirely;
+    /// one that keeps some songs stays, and starts from its first song if its chosen one went.
+    func willRemove(tracks removed: Set<TrackRow.ID>) async {
+        upNext.removeAll { entry in
+            library.tracks(of: entry.album.id).allSatisfy { removed.contains($0.id) }
+        }
+        let onDeck =
+            tracks.contains { removed.contains($0.id) } || player.queue.contains { removed.contains($0.id) }
+        guard onDeck else { return }
+        album = nil
+        tracks = []
+        layout = SideLayout(durations: [])
+        cuedSide = 0
+        intendedIndex = nil
+        // Unlike `perform`, never overtaken: the stop waits for the command in flight, and drops any still waiting,
+        // so nothing queued before it can start the old record again.
+        transportToken += 1
+        let previous = transport
+        let stop = Task { @MainActor [weak self] in
+            await previous?.value
+            await self?.player.play([], startingAt: 0)
+        }
+        transport = stop
+        await stop.value
+    }
+
     // MARK: Following the player
 
     /// Called when the player's status changes. At the end of the queue: repeat, else the next Up Next record, else

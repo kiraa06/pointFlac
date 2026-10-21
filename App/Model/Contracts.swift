@@ -55,6 +55,12 @@ enum SearchFilter: CaseIterable {
     func queueItems(for tracks: [TrackRow.ID]) -> [QueueItem]
     /// Imports files picked in Files; `rejected` holds one line per refused file ("name: reason").
     func importFiles(_ urls: [URL]) async -> (added: Int, rejected: [String])
+    /// What removing `album` (every song the shelf lists for it) plus `tracks` would do, before the user confirms:
+    /// how many songs would be deleted from this iPhone (the app's own copies) and how many only removed from the
+    /// library (files in folders added in place, which stay where they are).
+    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> (deletes: Int, removes: Int)
+    /// Removes `tracks` as `removalPlan` described, and returns once the shelf shows the library without them.
+    func remove(tracks: [TrackRow.ID]) async
 }
 
 /// Finding and downloading music from the online providers.
