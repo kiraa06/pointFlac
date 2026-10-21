@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PFCore
+import PFDSP
 
 /// The object the UI binds to. It plays a queue through a `PlaybackPipeline`, follows the audio session (routes,
 /// interruptions, volume, media-server resets), keeps an honest `SignalState`, and publishes Now Playing.
@@ -10,7 +11,9 @@ import PFCore
 /// drain both wait on render callbacks. So `pause()` remembers where playback was, `(index, frame)` from the
 /// pipeline's rendered position, and stops the pipeline. `resume()` starts a new one there. That re-opens the file and
 /// re-negotiates the rate, ~20–100 ms, and so also keeps the client rate equal to the hardware rate after a route
-/// change made while paused. A seek while paused only moves the remembered frame.
+/// change made while paused. A seek while paused only moves the remembered frame. With a Sound chain on, the
+/// remembered frame is the ring's, and the listener has heard up to one chain latency less (1.8–3.3 ms): that much is
+/// skipped at the resume, whose fresh chain opens on as much silence. The position shown runs that far ahead too.
 ///
 /// ## One pipeline per start, and stale events
 /// Every start builds a fresh pipeline: play, resume, a track change, a restart after a route change, a restart after
@@ -31,6 +34,33 @@ import PFCore
 /// Every pipeline negotiates through one `SessionGate`, so `requestSampleRate` calls run one at a time, in order,
 /// including a stopped pipeline's late one. The player itself never asks for a rate. Each pipeline stops its output
 /// before negotiating, and a retired pipeline's request is refused at its turn.
+///
+/// ## ReplayGain (Plan 4 Task 12)
+/// Each queue item's gain is worked out from its `loudness` and `sound.replayGain` (`replayGainDb(for:sound:)`, 0 in
+/// Pure) and handed to the pipeline with the item, which applies it on the decode thread. A settings change
+/// recomputes the queue's gains (`PlaybackPipeline.setGains`); they apply from the next item the pipeline enters,
+/// and on any seek, never to the item playing mid-stream. The exception (ruling R4-T12a): switching Pure on or off,
+/// or ReplayGain on or off, is heard at once, through a re-cue of the item playing at where it is, whenever that
+/// changes its gain. The strip lists ReplayGain exactly while a non-zero gain applies to the item playing.
+///
+/// ## Crossfade (Plan 4 Task 16, ruling R4-4)
+/// Every pipeline gets `sound.crossfade`, or Off in Pure (`crossfade(for:)`), at its start and with every settings
+/// change (`PlaybackPipeline.setCrossfade`), at once: it decides only boundaries the decode thread has yet to reach.
+/// The pipeline overlaps a boundary between two items of one plan: Always every one, Between albums only those
+/// `append` marked, which the app uses for the next Up Next record. Off and Pure keep every boundary gapless.
+/// - The incoming item is the current one from the overlap's first frame (its `trackStarted`, `currentIndex`,
+///   `position`), and the outgoing one counts as entered until the overlap's end, so a switch of Pure or ReplayGain
+///   reaches both: it re-cues, which ends the overlap, and the incoming item plays on alone at the new gains. Pure
+///   re-cues an overlap begun even when no gain changes, since Pure plays no crossfade.
+/// - A seek, a pause or a restart during an overlap ends it: they take the incoming item's position once the overlap
+///   is heard, and nothing of the outgoing item plays again.
+/// - A finger on the record during an overlap cancels the fade: the hand plays the incoming item alone, and the
+///   let-go's seek ends the overlap. Let go before the voice took over, the ring plays on and the fade finishes.
+/// - The strip lists Crossfade exactly while an overlap is heard, as it lists ReplayGain exactly while a gain applies
+///   (the outgoing item's included, during an overlap), not merely while crossfade is on.
+/// - `crossfadeSuppressed` (repeat-one, ruling R4-T16a) keeps every boundary gapless whatever the settings.
+/// - `removeAppended` takes back appended items that have not started (ruling R4-T16b): the app keeps an appended
+///   record in Up Next until its first track starts, and takes it back when the queue no longer leads to it.
 @MainActor
 @Observable
 public final class Player {
@@ -62,6 +92,8 @@ public final class Player {
     /// A failure, or `play([])`, clears the path altogether. Pause and the end of the queue keep the last track's path
     /// on show, refreshed only when the hardware really moves (`refreshIdleHardwareRate`).
     public private(set) var signal: SignalState
+    /// The Sound settings every pipeline plays with, clamped. Pure (the default) is bit-exact.
+    public private(set) var sound = SoundSettings()
 
     private let session: AudioSessionControlling
     private let gate: SessionGate
@@ -91,7 +123,36 @@ public final class Player {
     @ObservationIgnored private var anyItemStarted = false
     @ObservationIgnored private var lastFailure: String?
     @ObservationIgnored private var ticker: Task<Void, Never>?
+    /// The finger on the record, from `beginScrub()` until its let-go has settled.
+    @ObservationIgnored private var scrubRun: ScrubRun?
     @ObservationIgnored private var sessionEvents: Task<Void, Never>?
+    /// Clips counted by the pipelines retired so far, so `soundMeters.clipCount` runs on across them.
+    @ObservationIgnored private var retiredClips = 0
+    /// A switch of Pure or of ReplayGain on or off came while a finger was on the record: checked again once the
+    /// scrub ends (`finishScrub`).
+    @ObservationIgnored private var recueAfterScrub = false
+    /// Re-cues issued for a switch of Pure or ReplayGain (`recueIfGainsDiffer`). For tests.
+    @ObservationIgnored private(set) var recueCount = 0
+    /// The queue indices where an appended batch begins (`append`): the boundaries Between albums overlaps. Handed to
+    /// every pipeline started on this queue.
+    @ObservationIgnored private var appendedAt: Set<Int> = []
+    /// How many queue items the current engine's pipeline holds: those it was started with, and the appends it took.
+    /// Fewer than the queue once it refused an append; the rest then plays afresh when its queue ends.
+    @ObservationIgnored private var pipelineItems = 0
+    /// Bumped by `removeAppended`, so an append still on its way to the pipeline when its items were taken back is
+    /// dropped there.
+    @ObservationIgnored private var appendEpoch = 0
+
+    /// While true, every boundary is gapless whatever the crossfade settings say: for repeat-one, where a boundary
+    /// loops the same track and an overlap would cut the last fade's worth of it on every loop (ruling R4-T16a). It
+    /// reaches the pipeline at once, and an overlap already begun is re-cued away, as a switch to Pure does.
+    @ObservationIgnored public var crossfadeSuppressed = false {
+        didSet {
+            guard crossfadeSuppressed != oldValue, let engine else { return }
+            engine.pipeline.setCrossfade(effectiveCrossfade)
+            if crossfadeSuppressed { recueIfGainsDiffer(engine, thenApplySound: false) }
+        }
+    }
 
     /// - Parameters:
     ///   - makeOutput: builds the output every pipeline the player starts renders through, one at a time. Called on
@@ -126,6 +187,7 @@ public final class Player {
     deinit {
         sessionEvents?.cancel()
         ticker?.cancel()
+        scrubRun?.filler.stop()
         // The engine goes with the player. Its pipeline's deinit stops playback and finishes the pipeline's event
         // stream, which ends the engine's event task.
     }
@@ -138,6 +200,7 @@ public final class Player {
         resumeAfterInterruption = false
         retireEngine()
         queue = items
+        appendedAt = []
         anyItemStarted = false
         lastFailure = nil
         guard !items.isEmpty else {
@@ -149,6 +212,49 @@ public final class Player {
             return
         }
         await launch(at: min(max(index, 0), items.count - 1), frame: 0, for: .play).value
+    }
+
+    /// Adds `items` to the end of the queue, and marks the boundary into the first of them, which Between albums
+    /// overlaps (ruling R4-4: the app appends the next Up Next record while the last track of this one plays). The
+    /// pipeline playing takes them behind the queue it has, so they join it as if `play` had had them, gapless or
+    /// overlapped; one that has already found its queue's end refuses them, and they play afresh once it has played
+    /// out. While nothing plays they wait in the queue for the next start. The returned task finishes once the
+    /// pipeline has answered.
+    @discardableResult
+    public func append(_ items: [QueueItem]) -> Task<Void, Never> {
+        guard !items.isEmpty else { return Task {} }
+        let first = queue.count
+        appendedAt.insert(first)
+        queue += items
+        guard let engine, !engine.isRetired else { return Task {} }
+        let appended = items.map(playbackItem(for:))
+        let epoch = appendEpoch
+        return engine.enqueue { [weak self, weak engine] pipeline in
+            // Not if a start on its way already took them from the queue, or they were taken back meanwhile.
+            guard let self, let engine, self.engine === engine, !engine.isRetired, self.appendEpoch == epoch,
+                self.pipelineItems == first
+            else { return }
+            if pipeline.append(appended) { self.pipelineItems += appended.count }
+        }
+    }
+
+    /// Takes back the queue's items from `index` on, which `append` added and none of which has started: the queue
+    /// ends before them again, and the mark at their boundary goes with them. The pipeline playing drops them too,
+    /// flushing them from its ring by a re-cue at the playhead if it had already joined them there (the usual dip).
+    ///
+    /// Returns false, and changes nothing, once one of them plays: it is the current item, or the pipeline is
+    /// rendering it (its `trackStarted` is on its way). True when there was nothing to take back.
+    @discardableResult
+    public func removeAppended(from index: Int) -> Bool {
+        let index = max(index, 0)
+        guard index < queue.count else { return true }
+        if let current = currentIndex, current >= index { return false }
+        if let engine, !engine.isRetired, !engine.pipeline.removeItems(from: index) { return false }
+        queue.removeSubrange(index...)
+        appendedAt = appendedAt.filter { $0 < index }
+        appendEpoch += 1
+        pipelineItems = min(pipelineItems, index)
+        return true
     }
 
     /// Stops playback where it is (ruling R15). No effect unless playing or preparing.
@@ -189,7 +295,10 @@ public final class Player {
             engine.seeksInFlight += 1
             await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame, firstFrame: interval) }.value
             engine.seeksInFlight -= 1
+            // The new gain shows once the decode thread has taken the seek (the position updates catch it).
+            refreshProcessing()
         case .paused:
+            endPausedScrub()
             cue = Cue(index: index, frame: frame)
             showCue(playing: false)
         case .ended:
@@ -220,6 +329,262 @@ public final class Player {
         }
     }
 
+    // MARK: Sound
+
+    /// Plays `settings`, clamped, from the next render call (cross-faded in over 10 ms, after the chain's few
+    /// milliseconds of look-ahead; a change made while the last one is still fading waits for it), and shows the
+    /// blocks at work on the strip (`signal.activeProcessing`). Compiled here, on the main actor, for the playing plan.
+    /// While nothing plays it is only kept, and the next start compiles it for its plan.
+    ///
+    /// A ReplayGain change, or a switch to or from Pure, recomputes every queue item's gain.
+    /// - Switching Pure on or off, or ReplayGain on or off (`.off` to a mode or back), is heard at once (rulings
+    ///   R4-T12a and R4-T12b): when it changes the gain of any item the pipeline has entered and not yet played out
+    ///   (the one rendering, or one already joined behind it in the ring), playback is re-cued where it is
+    ///   (`recueIfGainsDiffer`), a short dip like any seek's (6 ms out, a gap, 6 ms in), and the Sound chain changes
+    ///   behind the re-cue's hold.
+    ///   When it does not (Pure toggled with ReplayGain off, or items that get 0 dB either way), nothing is re-cued.
+    /// - Any other ReplayGain change (mode, preamp, clipping prevention, reference) applies from the next item the
+    ///   pipeline enters, and on any seek: the item playing keeps its level, and the strip keeps listing ReplayGain
+    ///   while its gain is still on.
+    public func setSound(_ settings: SoundSettings) {
+        let settings = settings.clamped()
+        let gainsChanged = settings.pure != sound.pure || settings.replayGain != sound.replayGain
+        let switched =
+            settings.pure != sound.pure || (settings.replayGain.mode == .off) != (sound.replayGain.mode == .off)
+        sound = settings
+        if let engine {
+            // At once, whatever waits behind a re-cue's hold: it decides only boundaries the decode thread has yet to
+            // reach, so a switch to Pure stops the next overlap before the re-cue check below looks for one begun.
+            engine.pipeline.setCrossfade(effectiveCrossfade)
+            if gainsChanged { engine.pipeline.setGains(queueGains) }
+            // A change of chain waiting behind a re-cue's hold takes this one along (it applies the latest settings),
+            // so the chain never changes ahead of the hold.
+            let behindHold = engine.soundAppliesPending > 0
+            if switched, scrubRun != nil {
+                // The let-go seeks the pipeline, at the new gains; `finishScrub` checks again in case it does not.
+                recueAfterScrub = true
+                if !behindHold { engine.pipeline.setSound(settings) }
+            } else if switched, needsRecue(engine) {
+                // A gain changes: the chain changes behind the re-cue's hold, so gained audio never plays through
+                // the wrong chain (a limiter faded out under it, say).
+                recueIfGainsDiffer(engine, thenApplySound: true)
+            } else {
+                if !behindHold { engine.pipeline.setSound(settings) }
+                // Checked again behind a seek or a start still on its way, which may have entered at the old gains.
+                if switched { recueIfGainsDiffer(engine, thenApplySound: false) }
+            }
+        }
+        refreshProcessing()
+    }
+
+    /// Whether any item the pipeline has entered and not yet played out plays at another gain than the current
+    /// settings give it (`PlaybackPipeline.enteredGains`), the outgoing item of an overlap included.
+    private func gainsDiffer(_ engine: PlayerEngine) -> Bool {
+        engine.pipeline.enteredGains.contains { entered in
+            queue.indices.contains(entered.index)
+                && Self.replayGainDb(for: queue[entered.index], sound: sound) != entered.gainDb
+        }
+    }
+
+    /// Whether a switch must re-cue playback to be heard at once: some entered item's gain differs (`gainsDiffer`),
+    /// or Pure (or `crossfadeSuppressed`) is on while an overlap the pipeline began is still to be heard.
+    private func needsRecue(_ engine: PlayerEngine) -> Bool {
+        gainsDiffer(engine) || ((sound.pure || crossfadeSuppressed) && engine.pipeline.crossfadePending)
+    }
+
+    /// Behind every call already queued on the engine (a start, a seek on its way), re-cues playback where it is when
+    /// some entered item's gain differs from the current settings' (`gainsDiffer`), through the pipeline's seek path
+    /// (`PlaybackPipeline.recue`). The re-cue flushes the ring, joined items included, and the decode thread
+    /// re-enters each at the new gains. Then, with `thenApplySound`, the pipeline gets the latest Sound settings.
+    ///
+    /// Nothing is re-cued, and so there is no gap, when the gains agree, before the pipeline has entered an item (it
+    /// enters at the new gains), while a seek waits for the decode thread (likewise), while paused or ended (the next
+    /// start uses the new gains), or while a finger is on the record (checked again when it lets go).
+    private func recueIfGainsDiffer(_ engine: PlayerEngine, thenApplySound: Bool) {
+        if thenApplySound { engine.soundAppliesPending += 1 }
+        _ = engine.enqueue { [weak self, weak engine] pipeline in
+            guard let self, let engine, self.engine === engine, !engine.isRetired else { return }
+            if self.scrubRun != nil {
+                self.recueAfterScrub = true
+            } else if self.status == .playing || self.status == .preparing, self.needsRecue(engine) {
+                let point = self.currentPoint()
+                self.cue = point
+                self.recueCount += 1
+                engine.seeksInFlight += 1
+                await pipeline.recue(toFrame: point.frame, firstFrame: FirstFrameInterval(.seek))
+                engine.seeksInFlight -= 1
+            }
+            // The latest settings: a later `setSound` may have come meanwhile, and left the chain to this call.
+            if thenApplySound {
+                engine.soundAppliesPending -= 1
+                pipeline.setSound(self.sound)
+            }
+        }
+    }
+
+    // MARK: ReplayGain
+
+    /// The ReplayGain, in dB, for `item` under `settings`, worked out from what the library knows of its loudness
+    /// (`QueueItem.loudness`). Pure is not part of `settings`: `replayGainDb(for:sound:)` is this, and 0 in Pure.
+    ///
+    /// 1. `.off`: 0, and nothing below applies.
+    /// 2. The gain, in order of preference:
+    ///    - the tag gain for the mode (`REPLAYGAIN_TRACK_GAIN`, or `REPLAYGAIN_ALBUM_GAIN` in album mode), used as it
+    ///      is: tags are RG 2.0 values, never re-referenced to `referenceLufs`;
+    ///    - else the measured value, `referenceLufs − LUFS` (RG 2.0's −18 by default, ruling R4-7): the track's R128
+    ///      loudness, or the album's, measured as a whole, in album mode. A measurement with no usable loudness
+    ///      (silent, or under one 400 ms gating block: `measuredLufs` nil, `measuredPeak` set) gives none;
+    ///    - else 0.
+    ///
+    ///    Album mode with no album value at all (no album tag, and no album measurement, which the library only keeps
+    ///    while the album's tracks are those it was measured over) falls back to the track's tag, then its
+    ///    measurement.
+    /// 3. `preampDb` is added, to whichever gain was found, 0 included.
+    /// 4. With `preventClipping`, the result is capped at `−20·log10(peak)`, so the peak lands at full scale at most:
+    ///    the tag peak, else the measured true peak (both linear); in album mode the album's, falling back to the
+    ///    track's when the album has none. A cap only ever lowers a gain. With no peak known there is no cap (the
+    ///    limiter, in the chain whenever ReplayGain is on, still catches an over), nor with a peak of 0 (silence).
+    ///
+    /// A value that is not finite (a NaN setting) counts as absent; the result is always finite, and within
+    /// ±`maxGainDb`.
+    public nonisolated static func replayGainDb(for item: QueueItem, settings: ReplayGainSettings) -> Double {
+        replayGain(for: item, settings: settings).gainDb
+    }
+
+    /// `replayGainDb(for:settings:)`, with what it was worked out from (step 2 above), so the Sound tab can say where
+    /// a gain comes from by the one rule that makes it. `.off` gives 0 from `.none`.
+    public nonisolated static func replayGain(
+        for item: QueueItem, settings: ReplayGainSettings
+    ) -> (gainDb: Double, basis: ReplayGainBasis) {
+        guard settings.mode != .off else { return (0, .none) }
+        let loudness = item.loudness ?? TrackLoudness()
+        let reference = settings.referenceLufs.isFinite ? settings.referenceLufs : ReplayGainSettings().referenceLufs
+        /// `reference − lufs` for a usable measurement. Integrated loudness is gated at −70 LUFS, so a real one is
+        /// above it.
+        func measured(_ lufs: Double?) -> Double? {
+            guard let lufs, lufs.isFinite, lufs > -70 else { return nil }
+            return reference - lufs
+        }
+        func finite(_ value: Double?) -> Double? { value.flatMap { $0.isFinite ? $0 : nil } }
+        let trackPeak = finite(loudness.trackPeak) ?? finite(loudness.measuredPeak)
+        var gain: Double
+        var peak: Double?
+        let basis: ReplayGainBasis
+        if settings.mode == .album, let tag = finite(loudness.albumGainDb) {
+            (gain, basis) = (tag, .albumTag)
+            peak = finite(loudness.albumPeak) ?? finite(loudness.albumMeasuredPeak) ?? trackPeak
+        } else if settings.mode == .album, let scan = measured(loudness.albumMeasuredLufs) {
+            (gain, basis) = (scan, .albumScan)
+            peak = finite(loudness.albumPeak) ?? finite(loudness.albumMeasuredPeak) ?? trackPeak
+        } else if let tag = finite(loudness.trackGainDb) {
+            (gain, basis) = (tag, .trackTag)
+            peak = trackPeak
+        } else if let scan = measured(loudness.measuredLufs) {
+            (gain, basis) = (scan, .trackScan)
+            peak = trackPeak
+        } else {
+            (gain, basis) = (0, .none)
+            peak = trackPeak
+        }
+        if settings.preampDb.isFinite { gain += settings.preampDb }
+        if settings.preventClipping, let peak, peak > 0 {
+            gain = min(gain, -20 * log10(peak))
+        }
+        return (gain.isFinite ? min(max(gain, -maxGainDb), maxGainDb) : 0, basis)
+    }
+
+    /// The largest ReplayGain, either way, in dB: the largest tag gain the library reads (±60 dB) plus the largest
+    /// preamp (±15 dB). Only a measured gain against an absurd reference (a corrupt saved setting) reaches it; past it
+    /// the scale could overflow Float32.
+    public nonisolated static let maxGainDb = 75.0
+
+    /// `replayGainDb(for:settings:)` under the whole of `sound`: 0 in Pure, which ignores ReplayGain.
+    public nonisolated static func replayGainDb(for item: QueueItem, sound: SoundSettings) -> Double {
+        sound.pure ? 0 : replayGainDb(for: item, settings: sound.replayGain)
+    }
+
+    /// The gain of every queue item under the current settings, by ID, for `PlaybackPipeline.setGains`. Items with
+    /// the same ID are the same track, with the same loudness.
+    private var queueGains: [String: Double] {
+        var gains: [String: Double] = [:]
+        for item in queue { gains[item.id] = Self.replayGainDb(for: item, sound: sound) }
+        return gains
+    }
+
+    /// The queue as a pipeline starts it: each item with its gain under the current settings.
+    private var playbackItems: [PlaybackItem] {
+        queue.map(playbackItem(for:))
+    }
+
+    /// `item` as a pipeline plays it, with its gain under the current settings.
+    private func playbackItem(for item: QueueItem) -> PlaybackItem {
+        var playback = item.playbackItem
+        playback.gainDb = Self.replayGainDb(for: item, sound: sound)
+        return playback
+    }
+
+    /// The crossfade a pipeline plays under `sound`: Off in Pure, which plays none (ruling R4-4), else the settings'.
+    nonisolated static func crossfade(for sound: SoundSettings) -> CrossfadeSettings {
+        sound.pure ? CrossfadeSettings(mode: .off, seconds: sound.crossfade.seconds) : sound.crossfade
+    }
+
+    /// The crossfade every pipeline plays now: `crossfade(for: sound)`, or Off while `crossfadeSuppressed`.
+    private var effectiveCrossfade: CrossfadeSettings {
+        let crossfade = Self.crossfade(for: sound)
+        return crossfadeSuppressed ? CrossfadeSettings(mode: .off, seconds: crossfade.seconds) : crossfade
+    }
+
+    /// Starts `pipeline` at `frame` of `queue[index]` on the queue as it stands when the start reaches it (an append
+    /// or a removal since the launch is in it), with each item's gain, the appended boundaries and the crossfade.
+    private func start(
+        _ pipeline: PlaybackPipeline, at index: Int, frame: Int64, interval: FirstFrameInterval
+    ) async {
+        let items = playbackItems
+        pipelineItems = items.count
+        await pipeline.start(
+            items, at: index, fromFrame: frame, crossfade: effectiveCrossfade, appendedAt: appendedAt,
+            firstFrame: interval)
+    }
+
+    /// The gain `queue[index]` plays at now: what the pipeline applied to it while it renders, else what it gets
+    /// under the current settings, which is what the next start gives it.
+    private func gainDb(at index: Int) -> Double {
+        if let engine, engine.hasStarted, let rendering = engine.pipeline.renderingGain, rendering.index == index {
+            return rendering.gainDb
+        }
+        return Self.replayGainDb(for: queue[index], sound: sound)
+    }
+
+    /// Shows the blocks at work on what plays now (`signal.activeProcessing`): the Sound settings' blocks, with
+    /// ReplayGain listed exactly while a non-zero gain applies to the current item. An item that gets 0 dB is not
+    /// processed by it, though the limiter ReplayGain brings into the chain still runs; an item still playing at the
+    /// gain it started with, after a switch to Pure or to off, still is, and the strip says Processing until it ends
+    /// or a seek takes the new settings. Called whenever the settings, the item or the engine change, and with each
+    /// position update, which catches a seek or a gapless join taking effect.
+    ///
+    /// Crossfade is listed the same way: exactly while an overlap is heard (`PlaybackPipeline.crossfading`), last, as
+    /// `SoundSettings.activeBlockNames` orders it. During one, ReplayGain is listed while either item's gain applies.
+    private func refreshProcessing() {
+        var names = sound.activeBlockNames.filter { $0 != "ReplayGain" && $0 != "Crossfade" }
+        let fading = engine.flatMap { $0.hasStarted ? $0.pipeline.crossfading : nil }
+        if let index = currentIndex, queue.indices.contains(index),
+            gainDb(at: index) != 0 || (fading.map { $0.gainDb != 0 } ?? false)
+        {
+            names.insert("ReplayGain", at: 0)
+        }
+        if fading != nil { names.append("Crossfade") }
+        if signal.activeProcessing != names { signal.activeProcessing = names }
+    }
+
+    /// The Sound chain's meters: the peak since the last read, the clips since the player was made, and the latest
+    /// gain reduction. Reading starts a new peak interval, so keep to one reader. The floor, with nothing playing.
+    public var soundMeters: SoundMeters {
+        guard let engine else { return SoundMeters(peakDbFS: -120, clipCount: retiredClips, gainReductionDb: 0) }
+        var meters = engine.pipeline.soundMeters
+        meters.clipCount += retiredClips
+        return meters
+    }
+
     /// The pipeline playing now, if any. For tests.
     var pipeline: PlaybackPipeline? {
         engine?.pipeline
@@ -238,6 +603,7 @@ public final class Player {
         case .playing, .preparing, .ended:
             await launch(at: index, frame: 0, for: .play).value
         case .paused:
+            endPausedScrub()
             cue = Cue(index: index, frame: 0)
             showPending(for: index)
             showCue(playing: false)
@@ -269,7 +635,6 @@ public final class Player {
             return Task {}
         }
         self.engine = engine
-        let items = queue.map(\.playbackItem)
         let needsActivation = !sessionActive
         // The item's rate as imported: the negotiation that follows asks for the decoder's, normally the same.
         let preferredRate = queue[index].format.sampleRate
@@ -283,8 +648,9 @@ public final class Player {
                     return
                 }
             }
-            guard !engine.isRetired else { return }
-            await pipeline.start(items, at: index, fromFrame: frame, firstFrame: interval)
+            guard !engine.isRetired, let self else { return }
+            // The queue and settings as they stand now: a change since the launch reached no pipeline.
+            await self.start(pipeline, at: index, frame: frame, interval: interval)
             engine.hasStarted = true
         }
     }
@@ -298,6 +664,8 @@ public final class Player {
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
             negotiateRate: { rate in await gate.requestSampleRate(rate, for: lease) }, makeDecoder: makeDecoder)
+        // Before it starts, so its first configure compiles the chain.
+        pipeline.setSound(sound)
         let engine = PlayerEngine(pipeline: pipeline, lease: lease, generation: generation)
         // Captures the generation, not the engine, so the task never keeps a pipeline alive.
         let events = pipeline.events
@@ -315,9 +683,13 @@ public final class Player {
     /// Stops the current engine's pipeline and makes sure nothing it emitted from now on is handled.
     private func retireEngine() {
         stopTicker()
-        guard let engine else { return }
-        self.engine = nil
-        engine.retire()
+        if let engine {
+            self.engine = nil
+            engine.retire()
+            retiredClips += engine.pipeline.soundMeters.clipCount
+        }
+        // After the output stopped: ending the scrub first would let a render call play the ring in between.
+        abandonScrub()
     }
 
     /// Configures and activates the session, in turn with the negotiations, then reads the route again: the port and
@@ -333,6 +705,255 @@ public final class Player {
     }
 
     /// The system deactivated the session, or the media server took it down.
+    // MARK: Scrubbing
+
+    /// Whether a finger is on the record (or its let-go is still settling).
+    public var isScrubbing: Bool { scrubRun != nil }
+
+    /// A finger took hold of the record (spec §4.3). From now until `endScrub`, the music follows the hand: the
+    /// render thread plays it where the hand puts it, at the hand's speed and direction, through a band-limited
+    /// resampler. A playing record brakes to a stop under the finger; a paused one stays silent until it is turned.
+    ///
+    /// Returns whether the record is now held: false when nothing is playing or paused, or while a start or a seek is
+    /// still on its way (the caller then treats the turn as a plain jog, applied on release).
+    @discardableResult
+    public func beginScrub() -> Bool {
+        if let run = scrubRun {
+            guard run.settling != nil else { return true }
+            // Touched again while the last let-go was still settling (a scratch): carry on from where the needle is.
+            run.settling?.cancel()
+            run.settling = nil
+            guard engine === run.engine, !run.engine.isRetired else {
+                abandonScrub()
+                return beginScrub()
+            }
+            let anchor = run.engine.pipeline.scrubAnchor
+            let tap = run.tap
+            let generation = tap.generation.load(ordering: .acquiring)
+            let handedOver = tap.handedOver.load(ordering: .acquiring) == generation
+            let frame = handedOver ? anchor.frame : Int64(tap.voicePosition.rounded(.down))
+            let speed = handedOver ? 1 : tap.voiceSpeed
+            run.anchorFrame = frame
+            run.offsetFrames = 0
+            tap.begin(
+                window: run.window, anchorFrame: frame, anchorRendered: anchor.rendered, startSpeed: speed,
+                ringAllowed: run.wasPlaying)
+            signal.scrubbing = true
+            return true
+        }
+        guard let index = currentIndex, queue.indices.contains(index) else { return false }
+        let playing = status == .playing
+        guard playing || status == .paused else { return false }
+        let item = queue[index]
+        let runEngine: PlayerEngine
+        let anchorFrame: Int64
+        let anchorRendered: Int64
+        if playing {
+            guard let current = engine, current.hasStarted, current.seeksInFlight == 0 else { return false }
+            let anchor = current.pipeline.scrubAnchor
+            guard anchor.index == index else { return false }
+            runEngine = current
+            anchorFrame = anchor.frame
+            anchorRendered = anchor.rendered
+        } else {
+            // Nothing runs while paused (ruling R15): start a pipeline at the cue whose render thread plays only the
+            // voice. The status stays paused, and the pipeline goes again when the hand lets go.
+            guard cue.index == index, let started = startForScrub(at: index, frame: cue.frame) else { return false }
+            runEngine = started
+            anchorFrame = cue.frame
+            anchorRendered = 0
+        }
+        let window = ScrubWindow(format: item.format, totalFrames: item.totalFrames, at: anchorFrame)
+        // At the gain the ring plays the item at, so the voice and the ring meet at one level.
+        var voiceItem = item.playbackItem
+        voiceItem.gainDb = gainDb(at: index)
+        let filler = ScrubFiller(item: voiceItem, window: window, makeDecoder: makeDecoder)
+        let tap = runEngine.pipeline.scrubTap
+        // Before the paused pipeline's first render: its render thread starts with the voice.
+        tap.begin(
+            window: window, anchorFrame: anchorFrame, anchorRendered: anchorRendered, startSpeed: playing ? 1 : 0,
+            ringAllowed: playing)
+        filler.start()
+        scrubRun = ScrubRun(
+            index: index, engine: runEngine, tap: tap, window: window, filler: filler, wasPlaying: playing,
+            anchorFrame: anchorFrame)
+        signal.scrubbing = true
+        return true
+    }
+
+    /// The hand is `offsetSeconds` of music from where it took hold (one turn of the record is 1.8 s, forward
+    /// clockwise) and turns the record at platter speed `speed` (1 is normal play, negative backwards).
+    public func scrub(offsetSeconds: Double, speed: Double) {
+        guard let run = scrubRun, run.settling == nil else { return }
+        let frames = offsetSeconds * Double(run.window.sourceRate)
+        run.offsetFrames = frames
+        run.tap.setHand(offsetFrames: frames, speed: min(max(speed, -Self.fastestHand), Self.fastestHand))
+    }
+
+    /// The fastest a hand turns the record, in platter speeds: faster readings are touch noise.
+    static let fastestHand = 8.0
+
+    /// The hand let go. A playing record catches the platter turning under it, back to speed over `spinUpSeconds`
+    /// from rest (a slipmat's fraction of a second by default), and the pipeline takes over exactly where the needle
+    /// is, with a short cross-fade. A paused record stays paused where the hand left it. The returned task finishes
+    /// once that has settled.
+    @discardableResult
+    public func endScrub(spinUpSeconds: Double = 0.15) -> Task<Void, Never> {
+        guard let run = scrubRun, run.settling == nil else { return Task {} }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await settle(run, spinUpSeconds: spinUpSeconds)
+        }
+        run.settling = task
+        return task
+    }
+
+    private func settle(_ run: ScrubRun, spinUpSeconds: Double) async {
+        let tap = run.tap
+        let rate = Double(run.window.sourceRate)
+        let generation = tap.generation.load(ordering: .acquiring)
+        let voiceStarted = tap.voiceStarted.load(ordering: .acquiring) == generation
+        if run.wasPlaying {
+            // No voice ever started (its music was not decoded in time, or could not be): the ring played on all
+            // along, so there is nothing to hand back.
+            guard voiceStarted else {
+                finishScrub(run)
+                return
+            }
+            tap.motorSecondsBits.store(max(spinUpSeconds, 0.01).bitPattern, ordering: .relaxed)
+            tap.phase.store(ScrubTap.Phase.motor.rawValue, ordering: .releasing)
+            // The motor first: the ring can only take over once the record turns at exactly normal speed.
+            try? await Task.sleep(for: .seconds(spinUpSeconds))
+            let deadline = ContinuousClock.now + .seconds(4)
+            while tap.voiceSpeed < 0.9999, ContinuousClock.now < deadline {
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            guard !Task.isCancelled else { return }
+            guard engine === run.engine, !run.engine.isRetired, queue.indices.contains(run.index) else {
+                finishScrub(run)
+                return
+            }
+            // Line the ring up a little ahead of the needle, so its audio is buffered by the time the needle gets
+            // there; the render thread switches over at that exact frame (or skips the ring forward if the seek was
+            // slower than the lead).
+            var target = Int64(tap.voicePosition.rounded(.down)) + Int64(Self.handoverLead * rate)
+            if run.window.totalFrames > 0 { target = min(target, run.window.totalFrames) }
+            target = max(target, 0)
+            let item = queue[run.index]
+            cue = Cue(index: run.index, frame: target)
+            position = item.duration(ofFrames: target)
+            nowPlaying.show(item, elapsed: position, playing: true)
+            run.engine.seeksInFlight += 1
+            // The hand-over's seek, which does not fade in: the render thread cross-fades into the ring there.
+            await run.engine.enqueue { pipeline in
+                await pipeline.handOver(toFrame: target, firstFrame: FirstFrameInterval(.seek))
+            }.value
+            run.engine.seeksInFlight -= 1
+            // Only now, with the seek's hold in place: before it, the ring still holds the audio from before the
+            // hand took hold, which must not be faded into.
+            tap.handoverFrame.store(target, ordering: .releasing)
+            let handoverDeadline = ContinuousClock.now + .seconds(1.5)
+            while tap.handedOver.load(ordering: .acquiring) != generation, ContinuousClock.now < handoverDeadline {
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            guard !Task.isCancelled else { return }
+        } else {
+            tap.phase.store(ScrubTap.Phase.fade.rawValue, ordering: .releasing)
+            try? await Task.sleep(for: .seconds(RenderSource.fadeOutSeconds * 2))
+            guard !Task.isCancelled else { return }
+            var frame = run.anchorFrame + Int64(run.offsetFrames.rounded())
+            if run.window.totalFrames > 0 { frame = min(frame, run.window.totalFrames) }
+            frame = max(frame, 0)
+            // The output stops first (retireEngine also ends the run), so nothing renders after the fade.
+            if engine === run.engine { retireEngine() }
+            finishScrub(run)
+            // A transport command while the hand was down already moved the cue: it wins.
+            if queue.indices.contains(run.index), cue == Cue(index: run.index, frame: run.cueAtBegin) {
+                cue = Cue(index: run.index, frame: frame)
+                position = queue[run.index].duration(ofFrames: frame)
+                showCue(playing: false)
+            }
+        }
+        finishScrub(run)
+    }
+
+    /// A transport command while a paused record is held: the command wins, and the scrub's pipeline goes.
+    private func endPausedScrub() {
+        guard let run = scrubRun, !run.wasPlaying else { return }
+        if engine === run.engine { retireEngine() }
+        abandonScrub()
+    }
+
+    /// How far ahead of the needle the ring is lined up at the handover.
+    static let handoverLead = 0.15
+
+    /// Ends the current scrub at once: a transport command, a route change or a new queue took over. Callers stop
+    /// the output first where it is theirs to stop (see `retireEngine`).
+    private func abandonScrub() {
+        guard let run = scrubRun else { return }
+        run.settling?.cancel()
+        finishScrub(run)
+    }
+
+    private func finishScrub(_ run: ScrubRun) {
+        if scrubRun === run { scrubRun = nil }
+        guard !run.finished else { return }
+        run.finished = true
+        run.tap.retireWindow()
+        run.filler.stop()
+        signal.scrubbing = false
+        // A switch of Pure or ReplayGain during the scrub: a let-go that handed back to the ring seeked it at the new
+        // gains, and then nothing differs; one that did not (no voice ever started) is re-cued now.
+        if recueAfterScrub {
+            recueAfterScrub = false
+            if let engine { recueIfGainsDiffer(engine, thenApplySound: false) }
+        }
+    }
+
+    /// Where the needle is during a playing record's scrub, once its voice has started and until the ring has taken
+    /// over again: the rendered position stands still meanwhile.
+    private var scrubNeedle: Cue? {
+        guard let run = scrubRun, run.wasPlaying, run.engine === engine else { return nil }
+        let tap = run.tap
+        let generation = tap.generation.load(ordering: .acquiring)
+        guard tap.voiceStarted.load(ordering: .acquiring) == generation,
+            tap.handedOver.load(ordering: .acquiring) != generation
+        else { return nil }
+        return Cue(index: run.index, frame: max(0, Int64(tap.voicePosition.rounded(.down))))
+    }
+
+    /// A pipeline at `frame` of `queue[index]` for a paused record's scrub: like `launch`, but the status stays
+    /// paused, and until the hand lets go its render thread plays only the voice.
+    private func startForScrub(at index: Int, frame: Int64) -> PlayerEngine? {
+        let interval = FirstFrameInterval(.resume)
+        retireEngine()
+        let engine: PlayerEngine
+        do {
+            engine = try makeEngine()
+        } catch {
+            return nil
+        }
+        self.engine = engine
+        let needsActivation = !sessionActive
+        let preferredRate = queue[index].format.sampleRate
+        _ = engine.enqueue { [weak self] pipeline in
+            if needsActivation {
+                guard let self else { return }
+                do {
+                    try await activateSession(preferredRate: preferredRate)
+                } catch {
+                    return
+                }
+            }
+            guard !engine.isRetired, let self else { return }
+            await self.start(pipeline, at: index, frame: frame, interval: interval)
+            engine.hasStarted = true
+        }
+        return engine
+    }
+
     private func loseSession() {
         sessionActive = false
         sessionLosses += 1
@@ -342,6 +963,7 @@ public final class Player {
     /// is on its way to the pipeline, the pipeline still reports the old point and the cue already holds the target,
     /// so a pause, restart or interruption then keeps the seek.
     private func currentPoint() -> Cue {
+        if let needle = scrubNeedle { return needle }
         guard let engine, engine.hasStarted, engine.seeksInFlight == 0 else { return cue }
         let reported = engine.pipeline.position
         return queue.indices.contains(reported.index) ? Cue(index: reported.index, frame: reported.frame) : cue
@@ -387,6 +1009,7 @@ public final class Player {
         currentIndex = cue.index
         position = item.duration(ofFrames: cue.frame)
         nowPlaying.show(item, elapsed: position, playing: playing)
+        refreshProcessing()
     }
 
     // MARK: Events
@@ -419,6 +1042,9 @@ public final class Player {
                 engine?.negotiated = nil
                 show(path)
             }
+            // A paused record's scrub pipeline starts its track at once (nothing renders from the ring to hold the
+            // marker back), but it plays only the hand's voice: the record stays paused.
+            if let run = scrubRun, !run.wasPlaying, run.engine === engine { return }
             status = .playing
             // A resumed track starts mid-way: the pipeline reports the frame it started from.
             let reported = engine?.pipeline.position
@@ -426,14 +1052,17 @@ public final class Player {
             showCue(playing: true)
             startTicker()
         case .trackEnded:
-            // The next `trackStarted` or `queueEnded` follows.
-            break
+            // The next `trackStarted` or `queueEnded` follows; after an overlap, the strip drops Crossfade now.
+            refreshProcessing()
         case .itemFailed(let index, let message):
             Telemetry.logger.error("Item \(index, privacy: .public) failed: \(message, privacy: .public)")
             // The pipeline moves on to the next item by itself.
             lastFailure = message
         case .queueEnded:
-            if anyItemStarted {
+            if anyItemStarted, pipelineItems < queue.count {
+                // The pipeline refused an append, having reached its queue's end first: the rest plays afresh.
+                launch(at: pipelineItems, frame: 0, for: .play)
+            } else if anyItemStarted {
                 endQueue()
             } else {
                 fail(lastFailure ?? "Nothing in the queue could be played")
@@ -571,6 +1200,7 @@ public final class Player {
     private func showPending(for index: Int) {
         signal.source = queue[index].format
         forgetPath()
+        refreshProcessing()
     }
 
     /// Nothing to describe: no track, no path. The port and volume stay, as the session reports them.
@@ -617,6 +1247,7 @@ public final class Player {
         guard reported.index == index else { return }
         let elapsed = queue[index].duration(ofFrames: reported.frame)
         if elapsed != position { position = elapsed }
+        refreshProcessing()
     }
 }
 
@@ -629,7 +1260,40 @@ struct SignalPath: Equatable {
 }
 
 /// A point in the queue: an item and a source frame in it.
-private struct Cue {
+private struct Cue: Equatable {
     var index: Int
     var frame: Int64
+}
+
+/// One finger on the record: what it brought up, and the pipeline it plays through.
+@MainActor
+private final class ScrubRun {
+    let index: Int
+    let engine: PlayerEngine
+    let tap: ScrubTap
+    let window: ScrubWindow
+    let filler: ScrubFiller
+    let wasPlaying: Bool
+    /// The source frame the hand's offsets count from.
+    var anchorFrame: Int64
+    /// The cue when the hand took hold (a paused record's): a let-go leaves a cue moved meanwhile alone.
+    let cueAtBegin: Int64
+    var offsetFrames = 0.0
+    /// The let-go settling (spin-up and handover, or fade), while it runs.
+    var settling: Task<Void, Never>?
+    var finished = false
+
+    init(
+        index: Int, engine: PlayerEngine, tap: ScrubTap, window: ScrubWindow, filler: ScrubFiller, wasPlaying: Bool,
+        anchorFrame: Int64
+    ) {
+        self.index = index
+        self.engine = engine
+        self.tap = tap
+        self.window = window
+        self.filler = filler
+        self.wasPlaying = wasPlaying
+        self.anchorFrame = anchorFrame
+        cueAtBegin = anchorFrame
+    }
 }

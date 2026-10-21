@@ -123,6 +123,43 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// Spec §4.3 and §6.4: turning the record scrubs (the music follows the hand), and letting go spins it back up and
+    /// plays on, with the strip back from "Scrubbing".
+    @MainActor
+    func testPlatterScrubPlaysOnAfterLettingGo() {
+        let app = launch(demoPlay: true)
+        let record = app.descendants(matching: .any)["deckRecord"]
+        XCTAssertTrue(record.waitForExistence(timeout: 8))
+        let playing = NSPredicate(format: "label == 'Pause'")
+        expectation(for: playing, evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 5)
+        let from = record.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5))
+        let to = record.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85))
+        from.press(forDuration: 0.4, thenDragTo: to, withVelocity: .slow, thenHoldForDuration: 0.4)
+        let settled = NSPredicate { _, _ in
+            // "Scrubbing" lives in the small note beside the title now, not in the strip.
+            let note = app.descendants(matching: .any)["titleNote"]
+            return app.buttons["playButton"].label == "Pause" && !(note.exists && note.label.contains("Scrubbing"))
+        }
+        expectation(for: settled, evaluatedWith: nil)
+        waitForExpectations(timeout: 6)
+    }
+
+    /// The SIGNAL cell shows what is delivered (Hi-Res, Lossless or iOS speaker tuning) and the strip says so aloud.
+    @MainActor
+    func testSignalCellSpeaksTheDeliveredResolution() {
+        let app = launch(demoPlay: true)
+        let strip = app.descendants(matching: .any)["signalStrip"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 8))
+        let spoken = NSPredicate(
+            format:
+                "label CONTAINS 'Signal: ' AND (label CONTAINS 'iOS speaker tuning' OR "
+                + "label CONTAINS 'Hi-Res output' OR label CONTAINS 'Lossless output')")
+        expectation(for: spoken, evaluatedWith: strip)
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(strip.label.localizedCaseInsensitiveContains("bit-perfect"))
+    }
+
     @MainActor
     func testGetMusicSuggestionsAppearAsYouType() {
         let app = launch()
@@ -164,6 +201,95 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 10)
     }
 
+    /// A finished download can be swiped off the list, and the footer says its song stays in the library. Clear
+    /// shows only while there is something to clear.
+    @MainActor
+    func testFinishedDownloadCanBeRemoved() {
+        let app = launch()
+        app.tabBars.buttons["Get Music"].tap()
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("test\n")
+        let download = app.buttons["download-ia-Test-1"]
+        XCTAssertTrue(download.waitForExistence(timeout: 4))
+        download.tap()
+        app.tabBars.buttons["Downloads"].tap()
+        let row = app.descendants(matching: .any)["downloadRow-ia-Test-1"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        expectation(for: NSPredicate(format: "label CONTAINS 'Done'"), evaluatedWith: row)
+        waitForExpectations(timeout: 12)
+        XCTAssertTrue(app.staticTexts["Removing a finished download keeps the song in your library."].exists)
+        XCTAssertTrue(app.buttons["clearDownloads"].exists)
+
+        row.swipeLeft()
+        // A long swipe runs the only action at once; a short one shows its button.
+        let remove = app.buttons["Remove"]
+        if remove.waitForExistence(timeout: 2) { remove.tap() }
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
+        waitForExpectations(timeout: 3)
+        XCTAssertFalse(app.buttons["clearDownloads"].exists)
+    }
+
+    /// Kiran's request: an album can be deleted from the shelf. The fixtures were imported into the app's own library
+    /// folder, so the dialog deletes them from the iPhone, and the sleeve leaves the crate while the others stay. The
+    /// next launch's preload imports them again, so no other test misses them.
+    @MainActor
+    func testDeleteAlbumFromTheShelf() {
+        let app = launch()
+        openShelf(app)
+        let front = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(front.waitForExistence(timeout: 3))
+        let deleted = front.label
+        XCTAssertFalse(deleted.isEmpty)
+        front.press(forDuration: 1.2)
+        let delete = app.buttons["Delete Album…"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let confirm = app.buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        let onlyDeletes = NSPredicate(format: "label BEGINSWITH 'Deletes ' AND label ENDSWITH ' from this iPhone.'")
+        XCTAssertTrue(app.staticTexts.matching(onlyDeletes).firstMatch.exists)
+        confirm.tap()
+
+        let sleeve = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", deleted)).firstMatch
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: sleeve)
+        waitForExpectations(timeout: 5)
+        let next = app.descendants(matching: .any)["sleeve-0"]
+        XCTAssertTrue(next.waitForExistence(timeout: 3))
+        XCTAssertNotEqual(next.label, deleted)
+        XCTAssertTrue(app.descendants(matching: .any)["sleeve-1"].exists)
+        // Everything went, so the shelf has nothing to report as left behind.
+        XCTAssertFalse(app.staticTexts["importNote"].exists)
+    }
+
+    /// Deleting the record that is playing stops it and empties the platter, so nothing tries to play a deleted file.
+    @MainActor
+    func testDeletingThePlayingAlbumEmptiesTheDeck() {
+        let app = launch(demoPlay: true)
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        openShelf(app)
+        let field = app.textFields["shelfSearch"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap()
+        field.typeText("night drive")
+        let result = app.buttons["result-album-Night Drive"]
+        XCTAssertTrue(result.waitForExistence(timeout: 2))
+        result.press(forDuration: 1.2)
+        let delete = app.buttons["Delete Album…"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let confirm = app.buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
+
+        let screen = app.descendants(matching: .any)["deckScreen"]
+        expectation(for: NSPredicate(format: "label BEGINSWITH 'NO RECORD'"), evaluatedWith: screen)
+        waitForExpectations(timeout: 5)
+        XCTAssertFalse(app.buttons["result-album-Night Drive"].exists)
+    }
+
     /// The crate's flick, measured: UIKit's scroll-deceleration hitch ratio while the coverflow decelerates. No
     /// baseline is set; the numbers land in the log. The simulator's figures only hint at the device's (spec §8
     /// wants < 1 ms/s at 120 Hz on the iPhone itself).
@@ -184,13 +310,64 @@ final class PlayerUITests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testMonochromeToggle() {
+        let app = launch(demoPlay: true)
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 5))
+        let toggle = openMonochromeToggle(app)
+        // Start from a known state: the setting survives launches, so an earlier run may have left it on.
+        if toggle.value as? String == "1" { flip(toggle) }
+        // The switch's value follows the tap a moment later, longer on a loaded machine: wait for it each time.
+        waitFor(toggle, value: "0")
+        flip(toggle)
+        waitFor(toggle, value: "1")
+        app.tabBars.buttons["Player"].tap()
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
+        app.terminate()
+
+        // Monochrome isn't Sound state, but a persistence relaunch keeps everything saved.
+        let relaunched = launch(freshSound: false)
+        XCTAssertTrue(relaunched.buttons["shelfButton"].waitForExistence(timeout: 5))
+        let persisted = openMonochromeToggle(relaunched)
+        waitFor(persisted, value: "1")
+        // Leave the app as found.
+        flip(persisted)
+        waitFor(persisted, value: "0")
+    }
+
+    /// Waits up to 5 s for a switch to read `value`; no wait at all when it already does.
+    @MainActor
+    private func waitFor(_ toggle: XCUIElement, value: String) {
+        expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: toggle)
+        waitForExpectations(timeout: 5)
+    }
+
     // MARK: Helpers
 
+    /// A Form row's switch is the right-hand end of the row; a tap in the middle only hits the label.
     @MainActor
-    private func launch(demoPlay: Bool = false) -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
-        if demoPlay { app.launchArguments.append("-PFDemoPlay") }
+    private func flip(_ toggle: XCUIElement) {
+        let control = toggle.switches.firstMatch
+        if control.exists {
+            control.tap()
+        } else {
+            toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        }
+    }
+
+    @MainActor
+    private func openMonochromeToggle(_ app: XCUIApplication) -> XCUIElement {
+        app.tabBars.buttons["Settings"].tap()
+        let toggle = app.switches["monochromeToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        return toggle
+    }
+
+    @MainActor
+    /// From Pure defaults unless `freshSound` is false (a relaunch that tests persistence).
+    private func launch(demoPlay: Bool = false, freshSound: Bool = true) -> XCUIApplication {
+        let app = XCUIApplication.pointFlac(
+            ["-PFPreloadFixtures", "-PFStage", "deck"] + (demoPlay ? ["-PFDemoPlay"] : []), freshSound: freshSound)
         app.launch()
         return app
     }

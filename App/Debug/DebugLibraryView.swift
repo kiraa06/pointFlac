@@ -126,7 +126,7 @@ private struct DebugTrackRow: View {
             Text(file.title)
             Text(details).font(.footnote).foregroundStyle(.secondary)
             if !file.isSupported {
-                Text("Not supported in v1").font(.footnote).foregroundStyle(.orange)
+                Text("Not supported in v1").font(.footnote).monoForeground(.orange)
             }
         }
     }

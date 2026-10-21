@@ -16,6 +16,7 @@ struct PlayerScreen: View {
     let model: AppModel
     @Binding var tab: AppTab
     @AppStorage("playerView") private var stage: PlayerStage = .deck
+    @AppStorage("monochrome") private var monochrome = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shelfOpen = false
@@ -25,8 +26,9 @@ struct PlayerScreen: View {
     @Namespace private var discSpace
 
     private var playback: PlaybackController { model.playback }
-    private var theme: Theme { stage == .deck ? .deck(dark: scheme == .dark) : .cover(dark: scheme == .dark) }
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac") }
+    private var theme: Theme { .look(stage: stage, dark: scheme == .dark, monochrome: monochrome) }
+    /// What tints the glass: the record's colours, in greys under Monochrome (the sleeve and art keep theirs).
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
 
     var body: some View {
         GeometryReader { proxy in
@@ -36,12 +38,14 @@ struct PlayerScreen: View {
                 VStack(spacing: 0) {
                     StageSwitch(stage: $stage, theme: theme)
                         .padding(.top, 6)
+                        // Clear of the plinth: the switch floats above the stage, it does not sit on it.
+                        .padding(.bottom, Self.switchGap)
                     stageView(width: width)
                         .frame(height: stageHeight(proxy.size))
                     SharedControls(
                         playback: playback, theme: theme, upNextOpen: $upNextOpen,
                         hidden: handoff.hidesTitle, libraryEmpty: model.library.albums.isEmpty,
-                        addFromFiles: { importing = true }, getMusic: { tab = .getMusic })
+                        addFromFiles: { importing = true }, getMusic: { tab = .getMusic }, openSound: { tab = .sound })
                     Spacer(minLength: 0)
                     shelfPeek
                 }
@@ -127,10 +131,14 @@ struct PlayerScreen: View {
         .padding(.horizontal, 12)
     }
 
-    /// The deck's plinth sets the stage's height; the cover shares it, so switching never moves the controls.
+    /// The deck's plinth sets the stage's height; the cover shares it, so switching never moves the controls. The
+    /// switch's gap comes out of the same budget, so short screens shrink the stage rather than the controls.
     private func stageHeight(_ size: CGSize) -> CGFloat {
-        min(DeckLayout.height(forWidth: size.width - 24), max(260, size.height - 380))
+        min(DeckLayout.height(forWidth: size.width - 24), max(260, size.height - 380 - Self.switchGap))
     }
+
+    /// Space between the Deck / Cover switch and the stage below it.
+    static let switchGap: CGFloat = 14
 
     private var shelfPeek: some View {
         Button {

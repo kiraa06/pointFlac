@@ -159,3 +159,18 @@ import Testing
     #expect(peak > 1.005 && peak < 1.03)  // a slight settle on the spindle
     #expect(at(1) == 1)
 }
+
+/// Letting go of a held record on a running deck: the platter turns on under the slipmat, so the record catches it in
+/// a fraction of a second, not the motor's start-up from rest.
+@Test func releasedRecordCatchesThePlatterQuickly() {
+    var spin = SpinModel()
+    spin.place(at: 10, time: 0, spinning: false)
+    spin.setSpinning(true, at: 0, rampSeconds: SpinModel.releaseSeconds)
+    #expect(SpinModel.releaseSeconds <= 0.2)
+    #expect(spin.velocity(at: SpinModel.releaseSeconds) == SpinModel.fullSpeed)
+    #expect(spin.velocity(at: SpinModel.releaseSeconds / 2) < SpinModel.fullSpeed)
+    // Pressing play on a stopped record still uses the motor's own start-up.
+    var start = SpinModel()
+    start.setSpinning(true, at: 0)
+    #expect(start.velocity(at: SpinModel.releaseSeconds) < SpinModel.fullSpeed / 2)
+}

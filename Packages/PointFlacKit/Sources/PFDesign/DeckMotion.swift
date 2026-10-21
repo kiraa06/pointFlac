@@ -10,6 +10,10 @@ public struct SpinModel: Sendable, Equatable {
     public static let secondsPerTurn = 1.8
     public static let fullSpeed = 360 / secondsPerTurn  // degrees per second
 
+    /// Letting go of a held record on a running deck: the platter keeps turning under the slipmat, so the record
+    /// catches it in a fraction of a second. (`spinUpSeconds` is the motor's own start-up from rest, for play.)
+    public static let releaseSeconds = 0.15
+
     /// Time to reach full speed from rest, and to stop from full speed.
     public var spinUpSeconds: Double
     public var windDownSeconds: Double
@@ -25,8 +29,9 @@ public struct SpinModel: Sendable, Equatable {
         self.windDownSeconds = windDownSeconds
     }
 
-    /// Starts spinning up to 33⅓, or winding down to rest, from wherever the platter is at `t`.
-    public mutating func setSpinning(_ spinning: Bool, at t: Double) {
+    /// Starts spinning up to 33⅓, or winding down to rest, from wherever the platter is at `t`. `rampSeconds`, when
+    /// given, replaces the full-range ramp time (as `releaseSeconds` does for a let-go record).
+    public mutating func setSpinning(_ spinning: Bool, at t: Double, rampSeconds fullRamp: Double? = nil) {
         let angle = angle(at: t)
         let velocity = velocity(at: t)
         let target = spinning ? Self.fullSpeed : 0
@@ -36,7 +41,7 @@ public struct SpinModel: Sendable, Equatable {
         startVelocity = velocity
         targetVelocity = target
         let span = abs(target - velocity) / Self.fullSpeed
-        rampSeconds = span * (spinning ? spinUpSeconds : windDownSeconds)
+        rampSeconds = span * (fullRamp ?? (spinning ? spinUpSeconds : windDownSeconds))
     }
 
     /// Puts the record at `angle`, at rest (a hand let go of it), or spinning at once at full speed.

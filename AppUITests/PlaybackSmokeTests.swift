@@ -55,8 +55,8 @@ final class PlaybackSmokeTests: XCTestCase {
 
     @MainActor
     private func launch() -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput"]
+        // From Pure defaults: the strip's "● Pure" must not depend on Sound settings an earlier session saved.
+        let app = XCUIApplication.pointFlac(["-PFPreloadFixtures"])
         app.launch()
         app.tabBars.buttons["Settings"].tap()
         let diagnostics = app.buttons["diagnosticsLink"]

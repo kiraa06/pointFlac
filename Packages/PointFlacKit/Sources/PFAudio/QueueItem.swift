@@ -15,10 +15,14 @@ public struct QueueItem: Sendable, Hashable, Identifiable {
     public var totalFrames: Int64
     /// Cover art as image file data (JPEG or PNG), when the file has any.
     public var artwork: Data?
+    /// What the library knows about the track's loudness (its ReplayGain tags and the R128 scan), from which the
+    /// player works out its ReplayGain (`Player.replayGainDb(for:settings:)`); nil when nothing is known. As it was
+    /// when the item was made: a scan that measures the track later reaches the queues made after it.
+    public var loudness: TrackLoudness?
 
     public init(
         id: String, url: URL, title: String, artist: String, album: String, format: AudioFormat, totalFrames: Int64,
-        artwork: Data? = nil
+        artwork: Data? = nil, loudness: TrackLoudness? = nil
     ) {
         self.id = id
         self.url = url
@@ -28,8 +32,10 @@ public struct QueueItem: Sendable, Hashable, Identifiable {
         self.format = format
         self.totalFrames = totalFrames
         self.artwork = artwork
+        self.loudness = loudness
     }
 
+    /// The item as the pipeline plays it, at no gain: the player sets `gainDb` from its ReplayGain settings.
     public var playbackItem: PlaybackItem {
         PlaybackItem(id: id, url: url, format: format, totalFrames: totalFrames)
     }
@@ -60,4 +66,11 @@ public struct QueueItem: Sendable, Hashable, Identifiable {
         let frame = whole + (attoseconds / 1_000_000_000 * rate + 500_000_000) / 1_000_000_000
         return totalFrames > 0 ? min(frame, totalFrames) : frame
     }
+}
+
+/// What a track's ReplayGain is worked out from (`Player.replayGain(for:settings:)`): the tag for the mode, else the
+/// scan's measurement (in album mode the album's, measured as a whole), else nothing, when the track plays at the
+/// preamp alone.
+public enum ReplayGainBasis: Sendable, Equatable {
+    case albumTag, albumScan, trackTag, trackScan, none
 }

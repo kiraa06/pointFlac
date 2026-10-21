@@ -412,6 +412,41 @@
             #expect([UInt8](small.capturedBytes) == Array(wordBytes.prefix(12)), "bounded by its capacity")
         }
 
+        /// Review M-1: with the Sound chain at work, a call with no real frames can carry the chain's tail (its
+        /// look-ahead ringing out into the gap), so it is not flagged as silence. With the runner in Pure it still is.
+        @Test func renderCallbackLetsTheChainsTailThrough() throws {
+            let frames = 16
+            let calls = 8
+            var flat = SoundSettings()
+            flat.pure = false
+            let chain = SoundChain(flat, sampleRate: 48_000, channels: 2)
+            let latency = chain.latencyFrames
+            #expect(latency + 10 <= frames * calls)
+            let runner = ChainRunner()
+            runner.reset(to: chain)
+            let output = try RemoteIOOutput()
+            output.renderingEnabled = true
+            let words = (0..<20).map { UInt32(0x0101_0101) &* UInt32($0 + 1) }
+            let source = RenderSource(
+                channels: 2, capacityFrames: 64, renderedFrames: 0, inheritingHoldsFrom: nil, sound: runner)
+            #expect(words.withUnsafeBufferPointer { source.write($0) } == words.count)
+            output.source = source
+            var played: [UInt8] = []
+            for call in 0..<calls {
+                let block = renderOnce(output, frames: frames)
+                #expect(!block.silent, "call \(call): the chain is at work")
+                played += block.bytes
+            }
+            // The ten frames, bit for bit (the chain's limiter is transparent below its ceiling), a latency late.
+            let tail = Array(played[(latency * 8)..<((latency + 10) * 8)])
+            #expect(tail == words.withUnsafeBytes { [UInt8]($0) }, "the tail reached the unit")
+            #expect(source.renderedFrames == 10)
+
+            // Pure: an empty ring is flagged silence again.
+            runner.reset(to: nil)
+            #expect(renderOnce(output, frames: frames).silent, "Pure, empty ring")
+        }
+
         /// Every path on which the callback cannot or must not render: flagged silence in every buffer it was given,
         /// and the source and the capture left untouched.
         @Test func renderCallbackIsSilentWhenItCannotRender() throws {

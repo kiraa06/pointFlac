@@ -226,3 +226,107 @@ private let allStates: [SignalState] = [
         }
     }
 }
+
+@Test func resolutionTable() {
+    // USB and wired: Hi-Res iff the file is >= 24-bit and the hardware rate is above 48 kHz.
+    let rows: [(rate: Int, bits: Int, hiRes: Bool)] = [
+        (44_100, 16, false), (44_100, 24, false), (48_000, 16, false), (48_000, 24, false),
+        (96_000, 16, false), (96_000, 24, true), (192_000, 16, false), (192_000, 24, true),
+        (88_200, 24, true),
+    ]
+    for port in [OutputPort.usb("DAC"), .wired("EarPods")] {
+        for row in rows {
+            let signal = state(row.rate, row.bits, hardware: row.rate, port: port)
+            #expect(SignalStrip.badges(signal) == [row.hiRes ? "HI-RES" : "LOSSLESS", "PURE"], "\(row) \(port)")
+        }
+    }
+    // The hardware rate decides, not the file: 96 kHz played at 48 kHz is Lossless, and no longer Pure.
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 48_000)) == ["LOSSLESS"])
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == ["HI-RES"])
+    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000)) == ["HI-RES"])
+    // Built-in speaker: never a Lossless or Hi-Res claim, whatever the rates.
+    for row in rows {
+        let signal = state(row.rate, row.bits, hardware: row.rate, port: .builtIn)
+        #expect(SignalStrip.badges(signal) == ["PURE", "IOS SPEAKER TUNING"], "\(row)")
+        #expect(SignalStrip.signalBadges(signal).map(\.displayText) == ["Pure", "iOS speaker tuning"])
+    }
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 48_000, port: .builtIn)) == ["IOS SPEAKER TUNING"])
+    #expect(
+        SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .builtIn, processing: ["EQ"])) == [
+            "IOS SPEAKER TUNING"
+        ])
+    // Bluetooth, AirPlay, other route, idle, pending: no runs.
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"))).isEmpty)
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .airPlay("TV"))).isEmpty)
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .other("HDMI"))).isEmpty)
+    #expect(SignalStrip.badges(SignalState()).isEmpty)
+    #expect(SignalStrip.badges(SignalState(source: fmt(96_000, 24), port: .usb("DAC"))).isEmpty)
+    #expect(SignalStrip.badges(SignalState(source: fmt(96_000, 24), port: .builtIn)).isEmpty)
+    #expect(SignalState().resolution == nil)
+    #expect(state(96_000, 24, hardware: 96_000, port: .builtIn).resolution == DeliveredResolution.none)
+    // Downmixed: PCM is still delivered, so the run stays, and Pure does not.
+    #expect(
+        SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .wired("Mono"), hardwareChannels: 1))
+            == ["HI-RES"])
+    // The USB volume warning stays beside the runs.
+    #expect(SignalStrip.text(state(96_000, 24, hardware: 96_000, volume: 0.8)).hasSuffix("● Volume 80%"))
+}
+
+@Test func titleNoteTable() {
+    // A rate change gets no note: the details sheet states it.
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 48_000, port: .builtIn)) == nil)
+    #expect(SignalStrip.titleNote(state(96_000, 32, hardware: 96_000)) == "32→24-bit")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == "Processing")
+    #expect(
+        SignalStrip.titleNote(
+            state(48_000, 24, hardware: 48_000, port: .wired("Mono"), channels: 6, hardwareChannels: 2))
+            == "Downmixed 6→2")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, scrubbing: true)) == "Scrubbing")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000)) == nil)
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"))) == nil)
+    #expect(SignalStrip.titleNote(state(44_100, 16, hardware: 44_100, port: .airPlay("TV"))) == nil)
+    #expect(SignalStrip.titleNote(state(44_100, 16, hardware: 44_100, port: .other("HDMI"))) == nil)
+    #expect(SignalStrip.titleNote(SignalState()) == nil)
+    #expect(SignalStrip.titleNote(SignalState(source: fmt(96_000, 24), port: .usb("DAC"))) == nil)
+}
+
+@Test func badgeDisplayText() {
+    let runs = SignalStrip.signalBadges(state(96_000, 24, hardware: 96_000))
+    #expect(runs.map(\.displayText) == ["Hi-Res", "Pure"])
+    #expect(runs.map(\.accessibilityLabel) == ["Hi-Res output", "Pure"])
+    #expect(SignalBadge.lossless.displayText == "Lossless")
+    #expect(SignalBadge.speakerTuning.accessibilityLabel == "iOS speaker tuning")
+}
+
+@Test func cellKeepsItsWordsWhenThereIsNoResolutionToShow() {
+    let fallbacks: [(SignalState, String)] = [
+        (state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods")), "● Bluetooth (lossy)"),
+        (state(44_100, 16, hardware: 44_100, port: .airPlay("TV")), "● AirPlay (re-encoded)"),
+        (state(44_100, 16, hardware: 44_100, port: .other("HDMI")), "● Output may alter audio"),
+        (SignalState(source: fmt(96_000, 24), port: .usb("DAC")), "● Starting…"),
+    ]
+    for (signal, words) in fallbacks {
+        #expect(!SignalStrip.showsResolution(signal))
+        #expect(SignalStrip.text(signal).hasSuffix(words))
+        #expect(SignalStrip.titleNote(signal) == nil)
+    }
+    #expect(!SignalStrip.showsResolution(SignalState()))
+    #expect(SignalStrip.text(SignalState()) == "No record")
+    #expect(SignalStrip.showsResolution(state(96_000, 24, hardware: 96_000)))
+}
+
+@Test func titleNoteNeverRepeatsTheCellWords() {
+    let other = state(
+        48_000, 24, hardware: 48_000, port: .other("HDMI"), channels: 6, hardwareChannels: 2)
+    #expect(SignalStrip.text(other).hasSuffix("● Downmixed 6→2"))
+    #expect(SignalStrip.titleNote(other) == nil)
+    // Scrubbing on a lossy route: the cell says Scrubbing, the note stays quiet.
+    let scrub = state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"), scrubbing: true)
+    #expect(SignalStrip.titleNote(scrub) == nil)
+}
+
+@Test func titleNoteIsSpokenWithoutArrows() {
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 48_000, port: .builtIn)) == nil)
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 32, hardware: 96_000)) == "Reduced from 32-bit to 24-bit")
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 96_000)) == nil)
+}

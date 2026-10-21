@@ -1,7 +1,8 @@
 pointFlac: licences and third-party notices
 ===========================================
 
-pointFlac includes libFLAC, the reference FLAC library, under the licence below.
+pointFlac includes libFLAC, the reference FLAC library, libebur128, a port of libbs2b's crossfeed filter, and the
+OPRA headphone-correction database, each under the licence below.
 pointFlac itself is free software under the MIT licence, which follows it.
 
 
@@ -43,6 +44,85 @@ PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
 LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
 NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+libbs2b 3.1.0
+-------------
+
+Bauer stereophonic-to-binaural crossfeed, by Boris Mikhaylov.
+https://bs2b.sourceforge.net/ (pointFlac's crossfeed is a Swift port of its filter.)
+
+Licence: MIT.
+
+Copyright (c) 2005 Boris Mikhaylov
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+libebur128 1.2.6
+---------------
+
+EBU R128 loudness measurement library, by Jan Kokemüller.
+https://github.com/jiixyj/libebur128
+
+Licence: MIT.
+
+Copyright (c) 2011 Jan Kokemüller
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+OPRA headphone EQ database
+--------------------------
+
+Headphone correction presets (manufacturer, product and EQ data) and the OPRA logo come from the OPRA project,
+https://github.com/opra-project/OPRA, created and maintained by Roon Labs and the OPRA community.
+Built from commit 0b88ecd4e2bef7cf69fd5d50f1d06fb586c10865.
+
+Licence: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0),
+https://creativecommons.org/licenses/by-sa/4.0/legalcode.en
+Each preset is credited to its author in the app ("EQ by <author> · OPRA").
+
+Changes made to the data: it was converted to a compact JSON form (App/Resources/OPRA/opra.json) by
+scripts/build-opra.swift. Presets derived from AutoEq (every preset whose author contains "AutoEQ") were omitted,
+as were presets the equaliser cannot represent (more than 20 bands, or a band type it has no filter for). A band
+with no gain value was given 0 dB, and one with no Q value was given Q 0.7071; a preset with no preamp value was
+given a 0 dB preamp. Each preset's "details" text (its
+target or variant) was kept. The data is otherwise unmodified; the app limits values to its filters' ranges when it
+applies a preset (bands below 20 Hz play at 20 Hz). opra.json is that adapted data and is itself licensed under
+CC BY-SA 4.0. Only the data is under CC BY-SA 4.0; pointFlac's own code is not.
 
 
 pointFlac

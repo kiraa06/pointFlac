@@ -37,12 +37,23 @@ final class CoverIndex: Sendable {
 ///
 /// Covers are not put into `AlbumCard.artwork`: that would read every cover at each library change, and the
 /// library's cover cache holds only 32 MB. Instead `ArtworkLoader.source` reads a cover when its sleeve is first drawn.
+///
+/// It also starts the library's loudness scan (`Library.scanLoudness`, for ReplayGain), in the background, whenever a
+/// catalog brings tracks no earlier one had: once a launch, and after every import, download or rescan that adds any.
+/// The Sound tab's ReplayGain block shows what is known (`loudness`) and the scan's progress (`loudnessScan`).
 @MainActor
 @Observable
 final class RealLibrary: LibraryBrowsing {
     private(set) var albums: [AlbumCard] = []
     /// The latest snapshot, for the debug views and the music finder.
     private(set) var snapshot: LibrarySnapshot = .empty
+    /// The playable tracks' loudness data, recounted with each catalog.
+    private(set) var loudness = LoudnessSummary()
+    /// The background loudness scan, while one runs and has tracks to measure; nil otherwise.
+    private(set) var loudnessScan: LoudnessScanProgress?
+    /// Scan calls not yet returned. A call made while another runs is merged into it and returns at once, reporting
+    /// nothing; the first call's progress counts the merged work too, so progress shows until every call is back.
+    @ObservationIgnored private var scansRunning = 0
 
     @ObservationIgnored let library: Library
     @ObservationIgnored let box = SnapshotBox()
@@ -51,6 +62,8 @@ final class RealLibrary: LibraryBrowsing {
 
     /// Album ID → cover ID, for the lazy cover loader.
     @ObservationIgnored private let covers = CoverIndex()
+    /// The track IDs of the latest catalog, to tell when tracks come in (`measureNewTracks`).
+    @ObservationIgnored private var knownTrackIDs: Set<String> = []
 
     init(library: Library) {
         self.library = library
@@ -88,6 +101,9 @@ final class RealLibrary: LibraryBrowsing {
     private func apply(_ snapshot: LibrarySnapshot) {
         self.snapshot = snapshot
         box.replace(with: snapshot)
+        let summary = LoudnessSummary(snapshot.catalog.tracks.values.filter(\.isSupported))
+        if summary != loudness { loudness = summary }
+        measureNewTracks(in: snapshot.catalog)
         var built: [AlbumCard] = []
         var byID: [String: AlbumCard] = [:]
         var covers: [String: String] = [:]
@@ -142,11 +158,73 @@ final class RealLibrary: LibraryBrowsing {
         return (result.added.count, lines)
     }
 
+    /// Counted from the catalog, which knows each track's folder, so the dialog says exactly what `remove` will do. An
+    /// album is its whole catalog track list, not only the playable songs the shelf shows (controller ruling RD-1):
+    /// "delete the album" is asked to free the space, and a multichannel file left behind could never be reached.
+    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan {
+        var ids = album.map { snapshot.tracks(of: $0).map(\.id) } ?? []
+        ids += tracks.filter { !ids.contains($0) }
+        var plan = RemovalPlan()
+        for track in snapshot.tracks(ids: ids) {
+            plan.tracks.append(track.id)
+            if track.isInLibraryFolder {
+                plan.deletes += 1
+                if !track.isSupported { plan.unplayableDeletes += 1 }
+            } else {
+                plan.removes += 1
+                if !track.isSupported { plan.unplayableRemoves += 1 }
+            }
+        }
+        return plan
+    }
+
+    func remove(tracks: [TrackRow.ID]) async {
+        // A failure is logged by the library; either way the shelf then shows what the library holds.
+        _ = try? await library.remove(trackIDs: tracks)
+        await sync()
+    }
+
     /// The track's record code, from its album's side layout.
     private func side(of track: LibraryTrack) -> String? {
         let playable = snapshot.tracks(of: track.albumID).filter(\.isSupported)
         guard let index = playable.firstIndex(where: { $0.id == track.id }) else { return nil }
         return SideLayout(durations: playable.map(\.durationSeconds)).code(ofTrack: index)
+    }
+
+    /// Starts a background loudness scan when `catalog` holds a track the previous catalog did not: the first catalog
+    /// with tracks in it (so once a launch), and any that an import, a download or a rescan grew. The scan's own
+    /// results publish catalogs with the same tracks, which start nothing.
+    ///
+    /// The scan measures only what has no ReplayGain tag and was not measured yet, on `.background` tasks that yield
+    /// to playback's decode thread, and never downloads from iCloud; with nothing to measure it is a database read. One
+    /// asked for while another runs is merged into it (`Library.scanLoudness`), so imports in quick succession make
+    /// one scan. Queues made after a track is measured carry its loudness; one already playing keeps what it had.
+    private func measureNewTracks(in catalog: LibraryCatalog) {
+        let ids = Set(catalog.tracks.keys)
+        let grew = !ids.isSubset(of: knownTrackIDs)
+        knownTrackIDs = ids
+        guard grew else { return }
+        let library = library
+        scansRunning += 1
+        Task.detached(priority: .background) { [weak self] in
+            await library.scanLoudness { [weak self] done, total in
+                Task { @MainActor [weak self] in self?.scanProgressed(done: done, total: total) }
+            }
+            await self?.scanReturned()
+        }
+    }
+
+    /// The scan's `progress(done, total)`, hopped to the main actor. A report that arrives after every call returned
+    /// is late, and dropped.
+    private func scanProgressed(done: Int, total: Int) {
+        guard scansRunning > 0 else { return }
+        let next = total > 0 ? LoudnessScanProgress(done: min(done, total), total: total) : nil
+        if next != loudnessScan { loudnessScan = next }
+    }
+
+    private func scanReturned() {
+        scansRunning = max(scansRunning - 1, 0)
+        if scansRunning == 0 { loudnessScan = nil }
     }
 
     /// A track still in iCloud is listed and playable (the player fetches it first, spec §4.7); its format says so.
@@ -158,4 +236,39 @@ final class RealLibrary: LibraryBrowsing {
             durationSeconds: track.durationSeconds,
             format: track.formatLabel + (track.isCloudPending ? " · iCloud" : ""), side: side)
     }
+}
+
+/// What the library knows of its playable tracks' loudness (spec §4.8, ReplayGain): tag values, the scan's own
+/// measurements, and neither yet.
+struct LoudnessSummary: Equatable, Sendable {
+    /// With a ReplayGain tag, track or album: played from the tag.
+    var tagged = 0
+    /// Without a tag, but measured by the scan (including a track measured as silent, which gets no gain).
+    var measured = 0
+    /// Neither: not reached by a scan yet, in iCloud, or unreadable (the catalog can't tell which), shown as "Not
+    /// measured". These play at 0 dB.
+    var pending = 0
+
+    init() {}
+
+    init(_ tracks: some Sequence<LibraryTrack>) {
+        for track in tracks {
+            let l = track.loudness
+            if l?.trackGainDb != nil || l?.albumGainDb != nil {
+                tagged += 1
+            } else if l?.measuredPeak != nil {
+                measured += 1
+            } else {
+                pending += 1
+            }
+        }
+    }
+
+    var total: Int { tagged + measured + pending }
+}
+
+/// A loudness scan's tracks measured so far and planned in all (`Library.scanLoudness`'s cumulative count).
+struct LoudnessScanProgress: Equatable, Sendable {
+    var done: Int
+    var total: Int
 }

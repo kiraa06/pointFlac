@@ -1,15 +1,17 @@
 import PFAudio
 import SwiftUI
+import UIKit
 
 enum AppTab: Hashable {
-    case player, getMusic, downloads, settings
+    case player, getMusic, downloads, sound, settings
 }
 
-/// The app's frame (spec §4.1): the player is home, with the Shelf inside it; Get Music, Downloads and Settings sit
-/// beside it in a Liquid Glass tab bar. The appearance override applies here, to everything.
+/// The app's frame (spec §4.1): the player is home, with the Shelf inside it; Get Music, Downloads, Sound and Settings
+/// sit beside it in a Liquid Glass tab bar. The appearance override applies here, to everything.
 struct RootView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
+    @AppStorage("monochrome") private var monochrome = false
     @State private var tab: AppTab = Self.launchTab
     @Environment(\.scenePhase) private var scenePhase
     @State private var grace = BackgroundGrace()
@@ -26,17 +28,28 @@ struct RootView: View {
                 DownloadsView(finder: model.finder)
             }
             .badge(activeDownloads)
+            Tab("Sound", systemImage: "slider.vertical.3", value: AppTab.sound) {
+                SoundView(store: model.sound, playback: model.playback, library: model.realLibrary)
+            }
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView(model: model)
             }
         }
         .preferredColorScheme(appearance.colorScheme)
+        // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
+        // colour of their own read the flag. The look switches live, over a short fade.
+        .tint(monochrome ? Theme.monochromeTint : nil)
+        .environment(\.isMonochrome, monochrome)
+        .animation(.easeInOut(duration: 0.3), value: monochrome)
+        .onChange(of: monochrome, initial: true) { _, on in Self.tintWindows(on) }
         .task { await model.load() }
         .onChange(of: scenePhase) { old, new in
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
             // foreground). Launch already scans in `load()`.
             if old == .background, new != .background { Task { await model.reload() } }
             if new == .background, activeDownloads > 0 { grace.begin() }
+            // Leaving the foreground: the Sound settings' pending save is written now, not half a second later.
+            if new != .active { model.sound.flush() }
             if new == .active {
                 grace.end()
                 #if SOULSEEK
@@ -52,12 +65,21 @@ struct RootView: View {
         }
     }
 
-    /// `-PFTab getMusic|downloads|settings` (DEBUG only) opens on that tab, for screenshots.
+    /// UIKit-hosted pieces (alerts) take their tint from the window, not from SwiftUI's `.tint`.
+    private static func tintWindows(_ monochrome: Bool) {
+        let tint = monochrome ? UIColor(Theme.monochromeTint) : nil
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for window in scene.windows { window.tintColor = tint }
+        }
+    }
+
+    /// `-PFTab getMusic|downloads|sound|settings` (DEBUG only) opens on that tab, for screenshots.
     private static var launchTab: AppTab {
         #if DEBUG
             switch UserDefaults.standard.string(forKey: "PFTab") {
             case "getMusic": return .getMusic
             case "downloads": return .downloads
+            case "sound": return .sound
             case "settings": return .settings
             default: return .player
             }

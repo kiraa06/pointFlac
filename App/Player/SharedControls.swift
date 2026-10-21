@@ -14,6 +14,8 @@ struct SharedControls: View {
     var libraryEmpty = false
     var addFromFiles: () -> Void = {}
     var getMusic: () -> Void = {}
+    /// Shows the Sound tab, from the signal details.
+    var openSound: () -> Void = {}
 
     private var player: Player { playback.player }
 
@@ -21,7 +23,7 @@ struct SharedControls: View {
         VStack(alignment: .leading, spacing: 12) {
             titleBlock
                 .opacity(hidden ? 0 : 1)
-            SignalCells(signal: player.signal, theme: theme)
+            SignalCells(signal: player.signal, theme: theme, openSound: openSound)
             ProgressRow(playback: playback, theme: theme)
             transport
         }
@@ -57,12 +59,25 @@ struct SharedControls: View {
                         .foregroundStyle(theme.inkSecondary)
                 }
             } else {
-                Text(title)
-                    .font(Typeface.display(30))
-                    .tracking(-0.6)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-                    .accessibilityIdentifier("nowPlayingTitle")
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(title)
+                        .font(Typeface.display(30))
+                        .tracking(-0.6)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .accessibilityIdentifier("nowPlayingTitle")
+                    if let note = SignalStrip.titleNote(player.signal) {
+                        // Fixed size and a higher priority: a long title truncates first, the note never.
+                        Text(note)
+                            .font(Typeface.monoSmall)
+                            .foregroundStyle(player.signal.scrubbing ? theme.inkSecondary : theme.altered)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .layoutPriority(1)
+                            .accessibilityLabel("Signal note: \(SignalStrip.titleNoteSpoken(player.signal) ?? note)")
+                            .accessibilityIdentifier("titleNote")
+                    }
+                }
                 Text(subtitle)
                     .font(Typeface.artist)
                     .foregroundStyle(theme.inkSecondary)
@@ -141,7 +156,8 @@ struct SharedControls: View {
                     .overlay(alignment: .topTrailing) {
                         if !playback.upNext.isEmpty {
                             Text("\(playback.upNext.count)").font(.caption2.bold()).padding(3)
-                                .background(Circle().fill(theme.ok)).foregroundStyle(.black)
+                                .background(Circle().fill(theme.ok)).foregroundStyle(
+                                    theme.isMonochrome ? theme.playGlyph : .black)
                         }
                     }
             }
@@ -171,6 +187,9 @@ struct ProgressRow: View {
 
     private var player: Player { playback.player }
 
+    /// The playing record's colours: the played part of the bar is drawn in them.
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
+
     var body: some View { progress }
 
     private var length: Double { playback.currentTrack?.durationSeconds ?? 0 }
@@ -181,11 +200,10 @@ struct ProgressRow: View {
         VStack(spacing: 6) {
             GeometryReader { proxy in
                 let fraction = length > 0 ? min(max(elapsed / length, 0), 1) : 0
-                ZStack(alignment: .leading) {
-                    Capsule().fill(theme.hairline)
-                    Capsule().fill(theme.ink).frame(width: proxy.size.width * fraction)
-                }
-                .frame(height: 4)
+                WaveProgress(
+                    fraction: fraction, flowing: player.status == .playing,
+                    played: theme.isDark ? palette.base : palette.line, rest: theme.hairline
+                )
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .gesture(
@@ -222,24 +240,113 @@ struct ProgressRow: View {
     }
 }
 
+/// The progress bar's line: the played part a wave in the record's colour, flowing while the music plays (still while
+/// paused, and under Reduce Motion), easing flat into the playhead; the rest a plain line.
+struct WaveProgress: View {
+    let fraction: Double
+    let flowing: Bool
+    let played: Color
+    let rest: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// One wave every this many points, this tall either side of the line, flowing a wavelength in this many seconds.
+    static let wavelength: CGFloat = 16
+    static let amplitude: CGFloat = 3.5
+    static let secondsPerWave = 1.1
+    static let lineWidth: CGFloat = 3.5
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !flowing || reduceMotion)) { context in
+            Canvas { canvas, size in
+                let mid = size.height / 2
+                let head = size.width * min(max(fraction, 0), 1)
+                var restLine = Path()
+                restLine.move(to: CGPoint(x: head, y: mid))
+                restLine.addLine(to: CGPoint(x: size.width, y: mid))
+                canvas.stroke(restLine, with: .color(rest), style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                guard head > 0 else { return }
+                let seconds = context.date.timeIntervalSinceReferenceDate
+                let phase = reduceMotion ? 0 : 2 * Double.pi * seconds / Self.secondsPerWave
+                var wave = Path()
+                var x: CGFloat = 0
+                while x <= head {
+                    // The wave settles flat over its last half-wavelength, so it meets the playhead on the line.
+                    let taper = min(1, (head - x) / (Self.wavelength / 2))
+                    let y =
+                        mid + Self.amplitude * taper * CGFloat(sin(2 * Double.pi * Double(x / Self.wavelength) - phase))
+                    if x == 0 { wave.move(to: CGPoint(x: x, y: y)) } else { wave.addLine(to: CGPoint(x: x, y: y)) }
+                    x += 1
+                }
+                wave.addLine(to: CGPoint(x: head, y: mid))
+                canvas.stroke(
+                    wave, with: .color(played),
+                    style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .round, lineJoin: .round))
+                let dot = CGRect(x: head - 4, y: mid - 4, width: 8, height: 8)
+                canvas.fill(Path(ellipseIn: dot), with: .color(played))
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 /// The signal strip as the mockups draw it: FORMAT · DEPTH · DAC · SIGNAL cells, from `SignalStrip.text`, so the
-/// words are exactly the strip's and its honesty rules hold. The whole strip is one accessibility element whose
-/// label is the strip text, with the id the UI tests read.
+/// words are exactly the strip's and its honesty rules hold. When the delivered resolution is known, the SIGNAL cell
+/// shows its text (HI-RES / LOSSLESS, PURE) where the indicator words would be; the altered states are noted beside
+/// the title instead. The whole strip is one accessibility element with the id the UI tests read.
 struct SignalCells: View {
     let signal: SignalState
     let theme: Theme
+    var openSound: (() -> Void)?
     @State private var details = false
 
     var body: some View {
-        let text = SignalStrip.text(signal)
+        strip(SignalStrip.text(signal))
+    }
+
+    /// The strip's spoken label: the plain text, with the resolution's meaning in place of the indicator words.
+    private func spoken(_ text: String) -> String {
+        let badges = SignalStrip.signalBadges(signal)
+        let parts = text.components(separatedBy: " · ")
+        guard SignalStrip.showsResolution(signal), parts.count >= 4, parts[0] == "FLAC" else { return text }
+        var spoken = parts[0...2].joined(separator: ", ")
+        spoken += ". Signal: " + badges.map(\.accessibilityLabel).joined(separator: ", ")
+        if parts.count > 4 { spoken += ". " + parts[4...].joined(separator: " ") }
+        return spoken
+    }
+
+    /// The SIGNAL cell's text when the delivered resolution is known: plain words in the cell's own font, tinted by
+    /// meaning (Hi-Res gold, Lossless neutral, Pure green, speaker tuning quiet), joined by a quiet " · ". One Text, so it baselines with
+    /// the other cells.
+    private var resolutionText: Text {
+        let badges = SignalStrip.signalBadges(signal)
+        let dot = Text(" · ").foregroundStyle(theme.inkSecondary)
+        var result = Text("")
+        for (index, badge) in badges.enumerated() {
+            result = Text(
+                "\(result)\(index > 0 ? dot : Text(""))\(Text(badge.displayText).foregroundStyle(color(badge)))")
+        }
+        return result
+    }
+
+    private func color(_ badge: SignalBadge) -> Color {
+        switch badge {
+        case .pure: theme.ok
+        case .hiRes: theme.hiRes
+        case .lossless: theme.ink
+        case .speakerTuning: theme.inkSecondary
+        }
+    }
+
+    private func strip(_ text: String) -> some View {
         cells(text)
             .contentShape(Rectangle())
             .onTapGesture { details = true }
             .sheet(isPresented: $details) {
-                SignalDetailsSheet(signal: signal).presentationDetents([.medium, .large])
+                SignalDetailsSheet(signal: signal, openSound: sheetOpenSound)
+                    .presentationDetents([.medium, .large])
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(text)
+            .accessibilityLabel(spoken(text))
             .accessibilityAddTraits(.isStaticText)
             .accessibilityHint("Opens the signal details")
             .accessibilityAction { details = true }
@@ -252,10 +359,17 @@ struct SignalCells: View {
         if parts.count >= 4, parts[0] == "FLAC" {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .top, spacing: 8) {
-                    cell("FORMAT", parts[0])
-                    cell("DEPTH", parts[1])
-                    cell("DAC", parts[2])
-                    cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)
+                    // With the resolution text the first three cells size to their content, so the SIGNAL cell gets
+                    // the leftover width.
+                    let hugging = SignalStrip.showsResolution(signal)
+                    cell("FORMAT", parts[0], fixed: hugging)
+                    cell("DEPTH", parts[1], fixed: hugging)
+                    cell("DAC", parts[2], fixed: hugging)
+                    if hugging {
+                        resolutionCell
+                    } else {
+                        cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)
+                    }
                 }
                 if parts.count > 4 {
                     Text(parts[4...].joined(separator: " · "))
@@ -268,6 +382,16 @@ struct SignalCells: View {
                 cell("SIGNAL", text)
             }
         }
+    }
+
+    /// The SIGNAL cell with the resolution text in place of the indicator words, laid out like `cell`.
+    private var resolutionCell: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Rectangle().fill(theme.hairline).frame(height: 1)
+            Text("SIGNAL").font(Typeface.cellLabel).tracking(1.2).foregroundStyle(theme.inkSecondary)
+            resolutionText.font(Typeface.cellValue).lineLimit(1).minimumScaleFactor(0.85)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// One cell. The signal cell keeps its full width (`fixed`): its words are the claim, so they never truncate;
@@ -284,10 +408,19 @@ struct SignalCells: View {
         .fixedSize(horizontal: fixed, vertical: false)
     }
 
+    /// Open Sound in the details: the sheet closes as the tab changes.
+    private var sheetOpenSound: (() -> Void)? {
+        guard let openSound else { return nil }
+        return {
+            details = false
+            openSound()
+        }
+    }
+
     private func tint(_ value: String) -> Color? {
         if value.contains("Pure") { return theme.ok }
         if value.contains("Starting") { return nil }
-        return theme.warn
+        return theme.altered
     }
 }
 
@@ -323,6 +456,7 @@ struct UpNextSheet: View {
                         AlbumLine(album: entry.album)
                             .swipeActions {
                                 Button("Remove", role: .destructive) { playback.removeUpNext(entry) }
+                                    .monoDestructive()
                             }
                     }
                     .onMove { playback.moveUpNext(from: $0, to: $1) }
@@ -349,7 +483,7 @@ struct AlbumLine: View {
             }
             Spacer()
             Text(album.bestFormat.replacingOccurrences(of: "FLAC ", with: ""))
-                .font(Typeface.mono).foregroundStyle(.green)
+                .font(Typeface.mono).monoForeground(.green)
         }
     }
 }

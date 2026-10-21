@@ -5,6 +5,7 @@ import SwiftUI
 struct SettingsView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
+    @AppStorage("monochrome") private var monochrome = false
     @AppStorage(AppModel.lookupNamesKey) private var lookupNames = true
     @AppStorage(AppModel.lookupArtworkKey) private var lookupArtwork = false
 
@@ -23,9 +24,10 @@ struct SettingsView: View {
                     Text("Both the Deck and the Cover have a light and a dark look. System follows the phone.")
                 }
                 Section {
-                    LabeledContent("Turntable sounds", value: "Off")
+                    Toggle("Monochrome", isOn: $monochrome)
+                        .accessibilityIdentifier("monochromeToggle")
                 } footer: {
-                    Text("Needle and run-out sounds are off by default and never play in Pure mode.")
+                    Text("Everything in greys except album artwork.")
                 }
                 Section {
                     Toggle("Look up names online (MusicBrainz)", isOn: $lookupNames)
@@ -97,6 +99,7 @@ struct SettingsView: View {
                     Button("Sign Out", role: .destructive) {
                         Task { await account.signOut() }
                     }
+                    .monoDestructive()
                     .accessibilityIdentifier("soulseekSignOut")
                 } else {
                     TextField("Username", text: $username)
