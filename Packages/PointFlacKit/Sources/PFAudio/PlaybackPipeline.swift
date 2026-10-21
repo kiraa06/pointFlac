@@ -74,7 +74,8 @@ public enum PipelineEvent: Sendable, Equatable {
 ///   converted at its own ReplayGain, ahead of any resampler. The next item is entered, its `trackStarted` placed and
 ///   its `Timeline` segment begun, at the overlap's first frame; the outgoing item's `trackEnded` is at its last.
 ///   Always overlaps every such boundary, Between albums only those `append` marked; Off (the default) keeps every
-///   boundary as it was, gapless and bit-exact. A boundary that changes the plan never overlaps. A seek during an
+///   boundary as it was, gapless and bit-exact. A boundary that changes the plan never overlaps, nor one on an
+///   Int32 client, whose passthrough carries the source's words untouched. A seek during an
 ///   overlap ends it: once the overlap is heard it lands in the incoming item, and the outgoing one is cut off.
 ///
 /// Dropping the pipeline stops playback.
@@ -146,11 +147,23 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.append(items)
     }
 
+    /// Takes back the queue's items from `index` on, the reverse of `append`: the queue then ends before it. Any
+    /// thread. Items the decode thread has not entered are simply dropped. One it has entered, joined or overlapping
+    /// in the ring ahead of what is heard, is flushed by a re-cue at the playhead: the usual dip, then the item playing
+    /// carries on and ends the queue.
+    ///
+    /// Returns false, and takes nothing back, once one of them is being heard (its overlap or its first frame has
+    /// rendered: its `trackStarted` is on its way). True otherwise, also when there is nothing to take back.
+    @discardableResult
+    public func removeItems(from index: Int) -> Bool {
+        core.removeItems(from: index)
+    }
+
     /// Sets the crossfade (its seconds clamped to 1…12) from the next boundary the decode thread reaches: an overlap
     /// already begun plays out, as does anything decoded ahead in the ring. Any thread. Holds across `start`s until
     /// the next `start` gives its own.
     public func setCrossfade(_ settings: CrossfadeSettings) {
-        core.shared.withLock { $0.crossfade = PipelineCore.clamped(settings) }
+        core.setCrossfade(settings)
     }
 
     /// While an overlap is being heard: the item fading out under the one rendering, with the ReplayGain it plays at.
@@ -335,6 +348,8 @@ final class PipelineCore: @unchecked Sendable {
         var queueCount = 0
         /// The decode thread found the queue at its end with nothing appended: `append` is refused from then on.
         var queueClosed = false
+        /// Set by `removeItems` when the decode thread already holds items it took back: its queue ends here.
+        var queueLimit: Int?
     }
 
     /// The client rate and channel count the Sound chain is compiled for.
@@ -365,6 +380,9 @@ final class PipelineCore: @unchecked Sendable {
     private let sound = Mutex(SoundState())
     /// Decode threads that have not returned yet, including stopped sessions still unwinding. For tests.
     let liveDecodeThreads = Atomic<Int>(0)
+    /// Bumped, under `shared`'s lock and after the change, whenever the queue or the crossfade changes (`start`,
+    /// `append`, `removeItems`, `setCrossfade`): the decode thread looks at either again only when it has moved.
+    let queueStamp = Atomic<UInt64>(0)
     private let continuation: AsyncStream<PipelineEvent>.Continuation
     /// Serialises every call into `output`.
     private let outputGate = NSLock()
@@ -405,6 +423,8 @@ final class PipelineCore: @unchecked Sendable {
                 s.appendedStarts = []
                 s.queueCount = items.count
                 s.queueClosed = false
+                s.queueLimit = nil
+                queueStamp.wrappingAdd(1, ordering: .releasing)
                 return s.seekInterval.take()
             }
             output.stop()
@@ -422,7 +442,44 @@ final class PipelineCore: @unchecked Sendable {
             s.appendedStarts.insert(s.queueCount)
             s.appended += items
             s.queueCount += items.count
+            queueStamp.wrappingAdd(1, ordering: .releasing)
             return true
+        }
+    }
+
+    func removeItems(from index: Int) -> Bool {
+        let limit = max(index, 0)
+        var heard = false
+        let recueAt = shared.withLock { s -> Int64? in
+            guard s.session != nil, limit < s.queueCount else { return nil }
+            let playing = s.timeline.position(rendered: s.source?.renderedFrames ?? 0)
+            guard playing.index < limit else {
+                heard = true
+                return nil
+            }
+            // Those not taken by the decode thread yet are the last `appended.count` of the queue.
+            let pending = s.queueCount - s.appended.count
+            if limit < pending {
+                s.appended.removeAll()
+                s.queueLimit = min(s.queueLimit ?? limit, limit)
+            } else {
+                s.appended.removeSubrange((limit - pending)...)
+            }
+            s.appendedStarts = s.appendedStarts.filter { $0 < limit }
+            s.queueCount = limit
+            queueStamp.wrappingAdd(1, ordering: .releasing)
+            // Entered already, in the ring: a re-cue makes the ring forget it. A seek on its way does that anyway.
+            guard s.requestedSeek == nil, s.timeline.segments.contains(where: { $0.index >= limit }) else { return nil }
+            return playing.frame
+        }
+        if let recueAt { seek(toFrame: recueAt, firstFrame: FirstFrameInterval(.seek), fadeIn: true) }
+        return !heard
+    }
+
+    func setCrossfade(_ settings: CrossfadeSettings) {
+        shared.withLock { s in
+            s.crossfade = Self.clamped(settings)
+            queueStamp.wrappingAdd(1, ordering: .releasing)
         }
     }
 

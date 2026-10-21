@@ -57,18 +57,21 @@ private final class SignalDecoder: PCMDecoding {
     let signal: Signal
     /// Reads past this frame throw: a file deleted or evicted mid-playback.
     let failAfter: Int64?
+    /// The stream really ends here, though `totalFrames` says `signal.frames`: a length overstated in STREAMINFO.
+    let endsAt: Int64?
     private var position: Int64 = 0
 
-    init(_ signal: Signal, failAfter: Int64? = nil) {
+    init(_ signal: Signal, failAfter: Int64? = nil, endsAt: Int64? = nil) {
         self.signal = signal
         self.failAfter = failAfter
+        self.endsAt = endsAt
     }
 
     var format: AudioFormat { signal.format }
     var totalFrames: Int64 { signal.frames }
 
     func read(into buffer: UnsafeMutableBufferPointer<Int32>, maxFrames: Int) throws -> Int {
-        let end = min(signal.frames, failAfter ?? signal.frames)
+        let end = min(endsAt ?? signal.frames, failAfter ?? signal.frames)
         if position >= end, failAfter != nil { throw FlacDecodeError.ioError }
         let n = Int(min(Int64(min(maxFrames, buffer.count / 2)), end - position))
         for i in 0..<n {
@@ -83,12 +86,15 @@ private final class SignalDecoder: PCMDecoding {
     }
 }
 
-/// Opens the signal named by the item's ID, else the item's file. An ID in `failing` fails after that many frames.
+/// Opens the signal named by the item's ID, else the item's file. An ID in `failing` fails after that many frames;
+/// one in `short` ends after that many, its length overstated.
 private func decoders(
-    _ signals: [String: Signal], failing: [String: Int64] = [:]
+    _ signals: [String: Signal], failing: [String: Int64] = [:], short: [String: Int64] = [:]
 ) -> @Sendable (PlaybackItem) throws -> PCMDecoding {
     { item in
-        if let signal = signals[item.id] { return SignalDecoder(signal, failAfter: failing[item.id]) }
+        if let signal = signals[item.id] {
+            return SignalDecoder(signal, failAfter: failing[item.id], endsAt: short[item.id])
+        }
         return try FlacDecoder(url: item.url)
     }
 }
@@ -314,13 +320,13 @@ private final class PipelineRig {
 
     init(
         _ signals: [String: Signal] = [:], hardwareRate: @escaping @Sendable (Int) -> Int = { $0 },
-        int32Passthrough: Bool = false, failing: [String: Int64] = [:]
+        int32Passthrough: Bool = false, failing: [String: Int64] = [:], short: [String: Int64] = [:]
     ) {
         self.signals = signals
         puller = Puller(output)
         let pipeline = PlaybackPipeline(
             output: output, capabilities: OutputCapabilities(int32Passthrough: int32Passthrough),
-            negotiateRate: { hardwareRate($0) }, makeDecoder: decoders(signals, failing: failing))
+            negotiateRate: { hardwareRate($0) }, makeDecoder: decoders(signals, failing: failing, short: short))
         self.pipeline = pipeline
         let log = log
         collector = Task {
@@ -641,27 +647,22 @@ private final class PlayerRig {
             ])
     }
 
-    /// An Int32 client (a 32-bit source with passthrough) mixes its integer words, rounded and clipped to Int32. The
-    /// fixtures are 4096 frames, so the overlap is clamped to half the incoming item, 2048 frames.
-    @Test func mixesInt32Words() async {
+    /// An Int32 client (a 32-bit source with passthrough) carries the source's words untouched, so it never
+    /// overlaps, crossfade or not: the boundary is the gapless join, to the bit, as `purePathIsBitExact` plays it.
+    @Test func anInt32ClientJoinsGaplessly() async {
         let raw = Fixtures.rawSamples(Fixtures.named("s32-48000"))
         let rig = PipelineRig(int32Passthrough: true)
         await rig.pipeline.start(
             [fixtureItem("s32-48000", id: "a"), fixtureItem("s32-48000", id: "b")], at: 0, fromFrame: 0,
             crossfade: always(1))
         #expect(await rig.playToEnd())
-        let n = 2048
-        var want = Array(raw[0..<(2 * n)])
-        for k in 0..<n {
-            let w = PlaybackPipeline.crossfadeWeights(frame: k, of: n)
-            for c in 0..<2 {
-                let x = Double(raw[2 * (n + k) + c]) * w.outgoing + Double(raw[2 * k + c]) * w.incoming
-                want.append(Int32(clamping: Int64(x.rounded())))
-            }
-        }
-        want += raw[(2 * n)...]
-        #expect(mismatch(rig.output.capturedInt32, want) == nil)
+        #expect(mismatch(rig.output.capturedInt32, raw + raw) == nil)
         #expect(rig.output.plans.map(\.client) == [.int32])
+        #expect(
+            rig.log.events == [
+                .planChanged(rig.output.plans[0]), fixtureStarted(0, "s32-48000"), .trackEnded(0),
+                fixtureStarted(1, "s32-48000"), .trackEnded(1), .queueEnded,
+            ])
     }
 
     /// A crossfade switched off after the decode thread prepared an overlap, before it began, is called off at its
@@ -709,7 +710,78 @@ private final class PlayerRig {
             ])
     }
 
+    /// The outgoing item failing within an overlap is silent from there, the incoming one carrying on along its
+    /// curve; the failure fires at the overlap's end, where the outgoing item's end would have.
+    @Test func aFailureOfTheOutgoingItemInAnOverlap() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let rig = PipelineRig(["a": a, "b": b], failing: ["a": 50_000])
+        await rig.pipeline.start([rig.item("a"), rig.item("b")], at: 0, fromFrame: 0, crossfade: always(1))
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        var want = plain(a, 0..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 2000, of: 48_000)
+        for k in 2000..<48_000 {
+            let w = PlaybackPipeline.crossfadeWeights(frame: k, of: 48_000)
+            for c in 0..<2 {
+                want.append(Float(0 * w.outgoing + Double(b.float(Int64(k), channel: c)) * w.incoming))
+            }
+        }
+        want += plain(b, 48_000..<96_000)
+        #expect(mismatch(rig.captured, want) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), rig.started(0, "a"), rig.started(1, "b"), .itemFailed(0, "ioError"),
+                .trackEnded(1), .queueEnded,
+            ])
+    }
+
+    /// Both items running out within the same block of an overlap (lengths overstated: the outgoing item ends 2000
+    /// frames in, the incoming one after 1000) end it at the later of the two, with no silence padded after.
+    @Test func anOverlapWhoseItemsBothRunShortEndsWithThem() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let rig = PipelineRig(["a": a, "b": b], short: ["a": 50_000, "b": 1000])
+        await rig.pipeline.start([rig.item("a"), rig.item("b")], at: 0, fromFrame: 0, crossfade: always(1))
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        var want = plain(a, 0..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 1000, of: 48_000)
+        for k in 1000..<2000 {
+            let w = PlaybackPipeline.crossfadeWeights(frame: k, of: 48_000)
+            for c in 0..<2 {
+                want.append(Float(Double(a.float(Int64(48_000 + k), channel: c)) * w.outgoing + 0 * w.incoming))
+            }
+        }
+        #expect(rig.captured.count == 2 * 50_000)
+        #expect(mismatch(rig.captured, want) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), rig.started(0, "a"), rig.started(1, "b"), .trackEnded(0),
+                .trackEnded(1), .queueEnded,
+            ])
+    }
+
     // MARK: Seeks, stops, pauses, scrubs in an overlap
+
+    /// A seek during an overlap under the resampler ends it as without one: the position is the incoming item's, the
+    /// outgoing one's end fires at the seek, and what follows is the dip then the incoming item alone from the target.
+    @Test func aSeekDuringAnOverlapUnderTheResampler() async {
+        let a = noise(12, seconds: 2, rate: 96_000)
+        let b = noise(13, seconds: 2, rate: 96_000)
+        let rig = PipelineRig(["a": a, "b": b], hardwareRate: { _ in 48_000 })
+        await rig.pipeline.start([rig.item("a"), rig.item("b")], at: 0, fromFrame: 0, crossfade: always(1))
+        // The overlap renders from 48 000 (96 000 source frames, resampled to half).
+        #expect(await rig.puller.pull(upTo: 60_000))
+        await letTheRingFill()
+        let mark = rig.captured.count
+        await rig.pipeline.seek(toFrame: 100_000)
+        #expect(rig.pipeline.position == (1, 100_000))
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        let after = (rig.captured.count - mark) / 2
+        #expect(abs(after - (seekFade + 46_000)) <= 64, "\(after) frames after the seek")
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000, resample: RateChange(from: 96_000, to: 48_000))), rig.started(0, "a"),
+                rig.started(1, "b"), .trackEnded(0), .trackEnded(1), .queueEnded,
+            ])
+    }
 
     /// A seek during an overlap ends it. Once the overlap is heard (its start rendered) the position is the incoming
     /// item's, the seek lands in it, and nothing of the outgoing item plays again: it is cut off, and its
@@ -891,6 +963,119 @@ private final class PlayerRig {
         #expect(rig.player.pipeline?.position.index == 1)
         #expect(await rig.puller.pump { rig.player.status == .ended })
         #expect(rig.player.currentIndex == 1)
+    }
+
+    /// Previous during an overlap, on the incoming item's first seconds, goes back to the outgoing item's start on a
+    /// fresh pipeline: nothing of the overlap comes with it.
+    @Test func previousDuringAnOverlapGoesBackCleanly() async {
+        let rig = PlayerRig(["a": tone(440, seconds: 2), "b": tone(660, seconds: 2)])
+        rig.player.setSound(sound(always(1)))
+        await rig.player.play([rig.item("a"), rig.item("b")], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 60_000))
+        #expect(await rig.puller.eventually { rig.player.currentIndex == 1 })
+        await rig.player.previous()
+        #expect(rig.player.currentIndex == 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(rig.player.pipeline?.crossfadePending == false)
+        #expect(rig.player.pipeline?.position.index == 0)
+        rig.player.pause()
+    }
+
+    // MARK: Repeat-one (ruling R4-T16a)
+
+    /// With `crossfadeSuppressed` (repeat-one) every boundary is gapless whatever the crossfade setting: all of the
+    /// first item plays before the next starts, so the controller's restart at that boundary loops the whole track.
+    /// Turned on while an overlap is in the ring, it re-cues it away: the boundary then joins.
+    @Test func suppressedCrossfadeKeepsEveryBoundaryGapless() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let rig = PlayerRig(["a": a, "b": b])
+        rig.player.crossfadeSuppressed = true
+        rig.player.setSound(sound(always(1)))
+        await rig.player.play([rig.item("a"), rig.item("b")], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 96_000 - 512))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(rig.player.currentIndex == 0, "the next item started before the first played out")
+        #expect(rig.player.pipeline?.crossfadePending == false)
+        #expect(await rig.puller.pump { rig.player.currentIndex == 1 })
+        #expect(rig.puller.pulled >= 96_000)
+        #expect(await rig.puller.pump { rig.player.status == .ended })
+        #expect(rig.output.capturedFloat.count == 2 * 2 * 96_000)
+
+        let late = PlayerRig(["a": a, "b": b])
+        late.player.setSound(sound(always(1)))
+        await late.player.play([late.item("a"), late.item("b")], startingAt: 0)
+        #expect(await late.puller.eventually { late.player.status == .playing })
+        #expect(await late.puller.pull(upTo: 40_000))
+        await letTheRingFill()
+        #expect(late.player.pipeline?.crossfadePending == true, "the overlap is mixed ahead in the ring")
+        late.player.crossfadeSuppressed = true
+        await late.drained()
+        #expect(late.player.recueCount == 1)
+        #expect(await late.puller.pump { late.player.status == .ended })
+        let joined: Int = 40_000 + seekFade + 56_000 + 96_000
+        #expect(late.output.capturedFloat.count == 2 * joined)
+    }
+
+    // MARK: Taking an append back (ruling R4-T16b)
+
+    /// `removeAppended` takes back appended items that have not started, wherever the decode thread has got to:
+    /// not yet looked at (1024), joined gaplessly in the ring (80 000, flushed by a re-cue at the playhead: the dip),
+    /// or overlapping in the ring (40 000 under Always, likewise). The queue then ends with the first item. Once the
+    /// appended item is heard (60 000 under Always: the overlap renders) it is refused, and plays on.
+    @Test(arguments: [(CrossfadeMode.off, 1024), (.off, 80_000), (.always, 40_000), (.always, 60_000)])
+    func removeAppendedTakesBackWhatHasNotStarted(mode: CrossfadeMode, pulledTo: Int) async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let rig = PlayerRig(["a": a, "b": b])
+        if mode != .off { rig.player.setSound(sound(CrossfadeSettings(mode: mode, seconds: 1))) }
+        await rig.player.play([rig.item("a")], startingAt: 0)
+        await rig.player.append([rig.item("b")]).value
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: pulledTo))
+        await letTheRingFill()
+        let heard = mode == .always && pulledTo >= 48_000
+        if heard { #expect(await rig.puller.eventually { rig.player.currentIndex == 1 }) }
+        #expect(rig.player.removeAppended(from: 1) == !heard)
+        #expect(rig.player.queue.map(\.id) == (heard ? ["a", "b"] : ["a"]))
+        #expect(await rig.puller.pump { rig.player.status == .ended }, "status: \(rig.player.status)")
+        let captured = rig.output.capturedFloat
+        switch (mode, pulledTo) {
+        case (.off, 1024):
+            #expect(mismatch(captured, plain(a, 0..<96_000)) == nil)
+        case (.off, _):
+            let want =
+                plain(a, 0..<80_000) + seekDip(old: plain(a, 80_000..<96_000), new: plain(a, 80_000..<96_000))
+            #expect(mismatch(captured, want) == nil)
+        case (_, 40_000):
+            let joined: Int = 40_000 + seekFade + 56_000
+            #expect(captured.count == 2 * joined)
+        default:
+            let overlapped: Int = 2 * 96_000 - 48_000
+            #expect(captured.count == 2 * overlapped)
+            #expect(rig.player.currentIndex == 1)
+        }
+        #expect(rig.output.plans == [floatPlan(48_000)])
+    }
+
+    /// An append taken back before it reached the pipeline (it waits on the engine's queue) never does; a later
+    /// append at the same place plays.
+    @Test func anAppendTakenBackOnItsWayNeverReachesThePipeline() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let c = noise(14, seconds: 1)
+        let rig = PlayerRig(["a": a, "b": b, "c": c])
+        await rig.player.play([rig.item("a")], startingAt: 0)
+        let onItsWay = rig.player.append([rig.item("b")])
+        #expect(rig.player.removeAppended(from: 1))
+        await onItsWay.value
+        await rig.player.append([rig.item("c")]).value
+        #expect(rig.player.queue.map(\.id) == ["a", "c"])
+        #expect(await rig.puller.pump { rig.player.status == .ended }, "status: \(rig.player.status)")
+        #expect(mismatch(rig.output.capturedFloat, plain(a, 0..<96_000) + plain(c, 0..<48_000)) == nil)
+        #expect(rig.output.plans == [floatPlan(48_000)])
     }
 
     // MARK: Switches in an overlap (rulings R4-T12a, R4-T12b)

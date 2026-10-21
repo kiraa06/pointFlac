@@ -102,6 +102,10 @@ final class DecodeSession: @unchecked Sendable {
     private var sourceFrame: Int64 = 0
     /// Whether the current item's end has been looked at for an overlap with the next (once per entry).
     private var endConsidered = false
+    /// `PipelineCore.queueStamp` when the queue and crossfade were last looked at, and the crossfade seen then: the
+    /// per-block check locks only when the stamp has moved, so crossfade Off adds one atomic load per block.
+    private var seenStamp = UInt64.max
+    private var seenCrossfade = CrossfadeSettings()
     private var prepared: Prepared?
     private var overlap: Overlap?
     private var format: AudioFormat?
@@ -301,6 +305,8 @@ final class DecodeSession: @unchecked Sendable {
         var target = first
         var frame = frame
         var entry = entry
+        // Appends since the last look, and any items `removeItems` took back, before the queue is read.
+        takeAppends()
         while true {
             if target >= items.count { takeAppends() }
             guard target < items.count else { return nil }
@@ -337,8 +343,15 @@ final class DecodeSession: @unchecked Sendable {
         _ = core.withShared(for: self) { takeAppends(from: &$0) }
     }
 
-    /// `takeAppends` inside a critical section already held.
+    /// `takeAppends` inside a critical section already held. Items `removeItems` took back after this thread had
+    /// them (`queueLimit`) leave the queue first, with a next item prepared among them.
     private func takeAppends(from s: inout PipelineCore.Shared) {
+        if let limit = s.queueLimit {
+            s.queueLimit = nil
+            if items.count > limit { items.removeSubrange(limit...) }
+            batchStarts = batchStarts.filter { $0 < limit }
+            if let ready = prepared, ready.index >= limit { prepared = nil }
+        }
         guard !s.appended.isEmpty else { return }
         items += s.appended
         batchStarts.formUnion(s.appendedStarts)
@@ -576,15 +589,22 @@ final class DecodeSession: @unchecked Sendable {
 
     /// The crossfade's length in source frames at `rate` for the boundary after the current item, as the settings
     /// stand now; nil when that boundary cannot overlap: crossfade off, Between albums at a boundary `append` did not
-    /// mark, no next item (yet), or a current item of unknown length. Takes any appends meanwhile.
+    /// mark, no next item (yet), an Int32 client (passthrough keeps the source's words untouched), or a current item
+    /// of unknown length. Takes any appends meanwhile, locking only when the queue or the crossfade has changed.
     private func crossfadeFrames(total: Int64, rate: Int) -> Int? {
-        guard total > 0 else { return nil }
-        let settings = core.withShared(for: self) { s -> CrossfadeSettings in
-            takeAppends(from: &s)
-            return s.crossfade
+        guard total > 0, plan?.client == .float32 else { return nil }
+        let stamp = core.queueStamp.load(ordering: .acquiring)
+        if stamp != seenStamp {
+            let settings = core.withShared(for: self) { s -> CrossfadeSettings in
+                takeAppends(from: &s)
+                return s.crossfade
+            }
+            guard let settings else { return nil }
+            seenCrossfade = settings
+            seenStamp = stamp
         }
-        guard let settings, index + 1 < items.count, overlaps(settings, into: index + 1) else { return nil }
-        return PipelineCore.crossfadeFrames(settings, rate: rate)
+        guard index + 1 < items.count, overlaps(seenCrossfade, into: index + 1) else { return nil }
+        return PipelineCore.crossfadeFrames(seenCrossfade, rate: rate)
     }
 
     /// Whether `settings` overlap the boundary into item `next`: Always every boundary, Between albums only those
@@ -639,7 +659,9 @@ final class DecodeSession: @unchecked Sendable {
             index: next, renderedStart: boundary, sourceStart: 0, rate: plan.resample,
             totalFrames: ready.decoder.totalFrames, gainDb: 0)
         let entered = core.withShared(for: self) { s -> Double? in
-            guard overlaps(s.crossfade, into: next) else { return nil }
+            // Still wanted: not taken back by `removeItems`, nor called off by a switch to Off or Pure.
+            takeAppends(from: &s)
+            guard next < items.count, overlaps(s.crossfade, into: next) else { return nil }
             var segment = segment
             segment.gainDb = Self.enteredGainDb(s.gainsDb[item.id] ?? item.gainDb, client: client)
             s.timeline.append(segment, rendered: rendered, fadingOutUntil: end)
@@ -647,8 +669,8 @@ final class DecodeSession: @unchecked Sendable {
         }
         guard let entered else { return .stop }
         guard let gainDb = entered else {
-            // Called off: the join takes the decoder.
-            prepared = Prepared(index: next, decoder: ready.decoder, overlap: nil)
+            // Called off: the join takes the decoder, if the item is still in the queue.
+            if next < items.count { prepared = Prepared(index: next, decoder: ready.decoder, overlap: nil) }
             return .play
         }
         placeBoundaryEvents(at: boundary)
@@ -699,8 +721,11 @@ final class DecodeSession: @unchecked Sendable {
                     overlap.incomingEnd = .trackEnded(overlap.index)
                 }
             }
-            guard outgoing > 0 || incoming > 0 else { break }
-            let count = n * channels
+            // Both run out within this block (lengths overstated, or an incoming item of unknown length): the overlap
+            // ends at the later of the two, with no silence padded after.
+            let frames = max(outgoing, incoming)
+            guard frames > 0 else { break }
+            let count = frames * channels
             Self.convert(
                 samples, count: outgoing * channels, bits: format.bitsPerSample, plan: plan, gain: gain,
                 dither: &dither, into: words)
@@ -710,14 +735,13 @@ final class DecodeSession: @unchecked Sendable {
                 gain: overlap.gain, dither: &overlap.dither, into: incomingWords)
             Self.silence(incomingWords, from: incoming * channels, to: count)
             Self.mix(
-                incomingWords, into: words, frames: n, channels: channels, from: overlap.done, of: overlap.frames,
-                client: plan.client)
+                incomingWords, into: words, frames: frames, channels: channels, from: overlap.done, of: overlap.frames)
             // A seek that landed within a fade of the end overlaps at once: its fade-in is on what is heard, the mix.
-            if fadeInLeft > 0 { fadeIn(frames: n, channels: channels, client: plan.client) }
+            if fadeInLeft > 0 { fadeIn(frames: frames, channels: channels, client: plan.client) }
             sourceFrame += Int64(outgoing)
             overlap.incomingFrame += Int64(incoming)
-            overlap.done += n
-            if let step = writeWords(frames: n, count: count) { return step }
+            overlap.done += frames
+            if let step = writeWords(frames: frames, count: count) { return step }
         }
         return finishOverlap()
     }
@@ -769,29 +793,21 @@ final class DecodeSession: @unchecked Sendable {
         return (done, nil)
     }
 
-    /// Mixes `frames` frames of `incoming` into `words`, frames `start…` of an overlap `total` frames long, by
-    /// `PlaybackPipeline.crossfadeWeights`. The products are summed in Double and rounded once: to Float32 for a
-    /// Float32 client, to the nearest Int32, clipped, for an Int32 one.
+    /// Mixes `frames` frames of `incoming` into `words` (Float32 words: an overlap is only ever on a Float32 client),
+    /// frames `start…` of an overlap `total` frames long, by `PlaybackPipeline.crossfadeWeights`: the products summed
+    /// in Double and rounded once to Float32. An overshoot (up to +3 dB on correlated material) goes on to the
+    /// limiter, which is in the chain whenever crossfade is on.
     private static func mix(
         _ incoming: UnsafeMutableBufferPointer<UInt32>, into words: UnsafeMutableBufferPointer<UInt32>, frames: Int,
-        channels: Int, from start: Int, of total: Int, client: OutputPlan.Client
+        channels: Int, from start: Int, of total: Int
     ) {
         for f in 0..<frames {
             let w = PlaybackPipeline.crossfadeWeights(frame: start + f, of: total)
             let base = f * channels
-            switch client {
-            case .float32:
-                for i in base..<(base + channels) {
-                    let x = Double(Float(bitPattern: words[i])) * w.outgoing
-                    let y = Double(Float(bitPattern: incoming[i])) * w.incoming
-                    words[i] = Float(x + y).bitPattern
-                }
-            case .int32:
-                for i in base..<(base + channels) {
-                    let x = Double(Int32(bitPattern: words[i])) * w.outgoing
-                    let y = Double(Int32(bitPattern: incoming[i])) * w.incoming
-                    words[i] = UInt32(bitPattern: Int32(clamping: Int64((x + y).rounded())))
-                }
+            for i in base..<(base + channels) {
+                let x = Double(Float(bitPattern: words[i])) * w.outgoing
+                let y = Double(Float(bitPattern: incoming[i])) * w.incoming
+                words[i] = Float(x + y).bitPattern
             }
         }
     }

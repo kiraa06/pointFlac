@@ -14,8 +14,16 @@ import PFDesign
 /// player's queue once the last queued track starts (`Player.append`), so the pipeline can overlap the two records.
 /// The queue then holds several records, and `albumSegments` maps each player index to its record and track: the
 /// platter, `trackIndex` and `currentSide` follow the record playing, and the platter takes the appended record (with
-/// `autoLoads`) when its first track starts. An appended record has left Up Next. With crossfade Off, or in Pure,
-/// nothing is appended: the queue plays out and the next record starts afresh, as before.
+/// `autoLoads`) when its first track starts. With crossfade Off, or in Pure, nothing is appended: the queue plays out
+/// and the next record starts afresh, as before.
+///
+/// Between albums changes only how records join (ruling R4-T16b). An appended record stays in Up Next until its first
+/// track starts. When the queue no longer leads to it first, the player takes it back and it waits in Up Next as
+/// before: a repeat mode turned on, or the record removed, moved, or another put ahead of it in Up Next. A queue
+/// replaced meanwhile (another track tapped, the tonearm dropped, another record loaded) drops it with the old queue,
+/// and it is still in Up Next. Under repeat-one every boundary is a loop of the same track, so the player keeps them
+/// gapless whatever the crossfade setting (ruling R4-T16a). A record appended from a chosen song holds only the songs
+/// from there on, so Previous on that song goes back to the record before, which is what the queue holds.
 @MainActor
 @Observable
 final class PlaybackController {
@@ -44,6 +52,8 @@ final class PlaybackController {
         let tracks: [TrackRow]
         let start: Int
         let firstTrack: Int
+        /// For a record appended from Up Next, its entry there, until its first track starts.
+        var entry: UpNextEntry.ID?
 
         /// The album track at player index `index`, which must be at or after `start`.
         func track(at index: Int) -> Int { index - start + firstTrack }
@@ -63,7 +73,15 @@ final class PlaybackController {
     private(set) var tracks: [TrackRow] = []
     private(set) var layout = SideLayout(durations: [])
     private(set) var upNext: [UpNextEntry] = []
-    var repeatMode: RepeatMode = .off
+    var repeatMode: RepeatMode = .off {
+        didSet {
+            guard repeatMode != oldValue else { return }
+            // Repeat-one loops a track: an overlap at its end would cut the last fade's worth on every loop.
+            player.crossfadeSuppressed = repeatMode == .one
+            // A repeat replays this record: the one joined behind it is not next any more.
+            reconcileJoinedRecord()
+        }
+    }
     /// The side the needle will drop on when it is up: the deck's "turn the record over" moves it.
     private(set) var cuedSide = 0
     /// Bumped when the controller itself pulls the next record from Up Next, so the deck can play the short hand-off:
@@ -172,6 +190,7 @@ final class PlaybackController {
             return
         }
         if player.currentIndex != track { intendedIndex = track }
+        // A record joined behind the old queue goes with it; its entry is still in Up Next.
         if let album {
             albumSegments = [AlbumSegment(album: album, tracks: tracks, start: 0, firstTrack: 0)]
             platterSegment = 0
@@ -289,21 +308,24 @@ final class PlaybackController {
 
     func playNext(_ album: AlbumCard, startingAt track: TrackRow.ID? = nil) {
         upNext.insert(UpNextEntry(album: album, startTrack: track), at: 0)
-        // Added while the last track plays: with crossfade on, it joins the queue now.
-        appendNextRecordIfDue()
+        // Ahead of a record already joined behind the last track: that one is taken back, this one joins.
+        reconcileJoinedRecord()
     }
 
     func addToUpNext(_ album: AlbumCard, startingAt track: TrackRow.ID? = nil) {
         upNext.append(UpNextEntry(album: album, startTrack: track))
-        appendNextRecordIfDue()
+        // Added while the last track plays: with crossfade on, it joins the queue now.
+        reconcileJoinedRecord()
     }
 
     func removeUpNext(_ entry: UpNextEntry) {
         upNext.removeAll { $0.id == entry.id }
+        reconcileJoinedRecord()
     }
 
     func moveUpNext(from source: IndexSet, to destination: Int) {
         upNext.move(fromOffsets: source, toOffset: destination)
+        reconcileJoinedRecord()
     }
 
     // MARK: Deleting
@@ -317,6 +339,15 @@ final class PlaybackController {
     func willRemove(tracks removed: Set<TrackRow.ID>) async {
         upNext.removeAll { entry in
             library.tracks(of: entry.album.id).allSatisfy { removed.contains($0.id) }
+        }
+        // A record joined behind the queue goes back first if its entry went or any of its songs go: queued, they
+        // would stop the record playing. Nothing joins in its place here: the next record's songs may be going too.
+        if let joined = albumSegments.last, let entry = joined.entry,
+            !upNext.contains(where: { $0.id == entry })
+                || joined.tracks[joined.firstTrack...].contains(where: { removed.contains($0.id) }),
+            player.removeAppended(from: joined.start)
+        {
+            albumSegments.removeLast()
         }
         let onDeck =
             tracks.contains { removed.contains($0.id) } || player.queue.contains { removed.contains($0.id) }
@@ -371,7 +402,10 @@ final class PlaybackController {
     /// (`appendNextRecordIfDue`). Under one-track repeat, only a natural advance (the track played out) goes back; a
     /// move the controller asked for (Next, Previous, a seek) is left alone.
     func playerTrackChanged(from old: Int?, to new: Int?) {
-        if let new { followQueue(to: new) }
+        if let new {
+            joinedRecordsStarted(upTo: new)
+            followQueue(to: new)
+        }
         if let track = trackIndex, let side = layout.side(ofTrack: track) { cuedSide = side }
         appendNextRecordIfDue()
         if let intended = intendedIndex, new == intended {
@@ -385,6 +419,28 @@ final class PlaybackController {
         if segment.album.id != album?.id { cue(segment.album) }
         let track = segment.track(at: old)
         Task { await play(fromTrack: track) }
+    }
+
+    /// A record appended from Up Next leaves Up Next once its first track starts (player index `index` reached it).
+    private func joinedRecordsStarted(upTo index: Int) {
+        for i in albumSegments.indices where albumSegments[i].start <= index {
+            guard let entry = albumSegments[i].entry else { continue }
+            albumSegments[i].entry = nil
+            upNext.removeAll { $0.id == entry }
+        }
+    }
+
+    /// Keeps the record joined behind the queue only while the queue still leads to it: no repeat, and still first in
+    /// Up Next. Otherwise the player takes it back (`Player.removeAppended`), it waits in Up Next as it always did, and
+    /// the record now due joins instead, if any. One whose first track has started already stays.
+    private func reconcileJoinedRecord() {
+        if let joined = albumSegments.last, let entry = joined.entry,
+            repeatMode != .off || upNext.first?.id != entry,
+            player.removeAppended(from: joined.start)
+        {
+            albumSegments.removeLast()
+        }
+        appendNextRecordIfDue()
     }
 
     /// Puts the record of player index `index` on the platter when the queue has moved into another of its records,
@@ -404,8 +460,8 @@ final class PlaybackController {
     }
 
     /// Crossfade on (Between albums or Always, and not Pure), no repeat, a record waiting in Up Next, and the last
-    /// track of the player's queue just started: the waiting record joins the queue behind it, from its chosen song,
-    /// so the pipeline can overlap the boundary. It leaves Up Next.
+    /// track of the player's queue playing: the waiting record joins the queue behind it, from its chosen song, so the
+    /// pipeline can overlap the boundary. It stays in Up Next until its first track starts.
     private func appendNextRecordIfDue() {
         let sound = player.sound
         guard !sound.pure, sound.crossfade.mode != .off, repeatMode == .off, isPlaying, let entry = upNext.first,
@@ -418,9 +474,9 @@ final class PlaybackController {
         let ids = tracks[first...].map(\.id)
         let items = library.queueItems(for: Array(ids))
         guard items.count == ids.count else { return }
-        upNext.removeFirst()
         albumSegments.append(
-            AlbumSegment(album: entry.album, tracks: tracks, start: player.queue.count, firstTrack: first))
+            AlbumSegment(
+                album: entry.album, tracks: tracks, start: player.queue.count, firstTrack: first, entry: entry.id))
         player.append(items)
     }
 
