@@ -11,9 +11,9 @@ import Testing
 /// the limiter's delay). Clicks are the largest sample step against the tone's own slope. True peaks are read on an
 /// FFT-exact reconstruction of a periodic output, which shares no code or filter with the limiter's detector.
 ///
-/// Serialised: the counting tests count the chains made in their own task (`SoundChain.liveCounter`), and the
-/// suite's timing-sensitive runs are kept apart.
-@Suite("Sound chain", .serialized)
+/// Tests that check chains are freed hold weak references to their own chains, so chains other suites make in
+/// parallel can't affect them.
+@Suite("Sound chain")
 struct SoundChainTests {
     static let rate = 48_000.0
 
@@ -75,6 +75,12 @@ struct SoundChainTests {
 
     /// Frames a Pure-to-chain install takes before the chain alone is heard: its latency, then the 10 ms fade.
     static func settled(_ chain: SoundChain) -> Int { chain.latencyFrames + chain.fadeFrames }
+
+    /// A weak reference to a chain, to see that it was freed.
+    final class Freed {
+        weak var chain: SoundChain?
+        init(_ chain: SoundChain) { self.chain = chain }
+    }
 
     // MARK: Pure
 
@@ -264,7 +270,8 @@ struct SoundChainTests {
     /// it.
     static func sweep(
         _ kind: String, pureEvery: Int = 0, on runner: ChainRunner = ChainRunner()
-    ) -> (output: [Float], pureBlocks: Int) {
+    ) -> (output: [Float], pureBlocks: Int, chains: [Freed]) {
+        var chains: [Freed] = []
         let block = 64
         let installs = 1_000
         let amplitude = 0.25
@@ -285,7 +292,9 @@ struct SoundChainTests {
                 ? settings { $0.preamp.trimDb = db }
                 // Dragging an EQ handle: a peak on the tone, no auto headroom, so the level follows the gain.
                 : eq([EQBand(type: .peak, frequency: 440, gainDb: db, q: 1.41)], autoHeadroom: false)
-            runner.install(SoundChain(s, sampleRate: rate, channels: 2))
+            let chain = SoundChain(s, sampleRate: rate, channels: 2)
+            chains.append(Freed(chain))
+            runner.install(chain)
         }
         // Blocks played back untouched: where Pure took over.
         var pureBlocks = 0
@@ -298,13 +307,13 @@ struct SoundChainTests {
             runner.install(nil)
             _ = run(runner, tail, block: block)
         }
-        return (output, pureBlocks)
+        return (output, pureBlocks, chains)
     }
 
     @Test("1 000 installs, one per 64-frame block, sweeping −12…+12 dB, never step past 1.5 × the tone's slope")
     func installsCrossfadeWithoutClicks() {
         for kind in ["trim", "eq"] {
-            let (output, _) = Self.sweep(kind)
+            let (output, _, _) = Self.sweep(kind)
             let ratios = Self.largestStepRatios(output, channels: 2, hz: 440)
             #expect(output.allSatisfy { $0.isFinite })
             #expect(ratios.local < 1.5, "\(kind): largest step \(ratios.local) × the local slope")
@@ -315,7 +324,7 @@ struct SoundChainTests {
     @Test("Fading between a delayed chain and the undelayed Pure signal, both ways, is click-free too")
     func pureTransitionsWithoutClicks() {
         for kind in ["trim", "eq"] {
-            let (output, pureBlocks) = Self.sweep(kind, pureEvery: 40)
+            let (output, pureBlocks, _) = Self.sweep(kind, pureEvery: 40)
             let ratios = Self.largestStepRatios(output, channels: 2, hz: 440)
             #expect(pureBlocks >= 25, "\(kind): Pure took over \(pureBlocks) times")
             #expect(ratios.local < 1.5, "\(kind): largest step \(ratios.local) × the local slope")
@@ -323,73 +332,119 @@ struct SoundChainTests {
         }
     }
 
-    #if DEBUG
-        @Test("After that run and three installs of Pure, every chain is freed")
-        func retiredChainsAreFreed() {
-            let live = SoundChain.LiveCounter()
-            SoundChain.$liveCounter.withValue(live) {
-                let runner = ChainRunner()
-                _ = Self.sweep("eq", pureEvery: 40, on: runner)
-                // The runner is still alive, so the retire path freed them, not its deinit.
-                withExtendedLifetime(runner) {
-                    #expect(live.value == 0, "\(live.value) chains still alive")
-                }
+    @Test(
+        "One chain swapped for a very different one is click-free: ±12 and ±1 dB trims, an EQ band, crossfeed",
+        arguments: [
+            "trim −12 → +12", "trim +12 → −12", "trim −1 → +1", "EQ band appears", "EQ band goes", "crossfeed on",
+        ])
+    func chainSwapsWithoutClicks(jump: String) {
+        let band = [EQBand(type: .peak, frequency: 440, gainDb: 12, q: 1.41)]
+        let pair: (from: SoundSettings, to: SoundSettings) =
+            switch jump {
+            case "trim −12 → +12": (Self.settings { $0.preamp.trimDb = -12 }, Self.settings { $0.preamp.trimDb = 12 })
+            case "trim +12 → −12": (Self.settings { $0.preamp.trimDb = 12 }, Self.settings { $0.preamp.trimDb = -12 })
+            case "trim −1 → +1": (Self.settings { $0.preamp.trimDb = -1 }, Self.settings { $0.preamp.trimDb = 1 })
+            case "EQ band appears": (Self.eq([], autoHeadroom: false), Self.eq(band, autoHeadroom: false))
+            case "EQ band goes": (Self.eq(band, autoHeadroom: false), Self.eq([], autoHeadroom: false))
+            default: (Self.settings(), Self.settings { $0.crossfeed.enabled = true })
             }
+        // A 440 Hz tone, left and right a radian apart, so crossfeed changes both channels.
+        let input = Self.tone(440, amplitude: 0.25, frames: 24_000)
+        let runner = ChainRunner()
+        runner.install(SoundChain(pair.from, sampleRate: Self.rate, channels: 2))
+        // The first chain has long faded in from Pure by block 40 (frame 10 240): the swap is a chain-to-chain fade.
+        let output = Self.run(runner, input, block: 256) { index in
+            if index == 40 { runner.install(SoundChain(pair.to, sampleRate: Self.rate, channels: 2)) }
         }
+        let ratios = Self.largestStepRatios(output, channels: 2, hz: 440)
+        #expect(ratios.local < 1.5, "\(jump): largest step \(ratios.local) × the local slope")
+        #expect(ratios.global < 1.5, "\(jump): largest step \(ratios.global) × the loudest slope")
+        // And the swap took effect: the end differs from what the first chain alone gives.
+        let alone = ChainRunner()
+        alone.install(SoundChain(pair.from, sampleRate: Self.rate, channels: 2))
+        let unswapped = Self.run(alone, input, block: 256)
+        #expect(!Self.identical(output[40_000...], unswapped[40_000...]), "\(jump): the second chain plays")
+    }
 
-        @Test("A runner frees the chain it is playing, and the one in its mailbox, when it goes")
-        func runnerFreesItsChainsWhenItGoes() {
-            let live = SoundChain.LiveCounter()
-            SoundChain.$liveCounter.withValue(live) {
-                do {
-                    let runner = ChainRunner()
-                    runner.install(SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2))
-                    _ = Self.run(runner, Self.tone(1_000, amplitude: 0.5, frames: 1_024))
-                    runner.install(
-                        SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2))
-                    withExtendedLifetime(runner) { #expect(live.value == 2) }
-                }
-            }
-            #expect(live.value == 0)
+    @Test("After that run and three installs of Pure, every chain is freed while the runner lives")
+    func retiredChainsAreFreed() {
+        let runner = ChainRunner()
+        let (_, _, chains) = Self.sweep("eq", pureEvery: 40, on: runner)
+        runner.waitForFrees()
+        // The runner is still alive, so the retire path freed them, not its deinit.
+        withExtendedLifetime(runner) {
+            let alive = chains.filter { $0.chain != nil }.count
+            #expect(chains.count == 500)
+            #expect(alive == 0, "\(alive) of \(chains.count) chains still alive")
+            #expect(runner.strandedCount == 0, "nothing stranded: no render call stalled")
         }
+    }
 
-        @Test("A reset releases every chain the runner held, and the fresh chain plays from rest at once")
-        func resetReleasesEverythingAndStartsFresh() {
-            let live = SoundChain.LiveCounter()
-            SoundChain.$liveCounter.withValue(live) {
-                let runner = ChainRunner()
-                let tone = Self.tone(1_000, amplitude: 0.5, frames: 4_096)
-                // A chain playing, a second mid-fade and a third waiting: the output stops with all three held.
-                runner.install(SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2))
-                _ = Self.run(runner, tone)
-                runner.install(SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2))
-                _ = Self.run(runner, Array(tone.prefix(2 * 200)))
-                runner.install(SoundChain(Self.settings { $0.preamp.trimDb = -6 }, sampleRate: Self.rate, channels: 2))
-                #expect(live.value == 3)
-
-                // A new format: 96 kHz. It is heard from the first frame, with no fade and nothing of the old tone.
-                let fresh = Self.settings { $0.preamp.trimDb = -6 }
-                runner.reset(to: SoundChain(fresh, sampleRate: 96_000, channels: 2))
-                #expect(live.value == 1)
-                let reference = ChainRunner()
-                reference.reset(to: SoundChain(fresh, sampleRate: 96_000, channels: 2))
-                let input = Self.tone(10_000, amplitude: 0.25, frames: 2_048, rate: 96_000)
-                let got = Self.run(runner, input)
-                let want = Self.run(reference, input)
-                #expect(Self.identical(got[...], want[...]))
-                let latency = SoundChain(fresh, sampleRate: 96_000, channels: 2).latencyFrames
-                #expect(got.prefix(2 * latency).allSatisfy { $0 == 0 }, "the look-ahead starts empty")
-
-                // Back to Pure the same way: bit-identical at once.
-                runner.reset(to: nil)
-                let pure = Self.run(runner, input)
-                #expect(Self.identical(pure[...], input[...]))
-                withExtendedLifetime(reference) { #expect(live.value == 1, "only the reference's chain") }
-                withExtendedLifetime(runner) { #expect(runner.isIdle) }
-            }
-            #expect(live.value == 0)
+    @Test("A runner frees the chain it is playing, and the one in its mailbox, when it goes")
+    func runnerFreesItsChainsWhenItGoes() {
+        var tracked: [Freed] = []
+        do {
+            let runner = ChainRunner()
+            let playing = SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2)
+            tracked.append(Freed(playing))
+            runner.install(playing)
+            _ = Self.run(runner, Self.tone(1_000, amplitude: 0.5, frames: 1_024))
+            let waiting = SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2)
+            tracked.append(Freed(waiting))
+            runner.install(waiting)
+            withExtendedLifetime(runner) { #expect(tracked.allSatisfy { $0.chain != nil }, "both held while it lives") }
         }
-    #endif
+        #expect(tracked.allSatisfy { $0.chain == nil })
+    }
+
+    @Test("A reset frees every chain the runner held, and the fresh chain plays from rest at once")
+    func resetFreesEverythingAndStartsFresh() {
+        let runner = ChainRunner()
+        var held: [Freed] = []
+        /// Installs a chain the test keeps only a weak reference to.
+        func install(_ s: SoundSettings) {
+            let chain = SoundChain(s, sampleRate: Self.rate, channels: 2)
+            held.append(Freed(chain))
+            runner.install(chain)
+        }
+        // A chain playing, a second mid-fade and a third waiting: the output stops with all three held.
+        let tone = Self.tone(1_000, amplitude: 0.5, frames: 4_096)
+        install(Self.settings())
+        _ = Self.run(runner, tone)
+        install(Self.settings { $0.preamp.trimDb = -3 })
+        _ = Self.run(runner, Array(tone.prefix(2 * 200)))
+        install(Self.settings { $0.preamp.trimDb = -6 })
+        runner.waitForFrees()
+        #expect(held.allSatisfy { $0.chain != nil }, "playing, fading out and waiting")
+
+        // A new format, 96 kHz: heard from the first frame, with no fade and nothing of the old tone.
+        let fresh = Self.settings { $0.preamp.trimDb = -6 }
+        let next = { () -> Freed in
+            let chain = SoundChain(fresh, sampleRate: 96_000, channels: 2)
+            runner.reset(to: chain)
+            return Freed(chain)
+        }()
+        runner.waitForFrees()
+        #expect(held.allSatisfy { $0.chain == nil }, "every chain it held is freed")
+        #expect(next.chain != nil)
+        let reference = ChainRunner()
+        reference.reset(to: SoundChain(fresh, sampleRate: 96_000, channels: 2))
+        let input = Self.tone(10_000, amplitude: 0.25, frames: 2_048, rate: 96_000)
+        let got = Self.run(runner, input)
+        #expect(Self.identical(got[...], Self.run(reference, input)[...]))
+        let latency = SoundChain(fresh, sampleRate: 96_000, channels: 2).latencyFrames
+        #expect(got.prefix(2 * latency).allSatisfy { $0 == 0 }, "the look-ahead starts empty")
+
+        // Back to Pure the same way: bit-identical at once, and the chain is freed while the runner lives.
+        runner.reset(to: nil)
+        #expect(Self.identical(Self.run(runner, input)[...], input[...]))
+        runner.waitForFrees()
+        withExtendedLifetime(runner) {
+            #expect(next.chain == nil)
+            #expect(runner.isIdle)
+            #expect(runner.strandedCount == 0)
+        }
+    }
 
     @Test("Reinstalling the same settings every block, or the same chain, is inaudible: state carries over")
     func reinstallingIsSeamless() {
@@ -424,6 +479,25 @@ struct SoundChainTests {
             let worst = zip(output, reference).map { abs($0 - $1) }.max() ?? 0
             #expect(worst <= 1e-6, "\(name): largest difference \(worst)")
         }
+    }
+
+    @Test("A fade's end weights take one side whole: priming from Pure is bit for bit, and no dry NaN leaks after")
+    func fadeEndsAreExact() {
+        let s = Self.eq([EQBand(type: .peak, frequency: 1_000, gainDb: 6, q: 1)])
+        let chain = SoundChain(s, sampleRate: Self.rate, channels: 2)
+        let latency = chain.latencyFrames
+        var input = Self.tone(1_000, amplitude: 0.5, frames: 4_096)
+        // Odd values while the new chain primes (the dry signal heard alone), and at the fade's last frame.
+        let odd: [Float] = [-0.0, .nan, Float(bitPattern: 0x7FA0_0001), .infinity, -.leastNonzeroMagnitude]
+        for (i, v) in odd.enumerated() { input[2 * (10 + i)] = v }
+        let last = Self.settled(chain) - 1
+        input[2 * last] = .nan
+        input[2 * last + 1] = .infinity
+        let runner = ChainRunner()
+        runner.install(chain)
+        let output = Self.run(runner, input, block: 64)
+        #expect(Self.identical(output[..<(2 * latency)], input[..<(2 * latency)]), "priming is the input, bit for bit")
+        #expect(output[(2 * last)...].allSatisfy { $0.isFinite }, "from the fade's last frame on, the chain alone")
     }
 
     // MARK: Formats
@@ -643,6 +717,8 @@ struct SoundChainTests {
     func ceilingHoldsAtExtremes(rate: Double) {
         let ceiling = -0.3
         let stacked = [EQBand](repeating: EQBand(type: .peak, frequency: 20_000, gainDb: 24, q: 20), count: 20)
+        // 0.44 × 44.1 kHz, under the noise's 0.45·fs edge at both rates.
+        let inBand = [EQBand](repeating: EQBand(type: .peak, frequency: 19_404, gainDb: 24, q: 20), count: 20)
         let cases: [(name: String, settings: SoundSettings)] = [
             (
                 "20 kHz stack, auto headroom, +12 dB trim",
@@ -655,6 +731,13 @@ struct SoundChainTests {
                 "20 kHz stack, no auto headroom, +12 dB trim",
                 Self.settings {
                     $0.eq = EQSettings(enabled: true, mode: .parametric, bands: stacked)
+                    $0.preamp = PreampSettings(autoHeadroom: false, trimDb: 12)
+                }
+            ),
+            (
+                "19.4 kHz stack (inside the band at 44.1 kHz too), no auto headroom, +12 dB trim",
+                Self.settings {
+                    $0.eq = EQSettings(enabled: true, mode: .parametric, bands: inBand)
                     $0.preamp = PreampSettings(autoHeadroom: false, trimDb: 12)
                 }
             ),
