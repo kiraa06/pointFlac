@@ -231,12 +231,17 @@ final class ScrubTap: @unchecked Sendable {
     /// The source frame at which the ring takes over again; −1 for none yet.
     let handoverFrame = Atomic<Int64>(-1)
     let window = Atomic<UnsafeMutableRawPointer?>(nil)
+    /// Whether the ring may play while no voice does: true for a playing record (it plays on until the voice takes
+    /// over, and after the handover), false for a paused one, whose ring holds the music at the old cue.
+    let ringAllowed = Atomic<Bool>(false)
 
     // Render → player.
     let voicePositionBits = Atomic<UInt64>(0)
     let voiceSpeedBits = Atomic<UInt64>(0)
     /// The generation whose voice has handed over to the ring.
     let handedOver = Atomic<UInt64>(0)
+    /// The generation whose voice has started (the music at the needle was decoded in time).
+    let voiceStarted = Atomic<UInt64>(0)
     /// Set while a render call may be reading the window (see `retireWindow`).
     let rendering = Atomic<Bool>(false)
 
@@ -244,8 +249,10 @@ final class ScrubTap: @unchecked Sendable {
     /// lives; the render thread reaches them without reference counting.
     let state: UnsafeMutablePointer<ScrubRenderState>
 
-    /// The window of the current run, kept alive here while the render thread may read it.
+    /// The window of the current run, kept alive here while the render thread may read it, and any window a stuck
+    /// render call might still hold (kept for good rather than freed under it).
     private let keep = Mutex<ScrubWindow?>(nil)
+    private let stranded = Mutex<[ScrubWindow]>([])
 
     init() {
         state = .allocate(capacity: 1)
@@ -260,13 +267,19 @@ final class ScrubTap: @unchecked Sendable {
     var currentPhase: Phase { Phase(rawValue: phase.load(ordering: .acquiring)) ?? .idle }
 
     /// Player: starts a run. The render thread takes over from the ring at its next call.
-    func begin(window: ScrubWindow, anchorFrame: Int64, anchorRendered: Int64, startSpeed: Double) {
+    func begin(
+        window: ScrubWindow, anchorFrame: Int64, anchorRendered: Int64, startSpeed: Double, ringAllowed: Bool
+    ) {
         keep.withLock { $0 = window }
         self.window.store(Unmanaged.passUnretained(window).toOpaque(), ordering: .releasing)
         self.anchorFrame.store(anchorFrame, ordering: .relaxed)
         self.anchorRendered.store(anchorRendered, ordering: .relaxed)
         startSpeedBits.store(startSpeed.bitPattern, ordering: .relaxed)
+        self.ringAllowed.store(ringAllowed, ordering: .releasing)
         handoverFrame.store(-1, ordering: .relaxed)
+        // Until this run's voice starts, the needle is where the hand landed.
+        voicePositionBits.store(Double(anchorFrame).bitPattern, ordering: .releasing)
+        voiceSpeedBits.store(startSpeed.bitPattern, ordering: .releasing)
         // The hand has just landed and holds the record: a playing record brakes to a stop under it.
         setHand(offsetFrames: 0, speed: 0)
         phase.store(Phase.hand.rawValue, ordering: .releasing)
@@ -307,7 +320,14 @@ final class ScrubTap: @unchecked Sendable {
         while rendering.load(ordering: .sequentiallyConsistent), ContinuousClock.now < deadline {
             Thread.sleep(forTimeInterval: 0.0005)
         }
-        keep.withLock { $0 = nil }
+        let window = keep.withLock { kept in
+            defer { kept = nil }
+            return kept
+        }
+        // A render call still inside after 200 ms (a stalled render thread) may hold it: never free it under it.
+        if rendering.load(ordering: .sequentiallyConsistent), let window {
+            stranded.withLock { $0.append(window) }
+        }
     }
 }
 
@@ -320,6 +340,9 @@ struct ScrubRenderState {
     var voice: ScrubVoice?
     /// The voice has taken over for this run (it stays nil until the music at the needle is decoded).
     var started = false
+    /// The source format the voice was made for: channels and client rate.
+    var voiceChannels = 0
+    var voiceClientRate = 0
     var generation: UInt64 = 0
     var handSequence: UInt64 = 0
     /// Where the voice started, the anchor of the hand's offsets.

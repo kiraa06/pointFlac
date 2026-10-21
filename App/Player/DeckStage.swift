@@ -92,6 +92,10 @@ struct DeckStage: View {
     @State private var snapTrack: Int?
     @State private var jog: Jog?
     @State private var holdTimer: Task<Void, Never>?
+    /// True while a finger is on the record. Gesture state resets even when the system cancels the gesture (a call
+    /// banner, the app leaving the foreground), which `onEnded` does not report: the hold is let go then too.
+    @GestureState private var touching = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var flip = 0.0
     @State private var restTick = 0
 
@@ -106,13 +110,16 @@ struct DeckStage: View {
         /// The hand's turning speed, smoothed over a few touches, in degrees per second.
         var velocity: Double
         var engaged: Bool
+        /// The player holds the record (`beginScrub` took it); otherwise the turn is a plain jog, applied on release.
+        var scrubbing = false
         let began: Date
         /// How far the finger has moved, in points.
         var travel: CGFloat
         var lastLocation: CGPoint
     }
 
-    /// A finger that holds still this long holds the record (a playing one brakes to a stop under it).
+    /// A finger that holds a playing record still this long takes hold of it (it brakes to a stop under it). A paused
+    /// record is only taken hold of by turning it, so a slow tap still turns it over.
     static let holdToEngage: Duration = .milliseconds(150)
     /// A finger that moves this far holds the record at once.
     static let travelToEngage: CGFloat = 3
@@ -155,6 +162,18 @@ struct DeckStage: View {
         }
         .onChange(of: handoff.spinning) { _, spinning in
             spin.setSpinning(spinning || playback.isPlaying, at: Date.timeIntervalSinceReferenceDate)
+        }
+        .onChange(of: touching) { _, touching in
+            // A cancelled gesture resets `touching` without `onEnded`; a normal end runs `onEnded` first, which clears
+            // `jog`, so this only lets go of a hold nothing else will.
+            guard !touching else { return }
+            Task { @MainActor in if jog != nil { letGo(asTap: false) } }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active, jog != nil { letGo(asTap: false) }
+        }
+        .onDisappear {
+            if jog != nil { letGo(asTap: false) }
         }
         .onChange(of: handoff.landed) { _, landed in
             if landed {
@@ -381,6 +400,7 @@ struct DeckStage: View {
     /// record over while the needle is up.
     private func jogGesture(_ layout: DeckLayout) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .updating($touching) { _, touching, _ in touching = true }
             .onChanged { value in
                 let r = layout.recordRadius
                 let finger = atan2(value.location.y - r, value.location.x - r) * 180 / .pi
@@ -389,10 +409,13 @@ struct DeckStage: View {
                         baseAngle: 0, lastFinger: finger, degrees: 0, lastTime: value.time, velocity: 0,
                         engaged: false, began: value.time, travel: 0, lastLocation: value.location)
                     holdTimer?.cancel()
-                    holdTimer = Task {
-                        try? await Task.sleep(for: Self.holdToEngage)
-                        guard !Task.isCancelled else { return }
-                        engageJog()
+                    holdTimer = nil
+                    if playback.isPlaying {
+                        holdTimer = Task {
+                            try? await Task.sleep(for: Self.holdToEngage)
+                            guard !Task.isCancelled else { return }
+                            engageJog()
+                        }
                     }
                     return
                 }
@@ -402,31 +425,28 @@ struct DeckStage: View {
                 let delta = JogMath.delta(from: current.lastFinger, to: finger)
                 current.lastFinger = finger
                 let dt = value.time.timeIntervalSince(current.lastTime)
-                current.lastTime = value.time
                 if current.engaged {
                     current.degrees += delta
-                    if dt > 0 { current.velocity = current.velocity * 0.5 + delta / dt * 0.5 }
+                    // The hand's speed from this touch: a touch after a pause starts afresh, and touches coalesced a
+                    // millisecond apart only add their turn (their speed would be noise).
+                    if dt > 0.05 {
+                        current.velocity = delta / dt
+                        current.lastTime = value.time
+                    } else if dt >= 0.002 {
+                        current.velocity = current.velocity * 0.5 + delta / dt * 0.5
+                        current.lastTime = value.time
+                    }
                     jog = current
-                    playback.scrub(degrees: current.degrees, degreesPerSecond: current.velocity)
+                    if current.scrubbing {
+                        playback.scrub(degrees: current.degrees, degreesPerSecond: current.velocity)
+                    }
                 } else {
+                    current.lastTime = value.time
                     jog = current
                     if current.travel >= Self.travelToEngage { engageJog() }
                 }
             }
-            .onEnded { _ in
-                holdTimer?.cancel()
-                holdTimer = nil
-                guard let ended = jog else { return }
-                jog = nil
-                guard ended.engaged else {
-                    tapRecord()
-                    return
-                }
-                let now = Date.timeIntervalSinceReferenceDate
-                spin.place(at: ended.baseAngle + ended.degrees, time: now, spinning: false)
-                spin.setSpinning(playback.isPlaying, at: now)
-                playback.endScrub(spinUpSeconds: spin.spinUpSeconds)
-            }
+            .onEnded { _ in letGo(asTap: true) }
     }
 
     /// The finger takes hold of the record: the picture stops under it, where it was, and the music follows the hand.
@@ -436,8 +456,29 @@ struct DeckStage: View {
         current.baseAngle = spin.angle(at: Date.timeIntervalSinceReferenceDate)
         current.degrees = 0
         current.velocity = 0
+        current.scrubbing = playback.beginScrub()
         jog = current
-        playback.beginScrub()
+    }
+
+    /// The finger left the record. A touch that never took hold is a tap (unless the system cancelled it); a hold
+    /// lets the record go: it spins back up if it was playing, and the music hands back to the player.
+    private func letGo(asTap: Bool) {
+        holdTimer?.cancel()
+        holdTimer = nil
+        guard let ended = jog else { return }
+        jog = nil
+        guard ended.engaged else {
+            if asTap { tapRecord() }
+            return
+        }
+        let now = Date.timeIntervalSinceReferenceDate
+        spin.place(at: ended.baseAngle + ended.degrees, time: now, spinning: false)
+        spin.setSpinning(playback.isPlaying, at: now)
+        if ended.scrubbing {
+            playback.endScrub(spinUpSeconds: spin.spinUpSeconds)
+        } else {
+            jogBy(JogMath.seconds(forDegrees: ended.degrees))
+        }
     }
 
     private func jogBy(_ seconds: Double) {

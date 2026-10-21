@@ -174,8 +174,10 @@ final class PlaybackController {
 
     // MARK: A finger on the record
 
-    /// The hand holds the record (spec §4.3): from now until `endScrub`, the music follows it.
-    func beginScrub() {
+    /// The hand holds the record (spec §4.3): from now until `endScrub`, the music follows it. False when the player
+    /// cannot take hold now (nothing cued, or a start or seek still on its way).
+    @discardableResult
+    func beginScrub() -> Bool {
         player.beginScrub()
     }
 

@@ -180,13 +180,35 @@ public final class RenderSource: @unchecked Sendable {
             state.pointee.voice = nil
             return nil
         }
+        // `begin` writes a new run's phase and hand before bumping the generation: if one began meanwhile, this call
+        // still belongs to the old run, so it ignores the phase's commands; the next call starts the new run.
+        let settled = tap.generation.load(ordering: .acquiring) == generation
+        let ringAllowed = tap.ringAllowed.load(ordering: .acquiring)
+        /// No voice to play: a playing record plays on from the ring; a paused one is silent (its ring holds the
+        /// music at the old cue, which must never be heard).
+        func withoutVoice() -> Int? {
+            if ringAllowed { return nil }
+            words.update(repeating: 0, count: frames * channels)
+            return frames
+        }
         let window = Unmanaged<ScrubWindow>.fromOpaque(rawWindow)
         return window._withUnsafeGuaranteedRef { window -> Int? in
             if state.pointee.generation != generation {
                 state.pointee = ScrubRenderState(generation: generation)
             }
+            // The voice belongs to the source it started on. A let-go at a track's end can carry the pipeline into
+            // the next track in another format (channels or rate): that source plays the ring, the voice is done.
+            if state.pointee.voice != nil,
+                state.pointee.voiceChannels != channels || state.pointee.voiceClientRate != clientRate
+            {
+                state.pointee.voice = nil
+                tap.handedOver.store(generation, ordering: .releasing)
+                return withoutVoice()
+            }
             if state.pointee.voice == nil, !state.pointee.started {
-                guard clientRate > 0, (1...8).contains(channels), window.channels == channels else { return nil }
+                guard clientRate > 0, (1...8).contains(channels), window.channels == channels else {
+                    return withoutVoice()
+                }
                 // The voice starts where the ring would play next, at the speed the record turns, once the music
                 // there is decoded. Until then (a few milliseconds) a playing record plays on from the ring, so the
                 // hand's landing is seamless, and a paused one stays silent.
@@ -201,18 +223,23 @@ public final class RenderSource: @unchecked Sendable {
                 let needle = Int64(start.rounded(.down))
                 let behind = Int64(ScrubKernel.reach(cutoff: ScrubKernel.cutoff(forAdvance: 1))) + 1
                 guard needle - behind >= valid.lowerBound, needle + Self.startAhead < valid.upperBound else {
-                    if speed != 0 { return nil }
-                    words.update(repeating: 0, count: frames * channels)
-                    return frames
+                    return withoutVoice()
                 }
                 state.pointee.started = true
                 state.pointee.start = start
+                state.pointee.voiceChannels = channels
+                state.pointee.voiceClientRate = clientRate
                 state.pointee.voice = ScrubVoice(
                     channels: channels, sourceRate: Double(window.sourceRate), outputRate: Double(clientRate),
                     at: start, speed: speed)
+                tap.voicePositionBits.store(start.bitPattern, ordering: .releasing)
+                tap.voiceSpeedBits.store(speed.bitPattern, ordering: .releasing)
+                tap.voiceStarted.store(generation, ordering: .releasing)
             }
-            guard var voice = state.pointee.voice else { return nil }
-            renderVoice(&voice, state: state, tap: tap, phase: phase, window: window, into: words, frames: frames)
+            guard var voice = state.pointee.voice else { return withoutVoice() }
+            renderVoice(
+                &voice, state: state, tap: tap, phase: settled ? phase : nil, window: window, into: words,
+                frames: frames)
             state.pointee.voice = state.pointee.crossfade == Int.max ? nil : voice
             return frames
         }
@@ -220,7 +247,7 @@ public final class RenderSource: @unchecked Sendable {
 
     private func renderVoice(
         _ voice: inout ScrubVoice, state: UnsafeMutablePointer<ScrubRenderState>, tap: ScrubTap,
-        phase: ScrubTap.Phase, window: ScrubWindow, into words: UnsafeMutablePointer<UInt32>, frames: Int
+        phase: ScrubTap.Phase?, window: ScrubWindow, into words: UnsafeMutablePointer<UInt32>, frames: Int
     ) {
         // A seek (the handover's) needs its flush acknowledged even though the ring is not being played.
         let flush = flushRequested.load(ordering: .acquiring)
@@ -245,7 +272,7 @@ public final class RenderSource: @unchecked Sendable {
             if state.pointee.fadeLeft < 0 {
                 state.pointee.fadeLeft = max(1, Int(Self.fadeOutSeconds * Double(clientRate)))
             }
-        case .idle:
+        case .idle, nil:
             break
         }
         // Where in this call the ring takes over: once the handover's audio is in the ring and the needle reaches it.
@@ -257,6 +284,12 @@ public final class RenderSource: @unchecked Sendable {
             let step = voice.speed * voice.nominal
             if handover >= 0, !held, buffered, step > 0 {
                 let reach = Int(((Double(handover) - voice.position) / step).rounded(.up))
+                if reach < 0 {
+                    // The seek took longer than the lead and the needle is past the handover frame: skip the ring
+                    // forward to the needle (as far as it is buffered) rather than replay what the voice just played.
+                    let available = unretainedRing._withUnsafeGuaranteedRef { $0.availableToRead } / channels
+                    skipRing(min(-reach, max(0, available - frames)))
+                }
                 if reach < frames {
                     voiceOnly = max(0, reach)
                     state.pointee.crossfade = 0
@@ -309,6 +342,22 @@ public final class RenderSource: @unchecked Sendable {
         }
     }
 
+    /// Drops `count` frames from the ring, counting them as rendered so positions stay right.
+    private func skipRing(_ count: Int) {
+        var left = count
+        scratch.withMemoryRebound(to: UInt32.self, capacity: Self.scratchFrames * channels) { words in
+            while left > 0 {
+                let n = min(left, Self.scratchFrames)
+                let got = unretainedRing._withUnsafeGuaranteedRef {
+                    $0.read(into: UnsafeMutableBufferPointer(start: words, count: n * channels))
+                }
+                guard got > 0 else { break }
+                rendered.store(rendered.load(ordering: .relaxed) + Int64(got / channels), ordering: .releasing)
+                left -= got / channels
+            }
+        }
+    }
+
     /// The let-go stopped record's fade, over the first `frames` of the scratch.
     private func fadeOut(_ frames: Int, state: UnsafeMutablePointer<ScrubRenderState>) {
         let total = max(1, Int(Self.fadeOutSeconds * Double(clientRate)))
@@ -322,6 +371,7 @@ public final class RenderSource: @unchecked Sendable {
     /// A Float32 sample as a client word.
     @inline(__always)
     private func word(_ x: Float) -> UInt32 {
+        guard x.isFinite else { return 0 }
         if floatClient { return x.bitPattern }
         let clipped = min(max(Double(x), -1), 1 - 1 / 2_147_483_648)
         return UInt32(bitPattern: Int32((clipped * 2_147_483_648).rounded()))

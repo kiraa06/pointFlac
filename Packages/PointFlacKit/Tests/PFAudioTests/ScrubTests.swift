@@ -48,12 +48,15 @@ private final class ScrubRig {
     let player: Player
     private(set) var pulled = 0
 
-    init() {
+    init(
+        session: FakeSession = FakeSession(),
+        makeDecoder: @escaping @Sendable (PlaybackItem) throws -> PCMDecoding = { _ in SineDecoder() }
+    ) {
         let output = output
         player = Player(
-            session: FakeSession(), makeOutput: { output },
+            session: session, makeOutput: { output },
             capabilities: OutputCapabilities(int32Passthrough: false), nowPlaying: SilentNowPlaying(),
-            makeDecoder: { _ in SineDecoder() })
+            makeDecoder: makeDecoder)
     }
 
     /// Plays the part of the render thread for `frames` frames, in 512-frame calls, letting the player run between.
@@ -87,6 +90,16 @@ private final class ScrubRig {
             }
         }
         return true
+    }
+
+    /// Waits (pulling) for a settling let-go to finish.
+    func settle(_ task: Task<Void, Never>) async -> Bool {
+        var done = false
+        Task { @MainActor in
+            await task.value
+            done = true
+        }
+        return await pump { done }
     }
 
     /// The left channel of the last `frames` frames captured.
@@ -292,5 +305,105 @@ struct ScrubTests {
         await rig.pull(22_050)
         #expect(rms(rig.lastLeft(4_410)) < 1e-3)
         #expect(largestStep(rig.lastLeft(30_000)) < toneSlope * 1.5)
+    }
+
+    @Test("A paused record held still is silent: its pipeline's ring, at the old cue, is never heard")
+    func pausedHoldIsSilent() async {
+        let rig = ScrubRig()
+        #expect(await rig.startPlaying())
+        await rig.pull(44_100)
+        rig.player.pause()
+        let captured = rig.output.capturedFloat.count
+        rig.player.beginScrub()
+        #expect(await rig.pump { rig.output.isStarted })
+        await rig.pull(13_230)
+        #expect(await rig.settle(rig.player.endScrub()))
+        let since = Array(rig.output.capturedFloat[captured...])
+        #expect(!since.isEmpty)
+        #expect(since.allSatisfy { $0 == 0 })
+        #expect(rig.player.status == .paused && !rig.output.isStarted)
+    }
+
+    @Test("If the scrub's music cannot be decoded, the record plays on and letting go changes nothing")
+    func voiceThatNeverStartsLeavesPlaybackAlone() async {
+        // The scrub filler's decoder fails; the pipeline's works.
+        let rig = ScrubRig(makeDecoder: { _ in
+            if Thread.current.name == "pointFlac.scrub" { throw CocoaError(.fileReadCorruptFile) }
+            return SineDecoder()
+        })
+        #expect(await rig.startPlaying())
+        await rig.pull(44_100)
+        rig.player.beginScrub()
+        rig.player.scrub(offsetSeconds: 2, speed: 3)
+        await rig.pull(8_820)
+        let before = rig.player.pipeline?.position.frame ?? 0
+        let clock = ContinuousClock()
+        let start = clock.now
+        #expect(await rig.settle(rig.player.endScrub(spinUpSeconds: 0.05)))
+        #expect(clock.now - start < .seconds(1))
+        #expect(!rig.player.isScrubbing && !rig.player.signal.scrubbing)
+        // No seek to a stale needle: the ring played on all along.
+        await rig.pull(4_410)
+        let after = rig.player.pipeline?.position.frame ?? 0
+        #expect(abs(after - before - 4_410) <= 1_024)
+        #expect(largestStep(rig.lastLeft(30_000)) < toneSlope * 1.5)
+    }
+
+    @Test("Pausing mid-scrub keeps the needle where the hand put it")
+    func pauseMidScrubKeepsTheNeedle() async {
+        let rig = ScrubRig()
+        #expect(await rig.startPlaying())
+        await rig.pull(44_100)
+        rig.player.beginScrub()
+        let anchor = rig.player.pipeline?.scrubTap.anchorFrame.load(ordering: .acquiring) ?? 0
+        var offset = 0.0
+        for _ in 0..<60 {
+            offset += 512.0 / 44_100
+            rig.player.scrub(offsetSeconds: offset, speed: 1)
+            await rig.pull(512)
+        }
+        rig.player.pause()
+        #expect(!rig.player.isScrubbing && !rig.player.signal.scrubbing)
+        #expect(rig.player.status == .paused)
+        let paused = Double(rig.player.position / .seconds(1)) * 44_100
+        #expect(abs(paused - (Double(anchor) + offset * 44_100)) < 2_000)
+    }
+
+    @Test("A seek while a paused record is held wins: the scrub ends and the cue is the seek's")
+    func seekDuringPausedScrubWins() async {
+        let rig = ScrubRig()
+        #expect(await rig.startPlaying())
+        await rig.pull(44_100)
+        rig.player.pause()
+        rig.player.beginScrub()
+        #expect(await rig.pump { rig.output.isStarted })
+        rig.player.scrub(offsetSeconds: 0.5, speed: 1)
+        await rig.pull(2_048)
+        await rig.player.seek(to: .seconds(5))
+        #expect(!rig.player.isScrubbing && !rig.output.isStarted)
+        #expect(await rig.settle(rig.player.endScrub()))
+        #expect(rig.player.position == .seconds(5))
+        #expect(rig.player.status == .paused)
+    }
+
+    @Test("Resampled output (48 kHz hardware, 44.1 kHz file): the hand's speed still sets the pitch")
+    func resampledPitch() async {
+        let rig = ScrubRig(session: FakeSession(rateResponse: { _ in 48_000 }))
+        #expect(await rig.startPlaying())
+        #expect(rig.output.plans.last?.clientSampleRate == 48_000)
+        await rig.pull(48_000)
+        rig.player.beginScrub()
+        var offset = 0.0
+        for _ in 0..<60 {
+            offset += 512.0 / 48_000
+            rig.player.scrub(offsetSeconds: offset, speed: 1)
+            await rig.pull(512)
+        }
+        let tail = rig.lastLeft(8_192)
+        #expect(abs(frequency(tail, rate: 48_000) - 440) < 4.4)
+        #expect(abs(rms(tail) - fullLevel) < fullLevel * 0.05)
+        #expect(await rig.settle(rig.player.endScrub(spinUpSeconds: 0.05)))
+        await rig.pull(9_600)
+        #expect(largestStep(rig.lastLeft(40_000)) < toneSlope * 1.5)
     }
 }

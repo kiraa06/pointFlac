@@ -128,6 +128,7 @@ public final class Player {
     deinit {
         sessionEvents?.cancel()
         ticker?.cancel()
+        scrubRun?.filler.stop()
         // The engine goes with the player. Its pipeline's deinit stops playback and finishes the pipeline's event
         // stream, which ends the engine's event task.
     }
@@ -192,6 +193,7 @@ public final class Player {
             await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame, firstFrame: interval) }.value
             engine.seeksInFlight -= 1
         case .paused:
+            endPausedScrub()
             cue = Cue(index: index, frame: frame)
             showCue(playing: false)
         case .ended:
@@ -240,6 +242,7 @@ public final class Player {
         case .playing, .preparing, .ended:
             await launch(at: index, frame: 0, for: .play).value
         case .paused:
+            endPausedScrub()
             cue = Cue(index: index, frame: 0)
             showPending(for: index)
             showCue(playing: false)
@@ -316,11 +319,13 @@ public final class Player {
 
     /// Stops the current engine's pipeline and makes sure nothing it emitted from now on is handled.
     private func retireEngine() {
-        abandonScrub()
         stopTicker()
-        guard let engine else { return }
-        self.engine = nil
-        engine.retire()
+        if let engine {
+            self.engine = nil
+            engine.retire()
+        }
+        // After the output stopped: ending the scrub first would let a render call play the ring in between.
+        abandonScrub()
     }
 
     /// Configures and activates the session, in turn with the negotiations, then reads the route again: the port and
@@ -341,13 +346,16 @@ public final class Player {
     /// Whether a finger is on the record (or its let-go is still settling).
     public var isScrubbing: Bool { scrubRun != nil }
 
-    /// A finger landed on the record (spec §4.3). From now until `endScrub`, the music follows the hand: the render
-    /// thread plays it where the hand puts it, at the hand's speed and direction, through a band-limited resampler.
-    /// A playing record brakes to a stop under the finger; a paused one stays silent until it is turned. No effect
-    /// unless playing or paused.
-    public func beginScrub() {
+    /// A finger took hold of the record (spec §4.3). From now until `endScrub`, the music follows the hand: the
+    /// render thread plays it where the hand puts it, at the hand's speed and direction, through a band-limited
+    /// resampler. A playing record brakes to a stop under the finger; a paused one stays silent until it is turned.
+    ///
+    /// Returns whether the record is now held: false when nothing is playing or paused, or while a start or a seek is
+    /// still on its way (the caller then treats the turn as a plain jog, applied on release).
+    @discardableResult
+    public func beginScrub() -> Bool {
         if let run = scrubRun {
-            guard run.settling != nil else { return }
+            guard run.settling != nil else { return true }
             // Touched again while the last let-go was still settling (a scratch): carry on from where the needle is.
             run.settling?.cancel()
             run.settling = nil
@@ -357,33 +365,36 @@ public final class Player {
             }
             let anchor = run.engine.pipeline.scrubAnchor
             let tap = run.tap
-            let handedOver = tap.handedOver.load(ordering: .acquiring) == tap.generation.load(ordering: .acquiring)
+            let generation = tap.generation.load(ordering: .acquiring)
+            let handedOver = tap.handedOver.load(ordering: .acquiring) == generation
             let frame = handedOver ? anchor.frame : Int64(tap.voicePosition.rounded(.down))
             let speed = handedOver ? 1 : tap.voiceSpeed
             run.anchorFrame = frame
             run.offsetFrames = 0
-            tap.begin(window: run.window, anchorFrame: frame, anchorRendered: anchor.rendered, startSpeed: speed)
+            tap.begin(
+                window: run.window, anchorFrame: frame, anchorRendered: anchor.rendered, startSpeed: speed,
+                ringAllowed: run.wasPlaying)
             signal.scrubbing = true
-            return
+            return true
         }
-        guard let index = currentIndex, queue.indices.contains(index) else { return }
+        guard let index = currentIndex, queue.indices.contains(index) else { return false }
         let playing = status == .playing
-        guard playing || status == .paused else { return }
+        guard playing || status == .paused else { return false }
         let item = queue[index]
         let runEngine: PlayerEngine
         let anchorFrame: Int64
         let anchorRendered: Int64
         if playing {
-            guard let current = engine, current.hasStarted, current.seeksInFlight == 0 else { return }
+            guard let current = engine, current.hasStarted, current.seeksInFlight == 0 else { return false }
             let anchor = current.pipeline.scrubAnchor
-            guard anchor.index == index else { return }
+            guard anchor.index == index else { return false }
             runEngine = current
             anchorFrame = anchor.frame
             anchorRendered = anchor.rendered
         } else {
             // Nothing runs while paused (ruling R15): start a pipeline at the cue whose render thread plays only the
             // voice. The status stays paused, and the pipeline goes again when the hand lets go.
-            guard cue.index == index, let started = startForScrub(at: index, frame: cue.frame) else { return }
+            guard cue.index == index, let started = startForScrub(at: index, frame: cue.frame) else { return false }
             runEngine = started
             anchorFrame = cue.frame
             anchorRendered = 0
@@ -392,22 +403,28 @@ public final class Player {
         let filler = ScrubFiller(item: item.playbackItem, window: window, makeDecoder: makeDecoder)
         let tap = runEngine.pipeline.scrubTap
         // Before the paused pipeline's first render: its render thread starts with the voice.
-        tap.begin(window: window, anchorFrame: anchorFrame, anchorRendered: anchorRendered, startSpeed: playing ? 1 : 0)
+        tap.begin(
+            window: window, anchorFrame: anchorFrame, anchorRendered: anchorRendered, startSpeed: playing ? 1 : 0,
+            ringAllowed: playing)
         filler.start()
         scrubRun = ScrubRun(
             index: index, engine: runEngine, tap: tap, window: window, filler: filler, wasPlaying: playing,
             anchorFrame: anchorFrame)
         signal.scrubbing = true
+        return true
     }
 
-    /// The hand is `offsetSeconds` of music from where it landed (one turn of the record is 1.8 s, forward clockwise)
-    /// and turns the record at platter speed `speed` (1 is normal play, negative backwards).
+    /// The hand is `offsetSeconds` of music from where it took hold (one turn of the record is 1.8 s, forward
+    /// clockwise) and turns the record at platter speed `speed` (1 is normal play, negative backwards).
     public func scrub(offsetSeconds: Double, speed: Double) {
         guard let run = scrubRun, run.settling == nil else { return }
         let frames = offsetSeconds * Double(run.window.sourceRate)
         run.offsetFrames = frames
-        run.tap.setHand(offsetFrames: frames, speed: speed)
+        run.tap.setHand(offsetFrames: frames, speed: min(max(speed, -Self.fastestHand), Self.fastestHand))
     }
+
+    /// The fastest a hand turns the record, in platter speeds: faster readings are touch noise.
+    static let fastestHand = 8.0
 
     /// The hand let go. A playing record spins back up over `spinUpSeconds` (the deck's motor, from rest), and the
     /// pipeline takes over exactly where the needle is, with a short cross-fade. A paused record stays paused where
@@ -426,7 +443,15 @@ public final class Player {
     private func settle(_ run: ScrubRun, spinUpSeconds: Double) async {
         let tap = run.tap
         let rate = Double(run.window.sourceRate)
+        let generation = tap.generation.load(ordering: .acquiring)
+        let voiceStarted = tap.voiceStarted.load(ordering: .acquiring) == generation
         if run.wasPlaying {
+            // No voice ever started (its music was not decoded in time, or could not be): the ring played on all
+            // along, so there is nothing to hand back.
+            guard voiceStarted else {
+                finishScrub(run)
+                return
+            }
             tap.motorSecondsBits.store(max(spinUpSeconds, 0.01).bitPattern, ordering: .relaxed)
             tap.phase.store(ScrubTap.Phase.motor.rawValue, ordering: .releasing)
             // The motor first: the ring can only take over once the record turns at exactly normal speed.
@@ -442,23 +467,25 @@ public final class Player {
                 return
             }
             // Line the ring up a little ahead of the needle, so its audio is buffered by the time the needle gets
-            // there; the render thread switches over at that exact frame.
+            // there; the render thread switches over at that exact frame (or skips the ring forward if the seek was
+            // slower than the lead).
             var target = Int64(tap.voicePosition.rounded(.down)) + Int64(Self.handoverLead * rate)
             if run.window.totalFrames > 0 { target = min(target, run.window.totalFrames) }
             target = max(target, 0)
-            tap.handoverFrame.store(target, ordering: .releasing)
             let item = queue[run.index]
             cue = Cue(index: run.index, frame: target)
             position = item.duration(ofFrames: target)
+            nowPlaying.show(item, elapsed: position, playing: true)
             run.engine.seeksInFlight += 1
             await run.engine.enqueue { pipeline in
                 await pipeline.seek(toFrame: target, firstFrame: FirstFrameInterval(.seek))
             }.value
             run.engine.seeksInFlight -= 1
+            // Only now, with the seek's hold in place: before it, the ring still holds the audio from before the
+            // hand took hold, which must not be faded into.
+            tap.handoverFrame.store(target, ordering: .releasing)
             let handoverDeadline = ContinuousClock.now + .seconds(1.5)
-            while tap.handedOver.load(ordering: .acquiring) != tap.generation.load(ordering: .acquiring),
-                ContinuousClock.now < handoverDeadline
-            {
+            while tap.handedOver.load(ordering: .acquiring) != generation, ContinuousClock.now < handoverDeadline {
                 guard !Task.isCancelled else { return }
                 try? await Task.sleep(for: .milliseconds(5))
             }
@@ -470,9 +497,11 @@ public final class Player {
             var frame = run.anchorFrame + Int64(run.offsetFrames.rounded())
             if run.window.totalFrames > 0 { frame = min(frame, run.window.totalFrames) }
             frame = max(frame, 0)
-            finishScrub(run)
+            // The output stops first (retireEngine also ends the run), so nothing renders after the fade.
             if engine === run.engine { retireEngine() }
-            if queue.indices.contains(run.index) {
+            finishScrub(run)
+            // A transport command while the hand was down already moved the cue: it wins.
+            if queue.indices.contains(run.index), cue == Cue(index: run.index, frame: run.cueAtBegin) {
                 cue = Cue(index: run.index, frame: frame)
                 position = queue[run.index].duration(ofFrames: frame)
                 showCue(playing: false)
@@ -481,10 +510,18 @@ public final class Player {
         finishScrub(run)
     }
 
+    /// A transport command while a paused record is held: the command wins, and the scrub's pipeline goes.
+    private func endPausedScrub() {
+        guard let run = scrubRun, !run.wasPlaying else { return }
+        if engine === run.engine { retireEngine() }
+        abandonScrub()
+    }
+
     /// How far ahead of the needle the ring is lined up at the handover.
     static let handoverLead = 0.15
 
-    /// Ends the current scrub at once: a transport command, a route change or a new queue took over.
+    /// Ends the current scrub at once: a transport command, a route change or a new queue took over. Callers stop
+    /// the output first where it is theirs to stop (see `retireEngine`).
     private func abandonScrub() {
         guard let run = scrubRun else { return }
         run.settling?.cancel()
@@ -498,6 +535,18 @@ public final class Player {
         run.tap.retireWindow()
         run.filler.stop()
         signal.scrubbing = false
+    }
+
+    /// Where the needle is during a playing record's scrub, once its voice has started and until the ring has taken
+    /// over again: the rendered position stands still meanwhile.
+    private var scrubNeedle: Cue? {
+        guard let run = scrubRun, run.wasPlaying, run.engine === engine else { return nil }
+        let tap = run.tap
+        let generation = tap.generation.load(ordering: .acquiring)
+        guard tap.voiceStarted.load(ordering: .acquiring) == generation,
+            tap.handedOver.load(ordering: .acquiring) != generation
+        else { return nil }
+        return Cue(index: run.index, frame: max(0, Int64(tap.voicePosition.rounded(.down))))
     }
 
     /// A pipeline at `frame` of `queue[index]` for a paused record's scrub: like `launch`, but the status stays
@@ -540,6 +589,7 @@ public final class Player {
     /// is on its way to the pipeline, the pipeline still reports the old point and the cue already holds the target,
     /// so a pause, restart or interruption then keeps the seek.
     private func currentPoint() -> Cue {
+        if let needle = scrubNeedle { return needle }
         guard let engine, engine.hasStarted, engine.seeksInFlight == 0 else { return cue }
         let reported = engine.pipeline.position
         return queue.indices.contains(reported.index) ? Cue(index: reported.index, frame: reported.frame) : cue
@@ -830,7 +880,7 @@ struct SignalPath: Equatable {
 }
 
 /// A point in the queue: an item and a source frame in it.
-private struct Cue {
+private struct Cue: Equatable {
     var index: Int
     var frame: Int64
 }
@@ -846,6 +896,8 @@ private final class ScrubRun {
     let wasPlaying: Bool
     /// The source frame the hand's offsets count from.
     var anchorFrame: Int64
+    /// The cue when the hand took hold (a paused record's): a let-go leaves a cue moved meanwhile alone.
+    let cueAtBegin: Int64
     var offsetFrames = 0.0
     /// The let-go settling (spin-up and handover, or fade), while it runs.
     var settling: Task<Void, Never>?
@@ -862,5 +914,6 @@ private final class ScrubRun {
         self.filler = filler
         self.wasPlaying = wasPlaying
         self.anchorFrame = anchorFrame
+        cueAtBegin = anchorFrame
     }
 }
