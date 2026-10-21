@@ -42,6 +42,25 @@ import PFDSP
 /// and on any seek, never to the item playing mid-stream. The exception (ruling R4-T12a): switching Pure on or off,
 /// or ReplayGain on or off, is heard at once, through a re-cue of the item playing at where it is, whenever that
 /// changes its gain. The strip lists ReplayGain exactly while a non-zero gain applies to the item playing.
+///
+/// ## Crossfade (Plan 4 Task 16, ruling R4-4)
+/// Every pipeline gets `sound.crossfade`, or Off in Pure (`crossfade(for:)`), at its start and with every settings
+/// change (`PlaybackPipeline.setCrossfade`), at once: it decides only boundaries the decode thread has yet to reach.
+/// The pipeline overlaps a boundary between two items of one plan: Always every one, Between albums only those
+/// `append` marked, which the app uses for the next Up Next record. Off and Pure keep every boundary gapless.
+/// - The incoming item is the current one from the overlap's first frame (its `trackStarted`, `currentIndex`,
+///   `position`), and the outgoing one counts as entered until the overlap's end, so a switch of Pure or ReplayGain
+///   reaches both: it re-cues, which ends the overlap, and the incoming item plays on alone at the new gains. Pure
+///   re-cues an overlap begun even when no gain changes, since Pure plays no crossfade.
+/// - A seek, a pause or a restart during an overlap ends it: they take the incoming item's position once the overlap
+///   is heard, and nothing of the outgoing item plays again.
+/// - A finger on the record during an overlap cancels the fade: the hand plays the incoming item alone, and the
+///   let-go's seek ends the overlap. Let go before the voice took over, the ring plays on and the fade finishes.
+/// - The strip lists Crossfade exactly while an overlap is heard, as it lists ReplayGain exactly while a gain applies
+///   (the outgoing item's included, during an overlap), not merely while crossfade is on.
+/// - `crossfadeSuppressed` (repeat-one, ruling R4-T16a) keeps every boundary gapless whatever the settings.
+/// - `removeAppended` takes back appended items that have not started (ruling R4-T16b): the app keeps an appended
+///   record in Up Next until its first track starts, and takes it back when the queue no longer leads to it.
 @MainActor
 @Observable
 public final class Player {
@@ -114,6 +133,26 @@ public final class Player {
     @ObservationIgnored private var recueAfterScrub = false
     /// Re-cues issued for a switch of Pure or ReplayGain (`recueIfGainsDiffer`). For tests.
     @ObservationIgnored private(set) var recueCount = 0
+    /// The queue indices where an appended batch begins (`append`): the boundaries Between albums overlaps. Handed to
+    /// every pipeline started on this queue.
+    @ObservationIgnored private var appendedAt: Set<Int> = []
+    /// How many queue items the current engine's pipeline holds: those it was started with, and the appends it took.
+    /// Fewer than the queue once it refused an append; the rest then plays afresh when its queue ends.
+    @ObservationIgnored private var pipelineItems = 0
+    /// Bumped by `removeAppended`, so an append still on its way to the pipeline when its items were taken back is
+    /// dropped there.
+    @ObservationIgnored private var appendEpoch = 0
+
+    /// While true, every boundary is gapless whatever the crossfade settings say: for repeat-one, where a boundary
+    /// loops the same track and an overlap would cut the last fade's worth of it on every loop (ruling R4-T16a). It
+    /// reaches the pipeline at once, and an overlap already begun is re-cued away, as a switch to Pure does.
+    @ObservationIgnored public var crossfadeSuppressed = false {
+        didSet {
+            guard crossfadeSuppressed != oldValue, let engine else { return }
+            engine.pipeline.setCrossfade(effectiveCrossfade)
+            if crossfadeSuppressed { recueIfGainsDiffer(engine, thenApplySound: false) }
+        }
+    }
 
     /// - Parameters:
     ///   - makeOutput: builds the output every pipeline the player starts renders through, one at a time. Called on
@@ -161,6 +200,7 @@ public final class Player {
         resumeAfterInterruption = false
         retireEngine()
         queue = items
+        appendedAt = []
         anyItemStarted = false
         lastFailure = nil
         guard !items.isEmpty else {
@@ -172,6 +212,49 @@ public final class Player {
             return
         }
         await launch(at: min(max(index, 0), items.count - 1), frame: 0, for: .play).value
+    }
+
+    /// Adds `items` to the end of the queue, and marks the boundary into the first of them, which Between albums
+    /// overlaps (ruling R4-4: the app appends the next Up Next record while the last track of this one plays). The
+    /// pipeline playing takes them behind the queue it has, so they join it as if `play` had had them, gapless or
+    /// overlapped; one that has already found its queue's end refuses them, and they play afresh once it has played
+    /// out. While nothing plays they wait in the queue for the next start. The returned task finishes once the
+    /// pipeline has answered.
+    @discardableResult
+    public func append(_ items: [QueueItem]) -> Task<Void, Never> {
+        guard !items.isEmpty else { return Task {} }
+        let first = queue.count
+        appendedAt.insert(first)
+        queue += items
+        guard let engine, !engine.isRetired else { return Task {} }
+        let appended = items.map(playbackItem(for:))
+        let epoch = appendEpoch
+        return engine.enqueue { [weak self, weak engine] pipeline in
+            // Not if a start on its way already took them from the queue, or they were taken back meanwhile.
+            guard let self, let engine, self.engine === engine, !engine.isRetired, self.appendEpoch == epoch,
+                self.pipelineItems == first
+            else { return }
+            if pipeline.append(appended) { self.pipelineItems += appended.count }
+        }
+    }
+
+    /// Takes back the queue's items from `index` on, which `append` added and none of which has started: the queue
+    /// ends before them again, and the mark at their boundary goes with them. The pipeline playing drops them too,
+    /// flushing them from its ring by a re-cue at the playhead if it had already joined them there (the usual dip).
+    ///
+    /// Returns false, and changes nothing, once one of them plays: it is the current item, or the pipeline is
+    /// rendering it (its `trackStarted` is on its way). True when there was nothing to take back.
+    @discardableResult
+    public func removeAppended(from index: Int) -> Bool {
+        let index = max(index, 0)
+        guard index < queue.count else { return true }
+        if let current = currentIndex, current >= index { return false }
+        if let engine, !engine.isRetired, !engine.pipeline.removeItems(from: index) { return false }
+        queue.removeSubrange(index...)
+        appendedAt = appendedAt.filter { $0 < index }
+        appendEpoch += 1
+        pipelineItems = min(pipelineItems, index)
+        return true
     }
 
     /// Stops playback where it is (ruling R15). No effect unless playing or preparing.
@@ -270,6 +353,9 @@ public final class Player {
             settings.pure != sound.pure || (settings.replayGain.mode == .off) != (sound.replayGain.mode == .off)
         sound = settings
         if let engine {
+            // At once, whatever waits behind a re-cue's hold: it decides only boundaries the decode thread has yet to
+            // reach, so a switch to Pure stops the next overlap before the re-cue check below looks for one begun.
+            engine.pipeline.setCrossfade(effectiveCrossfade)
             if gainsChanged { engine.pipeline.setGains(queueGains) }
             // A change of chain waiting behind a re-cue's hold takes this one along (it applies the latest settings),
             // so the chain never changes ahead of the hold.
@@ -278,7 +364,7 @@ public final class Player {
                 // The let-go seeks the pipeline, at the new gains; `finishScrub` checks again in case it does not.
                 recueAfterScrub = true
                 if !behindHold { engine.pipeline.setSound(settings) }
-            } else if switched, gainsDiffer(engine) {
+            } else if switched, needsRecue(engine) {
                 // A gain changes: the chain changes behind the re-cue's hold, so gained audio never plays through
                 // the wrong chain (a limiter faded out under it, say).
                 recueIfGainsDiffer(engine, thenApplySound: true)
@@ -292,12 +378,18 @@ public final class Player {
     }
 
     /// Whether any item the pipeline has entered and not yet played out plays at another gain than the current
-    /// settings give it (`PlaybackPipeline.enteredGains`).
+    /// settings give it (`PlaybackPipeline.enteredGains`), the outgoing item of an overlap included.
     private func gainsDiffer(_ engine: PlayerEngine) -> Bool {
         engine.pipeline.enteredGains.contains { entered in
             queue.indices.contains(entered.index)
                 && Self.replayGainDb(for: queue[entered.index], sound: sound) != entered.gainDb
         }
+    }
+
+    /// Whether a switch must re-cue playback to be heard at once: some entered item's gain differs (`gainsDiffer`),
+    /// or Pure (or `crossfadeSuppressed`) is on while an overlap the pipeline began is still to be heard.
+    private func needsRecue(_ engine: PlayerEngine) -> Bool {
+        gainsDiffer(engine) || ((sound.pure || crossfadeSuppressed) && engine.pipeline.crossfadePending)
     }
 
     /// Behind every call already queued on the engine (a start, a seek on its way), re-cues playback where it is when
@@ -314,7 +406,7 @@ public final class Player {
             guard let self, let engine, self.engine === engine, !engine.isRetired else { return }
             if self.scrubRun != nil {
                 self.recueAfterScrub = true
-            } else if self.status == .playing || self.status == .preparing, self.gainsDiffer(engine) {
+            } else if self.status == .playing || self.status == .preparing, self.needsRecue(engine) {
                 let point = self.currentPoint()
                 self.cue = point
                 self.recueCount += 1
@@ -421,11 +513,37 @@ public final class Player {
 
     /// The queue as a pipeline starts it: each item with its gain under the current settings.
     private var playbackItems: [PlaybackItem] {
-        queue.map { item in
-            var playback = item.playbackItem
-            playback.gainDb = Self.replayGainDb(for: item, sound: sound)
-            return playback
-        }
+        queue.map(playbackItem(for:))
+    }
+
+    /// `item` as a pipeline plays it, with its gain under the current settings.
+    private func playbackItem(for item: QueueItem) -> PlaybackItem {
+        var playback = item.playbackItem
+        playback.gainDb = Self.replayGainDb(for: item, sound: sound)
+        return playback
+    }
+
+    /// The crossfade a pipeline plays under `sound`: Off in Pure, which plays none (ruling R4-4), else the settings'.
+    nonisolated static func crossfade(for sound: SoundSettings) -> CrossfadeSettings {
+        sound.pure ? CrossfadeSettings(mode: .off, seconds: sound.crossfade.seconds) : sound.crossfade
+    }
+
+    /// The crossfade every pipeline plays now: `crossfade(for: sound)`, or Off while `crossfadeSuppressed`.
+    private var effectiveCrossfade: CrossfadeSettings {
+        let crossfade = Self.crossfade(for: sound)
+        return crossfadeSuppressed ? CrossfadeSettings(mode: .off, seconds: crossfade.seconds) : crossfade
+    }
+
+    /// Starts `pipeline` at `frame` of `queue[index]` on the queue as it stands when the start reaches it (an append
+    /// or a removal since the launch is in it), with each item's gain, the appended boundaries and the crossfade.
+    private func start(
+        _ pipeline: PlaybackPipeline, at index: Int, frame: Int64, interval: FirstFrameInterval
+    ) async {
+        let items = playbackItems
+        pipelineItems = items.count
+        await pipeline.start(
+            items, at: index, fromFrame: frame, crossfade: effectiveCrossfade, appendedAt: appendedAt,
+            firstFrame: interval)
     }
 
     /// The gain `queue[index]` plays at now: what the pipeline applied to it while it renders, else what it gets
@@ -443,11 +561,18 @@ public final class Player {
     /// gain it started with, after a switch to Pure or to off, still is, and the strip says Processing until it ends
     /// or a seek takes the new settings. Called whenever the settings, the item or the engine change, and with each
     /// position update, which catches a seek or a gapless join taking effect.
+    ///
+    /// Crossfade is listed the same way: exactly while an overlap is heard (`PlaybackPipeline.crossfading`), last, as
+    /// `SoundSettings.activeBlockNames` orders it. During one, ReplayGain is listed while either item's gain applies.
     private func refreshProcessing() {
-        var names = sound.activeBlockNames.filter { $0 != "ReplayGain" }
-        if let index = currentIndex, queue.indices.contains(index), gainDb(at: index) != 0 {
+        var names = sound.activeBlockNames.filter { $0 != "ReplayGain" && $0 != "Crossfade" }
+        let fading = engine.flatMap { $0.hasStarted ? $0.pipeline.crossfading : nil }
+        if let index = currentIndex, queue.indices.contains(index),
+            gainDb(at: index) != 0 || (fading.map { $0.gainDb != 0 } ?? false)
+        {
             names.insert("ReplayGain", at: 0)
         }
+        if fading != nil { names.append("Crossfade") }
         if signal.activeProcessing != names { signal.activeProcessing = names }
     }
 
@@ -510,7 +635,6 @@ public final class Player {
             return Task {}
         }
         self.engine = engine
-        let items = playbackItems
         let needsActivation = !sessionActive
         // The item's rate as imported: the negotiation that follows asks for the decoder's, normally the same.
         let preferredRate = queue[index].format.sampleRate
@@ -524,8 +648,9 @@ public final class Player {
                     return
                 }
             }
-            guard !engine.isRetired else { return }
-            await pipeline.start(items, at: index, fromFrame: frame, firstFrame: interval)
+            guard !engine.isRetired, let self else { return }
+            // The queue and settings as they stand now: a change since the launch reached no pipeline.
+            await self.start(pipeline, at: index, frame: frame, interval: interval)
             engine.hasStarted = true
         }
     }
@@ -811,7 +936,6 @@ public final class Player {
             return nil
         }
         self.engine = engine
-        let items = playbackItems
         let needsActivation = !sessionActive
         let preferredRate = queue[index].format.sampleRate
         _ = engine.enqueue { [weak self] pipeline in
@@ -823,8 +947,8 @@ public final class Player {
                     return
                 }
             }
-            guard !engine.isRetired else { return }
-            await pipeline.start(items, at: index, fromFrame: frame, firstFrame: interval)
+            guard !engine.isRetired, let self else { return }
+            await self.start(pipeline, at: index, frame: frame, interval: interval)
             engine.hasStarted = true
         }
         return engine
@@ -928,14 +1052,17 @@ public final class Player {
             showCue(playing: true)
             startTicker()
         case .trackEnded:
-            // The next `trackStarted` or `queueEnded` follows.
-            break
+            // The next `trackStarted` or `queueEnded` follows; after an overlap, the strip drops Crossfade now.
+            refreshProcessing()
         case .itemFailed(let index, let message):
             Telemetry.logger.error("Item \(index, privacy: .public) failed: \(message, privacy: .public)")
             // The pipeline moves on to the next item by itself.
             lastFailure = message
         case .queueEnded:
-            if anyItemStarted {
+            if anyItemStarted, pipelineItems < queue.count {
+                // The pipeline refused an append, having reached its queue's end first: the rest plays afresh.
+                launch(at: pipelineItems, frame: 0, for: .play)
+            } else if anyItemStarted {
                 endQueue()
             } else {
                 fail(lastFailure ?? "Nothing in the queue could be played")

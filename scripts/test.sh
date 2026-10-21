@@ -38,7 +38,7 @@ swift format lint --strict --recursive App AppUITests Packages
 echo "== 3/7 swift test (host) =="
 swift test --package-path Packages/PointFlacKit
 
-echo "== 4/7 thread sanitizer: pipeline, player, ring, scrub, sound chain, sound in the pipeline, ReplayGain (host) =="
+echo "== 4/7 thread sanitizer: pipeline, player, ring, scrub, sound chain, sound in the pipeline, ReplayGain, crossfade (host) =="
 # TSan cannot see the ring's memmove copies (ruling R9), so stage 5 stresses their ordering in a release build.
 swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'PlaybackPipelineTests|PlayerTests|SampleRingTests'
 # The scrub suites on their own: their decoder threads would otherwise share the CPU with the pipeline's latency checks.
@@ -51,6 +51,9 @@ swift test --sanitize=thread --package-path Packages/PointFlacKit --filter Sound
 # ReplayGain on its own: gains set from the main actor and read by the decode thread as it enters each item, seek and
 # re-cue, and the gain it applied read back from the main actor.
 swift test --sanitize=thread --package-path Packages/PointFlacKit --filter ReplayGainTests
+# Crossfade on its own: the decode thread mixing two items while a render thread pulls, with appends, crossfade
+# changes, seeks, pauses, a scrub and Pure re-cues from the main actor.
+swift test --sanitize=thread --package-path Packages/PointFlacKit --filter CrossfadeTests
 
 echo "== 5/7 SampleRing ordering stress (release build) =="
 swift test -c release -Xswiftc -enable-testing --package-path Packages/PointFlacKit --filter SampleRingOrderingTests
