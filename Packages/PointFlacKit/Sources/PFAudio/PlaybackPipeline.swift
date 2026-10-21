@@ -11,12 +11,18 @@ public struct PlaybackItem: Sendable, Hashable, Identifiable {
     /// reports it.
     public var format: AudioFormat
     public var totalFrames: Int64
+    /// The item's ReplayGain in dB, applied on the decode thread in the Float32 conversion, ahead of the Sound chain.
+    /// 0 (the default) is no gain and no multiply: the samples pass exactly as before. A non-zero gain also takes a
+    /// 32-bit source off an Int32 client (`OutputFormatPolicy.plan(source:hardwareRate:capabilities:gainDb:)`).
+    /// `PlaybackPipeline.setGains(_:)` overrides it, by ID.
+    public var gainDb: Double
 
-    public init(id: String, url: URL, format: AudioFormat, totalFrames: Int64) {
+    public init(id: String, url: URL, format: AudioFormat, totalFrames: Int64, gainDb: Double = 0) {
         self.id = id
         self.url = url
         self.format = format
         self.totalFrames = totalFrames
+        self.gainDb = gainDb
     }
 }
 
@@ -52,6 +58,10 @@ public enum PipelineEvent: Sendable, Equatable {
 /// - The Sound chain (`setSound`) runs on the render thread over everything the output is handed, after the ring or
 ///   the scrub voice. It is compiled for the plan's client rate and channel count, afresh at every configure, before
 ///   the output starts. Pure (the default) leaves the output bit-identical.
+/// - ReplayGain is a static gain per item (`PlaybackItem.gainDb`, or `setGains`), applied on the decode thread in the
+///   Float32 conversion, so the chain, limiter included, sees the gained signal. The decode thread takes an item's
+///   gain when it enters the item (its start, a gapless join, a seek), so a change never alters the item playing
+///   mid-stream. A gain of 0 is no multiply at all.
 ///
 /// Dropping the pipeline stops playback.
 public final class PlaybackPipeline: @unchecked Sendable {
@@ -140,6 +150,23 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.soundSettings
     }
 
+    /// Sets the ReplayGain of items by ID, in dB, in place of their own `PlaybackItem.gainDb`, replacing what was set
+    /// before; an item whose ID is not here plays at its own gain. They hold for this pipeline's life, across `start`s.
+    ///
+    /// Each takes effect where the decode thread next enters an item: the next item it opens, or a seek. What is
+    /// already decoded keeps the gain it was decoded with, so the item playing never changes level mid-stream, and
+    /// neither does an item already joined behind it in the ring (up to half a second ahead). Any thread.
+    public func setGains(_ gainsDb: [String: Double]) {
+        core.shared.withLock { $0.gainsDb = gainsDb }
+    }
+
+    /// The ReplayGain applied to the audio rendering now, with the item it belongs to; nil until the first item is
+    /// entered. Like `position`, it follows rendered frames: across a gapless join it changes once the join renders,
+    /// and after a seek once the decode thread has taken it.
+    public var renderingGain: (index: Int, gainDb: Double)? {
+        core.shared.withLock { s in s.timeline.gain(rendered: s.source?.renderedFrames ?? 0) }
+    }
+
     /// The chain runner's meters (see `SoundMeters`). Reading starts a new peak interval, so keep to one reader.
     public var soundMeters: SoundMeters {
         core.soundRunner.meters
@@ -190,6 +217,8 @@ final class PipelineCore: @unchecked Sendable {
         var seekInterval: FirstFrameInterval?
         /// The Sound settings, clamped: compiled whenever they change, and at every configure for the new format.
         var soundSettings = SoundSettings()
+        /// ReplayGain by item ID, from `setGains`: read by the decode thread as it enters an item.
+        var gainsDb: [String: Double] = [:]
     }
 
     /// The client rate and channel count the Sound chain is compiled for.
@@ -358,6 +387,8 @@ struct Timeline {
         /// Rendered frames scale back to source frames by `from / to` when the segment is resampled.
         var rate: RateChange?
         var totalFrames: Int64
+        /// The ReplayGain the segment was decoded at, in dB.
+        var gainDb: Double
     }
 
     var startIndex = 0
@@ -388,6 +419,12 @@ struct Timeline {
         return (segment.index, frame)
     }
 
+    /// The ReplayGain of the segment being rendered, with its item; nil before the first segment.
+    func gain(rendered: Int64) -> (index: Int, gainDb: Double)? {
+        guard let segment = segments.last(where: { $0.renderedStart <= rendered }) ?? segments.first else { return nil }
+        return (segment.index, segment.gainDb)
+    }
+
     /// Pulls segment starts predicted past the true end of the stream back to it (see `clampBoundariesToWritten`).
     mutating func clampStarts(to end: Int64) {
         for i in segments.indices where segments[i].renderedStart > end {
@@ -408,5 +445,22 @@ struct Timeline {
     mutating func truncate(after rendered: Int64) -> Int? {
         segments.removeAll { $0.renderedStart > rendered }
         return segments.last?.index
+    }
+}
+
+extension OutputFormatPolicy {
+    /// `plan(source:hardwareRate:capabilities:)` for an item played at a ReplayGain of `gainDb`. The gain is a multiply
+    /// in the Float32 conversion, so a non-zero one takes a 32-bit source off an Int32 client onto Float32, TPDF-dithered
+    /// to 24 bits first as it is without passthrough, and the strip then shows the reduction. No other plan changes: a
+    /// source of 24 bits or fewer is on Float32 already. A gain of 0 leaves every plan as it is.
+    static func plan(
+        source: AudioFormat, hardwareRate: Int, capabilities: OutputCapabilities, gainDb: Double
+    ) -> OutputPlan {
+        var plan = plan(source: source, hardwareRate: hardwareRate, capabilities: capabilities)
+        if gainDb != 0, plan.client == .int32 {
+            plan.client = .float32
+            plan.reduceTo24 = source.bitsPerSample > 24
+        }
+        return plan
     }
 }

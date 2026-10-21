@@ -59,6 +59,8 @@ final class DecodeSession: @unchecked Sendable {
     /// Events for the next boundary (the end or failure of what came before), placed once the boundary is known.
     private var boundaryEvents: [PipelineEvent] = []
     private var dither: TPDFDither
+    /// The current item's ReplayGain, linear: exactly 1 for a gain of 0 dB, which then multiplies nothing.
+    private var gain = 1.0
     private var converter: SampleRateConverter?
     /// `written` when `converter` was created, and the source frames fed to it since.
     private var converterBase: Int64 = 0
@@ -133,8 +135,9 @@ final class DecodeSession: @unchecked Sendable {
             return .finishQueue
         }
         let nextFormat = next.format
+        let nextGainDb = gainDb(of: target)
         var boundary = written
-        if isCompatible(nextFormat) {
+        if isCompatible(nextFormat, gainDb: nextGainDb) {
             if entry == .next, converter != nil { boundary = converterBoundary }
             placeBoundaryEvents(at: boundary)
         } else {
@@ -144,7 +147,7 @@ final class DecodeSession: @unchecked Sendable {
             // The output stops once this is rendered: the silence until then is the gap, not an underrun.
             source?.markEndOfStream()
             if let step = drain() { return step }
-            switch reconfigure(for: nextFormat) {
+            switch reconfigure(for: nextFormat, gainDb: nextGainDb) {
             case .configured: break
             case .interrupted(let step): return step
             case .failed(let message):
@@ -170,11 +173,12 @@ final class DecodeSession: @unchecked Sendable {
         decoder = next
         index = target
         format = nextFormat
+        gain = nextGainDb == 0 ? 1 : pow(10, nextGainDb / 20)
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
         let segment = Timeline.Segment(
             index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
-            totalFrames: next.totalFrames)
+            totalFrames: next.totalFrames, gainDb: nextGainDb)
         let rendered = source.renderedFrames
         _ = core.withShared(for: self) { s in
             s.timeline.append(segment, rendered: rendered)
@@ -222,14 +226,25 @@ final class DecodeSession: @unchecked Sendable {
         return nil
     }
 
-    /// Whether an item of format `next` can continue into the running output: the same plan at the current hardware
-    /// rate, and the same channel count.
-    private func isCompatible(_ next: AudioFormat) -> Bool {
+    /// The ReplayGain item `index` plays at, in dB: what `setGains` last gave its ID, else its own. A value that is not
+    /// finite is no gain.
+    private func gainDb(of index: Int) -> Double {
+        let item = items[index]
+        let set = core.withShared(for: self) { $0.gainsDb[item.id] } ?? nil
+        let gainDb = set ?? item.gainDb
+        return gainDb.isFinite ? gainDb : 0
+    }
+
+    /// Whether an item of format `next`, at a ReplayGain of `gainDb`, can continue into the running output: the same
+    /// plan at the current hardware rate, and the same channel count. Its gain itself needs no plan of its own, only
+    /// the Float32 client a gain asks for.
+    private func isCompatible(_ next: AudioFormat, gainDb: Double) -> Bool {
         guard outputRunning, let plan, let hardwareRate, let format, format.channels == next.channels else {
             return false
         }
         let capabilities = core.capabilities
-        return OutputFormatPolicy.plan(source: next, hardwareRate: hardwareRate, capabilities: capabilities) == plan
+        return OutputFormatPolicy.plan(
+            source: next, hardwareRate: hardwareRate, capabilities: capabilities, gainDb: gainDb) == plan
     }
 
     /// Where the current resampled stream crosses into the next item: the converter's output frame for the input fed
@@ -304,7 +319,7 @@ final class DecodeSession: @unchecked Sendable {
     ///
     /// A rate ≤ 0 from `negotiateRate` means the session has no usable output rate. That fails the item: assuming the
     /// source rate instead would break "client rate == hardware rate" and let iOS resample silently.
-    private func reconfigure(for next: AudioFormat) -> Reconfiguration {
+    private func reconfigure(for next: AudioFormat, gainDb: Double) -> Reconfiguration {
         // Everything before this boundary is rendered; its events (an earlier item's failure) precede `.planChanged`.
         emitDueMarkers()
         guard core.withOutput(for: self, { $0.stop() }) != nil else { return .interrupted(.stop) }
@@ -314,7 +329,8 @@ final class DecodeSession: @unchecked Sendable {
         guard let rate = negotiate(next.sampleRate) else { return .interrupted(.stop) }
         guard rate > 0 else { return .failed("Output rate unavailable") }
         hardwareRate = rate
-        let newPlan = OutputFormatPolicy.plan(source: next, hardwareRate: rate, capabilities: core.capabilities)
+        let newPlan = OutputFormatPolicy.plan(
+            source: next, hardwareRate: rate, capabilities: core.capabilities, gainDb: gainDb)
         let channels = next.channels
         let rendered = written
         do {
@@ -384,7 +400,8 @@ final class DecodeSession: @unchecked Sendable {
                 return .advance
             }
             let count = frames * channels
-            Self.convert(samples, count: count, bits: format.bitsPerSample, plan: plan, dither: &dither, into: words)
+            Self.convert(
+                samples, count: count, bits: format.bitsPerSample, plan: plan, gain: gain, dither: &dither, into: words)
             let interrupted: Step?
             if let converter {
                 resampled.removeAll(keepingCapacity: true)
@@ -407,13 +424,19 @@ final class DecodeSession: @unchecked Sendable {
     ///   Exact for b ≤ 24.
     /// - Float32 reduced to 24 bits: shifted to full 32-bit range, TPDF-dithered in place to multiples of 256, then
     ///   divided by 2^31. Also exact, as 24 significant bits fit a Float32.
+    ///
+    /// `gain` (linear) is the item's ReplayGain, folded into the Float32 scale: one multiply per sample, as without
+    /// it, rounded once. At exactly 1 (0 dB) the scale is untouched, so the bits are too. On the reduced path it
+    /// applies after the dither, which keeps to the 24-bit grid of the source. It never reaches an Int32 client: a
+    /// gain puts a 32-bit source on Float32 (`OutputFormatPolicy.plan(source:hardwareRate:capabilities:gainDb:)`).
     private static func convert(
-        _ samples: UnsafeMutableBufferPointer<Int32>, count: Int, bits: Int, plan: OutputPlan,
+        _ samples: UnsafeMutableBufferPointer<Int32>, count: Int, bits: Int, plan: OutputPlan, gain: Double,
         dither: inout TPDFDither, into words: UnsafeMutableBufferPointer<UInt32>
     ) {
         let shift = 32 - bits
         switch plan.client {
         case .int32:
+            assert(gain == 1, "a ReplayGain never plays through an Int32 client")
             for i in 0..<count {
                 words[i] = UInt32(bitPattern: samples[i] << shift)
             }
@@ -422,12 +445,13 @@ final class DecodeSession: @unchecked Sendable {
                 samples[i] <<= shift
             }
             dither.reduce32To24(UnsafeMutableBufferPointer(rebasing: samples[0..<count]))
-            let scale: Float = 0x1p-31
+            let scale: Float = gain == 1 ? 0x1p-31 : Float(0x1p-31 * gain)
             for i in 0..<count {
                 words[i] = (Float(samples[i]) * scale).bitPattern
             }
         case .float32:
-            let scale = Float(sign: .plus, exponent: 1 - bits, significand: 1)
+            let exact = Float(sign: .plus, exponent: 1 - bits, significand: 1)
+            let scale = gain == 1 ? exact : Float(Double(exact) * gain)
             for i in 0..<count {
                 words[i] = (Float(samples[i]) * scale).bitPattern
             }

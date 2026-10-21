@@ -121,7 +121,11 @@ final class ScrubFiller: @unchecked Sendable {
             return
         }
         let channels = window.channels
-        let scale = Float(1) / Float(Double(1 << (decoder.format.bitsPerSample - 1)))
+        let unity = Float(1) / Float(Double(1 << (decoder.format.bitsPerSample - 1)))
+        // The item's ReplayGain, as the ring plays it (`PlaybackItem.gainDb`), so the voice and the ring meet at one
+        // level. At 0 dB the scale is untouched.
+        let gainDb = item.gainDb.isFinite ? item.gainDb : 0
+        let scale = gainDb == 0 ? unity : Float(Double(unity) * pow(10, gainDb / 20))
         var ints = [Int32](repeating: 0, count: Self.chunk * channels)
         var total = window.totalFrames > 0 ? window.totalFrames : decoder.totalFrames
         let reach = Int64(Self.reachSeconds * Double(window.sourceRate))
