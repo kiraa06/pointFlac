@@ -155,6 +155,9 @@ struct EQGraphView: View {
             if phase != .active { session.reset() }
         }
         .onDisappear { session.reset() }
+        // A drag or pinch whose band went away (deleted, or the mode switched) must not block the other handles.
+        .onChange(of: bandIDs) { session.reset() }
+        .onChange(of: eq.mode) { session.reset() }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("eqGraph")
     }
