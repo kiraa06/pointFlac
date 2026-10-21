@@ -696,6 +696,7 @@ struct Loupe: View {
     let detail: String?
     let seed: Int
     let phase: Double
+    @Environment(\.isMonochrome) private var mono
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -714,7 +715,10 @@ struct Loupe: View {
                     let fade = 1 - abs(Double(i) - Double(bars) / 2) / Double(bars) * 1.4
                     let bar = CGRect(
                         x: CGFloat(i) * w, y: size.height * (1 - h) / 2, width: w * 0.55, height: size.height * h)
-                    context.fill(Path(bar), with: .color(Color(red: 0.49, green: 1, blue: 0.7).opacity(max(0.2, fade))))
+                    context.fill(
+                        Path(bar),
+                        with: .color(
+                            (mono ? Color(white: 0.9) : Color(red: 0.49, green: 1, blue: 0.7)).opacity(max(0.2, fade))))
                 }
                 context.fill(
                     Path(CGRect(x: size.width / 2 - 0.75, y: -2, width: 1.5, height: size.height + 4)),

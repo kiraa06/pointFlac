@@ -15,16 +15,32 @@ struct SignalDetailsSheet: View {
                 } footer: {
                     Text(summary)
                 }
-                Section("Path") {
-                    row("Source", source, "The file as decoded: depth, rate and channels.")
-                    row("Processing", processing, "pointFlac's own processing. Pure means none.")
-                    row("Handed to iOS", handed, "What pointFlac gives the system's audio unit.")
-                    row("Hardware rate", hardware, "The rate the output runs at, as iOS reports it.")
-                    row(
-                        "Rate change", rateChange, "pointFlac changes the rate only when the output refuses the file's."
-                    )
-                    row("Depth", depth, "A depth the output can't take is reduced with TPDF dither, never truncated.")
-                    row("Output", output, "Bluetooth and AirPlay re-encode, so nothing on them is lossless.")
+                if !signal.activeProcessing.isEmpty {
+                    Section("Processing, in order") {
+                        ForEach(Array(signal.activeProcessing.enumerated()), id: \.offset) { index, name in
+                            Text("\(index + 1). \(name)").font(.body.monospacedDigit())
+                        }
+                    }
+                }
+                Section {
+                    Text(
+                        "Hi-Res means the file's 24 bits or more leave pointFlac intact at a hardware rate above "
+                            + "48 kHz, on a route iOS doesn't tune (USB or wired). Lossless is the same hand-off at "
+                            + "48 kHz or below. The built-in speaker is tuned by iOS, and Bluetooth and AirPlay "
+                            + "re-encode, so none of them gets either claim.")
+                }
+                if !outputFacts.isEmpty {
+                    Section("Output") {
+                        ForEach(outputFacts, id: \.label) { fact in
+                            if fact.value.isEmpty {
+                                Text(fact.label).font(.callout)
+                            } else {
+                                LabeledContent(fact.label, value: fact.value)
+                                    .font(.callout)
+                                    .accessibilityElement(children: .combine)
+                            }
+                        }
+                    }
                 }
                 if let volume = signal.systemVolume {
                     Section {
@@ -56,7 +72,7 @@ struct SignalDetailsSheet: View {
         case .idle: "Nothing is playing."
         case .pending: "Starting: the output is being set up for this track, so nothing about the path is known yet."
         case .pure: "Untouched by pointFlac: no processing, and the output runs at the file's rate."
-        case .resampled: "The rate changes on the way out. \(rateChange)."
+        case .resampled: "The rate changes on the way out. \(rateChange ?? "")."
         case .depthReduced(let from, let to):
             "pointFlac reduces \(from)-bit to \(to)-bit with TPDF dither, because the output can't take \(from)-bit."
         case .processing(let count): "pointFlac's processing is on: \(count) block\(count == 1 ? "" : "s")."
@@ -68,9 +84,43 @@ struct SignalDetailsSheet: View {
         }
     }
 
-    private var source: String {
-        guard let s = signal.source else { return "—" }
-        return "\(s.formattedDepth) · \(s.formattedRate) · \(s.channels) ch"
+    /// Only what pointFlac can state as fact: what the file is, what pointFlac does, what it sends iOS, what iOS
+    /// reports, and what it can't see. Nothing here claims the converter's bit depth, which iOS does not report.
+    /// A fact with an empty value is a sentence on its own.
+    private var outputFacts: [(label: String, value: String)] {
+        guard let source = signal.source, let plan = signal.plan else { return [] }
+        var facts: [(label: String, value: String)] = [
+            ("File", "FLAC \(source.formattedDepth) \(source.formattedRate) · \(source.channels) ch"),
+            ("pointFlac's processing", processing),
+        ]
+        var changes: [String] = []
+        let change = rateChange
+        if change == nil, let resample = plan.resample, resample.from != resample.to {
+            changes.append("resampled from \(AudioFormat.formatRate(resample.from))")
+        }
+        if plan.reduceTo24 { changes.append("dithered from \(source.bitsPerSample)-bit to 24-bit") }
+        let format = plan.client == .float32 ? "32-bit float" : "32-bit integer"
+        let note = changes.isEmpty ? "unchanged" : changes.joined(separator: "; ")
+        facts.append(("pointFlac sends iOS", "\(format) at \(AudioFormat.formatRate(plan.clientSampleRate)) (\(note))"))
+        if let change { facts.append(("Rate change", change)) }
+        if let rate = signal.hardwareRate {
+            facts.append(("Hardware rate", "\(AudioFormat.formatRate(rate)) (reported by iOS)"))
+        }
+        facts.append(("Converter bit depth", "not reported by iOS"))
+        switch signal.port {
+        case .builtIn:
+            facts.append(("After pointFlac", "iOS speaker tuning, which apps can't inspect or turn off"))
+        case .usb, .wired:
+            facts.append(
+                ("After pointFlac", "iOS converts to the DAC's format. Below full volume it scales the samples."))
+        default: break
+        }
+        facts.append(
+            (
+                "iOS audio settings such as Headphone Accommodations can also change the sound; pointFlac can't see them.",
+                ""
+            ))
+        return facts
     }
 
     /// "Pure" only when the strip says Pure; otherwise what pointFlac itself does.
@@ -79,40 +129,12 @@ struct SignalDetailsSheet: View {
         return signal.indicator == .pure ? "None (Pure)" : "None by pointFlac"
     }
 
-    private var handed: String {
-        guard let plan = signal.plan else { return "—" }
-        let client = plan.client == .float32 ? "32-bit float" : "32-bit integer"
-        let rate = AudioFormat(sampleRate: plan.clientSampleRate, bitsPerSample: 0, channels: 0).formattedRate
-        return "\(client) · \(rate)"
-    }
-
-    private var hardware: String {
-        signal.hardwareRate.map { AudioFormat(sampleRate: $0, bitsPerSample: 0, channels: 0).formattedRate } ?? "—"
-    }
-
     /// The rate change the strip shows, and who makes it: pointFlac before the output, or iOS after it.
-    private var rateChange: String {
-        guard case .resampled(let change) = signal.indicator else { return "None" }
-        let from = AudioFormat(sampleRate: change.from, bitsPerSample: 0, channels: 0).formattedRate
-        let to = AudioFormat(sampleRate: change.to, bitsPerSample: 0, channels: 0).formattedRate
+    private var rateChange: String? {
+        guard case .resampled(let change) = signal.indicator else { return nil }
+        let from = AudioFormat.formatRate(change.from)
+        let to = AudioFormat.formatRate(change.to)
         let byPointFlac = signal.plan?.resample.map { $0 == change } ?? false
         return "\(from) → \(to), by \(byPointFlac ? "pointFlac" : "iOS, after pointFlac's output")"
-    }
-
-    private var depth: String {
-        guard let plan = signal.plan else { return "—" }
-        return plan.reduceTo24 ? "Reduced to 24-bit, dithered" : "Unchanged"
-    }
-
-    private var output: String {
-        switch signal.port {
-        case .usb(let name): "USB · \(name)"
-        case .wired(let name): "Wired · \(name)"
-        case .bluetooth(let name): "Bluetooth · \(name)"
-        case .builtIn: "Built-in speaker"
-        case .airPlay(let name): "AirPlay · \(name)"
-        case .other(let name): "Other · \(name)"
-        case nil: "—"
-        }
     }
 }

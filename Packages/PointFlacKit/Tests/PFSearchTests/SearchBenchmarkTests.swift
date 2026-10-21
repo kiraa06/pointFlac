@@ -51,7 +51,7 @@ enum SyntheticLibrary {
                         id: "t\(a)-\(t)", url: URL(fileURLWithPath: "/m/\(a)/\(t).flac"), title: title, artist: artist,
                         albumArtist: "", album: album, albumID: albumID, discNumber: 1, trackNumber: t + 1,
                         year: 1960 + a % 60, format: AudioFormat(sampleRate: rate, bitsPerSample: bits, channels: 2),
-                        totalFrames: Int64(rate * 180), artworkID: nil))
+                        totalFrames: Int64(rate * 180), artworkID: nil, isInLibraryFolder: true))
             }
         }
         return LibraryCatalog(tracks: tracks)

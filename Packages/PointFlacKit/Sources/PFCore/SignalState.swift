@@ -19,6 +19,16 @@ public enum SignalIndicator: Equatable, Sendable {
     case otherRoute
 }
 
+/// The claim the strip can prove for a route where iOS does no tuning of its own (USB, wired). pointFlac always
+/// hands iOS 32-bit float, which holds 16- and 24-bit samples exactly, at the hardware rate iOS reports. Hi-Res: a file
+/// of at least 24 bits and a hardware rate above 48 kHz. Lossless: otherwise. `none` on every other route: the
+/// built-in speaker is tuned by iOS, and Bluetooth, AirPlay and unknown routes re-encode or may alter the audio.
+public enum DeliveredResolution: Equatable, Sendable {
+    case hiRes
+    case lossless
+    case none
+}
+
 /// Everything the signal strip needs to describe, honestly, what happens to the audio.
 public struct SignalState: Sendable, Equatable {
     public var source: AudioFormat?
@@ -95,6 +105,20 @@ public struct SignalState: Sendable, Equatable {
         }
         if case .other = port { return .otherRoute }
         return nil
+    }
+
+    /// What pointFlac can prove about the hand-off: nil with no plan or source; `.none` unless the route is USB or
+    /// wired. There, Hi-Res when the file is at least 24-bit and the hardware rate (iOS's own report, else the
+    /// negotiated client rate) is above 48 kHz, else Lossless. The converter's bit depth is not reported by iOS, so
+    /// no bit or rate numbers are claimed.
+    public var resolution: DeliveredResolution? {
+        guard let plan, let source else { return nil }
+        switch port {
+        case .usb, .wired: break
+        default: return DeliveredResolution.none
+        }
+        let rate = hardwareRate ?? plan.clientSampleRate
+        return source.bitsPerSample >= 24 && rate > 48_000 ? .hiRes : .lossless
     }
 
     /// Set only for a USB port with the system volume below full scale.

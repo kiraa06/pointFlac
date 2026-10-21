@@ -142,6 +142,32 @@ final class RealLibrary: LibraryBrowsing {
         return (result.added.count, lines)
     }
 
+    /// Counted from the catalog, which knows each track's folder, so the dialog says exactly what `remove` will do. An
+    /// album is its whole catalog track list, not only the playable songs the shelf shows (controller ruling RD-1):
+    /// "delete the album" is asked to free the space, and a multichannel file left behind could never be reached.
+    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan {
+        var ids = album.map { snapshot.tracks(of: $0).map(\.id) } ?? []
+        ids += tracks.filter { !ids.contains($0) }
+        var plan = RemovalPlan()
+        for track in snapshot.tracks(ids: ids) {
+            plan.tracks.append(track.id)
+            if track.isInLibraryFolder {
+                plan.deletes += 1
+                if !track.isSupported { plan.unplayableDeletes += 1 }
+            } else {
+                plan.removes += 1
+                if !track.isSupported { plan.unplayableRemoves += 1 }
+            }
+        }
+        return plan
+    }
+
+    func remove(tracks: [TrackRow.ID]) async {
+        // A failure is logged by the library; either way the shelf then shows what the library holds.
+        _ = try? await library.remove(trackIDs: tracks)
+        await sync()
+    }
+
     /// The track's record code, from its album's side layout.
     private func side(of track: LibraryTrack) -> String? {
         let playable = snapshot.tracks(of: track.albumID).filter(\.isSupported)

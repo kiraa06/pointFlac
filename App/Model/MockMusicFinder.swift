@@ -86,6 +86,24 @@ import Observation
             }
         }
 
+        /// Only finished rows go, as with the real manager; the demo's row can then be downloaded again.
+        func removeDownload(_ id: DownloadRow.ID) {
+            guard let row = downloads.first(where: { $0.id == id }), Self.isFinal(row.state) else { return }
+            downloads.removeAll { $0.id == id }
+            transfers[id] = nil
+        }
+
+        func clearDownloads(finished: Bool, failed: Bool) {
+            for row in downloads {
+                let done = row.state.hasPrefix("Done")
+                if (finished && done) || (failed && !done && Self.isFinal(row.state)) { removeDownload(row.id) }
+            }
+        }
+
+        private static func isFinal(_ state: String) -> Bool {
+            state.hasPrefix("Done") || state.hasPrefix("Failed") || state.hasPrefix("Cancelled")
+        }
+
         private func set(_ row: RemoteResultRow, _ state: String, _ progress: Double?) {
             guard let index = downloads.firstIndex(where: { $0.id == row.id }) else { return }
             downloads[index] = DownloadRow(id: row.id, title: row.title, state: state, progress: progress)

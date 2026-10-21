@@ -18,9 +18,12 @@ public struct AudioFormat: Sendable, Hashable, Codable {
     /// Why exact rather than one decimal: rounding showed 11025 as "11.0 kHz" and 22050 as "22.1 kHz", rates the file
     /// does not have, and the strip must never misstate the audio. Integer arithmetic, so no rate picks up a binary
     /// floating-point artefact either.
-    public var formattedRate: String {
-        let hz = sampleRate.magnitude
-        let sign = sampleRate < 0 ? "-" : ""
+    public var formattedRate: String { Self.formatRate(sampleRate) }
+
+    /// The same formatting for a bare rate in hertz, for callers that have no whole format.
+    public static func formatRate(_ rate: Int) -> String {
+        let hz = rate.magnitude
+        let sign = rate < 0 ? "-" : ""
         let whole = hz / 1000
         let fraction = hz % 1000
         guard fraction != 0 else { return "\(sign)\(whole) kHz" }
