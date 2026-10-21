@@ -24,12 +24,15 @@ struct CurveInput: Equatable, Sendable {
 /// The graph's curve (`SoundResponse.curveDb`, 256 points) and the automatic headroom (`autoHeadroomDb`), computed
 /// off the main actor: together they cost about 4 ms in Debug with twenty bands, a quarter of a frame. One computation
 /// runs at a time; a request made meanwhile replaces any waiting one, so a drag never builds a backlog and the last
-/// position always gets drawn.
+/// position always gets drawn. While headphone correction is on, the correction's own curve (its preamp included) is
+/// computed too, for the graph to draw under the total.
 @MainActor
 @Observable
 final class EQCurveModel {
     private(set) var curve: [(hz: Double, db: Double)] = []
     private(set) var headroomDb = 0.0
+    /// The correction's part of `curve`, or empty while correction is off.
+    private(set) var correctionCurve: [(hz: Double, db: Double)] = []
     @ObservationIgnored private var running = false
     @ObservationIgnored private var waiting: CurveInput?
     @ObservationIgnored private var last: CurveInput?
@@ -49,13 +52,23 @@ final class EQCurveModel {
         Task.detached(priority: .userInitiated) { [weak self] in
             let curve = SoundResponse.curveDb(input.settings, sampleRate: input.sampleRate, points: 256)
             let headroom = SoundResponse.autoHeadroomDb(input.settings, sampleRate: input.sampleRate)
-            await self?.finish(curve: curve, headroom: headroom)
+            var correction: [(hz: Double, db: Double)] = []
+            if input.settings.correction.enabled, !input.settings.correction.bands.isEmpty {
+                var alone = SoundSettings()
+                alone.pure = false
+                alone.correction = input.settings.correction
+                correction = SoundResponse.curveDb(alone, sampleRate: input.sampleRate, points: 256)
+            }
+            await self?.finish(curve: curve, headroom: headroom, correction: correction)
         }
     }
 
-    private func finish(curve: [(hz: Double, db: Double)], headroom: Double) {
+    private func finish(
+        curve: [(hz: Double, db: Double)], headroom: Double, correction: [(hz: Double, db: Double)]
+    ) {
         self.curve = curve
         headroomDb = headroom
+        correctionCurve = correction
         running = false
         if let next = waiting {
             waiting = nil
@@ -87,6 +100,8 @@ struct EQGraphView: View {
     /// One stable id per band, parallel to `eq.bands` (`SoundStore.bandIDs`).
     let bandIDs: [UUID]
     let curve: [(hz: Double, db: Double)]
+    /// The headphone correction's own curve, drawn faintly under `curve` with a legend; empty while correction is off.
+    var correctionCurve: [(hz: Double, db: Double)] = []
     /// The automatic headroom, or nil when it is switched off.
     let headroomDb: Double?
     let sampleRate: Double
@@ -123,6 +138,7 @@ struct EQGraphView: View {
                 ScreenPanel(theme: theme, cornerRadius: 12)
                 Canvas { context, canvasSize in
                     drawGrid(&context, canvasSize)
+                    if showsCorrection { drawCorrection(&context, canvasSize) }
                     drawCurve(&context, canvasSize)
                     if eq.mode == .graphic { drawGraphicPoints(&context, canvasSize) }
                 }
@@ -262,6 +278,21 @@ struct EQGraphView: View {
         }
     }
 
+    /// Whether the correction's own curve is drawn: while it is on, and the curve is not Pure's bypass.
+    private var showsCorrection: Bool { !correctionCurve.isEmpty && look != .bypassed }
+
+    /// The correction alone, a fine dotted line under the total, so what the EQ adds to it reads at a glance.
+    private func drawCorrection(_ context: inout GraphicsContext, _ size: CGSize) {
+        guard let first = correctionCurve.first else { return }
+        var line = Path()
+        line.move(to: CGPoint(x: x(first.hz, size.width), y: y(first.db, size.height)))
+        for p in correctionCurve.dropFirst() {
+            line.addLine(to: CGPoint(x: x(p.hz, size.width), y: y(p.db, size.height)))
+        }
+        context.stroke(
+            line, with: .color(ink.opacity(0.6)), style: StrokeStyle(lineWidth: 1.2, lineCap: .round, dash: [1.5, 3]))
+    }
+
     /// The ten graphic sliders' settings, as small rings at their centres.
     private func drawGraphicPoints(_ context: inout GraphicsContext, _ size: CGSize) {
         for (index, hz) in SoundRanges.graphicCentres.enumerated() {
@@ -281,6 +312,7 @@ struct EQGraphView: View {
                 Text(headroomCaption)
                     .accessibilityIdentifier("headroomCaption")
             }
+            if showsCorrection { legend }
             Spacer()
         }
         .font(.caption2.monospaced().weight(.semibold))
@@ -291,6 +323,27 @@ struct EQGraphView: View {
         .padding(.top, 7)
         .padding(.bottom, 5)
         .allowsHitTesting(false)
+    }
+
+    /// Which line is which, while the correction's own is drawn.
+    private var legend: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 4) {
+                Capsule().fill(curveColour).frame(width: 12, height: 2)
+                Text("TOTAL")
+            }
+            HStack(spacing: 4) {
+                Path { p in
+                    p.move(to: CGPoint(x: 0, y: 1))
+                    p.addLine(to: CGPoint(x: 12, y: 1))
+                }
+                .stroke(ink.opacity(0.6), style: StrokeStyle(lineWidth: 1.2, lineCap: .round, dash: [1.5, 3]))
+                .frame(width: 12, height: 2)
+                Text("CORRECTION")
+            }
+        }
+        .padding(.top, 2)
+        .accessibilityHidden(true)
     }
 
     private var modeCaption: String {

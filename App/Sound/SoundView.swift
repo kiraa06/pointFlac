@@ -304,8 +304,8 @@ private struct LiveEQGraph: View {
 
     var body: some View {
         EQGraphView(
-            eq: eq, bandIDs: bandIDs, curve: model.curve, headroomDb: autoHeadroom ? model.headroomDb : nil,
-            sampleRate: sampleRate,
+            eq: eq, bandIDs: bandIDs, curve: model.curve, correctionCurve: model.correctionCurve,
+            headroomDb: autoHeadroom ? model.headroomDb : nil, sampleRate: sampleRate,
             look: look, selection: $selection, theme: theme, setBand: setBand, addBand: addBand)
     }
 }
