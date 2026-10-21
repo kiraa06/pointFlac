@@ -59,6 +59,14 @@ final class DecodeSession: @unchecked Sendable {
     /// Events for the next boundary (the end or failure of what came before), placed once the boundary is known.
     private var boundaryEvents: [PipelineEvent] = []
     private var dither: TPDFDither
+    /// The current item's ReplayGain, linear: exactly 1 for a gain of 0 dB, which then multiplies nothing.
+    private var gain = 1.0
+    /// The re-cue's fade-in (`PlaybackPipeline.recue`): its length in source frames, and the frames of it still to
+    /// write. 0 left is no fade.
+    private var fadeInFrames = 0
+    private var fadeInLeft = 0
+    /// The seek being entered is a re-cue's: its audio fades in.
+    private var enteringRecue = false
     private var converter: SampleRateConverter?
     /// `written` when `converter` was created, and the source frames fed to it since.
     private var converterBase: Int64 = 0
@@ -133,8 +141,11 @@ final class DecodeSession: @unchecked Sendable {
             return .finishQueue
         }
         let nextFormat = next.format
+        // The gain as it stands now chooses the plan only (a gain needs Float32). The gain the item plays at is taken
+        // again when it is entered, below, after any drain and reconfigure.
+        let planGainDb = gainDb(of: target)
         var boundary = written
-        if isCompatible(nextFormat) {
+        if isCompatible(nextFormat, gainDb: planGainDb) {
             if entry == .next, converter != nil { boundary = converterBoundary }
             placeBoundaryEvents(at: boundary)
         } else {
@@ -144,7 +155,7 @@ final class DecodeSession: @unchecked Sendable {
             // The output stops once this is rendered: the silence until then is the gap, not an underrun.
             source?.markEndOfStream()
             if let step = drain() { return step }
-            switch reconfigure(for: nextFormat) {
+            switch reconfigure(for: nextFormat, gainDb: planGainDb) {
             case .configured: break
             case .interrupted(let step): return step
             case .failed(let message):
@@ -170,16 +181,40 @@ final class DecodeSession: @unchecked Sendable {
         decoder = next
         index = target
         format = nextFormat
+        // Only into a Float32 client: an Int32 one carries the source's words untouched.
+        if entry == .seek, enteringRecue, plan.client == .float32 {
+            fadeInFrames = max(1, Int((RenderSource.crossfadeSeconds * Double(nextFormat.sampleRate)).rounded()))
+            fadeInLeft = fadeInFrames
+        } else {
+            fadeInLeft = 0
+        }
+        enteringRecue = false
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
-        let segment = Timeline.Segment(
-            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
-            totalFrames: next.totalFrames)
+        // The item is entered here: its gain is taken and its segment published in one critical section, the lock
+        // `setGains` takes (ruling R4-T12b). A `setGains` before it gives this item the new gain; one after it finds
+        // the segment in `enteredGains`, so a switch can re-cue it. Nothing of the item is decoded before this, so no
+        // audio is ever heard at a gain `enteredGains` did not show. Across a drain and reconfigure (a plan change) the
+        // gain read for the plan may be stale by now; a Float32 plan takes any gain. An Int32 one (passthrough, with a
+        // gain of 0 when planned) takes none: the item then plays at 0 dB, as its segment says, and a gain set
+        // meanwhile reaches it at the next seek or re-cue.
+        let item = items[target]
+        let client = plan.client
         let rendered = source.renderedFrames
-        _ = core.withShared(for: self) { s in
+        let start = Timeline.Segment(
+            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
+            totalFrames: next.totalFrames, gainDb: 0)
+        let enteredGainDb = core.withShared(for: self) { s -> Double in
+            let set = s.gainsDb[item.id] ?? item.gainDb
+            let gainDb = client == .int32 || !set.isFinite ? 0 : set
+            var segment = start
+            segment.gainDb = gainDb
             s.timeline.append(segment, rendered: rendered)
             if s.requestedSeek == nil { s.timeline.pendingFrame = nil }
+            return gainDb
         }
+        guard let enteredGainDb else { return .stop }
+        gain = enteredGainDb == 0 ? 1 : pow(10, enteredGainDb / 20)
         return .play
     }
 
@@ -222,14 +257,25 @@ final class DecodeSession: @unchecked Sendable {
         return nil
     }
 
-    /// Whether an item of format `next` can continue into the running output: the same plan at the current hardware
-    /// rate, and the same channel count.
-    private func isCompatible(_ next: AudioFormat) -> Bool {
+    /// The ReplayGain item `index` would play at now, in dB: what `setGains` last gave its ID, else its own. A value
+    /// that is not finite is no gain. For choosing a plan; the item's own gain is taken as it is entered.
+    private func gainDb(of index: Int) -> Double {
+        let item = items[index]
+        let set = core.withShared(for: self) { $0.gainsDb[item.id] } ?? nil
+        let gainDb = set ?? item.gainDb
+        return gainDb.isFinite ? gainDb : 0
+    }
+
+    /// Whether an item of format `next`, at a ReplayGain of `gainDb`, can continue into the running output: the same
+    /// plan at the current hardware rate, and the same channel count. Its gain itself needs no plan of its own, only
+    /// the Float32 client a gain asks for.
+    private func isCompatible(_ next: AudioFormat, gainDb: Double) -> Bool {
         guard outputRunning, let plan, let hardwareRate, let format, format.channels == next.channels else {
             return false
         }
         let capabilities = core.capabilities
-        return OutputFormatPolicy.plan(source: next, hardwareRate: hardwareRate, capabilities: capabilities) == plan
+        return OutputFormatPolicy.plan(
+            source: next, hardwareRate: hardwareRate, capabilities: capabilities, gainDb: gainDb) == plan
     }
 
     /// Where the current resampled stream crosses into the next item: the converter's output frame for the input fed
@@ -304,7 +350,7 @@ final class DecodeSession: @unchecked Sendable {
     ///
     /// A rate ≤ 0 from `negotiateRate` means the session has no usable output rate. That fails the item: assuming the
     /// source rate instead would break "client rate == hardware rate" and let iOS resample silently.
-    private func reconfigure(for next: AudioFormat) -> Reconfiguration {
+    private func reconfigure(for next: AudioFormat, gainDb: Double) -> Reconfiguration {
         // Everything before this boundary is rendered; its events (an earlier item's failure) precede `.planChanged`.
         emitDueMarkers()
         guard core.withOutput(for: self, { $0.stop() }) != nil else { return .interrupted(.stop) }
@@ -314,7 +360,8 @@ final class DecodeSession: @unchecked Sendable {
         guard let rate = negotiate(next.sampleRate) else { return .interrupted(.stop) }
         guard rate > 0 else { return .failed("Output rate unavailable") }
         hardwareRate = rate
-        let newPlan = OutputFormatPolicy.plan(source: next, hardwareRate: rate, capabilities: core.capabilities)
+        let newPlan = OutputFormatPolicy.plan(
+            source: next, hardwareRate: rate, capabilities: core.capabilities, gainDb: gainDb)
         let channels = next.channels
         let rendered = written
         do {
@@ -384,7 +431,9 @@ final class DecodeSession: @unchecked Sendable {
                 return .advance
             }
             let count = frames * channels
-            Self.convert(samples, count: count, bits: format.bitsPerSample, plan: plan, dither: &dither, into: words)
+            Self.convert(
+                samples, count: count, bits: format.bitsPerSample, plan: plan, gain: gain, dither: &dither, into: words)
+            if fadeInLeft > 0 { fadeIn(frames: frames, channels: channels) }
             let interrupted: Step?
             if let converter {
                 resampled.removeAll(keepingCapacity: true)
@@ -407,13 +456,21 @@ final class DecodeSession: @unchecked Sendable {
     ///   Exact for b ≤ 24.
     /// - Float32 reduced to 24 bits: shifted to full 32-bit range, TPDF-dithered in place to multiples of 256, then
     ///   divided by 2^31. Also exact, as 24 significant bits fit a Float32.
+    ///
+    /// `gain` (linear) is the item's ReplayGain, folded into the scale. At exactly 1 (0 dB) the Float32 loops above
+    /// run untouched, so the bits are too. Any other gain takes the product in Double, from the integer sample and
+    /// the scale times the gain, and rounds it to Float32 at the end: within about half an ulp of the exact gained
+    /// value, where a Float32 scale would round twice. On the reduced path it applies after the dither, which keeps
+    /// to the 24-bit grid of the source. It never reaches an Int32 client: a gain puts a 32-bit source on Float32
+    /// (`OutputFormatPolicy.plan(source:hardwareRate:capabilities:gainDb:)`).
     private static func convert(
-        _ samples: UnsafeMutableBufferPointer<Int32>, count: Int, bits: Int, plan: OutputPlan,
+        _ samples: UnsafeMutableBufferPointer<Int32>, count: Int, bits: Int, plan: OutputPlan, gain: Double,
         dither: inout TPDFDither, into words: UnsafeMutableBufferPointer<UInt32>
     ) {
         let shift = 32 - bits
         switch plan.client {
         case .int32:
+            assert(gain == 1, "a ReplayGain never plays through an Int32 client")
             for i in 0..<count {
                 words[i] = UInt32(bitPattern: samples[i] << shift)
             }
@@ -422,16 +479,45 @@ final class DecodeSession: @unchecked Sendable {
                 samples[i] <<= shift
             }
             dither.reduce32To24(UnsafeMutableBufferPointer(rebasing: samples[0..<count]))
-            let scale: Float = 0x1p-31
-            for i in 0..<count {
-                words[i] = (Float(samples[i]) * scale).bitPattern
+            if gain == 1 {
+                let scale: Float = 0x1p-31
+                for i in 0..<count {
+                    words[i] = (Float(samples[i]) * scale).bitPattern
+                }
+            } else {
+                let scale = 0x1p-31 * gain
+                for i in 0..<count {
+                    words[i] = Float(Double(samples[i]) * scale).bitPattern
+                }
             }
         case .float32:
-            let scale = Float(sign: .plus, exponent: 1 - bits, significand: 1)
-            for i in 0..<count {
-                words[i] = (Float(samples[i]) * scale).bitPattern
+            if gain == 1 {
+                let scale = Float(sign: .plus, exponent: 1 - bits, significand: 1)
+                for i in 0..<count {
+                    words[i] = (Float(samples[i]) * scale).bitPattern
+                }
+            } else {
+                let scale = Double(sign: .plus, exponent: 1 - bits, significand: 1) * gain
+                for i in 0..<count {
+                    words[i] = Float(Double(samples[i]) * scale).bitPattern
+                }
             }
         }
+    }
+
+    /// Ramps the start of a re-cue's audio up from silence, linearly over `fadeInFrames`, in the converted Float32
+    /// words: frame k of the ramp is scaled by k / `fadeInFrames`. Past the ramp, nothing is touched.
+    private func fadeIn(frames: Int, channels: Int) {
+        let n = min(frames, fadeInLeft)
+        let done = fadeInFrames - fadeInLeft
+        for f in 0..<n {
+            let weight = Float(done + f) / Float(fadeInFrames)
+            for c in 0..<channels {
+                let i = f * channels + c
+                words[i] = (Float(bitPattern: words[i]) * weight).bitPattern
+            }
+        }
+        fadeInLeft -= n
     }
 
     private func reserveBuffers(channels: Int) {
@@ -507,7 +593,10 @@ final class DecodeSession: @unchecked Sendable {
         let taken = core.withShared(for: self) { s -> SeekRequest? in
             guard let target = s.requestedSeek else { return nil }
             s.requestedSeek = nil
-            return SeekRequest(target: target, ticket: s.source?.seekHoldTicket ?? 0, interval: s.seekInterval.take())
+            let fadeIn = s.seekFadesIn
+            s.seekFadesIn = false
+            return SeekRequest(
+                target: target, ticket: s.source?.seekHoldTicket ?? 0, interval: s.seekInterval.take(), fadeIn: fadeIn)
         }
         guard let taken else { return .stop }
         guard let request = taken else {
@@ -515,6 +604,7 @@ final class DecodeSession: @unchecked Sendable {
             return .play
         }
         let (target, ticket) = (request.target, request.ticket)
+        enteringRecue = request.fadeIn
         // Nothing renders from the ring now until the new position's audio, so the next real frame past `written` is
         // the first one at the target. An earlier seek still waiting for its frame is superseded.
         firstFrames.removeAll { watch in
@@ -575,6 +665,8 @@ private struct SeekRequest: Sendable {
     var target: Int64
     var ticket: UInt64
     var interval: FirstFrameInterval?
+    /// A re-cue's: the audio from `target` fades in.
+    var fadeIn: Bool
 }
 
 /// An item the pipeline refuses to play. Its description is the `.itemFailed` message, word for word.

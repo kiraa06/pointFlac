@@ -34,6 +34,14 @@ import PFDSP
 /// Every pipeline negotiates through one `SessionGate`, so `requestSampleRate` calls run one at a time, in order,
 /// including a stopped pipeline's late one. The player itself never asks for a rate. Each pipeline stops its output
 /// before negotiating, and a retired pipeline's request is refused at its turn.
+///
+/// ## ReplayGain (Plan 4 Task 12)
+/// Each queue item's gain is worked out from its `loudness` and `sound.replayGain` (`replayGainDb(for:sound:)`, 0 in
+/// Pure) and handed to the pipeline with the item, which applies it on the decode thread. A settings change
+/// recomputes the queue's gains (`PlaybackPipeline.setGains`); they apply from the next item the pipeline enters,
+/// and on any seek, never to the item playing mid-stream. The exception (ruling R4-T12a): switching Pure on or off,
+/// or ReplayGain on or off, is heard at once, through a re-cue of the item playing at where it is, whenever that
+/// changes its gain. The strip lists ReplayGain exactly while a non-zero gain applies to the item playing.
 @MainActor
 @Observable
 public final class Player {
@@ -101,6 +109,11 @@ public final class Player {
     @ObservationIgnored private var sessionEvents: Task<Void, Never>?
     /// Clips counted by the pipelines retired so far, so `soundMeters.clipCount` runs on across them.
     @ObservationIgnored private var retiredClips = 0
+    /// A switch of Pure or of ReplayGain on or off came while a finger was on the record: checked again once the
+    /// scrub ends (`finishScrub`).
+    @ObservationIgnored private var recueAfterScrub = false
+    /// Re-cues issued for a switch of Pure or ReplayGain (`recueIfGainsDiffer`). For tests.
+    @ObservationIgnored private(set) var recueCount = 0
 
     /// - Parameters:
     ///   - makeOutput: builds the output every pipeline the player starts renders through, one at a time. Called on
@@ -199,6 +212,8 @@ public final class Player {
             engine.seeksInFlight += 1
             await engine.enqueue { pipeline in await pipeline.seek(toFrame: frame, firstFrame: interval) }.value
             engine.seeksInFlight -= 1
+            // The new gain shows once the decode thread has taken the seek (the position updates catch it).
+            refreshProcessing()
         case .paused:
             endPausedScrub()
             cue = Cue(index: index, frame: frame)
@@ -237,11 +252,187 @@ public final class Player {
     /// milliseconds of look-ahead; a change made while the last one is still fading waits for it), and shows the
     /// blocks at work on the strip (`signal.activeProcessing`). Compiled here, on the main actor, for the playing plan.
     /// While nothing plays it is only kept, and the next start compiles it for its plan.
+    ///
+    /// A ReplayGain change, or a switch to or from Pure, recomputes every queue item's gain.
+    /// - Switching Pure on or off, or ReplayGain on or off (`.off` to a mode or back), is heard at once (rulings
+    ///   R4-T12a and R4-T12b): when it changes the gain of any item the pipeline has entered and not yet played out
+    ///   (the one rendering, or one already joined behind it in the ring), playback is re-cued where it is
+    ///   (`recueIfGainsDiffer`), a short gap with a fade-in, and the Sound chain changes behind the re-cue's hold.
+    ///   When it does not (Pure toggled with ReplayGain off, or items that get 0 dB either way), nothing is re-cued.
+    /// - Any other ReplayGain change (mode, preamp, clipping prevention, reference) applies from the next item the
+    ///   pipeline enters, and on any seek: the item playing keeps its level, and the strip keeps listing ReplayGain
+    ///   while its gain is still on.
     public func setSound(_ settings: SoundSettings) {
         let settings = settings.clamped()
+        let gainsChanged = settings.pure != sound.pure || settings.replayGain != sound.replayGain
+        let switched =
+            settings.pure != sound.pure || (settings.replayGain.mode == .off) != (sound.replayGain.mode == .off)
         sound = settings
-        signal.activeProcessing = settings.activeBlockNames
-        engine?.pipeline.setSound(settings)
+        if let engine {
+            if gainsChanged { engine.pipeline.setGains(queueGains) }
+            // A change of chain waiting behind a re-cue's hold takes this one along (it applies the latest settings),
+            // so the chain never changes ahead of the hold.
+            let behindHold = engine.soundAppliesPending > 0
+            if switched, scrubRun != nil {
+                // The let-go seeks the pipeline, at the new gains; `finishScrub` checks again in case it does not.
+                recueAfterScrub = true
+                if !behindHold { engine.pipeline.setSound(settings) }
+            } else if switched, gainsDiffer(engine) {
+                // A gain changes: the chain changes behind the re-cue's hold, so gained audio never plays through
+                // the wrong chain (a limiter faded out under it, say).
+                recueIfGainsDiffer(engine, thenApplySound: true)
+            } else {
+                if !behindHold { engine.pipeline.setSound(settings) }
+                // Checked again behind a seek or a start still on its way, which may have entered at the old gains.
+                if switched { recueIfGainsDiffer(engine, thenApplySound: false) }
+            }
+        }
+        refreshProcessing()
+    }
+
+    /// Whether any item the pipeline has entered and not yet played out plays at another gain than the current
+    /// settings give it (`PlaybackPipeline.enteredGains`).
+    private func gainsDiffer(_ engine: PlayerEngine) -> Bool {
+        engine.pipeline.enteredGains.contains { entered in
+            queue.indices.contains(entered.index)
+                && Self.replayGainDb(for: queue[entered.index], sound: sound) != entered.gainDb
+        }
+    }
+
+    /// Behind every call already queued on the engine (a start, a seek on its way), re-cues playback where it is when
+    /// some entered item's gain differs from the current settings' (`gainsDiffer`), through the pipeline's seek path
+    /// (`PlaybackPipeline.recue`). The re-cue flushes the ring, joined items included, and the decode thread
+    /// re-enters each at the new gains. Then, with `thenApplySound`, the pipeline gets the latest Sound settings.
+    ///
+    /// Nothing is re-cued, and so there is no gap, when the gains agree, before the pipeline has entered an item (it
+    /// enters at the new gains), while a seek waits for the decode thread (likewise), while paused or ended (the next
+    /// start uses the new gains), or while a finger is on the record (checked again when it lets go).
+    private func recueIfGainsDiffer(_ engine: PlayerEngine, thenApplySound: Bool) {
+        if thenApplySound { engine.soundAppliesPending += 1 }
+        _ = engine.enqueue { [weak self, weak engine] pipeline in
+            guard let self, let engine, self.engine === engine, !engine.isRetired else { return }
+            if self.scrubRun != nil {
+                self.recueAfterScrub = true
+            } else if self.status == .playing || self.status == .preparing, self.gainsDiffer(engine) {
+                let point = self.currentPoint()
+                self.cue = point
+                self.recueCount += 1
+                engine.seeksInFlight += 1
+                await pipeline.recue(toFrame: point.frame, firstFrame: FirstFrameInterval(.seek))
+                engine.seeksInFlight -= 1
+            }
+            // The latest settings: a later `setSound` may have come meanwhile, and left the chain to this call.
+            if thenApplySound {
+                engine.soundAppliesPending -= 1
+                pipeline.setSound(self.sound)
+            }
+        }
+    }
+
+    // MARK: ReplayGain
+
+    /// The ReplayGain, in dB, for `item` under `settings`, worked out from what the library knows of its loudness
+    /// (`QueueItem.loudness`). Pure is not part of `settings`: `replayGainDb(for:sound:)` is this, and 0 in Pure.
+    ///
+    /// 1. `.off`: 0, and nothing below applies.
+    /// 2. The gain, in order of preference:
+    ///    - the tag gain for the mode (`REPLAYGAIN_TRACK_GAIN`, or `REPLAYGAIN_ALBUM_GAIN` in album mode), used as it
+    ///      is: tags are RG 2.0 values, never re-referenced to `referenceLufs`;
+    ///    - else the measured value, `referenceLufs − LUFS` (RG 2.0's −18 by default, ruling R4-7): the track's R128
+    ///      loudness, or the album's, measured as a whole, in album mode. A measurement with no usable loudness
+    ///      (silent, or under one 400 ms gating block: `measuredLufs` nil, `measuredPeak` set) gives none;
+    ///    - else 0.
+    ///
+    ///    Album mode with no album value at all (no album tag, and no album measurement, which the library only keeps
+    ///    while the album's tracks are those it was measured over) falls back to the track's tag, then its
+    ///    measurement.
+    /// 3. `preampDb` is added, to whichever gain was found, 0 included.
+    /// 4. With `preventClipping`, the result is capped at `−20·log10(peak)`, so the peak lands at full scale at most:
+    ///    the tag peak, else the measured true peak (both linear); in album mode the album's, falling back to the
+    ///    track's when the album has none. A cap only ever lowers a gain. With no peak known there is no cap (the
+    ///    limiter, in the chain whenever ReplayGain is on, still catches an over), nor with a peak of 0 (silence).
+    ///
+    /// A value that is not finite (a NaN setting) counts as absent; the result is always finite, and within
+    /// ±`maxGainDb`.
+    public nonisolated static func replayGainDb(for item: QueueItem, settings: ReplayGainSettings) -> Double {
+        guard settings.mode != .off else { return 0 }
+        let loudness = item.loudness ?? TrackLoudness()
+        let reference = settings.referenceLufs.isFinite ? settings.referenceLufs : ReplayGainSettings().referenceLufs
+        /// `reference − lufs` for a usable measurement. Integrated loudness is gated at −70 LUFS, so a real one is
+        /// above it.
+        func measured(_ lufs: Double?) -> Double? {
+            guard let lufs, lufs.isFinite, lufs > -70 else { return nil }
+            return reference - lufs
+        }
+        func finite(_ value: Double?) -> Double? { value.flatMap { $0.isFinite ? $0 : nil } }
+        let trackGain = finite(loudness.trackGainDb) ?? measured(loudness.measuredLufs)
+        let trackPeak = finite(loudness.trackPeak) ?? finite(loudness.measuredPeak)
+        var gain: Double
+        var peak: Double?
+        if settings.mode == .album,
+            let albumGain = finite(loudness.albumGainDb) ?? measured(loudness.albumMeasuredLufs)
+        {
+            gain = albumGain
+            peak = finite(loudness.albumPeak) ?? finite(loudness.albumMeasuredPeak) ?? trackPeak
+        } else {
+            gain = trackGain ?? 0
+            peak = trackPeak
+        }
+        if settings.preampDb.isFinite { gain += settings.preampDb }
+        if settings.preventClipping, let peak, peak > 0 {
+            gain = min(gain, -20 * log10(peak))
+        }
+        return gain.isFinite ? min(max(gain, -maxGainDb), maxGainDb) : 0
+    }
+
+    /// The largest ReplayGain, either way, in dB: the largest tag gain the library reads (±60 dB) plus the largest
+    /// preamp (±15 dB). Only a measured gain against an absurd reference (a corrupt saved setting) reaches it; past it
+    /// the scale could overflow Float32.
+    public nonisolated static let maxGainDb = 75.0
+
+    /// `replayGainDb(for:settings:)` under the whole of `sound`: 0 in Pure, which ignores ReplayGain.
+    public nonisolated static func replayGainDb(for item: QueueItem, sound: SoundSettings) -> Double {
+        sound.pure ? 0 : replayGainDb(for: item, settings: sound.replayGain)
+    }
+
+    /// The gain of every queue item under the current settings, by ID, for `PlaybackPipeline.setGains`. Items with
+    /// the same ID are the same track, with the same loudness.
+    private var queueGains: [String: Double] {
+        var gains: [String: Double] = [:]
+        for item in queue { gains[item.id] = Self.replayGainDb(for: item, sound: sound) }
+        return gains
+    }
+
+    /// The queue as a pipeline starts it: each item with its gain under the current settings.
+    private var playbackItems: [PlaybackItem] {
+        queue.map { item in
+            var playback = item.playbackItem
+            playback.gainDb = Self.replayGainDb(for: item, sound: sound)
+            return playback
+        }
+    }
+
+    /// The gain `queue[index]` plays at now: what the pipeline applied to it while it renders, else what it gets
+    /// under the current settings, which is what the next start gives it.
+    private func gainDb(at index: Int) -> Double {
+        if let engine, engine.hasStarted, let rendering = engine.pipeline.renderingGain, rendering.index == index {
+            return rendering.gainDb
+        }
+        return Self.replayGainDb(for: queue[index], sound: sound)
+    }
+
+    /// Shows the blocks at work on what plays now (`signal.activeProcessing`): the Sound settings' blocks, with
+    /// ReplayGain listed exactly while a non-zero gain applies to the current item. An item that gets 0 dB is not
+    /// processed by it, though the limiter ReplayGain brings into the chain still runs; an item still playing at the
+    /// gain it started with, after a switch to Pure or to off, still is, and the strip says Processing until it ends
+    /// or a seek takes the new settings. Called whenever the settings, the item or the engine change, and with each
+    /// position update, which catches a seek or a gapless join taking effect.
+    private func refreshProcessing() {
+        var names = sound.activeBlockNames.filter { $0 != "ReplayGain" }
+        if let index = currentIndex, queue.indices.contains(index), gainDb(at: index) != 0 {
+            names.insert("ReplayGain", at: 0)
+        }
+        if signal.activeProcessing != names { signal.activeProcessing = names }
     }
 
     /// The Sound chain's meters: the peak since the last read, the clips since the player was made, and the latest
@@ -303,7 +494,7 @@ public final class Player {
             return Task {}
         }
         self.engine = engine
-        let items = queue.map(\.playbackItem)
+        let items = playbackItems
         let needsActivation = !sessionActive
         // The item's rate as imported: the negotiation that follows asks for the decoder's, normally the same.
         let preferredRate = queue[index].format.sampleRate
@@ -432,7 +623,10 @@ public final class Player {
             anchorRendered = 0
         }
         let window = ScrubWindow(format: item.format, totalFrames: item.totalFrames, at: anchorFrame)
-        let filler = ScrubFiller(item: item.playbackItem, window: window, makeDecoder: makeDecoder)
+        // At the gain the ring plays the item at, so the voice and the ring meet at one level.
+        var voiceItem = item.playbackItem
+        voiceItem.gainDb = gainDb(at: index)
+        let filler = ScrubFiller(item: voiceItem, window: window, makeDecoder: makeDecoder)
         let tap = runEngine.pipeline.scrubTap
         // Before the paused pipeline's first render: its render thread starts with the voice.
         tap.begin(
@@ -568,6 +762,12 @@ public final class Player {
         run.tap.retireWindow()
         run.filler.stop()
         signal.scrubbing = false
+        // A switch of Pure or ReplayGain during the scrub: a let-go that handed back to the ring seeked it at the new
+        // gains, and then nothing differs; one that did not (no voice ever started) is re-cued now.
+        if recueAfterScrub {
+            recueAfterScrub = false
+            if let engine { recueIfGainsDiffer(engine, thenApplySound: false) }
+        }
     }
 
     /// Where the needle is during a playing record's scrub, once its voice has started and until the ring has taken
@@ -594,7 +794,7 @@ public final class Player {
             return nil
         }
         self.engine = engine
-        let items = queue.map(\.playbackItem)
+        let items = playbackItems
         let needsActivation = !sessionActive
         let preferredRate = queue[index].format.sampleRate
         _ = engine.enqueue { [weak self] pipeline in
@@ -668,6 +868,7 @@ public final class Player {
         currentIndex = cue.index
         position = item.duration(ofFrames: cue.frame)
         nowPlaying.show(item, elapsed: position, playing: playing)
+        refreshProcessing()
     }
 
     // MARK: Events
@@ -855,6 +1056,7 @@ public final class Player {
     private func showPending(for index: Int) {
         signal.source = queue[index].format
         forgetPath()
+        refreshProcessing()
     }
 
     /// Nothing to describe: no track, no path. The port and volume stay, as the session reports them.
@@ -901,6 +1103,7 @@ public final class Player {
         guard reported.index == index else { return }
         let elapsed = queue[index].duration(ofFrames: reported.frame)
         if elapsed != position { position = elapsed }
+        refreshProcessing()
     }
 }
 

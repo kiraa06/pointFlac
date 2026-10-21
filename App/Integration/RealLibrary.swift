@@ -37,6 +37,9 @@ final class CoverIndex: Sendable {
 ///
 /// Covers are not put into `AlbumCard.artwork`: that would read every cover at each library change, and the
 /// library's cover cache holds only 32 MB. Instead `ArtworkLoader.source` reads a cover when its sleeve is first drawn.
+///
+/// It also starts the library's loudness scan (`Library.scanLoudness`, for ReplayGain), in the background, whenever a
+/// catalog brings tracks no earlier one had: once a launch, and after every import, download or rescan that adds any.
 @MainActor
 @Observable
 final class RealLibrary: LibraryBrowsing {
@@ -51,6 +54,8 @@ final class RealLibrary: LibraryBrowsing {
 
     /// Album ID → cover ID, for the lazy cover loader.
     @ObservationIgnored private let covers = CoverIndex()
+    /// The track IDs of the latest catalog, to tell when tracks come in (`measureNewTracks`).
+    @ObservationIgnored private var knownTrackIDs: Set<String> = []
 
     init(library: Library) {
         self.library = library
@@ -88,6 +93,7 @@ final class RealLibrary: LibraryBrowsing {
     private func apply(_ snapshot: LibrarySnapshot) {
         self.snapshot = snapshot
         box.replace(with: snapshot)
+        measureNewTracks(in: snapshot.catalog)
         var built: [AlbumCard] = []
         var byID: [String: AlbumCard] = [:]
         var covers: [String: String] = [:]
@@ -173,6 +179,25 @@ final class RealLibrary: LibraryBrowsing {
         let playable = snapshot.tracks(of: track.albumID).filter(\.isSupported)
         guard let index = playable.firstIndex(where: { $0.id == track.id }) else { return nil }
         return SideLayout(durations: playable.map(\.durationSeconds)).code(ofTrack: index)
+    }
+
+    /// Starts a background loudness scan when `catalog` holds a track the previous catalog did not: the first catalog
+    /// with tracks in it (so once a launch), and any that an import, a download or a rescan grew. The scan's own
+    /// results publish catalogs with the same tracks, which start nothing.
+    ///
+    /// The scan measures only what has no ReplayGain tag and was not measured yet, on `.background` tasks that yield
+    /// to playback's decode thread, and never downloads from iCloud; with nothing to measure it is a database read. One
+    /// asked for while another runs is merged into it (`Library.scanLoudness`), so imports in quick succession make
+    /// one scan. Queues made after a track is measured carry its loudness; one already playing keeps what it had.
+    private func measureNewTracks(in catalog: LibraryCatalog) {
+        let ids = Set(catalog.tracks.keys)
+        let grew = !ids.isSubset(of: knownTrackIDs)
+        knownTrackIDs = ids
+        guard grew else { return }
+        let library = library
+        Task.detached(priority: .background) {
+            await library.scanLoudness { _, _ in }
+        }
     }
 
     /// A track still in iCloud is listed and playable (the player fetches it first, spec §4.7); its format says so.

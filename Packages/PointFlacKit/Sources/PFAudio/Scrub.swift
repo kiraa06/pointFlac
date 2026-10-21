@@ -122,6 +122,10 @@ final class ScrubFiller: @unchecked Sendable {
         }
         let channels = window.channels
         let scale = Float(1) / Float(Double(1 << (decoder.format.bitsPerSample - 1)))
+        // The item's ReplayGain, as the ring plays it (`PlaybackItem.gainDb`), so the voice and the ring meet at one
+        // level: in Double, rounded to Float32 at the end, as the decode thread does. At 0 dB the loop is untouched.
+        let gainDb = item.gainDb.isFinite ? item.gainDb : 0
+        let gained = gainDb == 0 ? nil : Double(scale) * pow(10, gainDb / 20)
         var ints = [Int32](repeating: 0, count: Self.chunk * channels)
         var total = window.totalFrames > 0 ? window.totalFrames : decoder.totalFrames
         let reach = Int64(Self.reachSeconds * Double(window.sourceRate))
@@ -147,7 +151,11 @@ final class ScrubFiller: @unchecked Sendable {
                     guard n > 0 else { break }
                     for i in 0..<n {
                         let slot = window.storage + Int((frame + Int64(done + i)) & Int64(window.mask)) * channels
-                        for c in 0..<channels { slot[c] = Float(buffer[i * channels + c]) * scale }
+                        if let gained {
+                            for c in 0..<channels { slot[c] = Float(Double(buffer[i * channels + c]) * gained) }
+                        } else {
+                            for c in 0..<channels { slot[c] = Float(buffer[i * channels + c]) * scale }
+                        }
                     }
                     done += n
                 }
