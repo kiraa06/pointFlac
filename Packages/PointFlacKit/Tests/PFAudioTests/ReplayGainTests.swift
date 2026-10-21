@@ -3,6 +3,7 @@ import PFCore
 import PFDSP
 import PFFlac
 import PFTestSupport
+import Synchronization
 import Testing
 
 @testable import PFAudio
@@ -16,10 +17,18 @@ private let halfDb = 20 * log10(0.5)
 /// Sixty thousand frames (1.25 s) of 24-bit stereo at 48 kHz whose samples are a hash of their frame and channel, so
 /// any stretch of a capture can be matched to the source frames it came from. Longer than the ring (0.5 s), so the
 /// decode thread is still inside it while the first half second renders. Noise within ±1/8 of full scale (−18 dBFS),
-/// so its true peak stays far below the limiter's ceiling, which then only delays.
+/// so its true peak stays far below the limiter's ceiling, which then only delays. Ids starting "hash44" decode the
+/// same samples at 44.1 kHz.
 private final class HashDecoder: PCMDecoding {
     static let format = AudioFormat(sampleRate: 48_000, bitsPerSample: 24, channels: 2)
+    static let format44 = AudioFormat(sampleRate: 44_100, bitsPerSample: 24, channels: 2)
     static let frames: Int64 = 60_000
+
+    let format: AudioFormat
+
+    init(format: AudioFormat = HashDecoder.format) {
+        self.format = format
+    }
 
     static func value(_ frame: Int64, channel: Int) -> Int32 {
         Int32((frame &* 2_654_435_761 &+ Int64(channel) &* 40_503) & 0x1F_FFFF) - 0x10_0000
@@ -30,7 +39,6 @@ private final class HashDecoder: PCMDecoding {
         Float(value(frame, channel: channel)) * (0x1p-23 * gain)
     }
 
-    var format: AudioFormat { Self.format }
     var totalFrames: Int64 { Self.frames }
     private var position: Int64 = 0
 
@@ -48,8 +56,13 @@ private final class HashDecoder: PCMDecoding {
     }
 }
 
-/// Ids starting "hash" decode `HashDecoder`; anything else is a fixture file.
+/// The item IDs the decoder factory has opened, in order, so a test can tell the decode thread has reached an item.
+private let opened = Mutex<[String]>([])
+
+/// Ids starting "hash" decode `HashDecoder` (at 44.1 kHz for "hash44"); anything else is a fixture file.
 private let decoder: @Sendable (PlaybackItem) throws -> PCMDecoding = { item in
+    opened.withLock { $0.append(item.id) }
+    if item.id.hasPrefix("hash44") { return HashDecoder(format: HashDecoder.format44) }
     if item.id.hasPrefix("hash") { return HashDecoder() }
     return try FlacDecoder(url: item.url)
 }
@@ -64,8 +77,9 @@ private func fixtureItem(_ name: String, id: String? = nil, loudness: TrackLoudn
 
 private func hashItem(_ id: String, loudness: TrackLoudness?) -> QueueItem {
     QueueItem(
-        id: id, url: URL(fileURLWithPath: "/dev/null"), title: id, artist: "", album: "", format: HashDecoder.format,
-        totalFrames: HashDecoder.frames, loudness: loudness)
+        id: id, url: URL(fileURLWithPath: "/dev/null"), title: id, artist: "", album: "",
+        format: id.hasPrefix("hash44") ? HashDecoder.format44 : HashDecoder.format, totalFrames: HashDecoder.frames,
+        loudness: loudness)
 }
 
 /// A queue item that is only its loudness, for the gain rules.
@@ -620,26 +634,101 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(mismatch(Array(captured[(2 * frames)...]), want) == nil)
     }
 
+    /// Ruling R4-T12b across a boundary that is not gapless (re-review N1): a 48 kHz item at 0 dB, then a halved
+    /// 44.1 kHz one. In the first item's last half second the decode thread has opened the second and waits for the
+    /// ring to drain before it reconfigures; Pure set then reaches the second item, which takes its gain only once
+    /// entered, after the reconfigure: it plays bit-exact with its ungained source.
+    @Test func aSwitchReachesAnItemBehindARateChange() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.track))
+        let items = [
+            hashItem("hash-48", loudness: TrackLoudness(trackGainDb: 0)),
+            hashItem("hash44-n1", loudness: TrackLoudness(trackGainDb: halfDb)),
+        ]
+        await rig.player.play(items, startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        let frames = Int(HashDecoder.frames)
+        #expect(await rig.puller.pull(upTo: frames - 12_000))
+        // The decode thread has written out the first item and opened the second, and is draining the ring.
+        #expect(await rig.puller.eventually { opened.withLock { $0.contains("hash44-n1") } })
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(rig.player.pipeline?.enteredGains.map(\.index) == [0])
+        rig.player.setSound(SoundSettings())
+        await drained(rig.player)
+        #expect(await rig.puller.pump { rig.player.status == .ended })
+        #expect(rig.output.plans.map(\.clientSampleRate) == [48_000, 44_100])
+        let captured = rig.output.capturedFloat
+        #expect(captured.count == 2 * 2 * frames)
+        var want: [Float] = []
+        for n in Int64(0)..<HashDecoder.frames { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
+        #expect(mismatch(Array(captured[(2 * frames)...]), want) == nil)
+    }
+
+    /// Re-review N2: once a switch has queued its chain change behind a re-cue's hold, a later change that is no
+    /// switch (an EQ edit) waits behind the hold too; the queued call then hands the pipeline the latest settings.
+    @Test func aChainChangeAfterASwitchStaysBehindTheHold() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.off))
+        await rig.player.play([hashItem("hash-h", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 4096))
+        rig.player.setSound(sound(.track))
+        var withEQ = sound(.track)
+        withEQ.eq = EQSettings(
+            enabled: true, mode: .parametric, bands: [EQBand(type: .peak, frequency: 1_000, gainDb: 3, q: 1.41)])
+        rig.player.setSound(withEQ)
+        // Neither has reached the pipeline: the chain is still ReplayGain off's, until the hold is in place.
+        #expect(rig.player.pipeline?.soundSettings == sound(.off).clamped())
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
+        #expect(rig.player.pipeline?.soundSettings == withEQ.clamped())
+        #expect(rig.player.currentEngine?.soundAppliesPending == 0)
+        rig.player.pause()
+    }
+
     /// Review M2: a switch while a seek is still counted as on its way (the decode thread may have taken it at the old
-    /// gains before the main actor heard back) is checked behind it on the engine's queue, not dropped.
+    /// gains before the main actor heard back) is checked behind it on the engine's queue, not dropped. The re-cue
+    /// goes to the seek's target, where the playhead is: from one buffer after it, the ungained source from there.
     @Test func aSwitchWhileASeekIsInFlightIsStillChecked() async {
         let rig = PlayerRig()
         rig.player.setSound(sound(.track))
         await rig.player.play([hashItem("hash-f", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
-        guard let engine = rig.player.currentEngine else {
+        guard let engine = rig.player.currentEngine, let pipeline = rig.player.pipeline else {
             Issue.record("no engine")
             return
         }
-        // The seek's count, as `seek(to:)` holds it until its call returns.
+        // A real seek, which sets the cue; render calls of one frame let the decode thread take it, at the old gain,
+        // and stop as soon as it has entered the item there, before any of its audio is rendered.
+        await rig.player.seek(to: .milliseconds(500))
+        let target: Int64 = 24_000
+        let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(5))
+        while pipeline.enteredGains.isEmpty, ContinuousClock.now < deadline {
+            rig.puller.pullOnce(1)
+            try? await Task.sleep(for: .microseconds(200))
+        }
+        #expect(pipeline.enteredGains.first?.gainDb == halfDb)
+        #expect(pipeline.position == (0, target))
+        // The main actor has not heard back yet: the seek's count still stands, as `seek(to:)` holds it.
         engine.seeksInFlight += 1
         rig.player.setSound(SoundSettings())
         await drained(rig.player)
         #expect(rig.player.recueCount == 1)
         engine.seeksInFlight -= 1
-        #expect(await rig.puller.pull(upTo: 4096 + 2048))
-        #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        let base = rig.output.capturedFloat.count / 2
+        #expect(await rig.puller.pull(upTo: rig.puller.pulled + 4096))
+        let captured = rig.output.capturedFloat
+        var got: [Float] = []
+        var want: [Float] = []
+        for k in Int64(512)..<4096 {
+            for c in 0..<2 {
+                got.append(captured[2 * (base + Int(k)) + c])
+                want.append(HashDecoder.float(target + k, channel: c))
+            }
+        }
+        #expect(mismatch(got, want) == nil)
+        #expect(pipeline.renderingGain?.gainDb == 0)
         rig.player.pause()
     }
 

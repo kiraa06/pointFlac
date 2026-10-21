@@ -14,6 +14,9 @@ final class PlayerEngine {
     /// The path negotiated for the track about to start (its `.planChanged`), waiting for that track's `trackStarted`.
     /// The strip pairs a plan only with the track it was negotiated for, never with the one before it.
     var negotiated: SignalPath?
+    /// Calls queued to hand the pipeline the player's Sound settings behind a re-cue's hold, not yet run. While any is,
+    /// a later settings change leaves the chain to them, so it never changes ahead of the hold.
+    var soundAppliesPending = 0
     private(set) var isRetired = false
     private var lastCall: Task<Void, Never>?
 

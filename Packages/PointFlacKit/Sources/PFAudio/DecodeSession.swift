@@ -141,9 +141,11 @@ final class DecodeSession: @unchecked Sendable {
             return .finishQueue
         }
         let nextFormat = next.format
-        let nextGainDb = gainDb(of: target)
+        // The gain as it stands now chooses the plan only (a gain needs Float32). The gain the item plays at is taken
+        // again when it is entered, below, after any drain and reconfigure.
+        let planGainDb = gainDb(of: target)
         var boundary = written
-        if isCompatible(nextFormat, gainDb: nextGainDb) {
+        if isCompatible(nextFormat, gainDb: planGainDb) {
             if entry == .next, converter != nil { boundary = converterBoundary }
             placeBoundaryEvents(at: boundary)
         } else {
@@ -153,7 +155,7 @@ final class DecodeSession: @unchecked Sendable {
             // The output stops once this is rendered: the silence until then is the gap, not an underrun.
             source?.markEndOfStream()
             if let step = drain() { return step }
-            switch reconfigure(for: nextFormat, gainDb: nextGainDb) {
+            switch reconfigure(for: nextFormat, gainDb: planGainDb) {
             case .configured: break
             case .interrupted(let step): return step
             case .failed(let message):
@@ -179,7 +181,6 @@ final class DecodeSession: @unchecked Sendable {
         decoder = next
         index = target
         format = nextFormat
-        gain = nextGainDb == 0 ? 1 : pow(10, nextGainDb / 20)
         // Only into a Float32 client: an Int32 one carries the source's words untouched.
         if entry == .seek, enteringRecue, plan.client == .float32 {
             fadeInFrames = max(1, Int((RenderSource.crossfadeSeconds * Double(nextFormat.sampleRate)).rounded()))
@@ -190,14 +191,30 @@ final class DecodeSession: @unchecked Sendable {
         enteringRecue = false
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
-        let segment = Timeline.Segment(
-            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
-            totalFrames: next.totalFrames, gainDb: nextGainDb)
+        // The item is entered here: its gain is taken and its segment published in one critical section, the lock
+        // `setGains` takes (ruling R4-T12b). A `setGains` before it gives this item the new gain; one after it finds
+        // the segment in `enteredGains`, so a switch can re-cue it. Nothing of the item is decoded before this, so no
+        // audio is ever heard at a gain `enteredGains` did not show. Across a drain and reconfigure (a plan change) the
+        // gain read for the plan may be stale by now; a Float32 plan takes any gain. An Int32 one (passthrough, with a
+        // gain of 0 when planned) takes none: the item then plays at 0 dB, as its segment says, and a gain set
+        // meanwhile reaches it at the next seek or re-cue.
+        let item = items[target]
+        let client = plan.client
         let rendered = source.renderedFrames
-        _ = core.withShared(for: self) { s in
+        let start = Timeline.Segment(
+            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
+            totalFrames: next.totalFrames, gainDb: 0)
+        let enteredGainDb = core.withShared(for: self) { s -> Double in
+            let set = s.gainsDb[item.id] ?? item.gainDb
+            let gainDb = client == .int32 || !set.isFinite ? 0 : set
+            var segment = start
+            segment.gainDb = gainDb
             s.timeline.append(segment, rendered: rendered)
             if s.requestedSeek == nil { s.timeline.pendingFrame = nil }
+            return gainDb
         }
+        guard let enteredGainDb else { return .stop }
+        gain = enteredGainDb == 0 ? 1 : pow(10, enteredGainDb / 20)
         return .play
     }
 
@@ -240,8 +257,8 @@ final class DecodeSession: @unchecked Sendable {
         return nil
     }
 
-    /// The ReplayGain item `index` plays at, in dB: what `setGains` last gave its ID, else its own. A value that is not
-    /// finite is no gain.
+    /// The ReplayGain item `index` would play at now, in dB: what `setGains` last gave its ID, else its own. A value
+    /// that is not finite is no gain. For choosing a plan; the item's own gain is taken as it is entered.
     private func gainDb(of index: Int) -> Double {
         let item = items[index]
         let set = core.withShared(for: self) { $0.gainsDb[item.id] } ?? nil

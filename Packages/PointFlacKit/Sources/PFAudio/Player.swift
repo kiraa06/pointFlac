@@ -268,16 +268,19 @@ public final class Player {
         sound = settings
         if let engine {
             if gainsChanged { engine.pipeline.setGains(queueGains) }
+            // A change of chain waiting behind a re-cue's hold takes this one along (it applies the latest settings),
+            // so the chain never changes ahead of the hold.
+            let behindHold = engine.soundAppliesPending > 0
             if switched, scrubRun != nil {
                 // The let-go seeks the pipeline, at the new gains; `finishScrub` checks again in case it does not.
                 recueAfterScrub = true
-                engine.pipeline.setSound(settings)
+                if !behindHold { engine.pipeline.setSound(settings) }
             } else if switched, gainsDiffer(engine) {
                 // A gain changes: the chain changes behind the re-cue's hold, so gained audio never plays through
                 // the wrong chain (a limiter faded out under it, say).
                 recueIfGainsDiffer(engine, thenApplySound: true)
             } else {
-                engine.pipeline.setSound(settings)
+                if !behindHold { engine.pipeline.setSound(settings) }
                 // Checked again behind a seek or a start still on its way, which may have entered at the old gains.
                 if switched { recueIfGainsDiffer(engine, thenApplySound: false) }
             }
@@ -303,6 +306,7 @@ public final class Player {
     /// enters at the new gains), while a seek waits for the decode thread (likewise), while paused or ended (the next
     /// start uses the new gains), or while a finger is on the record (checked again when it lets go).
     private func recueIfGainsDiffer(_ engine: PlayerEngine, thenApplySound: Bool) {
+        if thenApplySound { engine.soundAppliesPending += 1 }
         _ = engine.enqueue { [weak self, weak engine] pipeline in
             guard let self, let engine, self.engine === engine, !engine.isRetired else { return }
             if self.scrubRun != nil {
@@ -315,8 +319,11 @@ public final class Player {
                 await pipeline.recue(toFrame: point.frame, firstFrame: FirstFrameInterval(.seek))
                 engine.seeksInFlight -= 1
             }
-            // The latest settings: a later `setSound` may have come meanwhile.
-            if thenApplySound { pipeline.setSound(self.sound) }
+            // The latest settings: a later `setSound` may have come meanwhile, and left the chain to this call.
+            if thenApplySound {
+                engine.soundAppliesPending -= 1
+                pipeline.setSound(self.sound)
+            }
         }
     }
 
