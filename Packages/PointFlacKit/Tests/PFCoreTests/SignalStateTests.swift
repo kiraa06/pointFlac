@@ -270,3 +270,10 @@ private let allStates: [SignalState] = [
     #expect(SignalStrip.titleNote(SignalState()) == nil)
     #expect(SignalStrip.titleNote(SignalState(source: fmt(96_000, 24), port: .usb("DAC"))) == nil)
 }
+
+@Test func badgeDisplayText() {
+    #expect(
+        SignalStrip.signalBadges(state(96_000, 24, hardware: 96_000)).map(\.displayText) == ["Hi-Res 24/96", "Pure"])
+    #expect(SignalBadge.hiRes(bits: 24, rate: 352_800).displayText == "Hi-Res 24/352.8")
+    #expect(SignalBadge.lossless(bits: 16, rate: 44_100).displayText == "Lossless 16/44.1")
+}

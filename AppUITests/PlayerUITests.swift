@@ -137,10 +137,25 @@ final class PlayerUITests: XCTestCase {
         let to = record.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85))
         from.press(forDuration: 0.4, thenDragTo: to, withVelocity: .slow, thenHoldForDuration: 0.4)
         let settled = NSPredicate { _, _ in
-            app.buttons["playButton"].label == "Pause" && !app.buttons["signalStrip"].label.contains("Scrubbing")
+            // "Scrubbing" lives in the small note beside the title now, not in the strip.
+            let note = app.descendants(matching: .any)["titleNote"]
+            return app.buttons["playButton"].label == "Pause" && !(note.exists && note.label.contains("Scrubbing"))
         }
         expectation(for: settled, evaluatedWith: nil)
         waitForExpectations(timeout: 6)
+    }
+
+    /// The SIGNAL cell shows what is delivered (Hi-Res or Lossless text) and the strip says so aloud.
+    @MainActor
+    func testSignalCellSpeaksTheDeliveredResolution() {
+        let app = launch(demoPlay: true)
+        let strip = app.descendants(matching: .any)["signalStrip"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 8))
+        let spoken = NSPredicate(
+            format: "label CONTAINS 'Signal: Hi-Res output' OR label CONTAINS 'Signal: Lossless output'")
+        expectation(for: spoken, evaluatedWith: strip)
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(strip.label.localizedCaseInsensitiveContains("bit-perfect"))
     }
 
     @MainActor

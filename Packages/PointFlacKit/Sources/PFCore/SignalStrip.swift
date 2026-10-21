@@ -87,6 +87,15 @@ public enum SignalBadge: Hashable, Sendable {
         }
     }
 
+    /// The same pill in mixed case, for the SIGNAL cell's plain text: `Hi-Res 24/96`, `Lossless 16/44.1`, `Pure`.
+    public var displayText: String {
+        switch self {
+        case .hiRes(let bits, let rate): "Hi-Res \(bits)/\(SignalStrip.shortRate(rate))"
+        case .lossless(let bits, let rate): "Lossless \(bits)/\(SignalStrip.shortRate(rate))"
+        case .pure: "Pure"
+        }
+    }
+
     public var accessibilityLabel: String {
         switch self {
         case .hiRes(let bits, let rate): "Hi-Res output, \(bits)-bit \(AudioFormat.formatRate(rate))"

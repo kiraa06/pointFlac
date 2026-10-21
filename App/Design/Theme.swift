@@ -39,7 +39,7 @@ struct Theme {
     /// lively rather than alarming. `warn` stays for real warnings, such as a USB volume below full scale.
     let altered: Color
     let warn: Color
-    /// The HI-RES pill's gold: delivered above 48 kHz at 24 bits or more.
+    /// The Hi-Res text's gold: delivered above 48 kHz at 24 bits or more.
     let hiRes: Color
     let playFill: Color
     let playGlyph: Color

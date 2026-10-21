@@ -288,7 +288,7 @@ struct WaveProgress: View {
 
 /// The signal strip as the mockups draw it: FORMAT · DEPTH · DAC · SIGNAL cells, from `SignalStrip.text`, so the
 /// words are exactly the strip's and its honesty rules hold. When the delivered resolution is known, the SIGNAL cell
-/// shows its pills (HI-RES / LOSSLESS, PURE) where the indicator words would be; the altered states are noted beside
+/// shows its text (HI-RES / LOSSLESS, PURE) where the indicator words would be; the altered states are noted beside
 /// the title instead. The whole strip is one accessibility element with the id the UI tests read.
 struct SignalCells: View {
     let signal: SignalState
@@ -299,7 +299,7 @@ struct SignalCells: View {
         strip(SignalStrip.text(signal))
     }
 
-    /// The strip's spoken label: the plain text, with the pills' meaning in place of the indicator words.
+    /// The strip's spoken label: the plain text, with the resolution's meaning in place of the indicator words.
     private func spoken(_ text: String) -> String {
         let badges = SignalStrip.signalBadges(signal)
         let parts = text.components(separatedBy: " · ")
@@ -310,26 +310,25 @@ struct SignalCells: View {
         return spoken
     }
 
-    /// The pills, in the SIGNAL cell. Tight padding, so two of them fit where "Resampled 96→48" did.
-    private var pills: some View {
-        HStack(spacing: 4) {
-            ForEach(SignalStrip.signalBadges(signal), id: \.self) { badge in
-                Text(badge.text)
-                    .font(Typeface.monoSmall)
-                    .foregroundStyle(color(badge))
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Capsule().strokeBorder(color(badge).opacity(0.7), lineWidth: 1))
-                    .lineLimit(1).fixedSize()
-                    .accessibilityIdentifier(badge == .pure ? "pill.pure" : "pill.resolution")
-            }
+    /// The SIGNAL cell's text when the delivered resolution is known: plain words in the cell's own font, tinted by
+    /// meaning (Hi-Res gold, Lossless neutral, Pure green), joined by a quiet " · ". One Text, so it baselines with
+    /// the other cells.
+    private var resolutionText: Text {
+        let badges = SignalStrip.signalBadges(signal)
+        let dot = Text(" · ").foregroundStyle(theme.inkSecondary)
+        var result = Text("")
+        for (index, badge) in badges.enumerated() {
+            result = Text(
+                "\(result)\(index > 0 ? dot : Text(""))\(Text(badge.displayText).foregroundStyle(color(badge)))")
         }
+        return result
     }
 
     private func color(_ badge: SignalBadge) -> Color {
         switch badge {
         case .pure: theme.ok
         case .hiRes: theme.hiRes
-        case .lossless: theme.inkSecondary
+        case .lossless: theme.ink
         }
     }
 
@@ -354,11 +353,14 @@ struct SignalCells: View {
         if parts.count >= 4, parts[0] == "FLAC" {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .top, spacing: 8) {
-                    cell("FORMAT", parts[0])
-                    cell("DEPTH", parts[1])
-                    cell("DAC", parts[2])
+                    // With the resolution text the first three cells size to their content, so the SIGNAL cell gets
+                    // the leftover width.
+                    let hugging = signal.resolution != nil
+                    cell("FORMAT", parts[0], fixed: hugging)
+                    cell("DEPTH", parts[1], fixed: hugging)
+                    cell("DAC", parts[2], fixed: hugging)
                     if signal.resolution != nil {
-                        pillCell
+                        resolutionCell
                     } else {
                         cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)
                     }
@@ -376,14 +378,14 @@ struct SignalCells: View {
         }
     }
 
-    /// The SIGNAL cell with pills in place of words, laid out like `cell` so the row keeps its rhythm.
-    private var pillCell: some View {
+    /// The SIGNAL cell with the resolution text in place of the indicator words, laid out like `cell`.
+    private var resolutionCell: some View {
         VStack(alignment: .leading, spacing: 3) {
             Rectangle().fill(theme.hairline).frame(height: 1)
             Text("SIGNAL").font(Typeface.cellLabel).tracking(1.2).foregroundStyle(theme.inkSecondary)
-            pills
+            resolutionText.font(Typeface.cellValue).lineLimit(1).minimumScaleFactor(0.85)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// One cell. The signal cell keeps its full width (`fixed`): its words are the claim, so they never truncate;
