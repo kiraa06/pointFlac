@@ -13,18 +13,24 @@ public enum PathSanitizer {
     public static func localFileName(forRemotePath path: String) -> String {
         let components = path.split(whereSeparator: { $0 == "\\" || $0 == "/" })
         var name = String(components.last ?? "")
+        // FLAC names keep their extension even when the stem sanitises away (".flac", "..flac").
+        let isFLAC = name.lowercased().hasSuffix(".flac")
+        if isFLAC { name = String(name.dropLast(5)) }
         name = String(
-            name.unicodeScalars.map { scalar -> Character in
-                if scalar.value < 0x20 || scalar.value == 0x7F || scalar == ":" { return "_" }
-                return Character(scalar)
-            })
+            String.UnicodeScalarView(
+                name.unicodeScalars.compactMap { scalar -> Unicode.Scalar? in
+                    // Format characters (such as U+202E, which reverses the displayed name) are dropped.
+                    if scalar.properties.generalCategory == .format { return nil }
+                    if scalar.value < 0x20 || scalar.value == 0x7F || scalar == ":" { return "_" }
+                    return scalar
+                }))
         name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         while name.hasPrefix(".") { name.removeFirst() }
         name = name.trimmingCharacters(in: .whitespaces)
 
         var stem = name
-        var ext = ""
-        if let dot = name.lastIndex(of: "."), dot != name.startIndex, name[dot...].utf8.count <= 16 {
+        var ext = isFLAC ? ".flac" : ""
+        if !isFLAC, let dot = name.lastIndex(of: "."), dot != name.startIndex, name[dot...].utf8.count <= 16 {
             stem = String(name[..<dot])
             ext = String(name[dot...]).lowercased()
         }
@@ -32,6 +38,12 @@ public enum PathSanitizer {
         let budget = maxNameBytes - ext.utf8.count
         while stem.utf8.count > budget, !stem.isEmpty { stem.removeLast() }
         return stem + ext
+    }
+
+    /// A NUL-free, fixed-length identifier for a peer and path.
+    static func resultID(peer: String, path: String) -> String {
+        let digest = SHA256.hash(data: Data("\(peer)\u{0}\(path)".utf8))
+        return "slsk-" + digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Everything before the last separator, for grouping results by folder.

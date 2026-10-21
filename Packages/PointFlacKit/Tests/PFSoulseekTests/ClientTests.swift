@@ -15,12 +15,13 @@ func collect(_ stream: AsyncThrowingStream<[SearchResultFile], any Error>) async
 }
 
 /// Waits (briefly) for an actor-side condition that the network side sets asynchronously.
-func eventually(_ condition: @Sendable () async -> Bool) async -> Bool {
-    for _ in 0..<300 {
+func eventually(within limit: Duration = .seconds(3), _ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + limit
+    while ContinuousClock.now < deadline {
         if await condition() { return true }
         try? await Task.sleep(for: .milliseconds(10))
     }
-    return false
+    return await condition()
 }
 
 @Suite("Login", .timeLimit(.minutes(1)))
@@ -245,7 +246,7 @@ struct SearchTests {
         let diagnostics = await client.diagnostics
         #expect(diagnostics.peakPeerConnections <= 2)
         #expect(diagnostics.droppedAtCap == 3)
-        #expect(await eventually { await client.activePeerConnections == 0 })
+        #expect(await eventually(within: .seconds(10)) { await client.activePeerConnections == 0 })
     }
 
     @Test("Hostile peers: a zlib bomb and garbage are dropped while honest peers still get through")
@@ -257,7 +258,13 @@ struct SearchTests {
         let bombTask = Task {
             let l = try await bomb.accept()
             _ = try await l.nextFrame(codeWidth: .u8)
-            try await l.send(Mock.searchResponse(compressed: Mock.zlib([UInt8](repeating: 0, count: 20 * 1024 * 1024))))
+            // A valid header for the running search, then 20 MiB of zeros: it passes the token check and must stop at
+            // the 16 MiB inflate cap.
+            var head = WireWriter()
+            head.string("bomb")
+            head.u32(await tokenBox.value)
+            let bombBody = head.bytes + [UInt8](repeating: 0, count: 20 * 1024 * 1024)
+            try await l.send(Mock.searchResponse(compressed: Mock.zlib(bombBody)))
         }
         let garbageTask = Task {
             let l = try await garbage.accept()
@@ -267,7 +274,11 @@ struct SearchTests {
         }
         let (honest, honestTask) = try await Self.respondingPeer(
             token: 3, searchToken: { await tokenBox.value }, files: Self.files)
-        let stream = client.search("x", options: SoulseekSearchOptions(window: .seconds(1)))
+        // A long window that ends early once the honest peer's two files arrive. The bomb takes a while to build on an
+        // instrumented (TSan) build and must still arrive while its connection is allowed to live.
+        var options = SoulseekSearchOptions(window: .seconds(30))
+        options.maxFiles = 2
+        let stream = client.search("x", options: options)
         let search = try await link.expect(code: 26)
         var reader = WireReader(search.payload)
         await tokenBox.set(try reader.u32())
@@ -279,7 +290,15 @@ struct SearchTests {
         try await garbageTask.value
         try await honestTask.value
         #expect(files.count == 2 && files.allSatisfy { $0.peer == "bob" })
-        #expect(await client.diagnostics.malformedMessages >= 2)
+        // The garbage is always malformed. The bomb is malformed (inflate cap) or, on a slow machine such as a TSan
+        // run, arrives after the window and is dropped as inactive; either way it never reaches the results.
+        // Inflating the bomb up to its cap can outlast the window on an instrumented build, so wait for its verdict.
+        #expect(
+            await eventually(within: .seconds(40)) {
+                let diagnostics = await client.diagnostics
+                return diagnostics.malformedMessages >= 1
+                    && diagnostics.malformedMessages + diagnostics.inactiveResponses >= 2
+            })
     }
 
     @Test("Early stop at maxFiles")

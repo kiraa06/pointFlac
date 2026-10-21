@@ -6,15 +6,17 @@ import Foundation
 /// `peer` is the username the *server* gave in its `ConnectToPeer` message, not the name the peer wrote into its own
 /// response, because peers are unauthenticated (spec §5.6).
 public struct SearchResultFile: Sendable, Hashable, Identifiable {
-    /// Stable per peer and path, so duplicate responses collapse and the UI can key rows.
-    public var id: String { "\(peer)\u{0}\(path)" }
-    public var peer: String
+    /// Stable per peer and path, so duplicate responses collapse and the UI can key rows. A hash, so it carries no NUL
+    /// or path characters into `RemoteTrack.id`.
+    public let id: String
+    /// Read-only: `id`, `fileName` and `folder` are derived from these, and downloads re-derive the local name.
+    public private(set) var peer: String
     /// The remote path exactly as the peer sent it (backslash separated). Only ever sent back to that peer.
-    public var path: String
+    public private(set) var path: String
     /// A sanitised base name that is safe to use locally (see `PathSanitizer`).
-    public var fileName: String
+    public private(set) var fileName: String
     /// The remote folder, for grouping results by peer and folder (§4.7).
-    public var folder: String
+    public private(set) var folder: String
     public var sizeBytes: Int64
     /// Attribute 5. `nil` when the peer did not say.
     public var bitsPerSample: Int?
@@ -34,6 +36,7 @@ public struct SearchResultFile: Sendable, Hashable, Identifiable {
         bitrate: Int? = nil, durationSeconds: Int? = nil, freeSlot: Bool = true, uploadSpeed: Int = 0,
         queueLength: Int = 0
     ) {
+        self.id = PathSanitizer.resultID(peer: peer, path: path)
         self.peer = peer
         self.path = path
         self.fileName = PathSanitizer.localFileName(forRemotePath: path)
@@ -111,6 +114,23 @@ public struct SoulseekConfiguration: Sendable {
     public var fileConnectionTimeout: Duration = .seconds(60)
     /// A transfer that receives no bytes for this long fails (and can resume later).
     public var transferIdleTimeout: Duration = .seconds(60)
+    /// Connections at once to one peer, of any kind. A peer cannot occupy the search budget through many tokens.
+    public var maxConnectionsPerPeer = 4
+    /// Absolute lifetime of a search connection (capped further by the search window), against slowloris peers.
+    public var searchConnectionLifetime: Duration = .seconds(30)
+    /// Responses inflated and parsed at once across all peers. With 1 MiB frames and 16 MiB inflate this bounds the
+    /// transient memory to tens of megabytes, far from iOS's jetsam limits.
+    public var maxConcurrentParses = 4
+    /// Largest file accepted. FLAC albums' longest tracks are far below this; anything larger is hostile or wrong.
+    public var maxFileSize: Int64 = 2 * 1024 * 1024 * 1024
+    /// Free space where downloads land. Injectable for tests.
+    public var availableCapacity: @Sendable (URL) -> Int64? = { url in
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage
+    }
+    /// Peer addresses from the server that are loopback, private (RFC 1918), link-local, multicast or unspecified are
+    /// refused: a hostile server must not aim connections into the user's own network. Tests turn this on.
+    public var allowPrivatePeerAddresses = false
 
     public init() {}
 }
@@ -149,13 +169,18 @@ public enum SoulseekTransferFailure: Error, Sendable, Equatable {
     case peerUnreachable
     case denied(String)
     case uploadFailed
-    /// The peer announced more bytes than the search result said (§5.6: never accept a larger size).
+    /// The peer announced a different size than the search result (§5.6). Larger is hostile; smaller would end in a
+    /// truncated file reported as finished.
     case sizeMismatch(expected: Int64, announced: Int64)
     case timeout
     case incomplete(received: Int64, expected: Int64)
     case cancelled
     /// The same peer and path is already downloading.
     case alreadyInProgress
+    /// Larger than `maxFileSize`.
+    case fileTooLarge
+    /// Not enough free space for the rest of the file.
+    case insufficientStorage
     case io(String)
     case protocolViolation(String)
 }

@@ -177,7 +177,7 @@ struct MessageTests {
                 Mock.File(path: "Music\\x.mp3", size: 5_000_000, attributes: [(0, 320)]),
             ], freeSlot: false, speed: 123_456, queue: 7)
         let response = try SearchResponse.parse(try Inflate.zlib(Mock.zlib(payload), limit: 1 << 20))
-        let results = response.results(peer: "bob")
+        let results = response.results(peer: "bob", filter: ResultFilter(flacOnly: false))
         #expect(results.count == 2)
         let flac = results[0]
         #expect(flac.peer == "bob")  // the server's name, not the one the peer wrote

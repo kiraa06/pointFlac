@@ -25,6 +25,7 @@ struct LiveTests {
         options.maxFiles = 5_000
         var files: [SearchResultFile] = []
         var batches = 0
+        let searchStart = ContinuousClock.now
         for try await batch in client.search(query, options: options) {
             files += batch
             batches += 1
@@ -33,7 +34,9 @@ struct LiveTests {
         let peers = Set(files.map(\.peer)).count
         let hiRes = files.filter { ($0.bitsPerSample ?? 0) >= 24 }.count
         print(
-            "LIVE: major \(config.majorVersion); \(diagnostics.connectRequests) connect requests,",
+            "LIVE: major \(config.majorVersion); search took \(ContinuousClock.now - searchStart);",
+            "\(diagnostics.connectRequests) connect requests, \(diagnostics.inactiveResponses) inactive,",
+            "\(diagnostics.droppedPerPeer) dropped per peer, \(diagnostics.refusedAddresses) refused addresses,",
             "\(diagnostics.droppedAtCap) dropped at cap, peak \(diagnostics.peakPeerConnections) in flight,",
             "\(diagnostics.searchResponses) responses, \(diagnostics.malformedMessages) malformed;",
             "\(files.count) FLAC files from \(peers) peers in \(batches) batches, \(hiRes) at 24-bit or more;",

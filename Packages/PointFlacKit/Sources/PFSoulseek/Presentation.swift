@@ -2,7 +2,8 @@ import Foundation
 
 /// One peer's folder from a search: the unit §4.7 asks the UI to show ("grouped by peer and complete folder").
 public struct SearchResultFolder: Sendable, Hashable, Identifiable {
-    public var id: String { "\(peer)\u{0}\(folder)" }
+    /// A NUL-free hash of peer and folder, like `SearchResultFile.id`.
+    public var id: String { PathSanitizer.resultID(peer: peer, path: folder + "\\") }
     public var peer: String
     /// The remote folder path, as `browseFolder(_:of:)` expects it.
     public var folder: String
@@ -91,6 +92,8 @@ extension SoulseekTransferFailure {
         case .incomplete: "The transfer stopped early; it will resume from where it stopped"
         case .cancelled: "Cancelled"
         case .alreadyInProgress: "Already downloading"
+        case .fileTooLarge: "The file is too large"
+        case .insufficientStorage: "Not enough free space"
         case .io(let what): "Could not save the file (\(what))"
         case .protocolViolation: "The peer broke the protocol"
         }

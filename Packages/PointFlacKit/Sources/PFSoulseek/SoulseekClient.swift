@@ -25,6 +25,10 @@ public actor SoulseekClient {
         public var searchResponses = 0
         public var malformedMessages = 0
         public var peakPeerConnections = 0
+        public var droppedPerPeer = 0
+        public var refusedAddresses = 0
+        /// Responses for searches that had already ended, dropped before inflating.
+        public var inactiveResponses = 0
     }
 
     /// Never logs credentials, queries, paths or message contents (§5.8); counts and states only.
@@ -43,13 +47,19 @@ public actor SoulseekClient {
     var nextSearchSlot: ContinuousClock.Instant?
     var searches: [UInt32: SearchSession] = [:]
     var activePeerConnections = 0
+    var connectionsPerPeer: [String: Int] = [:]
+    var peerSlots: [UUID: (peer: String, link: FramedLink?)] = [:]
+    /// Bounds how many responses are inflated and parsed at once (memory budget, see `maxConcurrentParses`).
+    nonisolated let parseGate: AsyncSemaphore
 
     var transfers: [UUID: TransferEntry] = [:]
-    var folderWaiters: [UInt32: (peer: String, continuation: CheckedContinuation<[SearchResultFile]?, Never>)] = [:]
+    var folderWaiters:
+        [UInt32: (peer: String, flacOnly: Bool, continuation: CheckedContinuation<[SearchResultFile]?, Never>)] = [:]
     var addressWaiters: [UUID: (username: String, continuation: CheckedContinuation<PeerAddress?, Never>)] = [:]
 
     public init(configuration: SoulseekConfiguration = SoulseekConfiguration()) {
         self.configuration = configuration
+        self.parseGate = AsyncSemaphore(configuration.maxConcurrentParses)
     }
 
     // MARK: - State
@@ -94,13 +104,17 @@ public actor SoulseekClient {
         reconnectTask?.cancel()
         reconnectTask = nil
         sessionEpoch += 1
+        let epoch = sessionEpoch
         credentials = (username, password)
         setState(.connecting)
         do {
             try await establishSession()
         } catch {
-            credentials = nil
-            setState(.failed(error))
+            // Only this login's own failure may clear the account: a newer login or a logout owns the state now.
+            if epoch == sessionEpoch {
+                credentials = nil
+                setState(.failed(error))
+            }
             throw error
         }
     }
@@ -164,23 +178,20 @@ public actor SoulseekClient {
                     minor: config.minorVersion))
             reply = try await Self.awaitLoginReply(framed, timeout: config.loginTimeout)
         } catch LinkError.timeout {
-            framed.close()
-            server = nil
+            discard(framed)
             throw .timeout
         } catch {
-            framed.close()
-            server = nil
-            throw .serverUnavailable
+            discard(framed)
+            throw generation == serverGeneration ? .serverUnavailable : .connectionLost
         }
         guard generation == serverGeneration, epoch == sessionEpoch else {
-            framed.close()
+            discard(framed)
             throw .connectionLost
         }
 
         if case .loginFailed(let reason) = reply {
-            logger.notice("Soulseek: login refused (\(reason, privacy: .public))")
-            framed.close()
-            server = nil
+            logger.notice("Soulseek: login refused (\(reason, privacy: .private))")
+            discard(framed)
             switch reason {
             case "INVALIDPASS": throw .invalidPassword
             case "INVALIDUSERNAME": throw .invalidUsername
@@ -197,6 +208,12 @@ public actor SoulseekClient {
         ] {
             try? await framed.send(message)
         }
+        // A logout or a newer login may have run during those sends.
+        guard generation == serverGeneration, epoch == sessionEpoch else {
+            discard(framed)
+            throw .connectionLost
+        }
+        excludedPhrasesReceived = false
 
         serverTasks.append(
             Task { [weak self] in
@@ -230,6 +247,12 @@ public actor SoulseekClient {
         logger.info("Soulseek: logged in (protocol \(config.majorVersion, privacy: .public))")
     }
 
+    /// Closes a server link from a login attempt, clearing `server` only if it is still that link.
+    private func discard(_ framed: FramedLink) {
+        framed.close()
+        if server === framed { server = nil }
+    }
+
     private static func awaitLoginReply(_ framed: FramedLink, timeout: Duration) async throws -> ServerMessage {
         let deadline = ContinuousClock.now + timeout
         while true {
@@ -250,6 +273,7 @@ public actor SoulseekClient {
         guard state != .kicked else { return }
         finishAllSearches(error: .connectionLost)
         guard configuration.autoReconnect, credentials != nil else {
+            tearDownServer()  // also stops the keepalive
             setState(.failed(.connectionLost))
             return
         }
@@ -276,10 +300,12 @@ public actor SoulseekClient {
     /// One reconnect attempt. Returns true when reconnecting should stop (success or a final refusal).
     private func attemptReconnect() async -> Bool {
         guard credentials != nil else { return true }
+        let epoch = sessionEpoch
         do {
             try await establishSession()
             return true
         } catch {
+            guard epoch == sessionEpoch else { return true }  // a login or logout took over
             switch error {
             case .invalidPassword, .invalidUsername, .invalidVersion, .rejected:
                 credentials = nil
@@ -333,82 +359,142 @@ public actor SoulseekClient {
     // MARK: - Indirect peer connections
 
     /// The server forwards a peer's request to reach us (we are behind NAT, so peers cannot connect in). We connect out
-    /// and identify ourselves with PierceFireWall. Search peers are capped and only accepted while a search is
-    /// collecting; peers we are downloading from always get through.
+    /// and identify ourselves with PierceFireWall. Search peers are capped globally and per peer, live at most until
+    /// the search window ends, and are only accepted while a search is collecting. Peers we are downloading from or
+    /// browsing bypass the global cap (a busy search must not stall a download) but still count towards it.
     private func handleConnectRequest(_ request: ConnectRequest) {
         diagnostics.connectRequests += 1
+        guard configuration.allowPrivatePeerAddresses || AddressPolicy.isPublic(request.ip) else {
+            diagnostics.refusedAddresses += 1
+            return
+        }
+        let config = configuration
         switch request.type {
         case "P":
             let wanted = hasBusiness(with: request.username)
-            if !wanted {
-                guard searchesAcceptingPeers() else { return }
-                guard activePeerConnections < configuration.maxConcurrentPeerConnections else {
-                    diagnostics.droppedAtCap += 1
-                    return
-                }
-            }
-            beginPeerConnection()
-            let timeout = wanted ? configuration.transferRequestTimeout : configuration.peerReadTimeout
-            let config = configuration
-            Task { [weak self] in
-                guard let self else { return }
-                await Self.runPiercedPeer(request, client: self, config: config, readTimeout: timeout)
-                await self.endPeerConnection()
+            if !wanted && !searchesAcceptingPeers() { return }
+            guard let slot = reservePeerSlot(for: request.username, bypassGlobalCap: wanted) else { return }
+            let deadline = wanted ? nil : searchConnectionDeadline()
+            let timeout = wanted ? config.transferRequestTimeout : config.peerReadTimeout
+            let maxFrame = wanted ? FrameCaps.peer : FrameCaps.searchPeer
+            Task {
+                await Self.runPiercedPeer(
+                    request, client: self, config: config, slot: slot, readTimeout: timeout, deadline: deadline,
+                    maxFrame: maxFrame)
+                await self.releasePeerSlot(slot)
             }
         case "F":
-            guard transfers.values.contains(where: { $0.peer == request.username && $0.isAwaitingFile }) else {
-                return
-            }
-            let config = configuration
-            Task { [weak self] in
-                guard let self else { return }
-                await Self.runPiercedFile(request, client: self, config: config)
-            }
+            guard transfers.values.contains(where: { $0.peer == request.username && $0.isAwaitingFile }),
+                let slot = reservePeerSlot(for: request.username, bypassGlobalCap: true)
+            else { return }
+            Task { await Self.runPiercedFile(request, client: self, config: config, slot: slot) }
         default:
             // "D" (distributed search relays): pointFlac is a leaf and relays nothing.
             break
         }
     }
 
-    func beginPeerConnection() {
-        activePeerConnections += 1
-        diagnostics.peakPeerConnections = max(diagnostics.peakPeerConnections, activePeerConnections)
+    /// A search connection lives until the last running search's window closes, and never longer than
+    /// `searchConnectionLifetime`, however slowly the peer trickles bytes.
+    private func searchConnectionDeadline() -> ContinuousClock.Instant {
+        let now = ContinuousClock.now
+        let latest = searches.values.map(\.deadline).max() ?? now
+        return min(latest, now + configuration.searchConnectionLifetime)
     }
 
-    func endPeerConnection() { activePeerConnections = max(0, activePeerConnections - 1) }
+    // MARK: - Connection slots
+
+    /// Reserves one connection slot for `peer`. Every peer connection (search, control, browse, file) holds one, so
+    /// the global and per-peer limits see all of them.
+    func reservePeerSlot(for peer: String, bypassGlobalCap: Bool) -> UUID? {
+        guard connectionsPerPeer[peer, default: 0] < configuration.maxConnectionsPerPeer else {
+            diagnostics.droppedPerPeer += 1
+            return nil
+        }
+        if !bypassGlobalCap && activePeerConnections >= configuration.maxConcurrentPeerConnections {
+            diagnostics.droppedAtCap += 1
+            return nil
+        }
+        activePeerConnections += 1
+        connectionsPerPeer[peer, default: 0] += 1
+        diagnostics.peakPeerConnections = max(diagnostics.peakPeerConnections, activePeerConnections)
+        let slot = UUID()
+        peerSlots[slot] = (peer, nil)
+        return slot
+    }
+
+    /// Records the link that holds `slot`, so it can be closed when the business with that peer ends.
+    func attach(_ link: FramedLink, to slot: UUID) {
+        if peerSlots[slot] != nil {
+            peerSlots[slot]?.link = link
+        } else {
+            link.close()
+        }
+    }
+
+    func releasePeerSlot(_ slot: UUID) {
+        guard let entry = peerSlots.removeValue(forKey: slot) else { return }
+        activePeerConnections = max(0, activePeerConnections - 1)
+        let remaining = connectionsPerPeer[entry.peer, default: 1] - 1
+        connectionsPerPeer[entry.peer] = remaining > 0 ? remaining : nil
+    }
+
+    /// Closes every link to `peer` once nothing more is expected from it (a download or listing ended), instead of
+    /// letting forwarded connections linger for the full transfer timeout.
+    func closeIdleLinks(for peer: String) {
+        guard !hasBusiness(with: peer) else { return }
+        for entry in peerSlots.values where entry.peer == peer { entry.link?.close() }
+    }
 
     func notePeerConnectFailure() { diagnostics.peerConnectFailures += 1 }
 
+    func noteInactiveResponse() { diagnostics.inactiveResponses += 1 }
+
     @concurrent
     private nonisolated static func runPiercedPeer(
-        _ request: ConnectRequest, client: SoulseekClient, config: SoulseekConfiguration, readTimeout: Duration
+        _ request: ConnectRequest, client: SoulseekClient, config: SoulseekConfiguration, slot: UUID,
+        readTimeout: Duration, deadline: ContinuousClock.Instant?, maxFrame: Int
     ) async {
-        let link: TCPLink
+        let framed: FramedLink
         do {
-            link = try await TCPLink.connect(host: request.ip, port: request.port, timeout: config.peerConnectTimeout)
-            try await link.send(Outgoing.pierceFireWall(token: request.token))
+            framed = FramedLink(
+                try await TCPLink.connect(host: request.ip, port: request.port, timeout: config.peerConnectTimeout),
+                maxFrame: maxFrame)
+            await client.attach(framed, to: slot)
+            try await framed.send(Outgoing.pierceFireWall(token: request.token))
         } catch {
             await client.notePeerConnectFailure()
             return
         }
-        await servePeer(
-            FramedLink(link, maxFrame: FrameCaps.peer), peer: request.username, client: client,
-            readTimeout: readTimeout)
+        await servePeer(framed, peer: request.username, client: client, readTimeout: readTimeout, deadline: deadline)
     }
 
-    /// Reads peer messages from one P connection until it closes, times out, or has served its purpose. Search
-    /// connections close after their one response unless the peer is also one we are downloading from.
+    /// Reads peer messages from one P connection until it closes, times out, passes its deadline, or has served its
+    /// purpose. Search connections close after their one response unless we also have business with the peer.
     @concurrent
-    nonisolated static func servePeer(_ framed: FramedLink, peer: String, client: SoulseekClient, readTimeout: Duration)
-        async
-    {
+    nonisolated static func servePeer(
+        _ framed: FramedLink, peer: String, client: SoulseekClient, readTimeout: Duration,
+        deadline: ContinuousClock.Instant? = nil
+    ) async {
         defer { framed.close() }
+        var timeout = readTimeout
         while true {
             let frame: Frame
             do {
-                frame = try await framed.nextFrame(timeout: readTimeout)
+                frame = try await framed.nextFrame(timeout: timeout, deadline: deadline)
             } catch {
                 return
+            }
+            switch frame.code {
+            case PeerCode.fileSearchResponse:
+                await handleSearchFrame(frame, peer: peer, client: client)
+                if await !client.hasBusiness(with: peer) { return }
+                continue
+            case PeerCode.folderContentsResponse:
+                await handleFolderFrame(frame, peer: peer, client: client)
+                continue
+            default:
+                break
             }
             let message: PeerMessage
             do {
@@ -418,11 +504,6 @@ public actor SoulseekClient {
                 continue
             }
             switch message {
-            case .searchResponse(let response):
-                await client.receiveSearchResponse(response, peer: peer)
-                if await !client.hasBusiness(with: peer) { return }
-            case .folderContents(let listing):
-                await client.receiveFolderListing(listing, peer: peer)
             case .transferRequest(let direction, let token, let path, let size):
                 let reply = await client.handleTransferRequest(
                     peer: peer, direction: direction, token: token, path: path, size: size)
@@ -430,10 +511,58 @@ public actor SoulseekClient {
                 reply.deliver()
             case .placeInQueue, .uploadFailed, .uploadDenied:
                 await client.handleTransferNotice(message, peer: peer)
-            case .other:
+            case .searchResponse, .folderContents, .other:
                 break
             }
+            // Once nothing more is expected from this peer, a lingering connection only gets a short wait.
+            if await !client.hasBusiness(with: peer) { timeout = min(timeout, client.configuration.peerReadTimeout) }
         }
+    }
+
+    /// Search responses: read the token from the first inflated bytes, drop responses for searches that are not
+    /// running, then inflate, parse and filter under the shared parse gate, all off the actor. The actor only
+    /// receives the final, capped batch.
+    private nonisolated static func handleSearchFrame(_ frame: Frame, peer: String, client: SoulseekClient) async {
+        let token: UInt32
+        do {
+            token = try SearchResponse.token(fromPrefix: Inflate.zlibPrefix(frame.payload, count: 520))
+        } catch {
+            return await client.noteMalformed()
+        }
+        guard let filter = await client.resultFilter(forSearch: token) else {
+            return await client.noteInactiveResponse()
+        }
+        await client.parseGate.acquire()
+        var files: [SearchResultFile]?
+        if let inflated = try? Inflate.zlib(frame.payload, limit: Inflate.searchResponseLimit),
+            let response = try? SearchResponse.parse(inflated), response.token == token
+        {
+            files = response.results(peer: peer, filter: filter)
+        }
+        await client.parseGate.release()
+        guard let files else { return await client.noteMalformed() }
+        await client.receiveSearchBatch(files, token: token)
+    }
+
+    private nonisolated static func handleFolderFrame(_ frame: Frame, peer: String, client: SoulseekClient) async {
+        let token: UInt32
+        do {
+            var reader = WireReader(try Inflate.zlibPrefix(frame.payload, count: 4))
+            token = try reader.u32()
+        } catch {
+            return await client.noteMalformed()
+        }
+        guard let filter = await client.listingFilter(token: token, peer: peer) else { return }
+        await client.parseGate.acquire()
+        var files: [SearchResultFile]?
+        if let inflated = try? Inflate.zlib(frame.payload, limit: Inflate.folderListingLimit),
+            let listing = try? FolderListing.parse(inflated), listing.token == token
+        {
+            files = listing.results(peer: peer, filter: filter)
+        }
+        await client.parseGate.release()
+        guard let files else { return await client.noteMalformed() }
+        await client.receiveFolderListing(files, token: token, peer: peer)
     }
 }
 
