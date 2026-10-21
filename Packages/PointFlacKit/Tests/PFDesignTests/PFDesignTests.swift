@@ -144,3 +144,18 @@ import Testing
     #expect(ranges.map { String(text[$0]) } == ["Beyoncé", "Lem"])
     #expect(MatchHighlighter.ranges(of: "zzz", in: text).isEmpty)
 }
+
+/// The arc onto the platter uses its whole step: the old spring covered 91 % of the way in the first 30 % of the step,
+/// so the record darted onto the deck instead of flying there.
+@Test func arcGlidesAcrossItsWholeStepAndSettles() {
+    let timeline = HandoffTimeline()
+    let at = { (fraction: Double) in
+        timeline.progress(.arc, at: timeline.start(.arc) + (timeline.landTime - timeline.start(.arc)) * fraction)
+    }
+    #expect((0.05...0.2).contains(at(0.1)))  // moving at once (no stall after the slide), but not darting
+    #expect(at(0.3) < 0.7)  // the spring was at 0.91 here
+    #expect((0.75...0.92).contains(at(0.5)))
+    let peak = stride(from: 0.0, through: 1, by: 0.01).map(at).max() ?? 0
+    #expect(peak > 1.005 && peak < 1.03)  // a slight settle on the spindle
+    #expect(at(1) == 1)
+}

@@ -68,6 +68,13 @@ struct DeckLayout {
         let p = needle(at: arm.angle(forFraction: fraction))
         return hypot(p.x - recordCenter.x, p.y - recordCenter.y) / recordRadius
     }
+
+    /// The track gaps of a side, as `RecordDisc` draws them. The hand-off's record in flight uses it too, so the record
+    /// that lands looks exactly like the one that flew.
+    func bands(for timeline: SideTimeline) -> [CGFloat] {
+        guard timeline.total > 0 else { return [] }
+        return timeline.starts.dropFirst().map { bandRadius(forFraction: $0 / timeline.total) }
+    }
 }
 
 /// The glass turntable (spec §4.3): a frosted plinth, a strobe-dotted platter, the record as a picture disc, an
@@ -120,6 +127,7 @@ struct DeckStage: View {
                 $0.frame(in: .named(PlayerSpace.name))
             } action: { frame in
                 let l = DeckLayout(size: frame.size)
+                handoff.deckLayout = l
                 handoff.platterRect = CGRect(
                     x: frame.minX + l.recordCenter.x - l.recordRadius,
                     y: frame.minY + l.recordCenter.y - l.recordRadius,
@@ -401,9 +409,7 @@ struct DeckStage: View {
     // MARK: Text
 
     private func bands(_ layout: DeckLayout) -> [CGFloat] {
-        let timeline = playback.sideTimeline(playback.currentSide)
-        guard timeline.total > 0 else { return [] }
-        return timeline.starts.dropFirst().map { layout.bandRadius(forFraction: $0 / timeline.total) }
+        layout.bands(for: playback.sideTimeline(playback.currentSide))
     }
 
     private var armValue: String {

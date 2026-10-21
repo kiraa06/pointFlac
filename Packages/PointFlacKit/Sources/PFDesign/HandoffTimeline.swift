@@ -14,7 +14,7 @@ public struct HandoffTimeline: Sendable, Equatable {
         case slide
         /// The shelf sinks away.
         case sink
-        /// The record arcs to the platter, growing and turning, with a spring settle on the spindle.
+        /// The record arcs to the platter, growing and turning, gliding over the whole step and settling on the spindle.
         case arc
         /// The title and artist fade in under the deck.
         case title
@@ -57,12 +57,13 @@ public struct HandoffTimeline: Sendable, Equatable {
         return min(max((t - start(step)) / length, 0), 1)
     }
 
-    /// Eased progress of `step` at `t`: the sketch's ease for the slides, and a damped spring (which overshoots a
-    /// little, then settles) for the arc onto the spindle and the tonearm.
+    /// Eased progress of `step` at `t`: the sketch's ease for the slides, a glide for the arc onto the spindle, and a
+    /// damped spring (which overshoots a little, then settles) for the tonearm.
     public func progress(_ step: Step, at t: Double) -> Double {
         let x = linear(step, at: t)
         switch step {
-        case .arc, .arm: return Easing.spring(x)
+        case .arc: return Easing.glide(x)
+        case .arm: return Easing.spring(x)
         default: return Easing.easeOut(x)
         }
     }
@@ -73,6 +74,14 @@ public enum Easing {
     /// The sketch's `cubic-bezier(.25, .8, .25, 1)`: a fast start and a long, soft landing.
     public static func easeOut(_ x: Double) -> Double {
         cubicBezier(x, 0.25, 0.8, 0.25, 1)
+    }
+
+    /// A flight from 0 to 1 that uses the whole of x in 0...1: already moving at the start (so the record's rise
+    /// out of the sleeve flows straight into the swing, with no stall), the bulk of the travel mid-way, and a slight
+    /// overshoot (about 1.5 %) that settles back to exactly 1. The spring below does almost all of its travel in the
+    /// first third, which is right for a tonearm and too quick for a record crossing the screen.
+    public static func glide(_ x: Double) -> Double {
+        cubicBezier(x, 0.25, 0.1, 0.25, 1.15)
     }
 
     /// A damped spring from 0 to 1 over x in 0...1 (ζ = 0.7, about 5 % overshoot), exactly 1 at the end.

@@ -14,6 +14,8 @@ struct ShelfPanel: View {
     let close: () -> Void
     let getMusic: () -> Void
     /// An album (or a song on it) was picked, with the front sleeve's frame in the player's space for the hand-off.
+    /// The hand-off is flying a copy of the front sleeve: hide the real one so there is never a double.
+    var hidesFront = false
     let pick: (AlbumCard, TrackRow.ID?, CGRect?) -> Void
 
     @State private var query = ""
@@ -173,6 +175,7 @@ struct ShelfPanel: View {
                     ForEach(Array(albums.enumerated()), id: \.element.id) { index, album in
                         Sleeve(album: album)
                             .frame(width: sleeve, height: sleeve)
+                            .opacity(hidesFront && album.id == front ? 0 : 1)
                             .visualEffect { content, geometry in
                                 let width = geometry.bounds(of: .scrollView(axis: .horizontal))?.width ?? 400
                                 let mid = geometry.frame(in: .scrollView(axis: .horizontal)).midX

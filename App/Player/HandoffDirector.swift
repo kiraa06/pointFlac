@@ -24,6 +24,12 @@ final class HandoffDirector {
     private(set) var source: CGRect = .zero
     /// The record's frame on the platter, in the player's coordinate space; the deck keeps it current.
     var platterRect: CGRect = .zero
+    /// The deck's geometry, kept current by the deck, for the incoming record's track gaps.
+    @ObservationIgnored var deckLayout: DeckLayout?
+    /// The incoming record's track gaps, drawn while it flies so it lands looking exactly like the deck's record.
+    private(set) var incomingBands: [CGFloat] = []
+    /// How far the shelf travels as it sinks; the sleeve in flight sinks with it.
+    private(set) var sinkDistance: CGFloat = 0
     @ObservationIgnored private var startInstant = ContinuousClock.now
     @ObservationIgnored private var beats: Task<Void, Never>?
     /// The needle drop in flight, held so a later run can cancel it.
@@ -47,7 +53,7 @@ final class HandoffDirector {
 
     /// Starts a hand-off. A no-op while one runs: a tap during the flight belongs to the overlay, which finishes it.
     func start(
-        album: AlbumCard, track: TrackRow.ID?, from rect: CGRect, playback: PlaybackController,
+        album: AlbumCard, track: TrackRow.ID?, from rect: CGRect, sinkDistance: CGFloat, playback: PlaybackController,
         closeShelf: @escaping () -> Void
     ) {
         guard !isRunning else { return }
@@ -60,6 +66,8 @@ final class HandoffDirector {
         self.closeShelf = closeShelf
         palette = ArtPalette(seed: album.id)
         source = rect
+        self.sinkDistance = sinkDistance
+        incomingBands = deckLayout?.bands(for: playback.sideTimeline(of: album, startingAt: track)) ?? []
         landed = false
         spinning = false
         sinking = false
@@ -143,7 +151,11 @@ final class HandoffDirector {
     }
 }
 
-/// The travelling sleeve and record, drawn above everything while the hand-off runs.
+/// The travelling sleeve and record, drawn above everything (the shelf included) while the hand-off runs.
+///
+/// The record is drawn exactly as the deck draws it (same size, track gaps, sheen and shadow) and scaled down to the
+/// sleeve at the start, so at the landing the deck's record replaces it pixel for pixel. The sleeve is the shelf's own
+/// `Sleeve`, standing in for the front sleeve (which the shelf hides meanwhile) and sinking with the shelf.
 struct HandoffOverlay: View {
     let director: HandoffDirector
     let palette: ArtPalette
@@ -167,24 +179,32 @@ struct HandoffOverlay: View {
             let px = arc - 0.08 * sin(.pi * lin)
             let py = arc + 0.16 * sin(.pi * lin)
             let center = CGPoint(x: startCenter.x + dx * px, y: startCenter.y + dy * py)
-            let scale = 1 + (dst.width / max(size, 1) - 1) * arc
+            // Sleeve-sized at the start, the platter's size on landing; a slight swell as it leaves the sleeve, gone by
+            // the time it lands.
+            let fit = size / max(dst.width, 1)
+            let scale = (fit + (1 - fit) * arc) * (1 + 0.02 * slide * (1 - lin))
             ZStack {
                 Color.black.opacity(0.001)
                 if !director.landed, let album = director.album {
-                    RecordDisc(albumID: album.id, artwork: album.artwork, bands: [], grooveInk: .black)
-                        .frame(width: size, height: size)
-                        .rotationEffect(.degrees(HandoffDirector.landingAngle * arc))
-                        .scaleEffect(scale * (1 + 0.02 * slide))
-                        .shadow(color: .black.opacity(0.35), radius: 10, y: 6)
-                        .position(center)
+                    RecordDisc(
+                        albumID: album.id, artwork: album.artwork, bands: director.incomingBands, grooveInk: .black
+                    )
+                    .equatable()
+                    .rotationEffect(.degrees(HandoffDirector.landingAngle * arc))
+                    .overlay(RecordSheen())
+                    .frame(width: dst.width, height: dst.width)
+                    .shadow(color: .black.opacity(0.35), radius: 8, y: 5)
+                    .scaleEffect(scale)
+                    .position(center)
                 }
                 if let album = director.album, sink < 1 {
-                    ArtworkView(albumID: album.id, artwork: album.artwork)
+                    // The sink rides the shelf's own animation (same state, same transaction), not this clock, so
+                    // the sleeve and the shelf it stands in for move as one.
+                    Sleeve(album: album)
                         .frame(width: size, height: size)
-                        .clipShape(RoundedRectangle(cornerRadius: 3))
-                        .shadow(color: .black.opacity(0.25), radius: 8, y: 6)
                         .scaleEffect(1 + 0.06 * lift * (1 - sink))
-                        .position(x: src.midX, y: src.midY - 6 * lift + 640 * sink)
+                        .position(x: src.midX, y: src.midY - 6 * lift)
+                        .offset(y: director.shelfOffset(director.sinkDistance))
                 }
             }
         }

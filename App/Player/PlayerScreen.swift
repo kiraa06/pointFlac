@@ -52,9 +52,11 @@ struct PlayerScreen: View {
                     shelf(proxy.size)
                 }
                 if handoff.isRunning {
+                    // Above the shelf (zIndex 2): the sleeve lifts and the record leaves it in plain sight.
                     HandoffOverlay(director: handoff, palette: handoff.palette)
                         .allowsHitTesting(true)
                         .onTapGesture { finishHandoff() }
+                        .zIndex(3)
                 }
             }
             .coordinateSpace(.named(PlayerSpace.name))
@@ -156,7 +158,10 @@ struct PlayerScreen: View {
                 library: model.library, finder: model.finder, playback: playback, theme: theme,
                 close: { withAnimation(.spring(duration: 0.45)) { shelfOpen = false } },
                 getMusic: { tab = .getMusic },
-                pick: { album, track, frontRect in startHandoff(album, track: track, from: frontRect) }
+                hidesFront: handoff.isRunning,
+                pick: { album, track, frontRect in
+                    startHandoff(album, track: track, from: frontRect, sinkDistance: size.height)
+                }
             )
             .frame(height: size.height * 0.74)
             .offset(y: handoff.isRunning ? handoff.shelfOffset(size.height) : 0)
@@ -179,14 +184,16 @@ struct PlayerScreen: View {
 
     // MARK: The hand-off
 
-    private func startHandoff(_ album: AlbumCard, track: TrackRow.ID?, from rect: CGRect?) {
+    private func startHandoff(_ album: AlbumCard, track: TrackRow.ID?, from rect: CGRect?, sinkDistance: CGFloat) {
         if reduceMotion || rect == nil || handoff.platterRect == .zero {
             // Reduce Motion (spec §4.5): a short cross-fade instead.
             withAnimation(.easeInOut(duration: 0.25)) { shelfOpen = false }
             Task { await playback.load(album, startingAt: track) }
             return
         }
-        handoff.start(album: album, track: track, from: rect ?? .zero, playback: playback) {
+        handoff.start(
+            album: album, track: track, from: rect ?? .zero, sinkDistance: sinkDistance, playback: playback
+        ) {
             shelfOpen = false
         }
     }

@@ -82,6 +82,15 @@ final class PlaybackController {
 
     // MARK: Loading and playing
 
+    /// The side `album` would be cued on, without cueing it: the hand-off draws the incoming record's track gaps from
+    /// it before the record lands.
+    func sideTimeline(of album: AlbumCard, startingAt trackID: TrackRow.ID?) -> SideTimeline {
+        let tracks = library.tracks(of: album.id)
+        let layout = SideLayout(durations: tracks.map(\.durationSeconds))
+        let start = trackID.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
+        return SideTimeline(durations: layout.durations(onSide: layout.side(ofTrack: start) ?? 0))
+    }
+
     /// Puts `album` on the platter without dropping the needle: the hand-off's landing.
     func cue(_ album: AlbumCard, startingAt trackID: TrackRow.ID? = nil) {
         self.album = album
