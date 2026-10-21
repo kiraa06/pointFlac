@@ -501,8 +501,11 @@ struct BandRow: View {
         }
         .padding(.vertical, selected ? 4 : 2)
         .opacity(band.enabled ? 1 : 0.55)
+        // Every band's separator starts at the same place, compact or open.
+        .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Band \(index + 1), \(band.type.title)")
+        // Compact, the summary button already says "Band n, type"; open, the container says it once for the editor.
+        .accessibilityLabel(selected ? "Band \(index + 1), \(band.type.title)" : "")
     }
 
     private var badge: some View {

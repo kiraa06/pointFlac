@@ -160,6 +160,8 @@ final class SoundStore {
             $0.eq.bands = graphic.effectiveBands
             $0.eq.mode = .parametric
         }
+        // Even when the edit changed nothing (so `update` skipped it), the ids must match the bands again.
+        matchBandIDs()
     }
 
     /// Runout's warmth curve (spec §4.8, item 5): bass +2, treble −1.5, tilt −1, with Tone on.

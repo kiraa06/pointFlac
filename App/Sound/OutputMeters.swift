@@ -62,11 +62,19 @@ final class MeterBallistics {
     private var lastRead: Date?
 
     /// Starts afresh when polling resumes: one read of the player's meters, thrown away, so the peak held while
-    /// nothing was polling, and clips counted meanwhile, are never shown as new.
+    /// nothing was polling, and clips counted meanwhile, are never shown as new; and the bars, the holds and the LED
+    /// back at rest, so an old level does not fall away over silence.
     func resync(_ player: Player) {
         let m = player.soundMeters
         lastClipCount = m.clipCount
         lastRead = nil
+        level = Self.floorDb
+        peakHold = Self.floorDb
+        reduction = 0
+        reductionHold = 0
+        peakHoldUntil = .distantPast
+        reductionHoldUntil = .distantPast
+        clipUntil = .distantPast
     }
 
     /// Reads the player's meters, unless they were read for this frame already.
