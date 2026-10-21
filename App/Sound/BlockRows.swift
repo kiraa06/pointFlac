@@ -368,6 +368,8 @@ struct BlockHeaderRow: View {
     var crossfadeMode: CrossfadeMode = .betweenAlbums
     /// The automatic headroom the curve needs now (`SoundResponse.autoHeadroomDb`), for the preamp's total.
     var headroomDb = 0.0
+    /// The OPRA preset's target ("Harman Target"), once the catalog is read, for the correction's summary.
+    var correctionDetails: String?
     let set: (Bool) -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -444,7 +446,7 @@ struct BlockHeaderRow: View {
             let p = settings.preamp
             return "\(p.autoHeadroom ? "Auto headroom" : "Manual") · trim \(SoundFormat.gain(p.trimDb))"
         case .correction:
-            return CorrectionCredit(settings.correction).summary
+            return CorrectionCredit(settings.correction).summary(details: correctionDetails)
         case .crossfade:
             let c = settings.crossfade
             return "\((c.mode == .off ? crossfadeMode : c.mode).title) · \(SoundFormat.seconds(c.seconds))"

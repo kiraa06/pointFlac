@@ -58,6 +58,13 @@ final class OPRACatalog {
 
     func entry(id: String) -> Entry? { byID[id] }
 
+    /// An OPRA correction's target or variant ("Harman Target"), once the file is read; nil for none, or a file.
+    func details(of correction: CorrectionSettings) -> String? {
+        guard case .opra(let id) = correction.source, let details = entry(id: id)?.preset.details, !details.isEmpty
+        else { return nil }
+        return details
+    }
+
     /// The vendors and presets whose "vendor product" holds every word of `query`, or all of them for an empty query.
     func search(_ query: String) -> [Vendor] {
         let words = Self.fold(query).split(separator: " ").map(String.init)
@@ -143,14 +150,19 @@ struct CorrectionCredit {
     /// "Sennheiser HD 600, EQ by oratory1990, OPRA", for VoiceOver.
     var spoken: String { [name, byline, sourceMark].compactMap { $0 }.joined(separator: ", ") }
 
-    /// The block header's line, short, since the row below names the headphones and credits the author: "OPRA preset
-    /// · 10 bands", "Imported file · 10 bands".
-    var summary: String {
+    /// The block header's line, short, since the row below names the headphones, credits the author and gives the
+    /// bands and preamp: the OPRA preset's target ("Harman Target") once the catalog is read, else what it is.
+    func summary(details: String?) -> String {
         guard isChosen else { return "No headphones chosen" }
-        let bands = correction.bands.filter(\.enabled).count
-        let kind = if case .autoEq = correction.source { "Imported file" } else { "OPRA preset" }
-        return "\(kind) · \(bands) band\(bands == 1 ? "" : "s")"
+        if case .autoEq = correction.source { return "Imported file" }
+        return details ?? "OPRA preset"
     }
+}
+
+/// The OPRA project, which its terms ask every credit to link to.
+enum OPRAProject {
+    static let repository = URL(string: "https://github.com/opra-project/OPRA")!
+    static let repositoryLabel = "github.com/opra-project/OPRA"
 }
 
 // MARK: The correction row
@@ -160,16 +172,14 @@ struct CorrectionRows: View {
     let correction: CorrectionSettings
     let theme: Theme
     let choose: () -> Void
+    @Environment(\.openURL) private var openURL
 
     private var catalog: OPRACatalog { .shared }
 
     private var credit: CorrectionCredit { CorrectionCredit(correction) }
 
     /// The OPRA preset's details ("Harman Target"), once the catalog is read.
-    private var details: String? {
-        guard case .opra(let id) = correction.source, let preset = catalog.entry(id: id)?.preset else { return nil }
-        return preset.details.isEmpty ? nil : preset.details
-    }
+    private var details: String? { catalog.details(of: correction) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -182,19 +192,24 @@ struct CorrectionRows: View {
                         Text(credit.byline)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(theme.ink)
+                        // OPRA's terms: a link to the project with the credit, smaller than the author's.
                         if let mark = credit.sourceMark {
-                            Text("· \(mark)")
-                                .font(.caption)
-                                .foregroundStyle(theme.inkSecondary)
+                            Text("·").font(.caption).foregroundStyle(theme.inkSecondary)
+                            Link(destination: OPRAProject.repository) {
+                                Text(mark).underline().font(.caption).foregroundStyle(theme.inkSecondary)
+                            }
+                            // Its own tap target, not the whole row's.
+                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("opraCreditLink")
                         }
                     }
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(credit.spoken)
+                .modifier(OPRALinkAction(shown: credit.sourceMark != nil, open: { openURL(OPRAProject.repository) }))
                 .accessibilityIdentifier("correctionPreset")
                 Readout(
                     cells: [
-                        ReadoutCell(label: "Target", value: details ?? (credit.sourceMark == nil ? "Your file" : "—")),
                         ReadoutCell(label: "Bands", value: "\(correction.bands.filter(\.enabled).count)"),
                         ReadoutCell(
                             label: "Preamp", value: SoundFormat.gain(correction.preampDb),
@@ -227,16 +242,33 @@ struct CorrectionRows: View {
     }
 }
 
+/// VoiceOver's way to the OPRA link of a credit it reads as one element: a named action.
+private struct OPRALinkAction: ViewModifier {
+    let shown: Bool
+    let open: () -> Void
+
+    func body(content: Content) -> some View {
+        if shown {
+            content.accessibilityAction(named: "Open OPRA on GitHub", open)
+        } else {
+            content
+        }
+    }
+}
+
 // MARK: The picker
 
 /// Picks a headphone correction: every bundled OPRA preset, searchable by vendor and product, each credited "EQ by
 /// <author> · OPRA" with a preview of its curve; or an AutoEq `ParametricEQ.txt` of the user's own, imported through the
-/// Files picker. OPRA's logo and a link to its repository head the list, as its terms ask of a browser of its data.
+/// Files picker. OPRA's logo and a link to its repository head the list, as its terms ask of a browser of its data;
+/// while searching, a compact row of the two stays above the results.
 struct CorrectionPicker: View {
     let store: SoundStore
     let theme: Theme
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
+    /// The presets `query` finds, worked out once per query (and once the catalog is read).
+    @State private var results: [OPRACatalog.Vendor] = []
     @State private var importing = false
     @State private var failure: ImportFailure?
 
@@ -260,6 +292,11 @@ struct CorrectionPicker: View {
                     } footer: {
                         Text("A ParametricEQ.txt from AutoEq or Equalizer APO: up to 20 filters and a preamp.")
                             .foregroundStyle(theme.inkSecondary)
+                    }
+                    .listRowBackground(SoundGlass(theme: theme))
+                } else {
+                    Section {
+                        compactOPRAHeader
                     }
                     .listRowBackground(SoundGlass(theme: theme))
                 }
@@ -289,7 +326,7 @@ struct CorrectionPicker: View {
                         "Presets unavailable", systemImage: "exclamationmark.triangle",
                         description: Text("The OPRA presets could not be read. You can still import a file."))
                 case .loaded:
-                    if !query.isEmpty, catalog.search(query).isEmpty {
+                    if !query.isEmpty, results.isEmpty {
                         ContentUnavailableView.search(text: query)
                     }
                 }
@@ -297,6 +334,8 @@ struct CorrectionPicker: View {
         }
         .foregroundStyle(theme.ink)
         .tint(theme.processingTint)
+        .onChange(of: query, initial: true) { results = catalog.search(query) }
+        .onChange(of: catalog.state) { results = catalog.search(query) }
         .onAppear {
             catalog.load()
             #if DEBUG
@@ -319,17 +358,50 @@ struct CorrectionPicker: View {
         }
     }
 
-    private var opraHeader: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func logo(height: CGFloat) -> some View {
+        Group {
             if let logo = UIImage(named: "opra_logo") {
                 Image(uiImage: logo)
                     .renderingMode(.template)
                     .resizable()
                     .scaledToFit()
-                    .frame(height: 30)
+                    .frame(height: height)
                     .foregroundStyle(theme.ink)
                     .accessibilityLabel("OPRA")
             }
+        }
+    }
+
+    /// The repository link, in the tint so it reads as one, and its own tap target rather than its row's.
+    private var repositoryLink: some View {
+        Link(destination: OPRAProject.repository) {
+            Label(OPRAProject.repositoryLabel, systemImage: "arrow.up.right.square")
+                .font(.footnote.monospaced())
+                .foregroundStyle(theme.processingTint)
+        }
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("opraLink")
+    }
+
+    /// The logo and the link, above search results.
+    private var compactOPRAHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack {
+                logo(height: 16)
+                Spacer(minLength: 12)
+                repositoryLink
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                logo(height: 16)
+                repositoryLink
+            }
+        }
+        .accessibilityIdentifier("opraHeader")
+    }
+
+    private var opraHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            logo(height: 30)
             Text(
                 "OPRA is an open database of headphone EQ presets, each made by the person who measured the "
                     + "headphones. Pick yours to correct them toward a neutral target."
@@ -337,13 +409,7 @@ struct CorrectionPicker: View {
             .font(.subheadline)
             .foregroundStyle(theme.inkSecondary)
             .fixedSize(horizontal: false, vertical: true)
-            if let url = URL(string: "https://github.com/opra-project/OPRA") {
-                Link(destination: url) {
-                    Label("github.com/opra-project/OPRA", systemImage: "arrow.up.right.square")
-                        .font(.footnote.monospaced())
-                }
-                .accessibilityIdentifier("opraLink")
-            }
+            repositoryLink
         }
         .padding(.vertical, 6)
         .accessibilityIdentifier("opraHeader")
@@ -361,7 +427,7 @@ struct CorrectionPicker: View {
 
     @ViewBuilder
     private var presets: some View {
-        let vendors = catalog.search(query)
+        let vendors = results
         // One index letter per initial, on the first vendor that has it.
         let letters = Self.indexLetters(vendors.map(\.name))
         ForEach(vendors) { vendor in
@@ -402,12 +468,19 @@ struct CorrectionPicker: View {
             failure = ImportFailure(
                 fileName: nil, message: "The file couldn't be opened: \(error.localizedDescription)")
         case .success(let url):
-            switch AutoEqImport.correction(from: url) {
-            case .success(let correction):
-                store.applyCorrection(correction)
-                dismiss()
-            case .failure(let error):
-                failure = error
+            // Its size checked, then read and parsed, off the main actor: a file picked by mistake can be large, or
+            // on a slow provider.
+            Task {
+                let result = await Task.detached(priority: .userInitiated) {
+                    AutoEqImport.correction(contentsOf: url)
+                }.value
+                switch result {
+                case .success(let correction):
+                    store.applyCorrection(correction)
+                    dismiss()
+                case .failure(let reason):
+                    failure = ImportFailure(fileName: url.lastPathComponent, message: reason.message)
+                }
             }
         }
     }
@@ -510,75 +583,25 @@ private struct CurvePreview: View {
 // MARK: AutoEq import
 
 /// Why an imported file was refused, for the alert.
-struct ImportFailure: Error, Identifiable, Equatable {
+struct ImportFailure: Identifiable, Equatable {
     let fileName: String?
     let message: String
     var id: String { (fileName ?? "") + message }
     var title: String { fileName.map { "Can't import “\($0)”" } ?? "Can't import the file" }
 }
 
-/// Reads a `ParametricEQ.txt` the user picked (AutoEq's, or any in Equalizer APO's layout) into a correction.
-enum AutoEqImport {
-    /// Larger than any real ParametricEQ file by far.
-    static let maxBytes = 256 * 1024
-
-    static func correction(from url: URL) -> Result<CorrectionSettings, ImportFailure> {
-        let fileName = url.lastPathComponent
-        func fail(_ message: String) -> Result<CorrectionSettings, ImportFailure> {
-            .failure(ImportFailure(fileName: fileName, message: message))
+extension AutoEqImport.Failure {
+    /// The alert's explanation, naming the line the parser could not read.
+    var message: String {
+        switch self {
+        case .unreadable(let reason): "It couldn't be read: \(reason)"
+        case .tooLarge: "It is too large to be a ParametricEQ file."
+        case .notText: "It isn't a text file pointFlac can read."
+        case .unsupportedLine(let number, let text):
+            "Line \(number) isn't a preamp or filter line pointFlac can read" + (text.isEmpty ? "." : ":\n\(text)")
+        case .tooManyBands:
+            "It switches on more than \(AutoEqParser.maxBands) filters, the most pointFlac's correction runs."
+        case .noFilters: "It has no filters switched on."
         }
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: .mappedIfSafe)
-        } catch {
-            return fail("It couldn't be read: \(error.localizedDescription)")
-        }
-        guard data.count <= maxBytes else { return fail("It is too large to be a ParametricEQ file.") }
-        guard let text = text(from: data) else { return fail("It isn't a text file pointFlac can read.") }
-        do {
-            let parsed = try AutoEqParser.parse(text)
-            guard !parsed.bands.isEmpty else { return fail("It has no filters switched on.") }
-            return .success(
-                CorrectionSettings(
-                    enabled: true, name: name(from: url), author: "", source: .autoEq(fileName: fileName),
-                    preampDb: parsed.preampDb, bands: parsed.bands))
-        } catch AutoEqParser.ParseError.unsupportedLine(let number) {
-            let line = lines(text).dropFirst(number - 1).first.map { String($0.prefix(80)) } ?? ""
-            return fail(
-                "Line \(number) isn't a preamp or filter line pointFlac can read"
-                    + (line.isEmpty ? "." : ":\n\(line.trimmingCharacters(in: .whitespaces))"))
-        } catch AutoEqParser.ParseError.tooManyBands {
-            return fail(
-                "It switches on more than \(AutoEqParser.maxBands) filters, the most pointFlac's correction runs.")
-        } catch {
-            return fail("It couldn't be read.")
-        }
-    }
-
-    /// UTF-16 with its byte-order mark, as some Windows editors save; else UTF-8, whose mark the parser skips.
-    static func text(from data: Data) -> String? {
-        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
-            return String(data: data, encoding: .utf16)
-        }
-        return String(data: data, encoding: .utf8)
-    }
-
-    /// The lines as the parser numbers them (a leading byte-order mark is not a line of its own).
-    private static func lines(_ text: String) -> [Substring] {
-        let body = text.first == "\u{FEFF}" ? text.dropFirst() : Substring(text)
-        return body.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-    }
-
-    /// "Sennheiser HD 600 ParametricEQ.txt" → "Sennheiser HD 600".
-    static func name(from url: URL) -> String {
-        var name = url.deletingPathExtension().lastPathComponent
-        for suffix in [" ParametricEQ", " Parametric EQ", "_ParametricEQ", "-ParametricEQ"]
-        where name.lowercased().hasSuffix(suffix.lowercased()) {
-            name.removeLast(suffix.count)
-        }
-        name = name.trimmingCharacters(in: .whitespaces)
-        return name.isEmpty ? "Imported correction" : name
     }
 }

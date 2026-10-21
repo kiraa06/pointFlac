@@ -194,7 +194,8 @@ struct SoundView: View {
         } else {
             BlockHeaderRow(
                 block: block, settings: s, theme: theme, replayGainMode: store.lastReplayGainMode,
-                crossfadeMode: store.lastCrossfadeMode
+                crossfadeMode: store.lastCrossfadeMode,
+                correctionDetails: block == .correction ? OPRACatalog.shared.details(of: s.correction) : nil
             ) { setBlock(block, on: $0) }
         }
     }
