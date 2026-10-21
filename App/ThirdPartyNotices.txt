@@ -1,8 +1,8 @@
 pointFlac: licences and third-party notices
 ===========================================
 
-pointFlac includes libFLAC, the reference FLAC library, and a port of libbs2b's crossfeed filter, each under the
-licence below.
+pointFlac includes libFLAC, the reference FLAC library, a port of libbs2b's crossfeed filter, and the OPRA
+headphone-correction database, each under the licence below.
 pointFlac itself is free software under the MIT licence, which follows it.
 
 
@@ -74,6 +74,24 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+OPRA headphone EQ database
+--------------------------
+
+Headphone correction presets (manufacturer, product and EQ data) and the OPRA logo come from the OPRA project,
+https://github.com/opra-project/OPRA, created and maintained by Roon Labs and the OPRA community.
+Built from commit 0b88ecd4e2bef7cf69fd5d50f1d06fb586c10865.
+
+Licence: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0),
+https://creativecommons.org/licenses/by-sa/4.0/legalcode.en
+Each preset is credited to its author in the app ("EQ by <author> · OPRA"). The data was converted to a compact
+JSON form and presets the equaliser cannot represent were left out; the data is otherwise unmodified. The
+conversion script is scripts/build-opra.swift. Only the data is under CC BY-SA 4.0; pointFlac's own code is not.
+
+Presets credited to AutoEQ or Rtings/AutoEQ were derived by OPRA from the AutoEq project,
+https://github.com/jaakkopasanen/AutoEq, which is under the MIT licence:
+Copyright (c) 2018-2022 Jaakko Pasanen
 
 
 pointFlac
