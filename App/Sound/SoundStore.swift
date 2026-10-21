@@ -33,9 +33,14 @@ final class SoundStore {
     @ObservationIgnored private let fileURL: URL
     @ObservationIgnored private let gate = FrameGate()
     /// The ReplayGain and crossfade modes their switches turn back on: the last one chosen, else Track and Between
-    /// albums. Turning a block off sets its mode to Off, so the mode it had is kept here (for this launch).
+    /// albums. Turning a block off sets its mode to Off, so the mode it had is kept here, and in `UserDefaults`
+    /// (`lastModesKey`), outside `sound.json`, whose format stays as it is.
     private(set) var lastReplayGainMode: ReplayGainMode = .track
     private(set) var lastCrossfadeMode: CrossfadeMode = .betweenAlbums
+
+    @ObservationIgnored private let defaults: UserDefaults
+    /// The `UserDefaults` keys of the last modes.
+    static let lastModesKey = (replayGain: "soundLastReplayGainMode", crossfade: "soundLastCrossfadeMode")
 
     /// What the player was last given.
     @ObservationIgnored private var applied: SoundSettings
@@ -47,11 +52,23 @@ final class SoundStore {
 
     /// Loads the saved settings and gives them to the player at once, so the first pipeline plays with them.
     init(
-        player: Player, fileURL: URL = SoundStore.defaultFileURL, saveDelay: Duration = .milliseconds(500)
+        player: Player, fileURL: URL = SoundStore.defaultFileURL, saveDelay: Duration = .milliseconds(500),
+        defaults: UserDefaults = .standard
     ) {
         self.player = player
         self.fileURL = fileURL
         self.saveDelay = saveDelay
+        self.defaults = defaults
+        if let raw = defaults.string(forKey: Self.lastModesKey.replayGain), let mode = ReplayGainMode(rawValue: raw),
+            mode != .off
+        {
+            lastReplayGainMode = mode
+        }
+        if let raw = defaults.string(forKey: Self.lastModesKey.crossfade), let mode = CrossfadeMode(rawValue: raw),
+            mode != .off
+        {
+            lastCrossfadeMode = mode
+        }
         let loaded = Self.load(from: fileURL)
         settings = loaded
         applied = loaded
@@ -119,12 +136,18 @@ final class SoundStore {
 
     /// Off, or the mode to level by; a mode other than Off is the one the switch turns back on.
     func setReplayGainMode(_ mode: ReplayGainMode) {
-        if mode != .off { lastReplayGainMode = mode }
+        if mode != .off {
+            lastReplayGainMode = mode
+            defaults.set(mode.rawValue, forKey: Self.lastModesKey.replayGain)
+        }
         update { $0.replayGain.mode = mode }
     }
 
     func setCrossfadeMode(_ mode: CrossfadeMode) {
-        if mode != .off { lastCrossfadeMode = mode }
+        if mode != .off {
+            lastCrossfadeMode = mode
+            defaults.set(mode.rawValue, forKey: Self.lastModesKey.crossfade)
+        }
         update { $0.crossfade.mode = mode }
     }
 
@@ -271,13 +294,15 @@ final class SoundStore {
     }
 
     #if DEBUG
-        /// UI-test launch arguments, applied before the store loads: `-PFResetSound` deletes the saved settings, so
-        /// the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a lenient reader would take
+        /// UI-test launch arguments, applied before the store loads: `-PFResetSound` deletes the saved settings (and
+        /// the remembered modes), so the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a lenient reader would take
         /// (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure. (`-PFSoundSaveDelay <s>`, read
         /// by `AppModel`, stretches the save's debounce, so a test can show that only the flush wrote.)
         static func prepareForLaunch(arguments: [String], fileURL: URL = defaultFileURL) {
             if arguments.contains("-PFResetSound") {
                 try? FileManager.default.removeItem(at: fileURL)
+                UserDefaults.standard.removeObject(forKey: lastModesKey.replayGain)
+                UserDefaults.standard.removeObject(forKey: lastModesKey.crossfade)
             }
             if arguments.contains("-PFCorruptSound") {
                 try? FileManager.default.createDirectory(
@@ -375,15 +400,15 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     }
 
     /// The limiter and the preamp have no switch: the limiter joins the chain whenever another block is on, and the
-    /// preamp whenever its trim is not 0 dB (its automatic headroom runs with any chain).
+    /// preamp's automatic headroom runs with any chain; the chain lists the preamp only while it trims.
     var isSwitchable: Bool { self != .limiter && self != .preamp }
 
-    /// The block's own state, whatever Pure says. The limiter's is whether any other block is on; the preamp's,
-    /// whether it trims.
+    /// The block's own state, whatever Pure says. The limiter's is whether any other block is on; the preamp's, whether
+    /// it can change the level: a trim, or automatic headroom. (Whether the chain lists it is `isActive`: a trim.)
     func isOn(in s: SoundSettings) -> Bool {
         switch self {
         case .replayGain: return s.replayGain.mode != .off
-        case .preamp: return s.preamp.trimDb != 0
+        case .preamp: return s.preamp.trimDb != 0 || s.preamp.autoHeadroom
         case .correction: return s.correction.enabled
         case .eq: return s.eq.enabled
         case .tone: return s.tone.enabled
@@ -406,7 +431,9 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     func spokenState(in s: SoundSettings) -> String {
         switch self {
         case .limiter: return isActive(in: s) ? "Running" : "Standby"
-        case .preamp: return isOn(in: s) ? "Trim \(SoundFormat.gainSpoken(s.preamp.trimDb))" : "No trim"
+        case .preamp:
+            if s.preamp.trimDb != 0 { return "Trim \(SoundFormat.gainSpoken(s.preamp.trimDb))" }
+            return s.preamp.autoHeadroom ? "Auto headroom" : "Off"
         default: return isOn(in: s) ? "On" : "Off"
         }
     }

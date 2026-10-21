@@ -245,7 +245,8 @@ struct LoudnessSummary: Equatable, Sendable {
     var tagged = 0
     /// Without a tag, but measured by the scan (including a track measured as silent, which gets no gain).
     var measured = 0
-    /// Neither: not reached by a scan yet, in iCloud, or unreadable. These play at 0 dB.
+    /// Neither: not reached by a scan yet, in iCloud, or unreadable (the catalog can't tell which), shown as "Not
+    /// measured". These play at 0 dB.
     var pending = 0
 
     init() {}

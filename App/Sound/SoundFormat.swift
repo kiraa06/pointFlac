@@ -82,6 +82,11 @@ enum SoundFormat {
         "Q \(SoundFormat.q(q))"
     }
 
+    /// "4.7 dB": a size of change, without its sign.
+    static func magnitude(_ db: Double) -> String {
+        "\(String(format: "%.1f", abs(db))) dB"
+    }
+
     /// "−18 LUFS".
     static func lufs(_ value: Double) -> String {
         let text = trimmed(abs(tenth(value)))

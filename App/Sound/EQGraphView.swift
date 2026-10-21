@@ -33,6 +33,14 @@ final class EQCurveModel {
     private(set) var headroomDb = 0.0
     /// The correction's part of `curve`, or empty while correction is off.
     private(set) var correctionCurve: [(hz: Double, db: Double)] = []
+    /// The last correction curve and what it was computed from: an EQ drag leaves the correction as it is, so its curve
+    /// is not worked out again for every frame of it.
+    @ObservationIgnored private var correctionCache: (key: CorrectionKey, curve: [(hz: Double, db: Double)])?
+
+    private struct CorrectionKey: Equatable, Sendable {
+        var correction: CorrectionSettings
+        var sampleRate: Double
+    }
     @ObservationIgnored private var running = false
     @ObservationIgnored private var waiting: CurveInput?
     @ObservationIgnored private var last: CurveInput?
@@ -49,26 +57,31 @@ final class EQCurveModel {
 
     private func start(_ input: CurveInput) {
         running = true
+        let wanted = input.settings.correction.enabled && !input.settings.correction.bands.isEmpty
+        let key = CorrectionKey(correction: input.settings.correction, sampleRate: input.sampleRate)
+        let cached = wanted ? correctionCache.flatMap { $0.key == key ? $0.curve : nil } : []
         Task.detached(priority: .userInitiated) { [weak self] in
             let curve = SoundResponse.curveDb(input.settings, sampleRate: input.sampleRate, points: 256)
             let headroom = SoundResponse.autoHeadroomDb(input.settings, sampleRate: input.sampleRate)
-            var correction: [(hz: Double, db: Double)] = []
-            if input.settings.correction.enabled, !input.settings.correction.bands.isEmpty {
+            var correction = cached ?? []
+            if cached == nil {
                 var alone = SoundSettings()
                 alone.pure = false
                 alone.correction = input.settings.correction
                 correction = SoundResponse.curveDb(alone, sampleRate: input.sampleRate, points: 256)
             }
-            await self?.finish(curve: curve, headroom: headroom, correction: correction)
+            await self?.finish(curve: curve, headroom: headroom, correction: correction, key: wanted ? key : nil)
         }
     }
 
     private func finish(
-        curve: [(hz: Double, db: Double)], headroom: Double, correction: [(hz: Double, db: Double)]
+        curve: [(hz: Double, db: Double)], headroom: Double, correction: [(hz: Double, db: Double)],
+        key: CorrectionKey?
     ) {
         self.curve = curve
         headroomDb = headroom
         correctionCurve = correction
+        if let key { correctionCache = (key, correction) }
         running = false
         if let next = waiting {
             waiting = nil
@@ -140,6 +153,7 @@ struct EQGraphView: View {
                     drawGrid(&context, canvasSize)
                     if showsCorrection { drawCorrection(&context, canvasSize) }
                     drawCurve(&context, canvasSize)
+                    drawScale(&context, canvasSize)
                     if eq.mode == .graphic { drawGraphicPoints(&context, canvasSize) }
                 }
                 .accessibilityElement()
@@ -238,12 +252,24 @@ struct EQGraphView: View {
         for (hz, text) in [(100.0, "100"), (1000, "1k"), (10_000, "10k")] {
             context.draw(label(text), at: CGPoint(x: x(hz, size.width) + 3, y: size.height - 4), anchor: .bottomLeading)
         }
-        // The dB scale at the right-hand edge, where handles are rarest (above 16 kHz; a high-pass often sits at the
-        // left).
+    }
+
+    /// The dB scale at the right-hand edge, where handles are rarest (above 16 kHz; a high-pass often sits at the left).
+    /// Drawn over the curve, on a small plate of the screen's glass: a correction's preamp often runs the curve through
+    /// the labels.
+    private func drawScale(_ context: inout GraphicsContext, _ size: CGSize) {
         for db in [12.0, 0, -12] {
-            let text = db == 0 ? "0" : SoundFormat.signed(db, decimals: 0)
-            context.draw(
-                label(text), at: CGPoint(x: size.width - 5, y: y(db, size.height) - 5), anchor: .bottomTrailing)
+            let text = context.resolve(
+                Text(db == 0 ? "0" : SoundFormat.signed(db, decimals: 0))
+                    .font(.caption2.monospaced().weight(.medium)).textScale(.secondary)
+                    .foregroundStyle(ink.opacity(0.5)))
+            let corner = CGPoint(x: size.width - 5, y: y(db, size.height) - 5)
+            let measured = text.measure(in: size)
+            let plate = CGRect(
+                x: corner.x - measured.width - 2, y: corner.y - measured.height - 1, width: measured.width + 4,
+                height: measured.height + 2)
+            context.fill(Path(roundedRect: plate, cornerRadius: 2), with: .color(theme.lcdBack.opacity(0.8)))
+            context.draw(text, at: corner, anchor: .bottomTrailing)
         }
     }
 

@@ -152,8 +152,8 @@ struct SoundView: View {
                 switch block {
                 case .replayGain:
                     ReplayGainRows(
-                        replayGain: s.replayGain, mode: store.lastReplayGainMode, store: store, theme: theme,
-                        player: player, library: library
+                        replayGain: s.replayGain, mode: store.lastReplayGainMode, pure: s.pure, store: store,
+                        theme: theme, player: player, library: library
                     )
                     .pureDimmed()
                 case .preamp:
@@ -515,17 +515,16 @@ struct SignalFlowRow: View {
             .accessibilityHidden(true)
     }
 
-    /// A capsule is a menu with a primary action: a tap switches a switchable block, and a touch and hold opens "Show
-    /// <block> settings". A menu rather than a context menu: a List row merges its rows' context menus into one, so
-    /// every capsule would offer the first one's item. The limiter's and the preamp's capsules have no switch, so a tap
-    /// opens their menu.
+    /// A switchable block's capsule is a menu with a primary action: a tap switches the block, and a touch and hold
+    /// opens "Show <block> settings". A menu rather than a context menu: a List row merges its rows' context menus into
+    /// one, so every capsule would offer the first one's item. The limiter's and the preamp's capsules have no switch,
+    /// so they are plain buttons that go straight to their settings.
     private func capsule(_ block: SoundBlock) -> some View {
         let title = "Show \(block.settingsName) settings"
-        let item = Button(title, systemImage: "arrow.down.to.line") { show(block) }
         return Group {
             if block.isSwitchable {
                 Menu {
-                    item
+                    Button(title, systemImage: "arrow.down.to.line") { show(block) }
                 } label: {
                     capsuleFace(block)
                 } primaryAction: {
@@ -533,11 +532,12 @@ struct SignalFlowRow: View {
                 }
                 .accessibilityAddTraits(.isToggle)
             } else {
-                Menu {
-                    item
+                Button {
+                    show(block)
                 } label: {
                     capsuleFace(block)
                 }
+                .accessibilityHint(title)
             }
         }
         .menuStyle(.button)

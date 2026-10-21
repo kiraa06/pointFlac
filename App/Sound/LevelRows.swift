@@ -81,6 +81,8 @@ struct ReplayGainRows: View {
     let replayGain: ReplayGainSettings
     /// The mode chosen, which the switch turns on while ReplayGain is off.
     let mode: ReplayGainMode
+    /// Pure is on: it applies no ReplayGain, whatever the settings say.
+    let pure: Bool
     let store: SoundStore
     let theme: Theme
     let player: Player
@@ -114,16 +116,20 @@ struct ReplayGainRows: View {
         }
         .tint(theme.processingTint)
         .accessibilityIdentifier("preventClippingToggle")
-        ReplayGainReadout(replayGain: replayGain, player: player, theme: theme)
+        ReplayGainReadout(replayGain: replayGain, pure: pure, player: player, library: library, theme: theme)
         LibraryLoudnessRow(library: library, theme: theme)
     }
 }
 
-/// The reference (fixed at ReplayGain 2.0's −18 LUFS, ruling R4-7) and the gain the current track gets, with where it
-/// comes from. The gain is the player's own (`Player.replayGainDb`), so it is exactly what plays.
+/// The reference (fixed at ReplayGain 2.0's −18 LUFS, ruling R4-7), the gain the current track gets, and where it
+/// comes from. Both come from `Player.replayGain(for:settings:)`, the rule that makes the gain, so they are exactly what
+/// plays. A queue item keeps the loudness it was queued with; when the library has measured the track since, "From"
+/// says the measurement applies from the next play.
 private struct ReplayGainReadout: View {
     let replayGain: ReplayGainSettings
+    let pure: Bool
     let player: Player
+    let library: RealLibrary
     let theme: Theme
 
     private var item: QueueItem? {
@@ -132,65 +138,57 @@ private struct ReplayGainReadout: View {
     }
 
     var body: some View {
-        let gain = item.map { Player.replayGainDb(for: $0, settings: replayGain) }
         let on = replayGain.mode != .off
-        let source = item.map { ReplayGainBasis($0.loudness, mode: replayGain.mode) }
+        let now = item.map { Player.replayGain(for: $0, settings: replayGain) }
+        let later = nextPlayBasis(now: now?.basis)
         Readout(
             cells: [
                 ReadoutCell(label: "Reference", value: SoundFormat.lufs(replayGain.referenceLufs)),
                 ReadoutCell(
-                    label: "This track", value: !on ? "Off" : gain.map { SoundFormat.gain($0) } ?? "—",
-                    active: on && (gain ?? 0) != 0),
-                ReadoutCell(label: "From", value: on ? source?.title ?? "—" : "—"),
+                    label: "This track", value: !on ? "Off" : now.map { SoundFormat.gain($0.gainDb) } ?? "—",
+                    active: on && !pure && (now?.gainDb ?? 0) != 0),
+                ReadoutCell(label: "From", value: !on ? "—" : later != nil ? "Next play" : now?.basis.title ?? "—"),
             ], theme: theme
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("ReplayGain reference \(SoundFormat.lufsSpoken(replayGain.referenceLufs))")
-        .accessibilityValue(spoken(gain: gain, on: on, source: source))
+        .accessibilityValue(spoken(now, on: on, later: later))
         .accessibilityIdentifier("replayGainReadout")
     }
 
-    private func spoken(gain: Double?, on: Bool, source: ReplayGainBasis?) -> String {
+    /// What the library knows of the playing track now, if the queue item knew nothing of it and the library does:
+    /// the basis the next play will have.
+    private func nextPlayBasis(now: ReplayGainBasis?) -> ReplayGainBasis? {
+        guard now == ReplayGainBasis.none, let item, let track = library.snapshot.track(item.id) else { return nil }
+        let basis = Player.replayGain(for: QueueItem(track: track), settings: replayGain).basis
+        return basis == .none ? nil : basis
+    }
+
+    private func spoken(_ now: (gainDb: Double, basis: ReplayGainBasis)?, on: Bool, later: ReplayGainBasis?) -> String {
         guard on else { return "ReplayGain off" }
-        guard let gain, let source else { return "Nothing playing" }
-        return "This track \(SoundFormat.gainSpoken(gain)), from \(source.title.lowercased())"
+        guard let now else { return "Nothing playing" }
+        var text = "This track \(SoundFormat.gainSpoken(now.gainDb))"
+        if pure { text += ", bypassed by Pure" }
+        if let later { return text + ", \(later.title.lowercased()) applies from the next play" }
+        return text + ", from \(now.basis.title.lowercased())"
     }
 }
 
-/// What a track's ReplayGain is worked out from, in `Player.replayGainDb(for:settings:)`'s order of preference: the
-/// tag for the mode, else the scan's measurement (in album mode the album's, else the track's), else nothing.
-enum ReplayGainBasis {
-    case albumTag, albumMeasured, trackTag, trackMeasured, none
-
-    init(_ loudness: TrackLoudness?, mode: ReplayGainMode) {
-        let l = loudness ?? TrackLoudness()
-        func usable(_ lufs: Double?) -> Bool { lufs.map { $0.isFinite && $0 > -70 } ?? false }
-        if mode == .album, l.albumGainDb?.isFinite == true {
-            self = .albumTag
-        } else if mode == .album, usable(l.albumMeasuredLufs) {
-            self = .albumMeasured
-        } else if l.trackGainDb?.isFinite == true {
-            self = .trackTag
-        } else if usable(l.measuredLufs) {
-            self = .trackMeasured
-        } else {
-            self = .none
-        }
-    }
-
+extension ReplayGainBasis {
     var title: String {
         switch self {
         case .albumTag: "Album tag"
-        case .albumMeasured: "Album scan"
+        case .albumScan: "Album scan"
         case .trackTag: "Track tag"
-        case .trackMeasured: "Track scan"
+        case .trackScan: "Track scan"
         case .none: "No data"
         }
     }
 }
 
-/// What the library knows of its tracks' loudness: tagged, measured by pointFlac's scan, and pending, as a bar in
-/// proportion and as counts, with the scan's progress while one runs. It reads the library itself, so a scan's progress
+/// What the library knows of its tracks' loudness: tagged, measured by pointFlac's scan, and not measured (yet, or
+/// ever: the library can't tell a track the scan hasn't reached from one it can't read), as a bar in proportion and as
+/// counts, with the scan's progress in the header while one runs. It reads the library itself, so a scan's progress
 /// redraws this row alone.
 struct LibraryLoudnessRow: View {
     let library: RealLibrary
@@ -224,11 +222,6 @@ struct LibraryLoudnessRow: View {
                     VStack(alignment: .leading, spacing: 4) { legend(summary) }
                 }
             }
-            if let scan {
-                ProgressView(value: Double(scan.done), total: Double(max(scan.total, 1)))
-                    .tint(theme.processingTint)
-                    .accessibilityHidden(true)
-            }
         }
         .padding(.vertical, 4)
         .animation(.easeInOut(duration: 0.25), value: scan == nil)
@@ -261,7 +254,7 @@ struct LibraryLoudnessRow: View {
     private func legend(_ s: LoudnessSummary) -> some View {
         legendItem("Tagged", s.tagged, taggedColour)
         legendItem("Measured", s.measured, measuredColour)
-        legendItem("Pending", s.pending, pendingColour)
+        legendItem("Not measured", s.pending, pendingColour)
     }
 
     private func legendItem(_ title: String, _ count: Int, _ colour: Color) -> some View {
@@ -274,31 +267,12 @@ struct LibraryLoudnessRow: View {
 
     private func spoken(_ s: LoudnessSummary, _ scan: LoudnessScanProgress?) -> String {
         guard s.total > 0 else { return "No tracks yet" }
-        let counts = "\(s.tagged) tagged, \(s.measured) measured, \(s.pending) pending"
+        let counts = "\(s.tagged) tagged, \(s.measured) measured, \(s.pending) not measured"
         return scan.map { counts + "; measuring \($0.done) of \($0.total)" } ?? counts
     }
 }
 
 // MARK: Preamp
-
-/// The gain ahead of the filters, as `SoundChain` sums it: the correction's own preamp while correction is on, the
-/// automatic headroom while it is on, and the trim. (The chain also caps the sum at the limiter's largest drive, which
-/// only stacked boosts with headroom off reach.)
-struct PreampStage: Equatable {
-    /// Nil while correction is off.
-    var correctionDb: Double?
-    /// Nil while automatic headroom is off.
-    var headroomDb: Double?
-    var trimDb: Double
-
-    init(_ s: SoundSettings, headroomDb: Double) {
-        correctionDb = s.correction.enabled ? s.correction.preampDb : nil
-        self.headroomDb = s.preamp.autoHeadroom ? headroomDb : nil
-        trimDb = s.preamp.trimDb
-    }
-
-    var totalDb: Double { (correctionDb ?? 0) + (headroomDb ?? 0) + trimDb }
-}
 
 /// The preamp's header, reading the curve model itself: the automatic headroom follows an EQ drag frame by frame, and
 /// only this row redraws for it.
@@ -313,7 +287,8 @@ struct LivePreampHeader: View {
 }
 
 /// The preamp: automatic headroom, which lowers the level by as much as the curve boosts, so boosts cannot clip; a
-/// trim of the user's own; and the gain staging into the filters.
+/// trim of the user's own; and the gain staging into the filters, as the chain applies it
+/// (`SoundChain.preampStaging`), its drive cap included.
 struct PreampRows: View {
     let preamp: PreampSettings
     let settings: SoundSettings
@@ -328,7 +303,7 @@ struct PreampRows: View {
                 Text("Auto headroom")
                 Text(
                     headroom < -0.05
-                        ? "Lowers the level \(String(format: "%.1f", abs(headroom))) dB to absorb the curve's highest boost."
+                        ? "Lowers the level \(SoundFormat.magnitude(headroom)) to absorb the curve's highest boost."
                         : "The curve boosts nothing, so it needs no headroom."
                 )
                 .font(.caption)
@@ -344,14 +319,16 @@ struct PreampRows: View {
             set: { v in store.update { $0.preamp.trimDb = SoundFormat.tenth(v) } }
         )
         .accessibilityIdentifier("trimSlider")
-        let stage = PreampStage(settings, headroomDb: headroom)
+        let stage = SoundChain.preampStaging(settings, headroomDb: headroom)
         let running = !settings.activeBlockNames.isEmpty
         Readout(
             cells: [
                 ReadoutCell(label: "Correction", value: stage.correctionDb.map { SoundFormat.gain($0) } ?? "Off"),
                 ReadoutCell(label: "Headroom", value: stage.headroomDb.map { SoundFormat.gain($0) } ?? "Off"),
                 ReadoutCell(label: "Trim", value: SoundFormat.gain(stage.trimDb)),
-                ReadoutCell(label: "Total", value: SoundFormat.gain(stage.totalDb), active: running),
+                // Capped: stacked boosts with headroom off would drive the limiter past what it is made for.
+                ReadoutCell(
+                    label: stage.capped ? "Capped" : "Total", value: SoundFormat.gain(stage.totalDb), active: running),
             ], theme: theme
         )
         .accessibilityElement(children: .ignore)
@@ -360,8 +337,8 @@ struct PreampRows: View {
         .accessibilityIdentifier("gainStaging")
     }
 
-    private func spoken(_ stage: PreampStage, running: Bool) -> String {
-        var parts = [SoundFormat.gainSpoken(stage.totalDb)]
+    private func spoken(_ stage: PreampStaging, running: Bool) -> String {
+        var parts = [SoundFormat.gainSpoken(stage.totalDb) + (stage.capped ? ", capped" : "")]
         parts.append("correction \(stage.correctionDb.map(SoundFormat.gainSpoken) ?? "off")")
         parts.append("headroom \(stage.headroomDb.map(SoundFormat.gainSpoken) ?? "off")")
         parts.append("trim \(SoundFormat.gainSpoken(stage.trimDb))")
