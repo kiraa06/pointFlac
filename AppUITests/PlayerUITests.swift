@@ -317,9 +317,10 @@ final class PlayerUITests: XCTestCase {
         let toggle = openMonochromeToggle(app)
         // Start from a known state: the setting survives launches, so an earlier run may have left it on.
         if toggle.value as? String == "1" { flip(toggle) }
-        XCTAssertEqual(toggle.value as? String, "0")
+        // The switch's value follows the tap a moment later, longer on a loaded machine: wait for it each time.
+        waitFor(toggle, value: "0")
         flip(toggle)
-        XCTAssertEqual(toggle.value as? String, "1")
+        waitFor(toggle, value: "1")
         app.tabBars.buttons["Player"].tap()
         XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
         app.terminate()
@@ -327,10 +328,17 @@ final class PlayerUITests: XCTestCase {
         let relaunched = launch()
         XCTAssertTrue(relaunched.buttons["shelfButton"].waitForExistence(timeout: 5))
         let persisted = openMonochromeToggle(relaunched)
-        XCTAssertEqual(persisted.value as? String, "1")
+        waitFor(persisted, value: "1")
         // Leave the app as found.
         flip(persisted)
-        XCTAssertEqual(persisted.value as? String, "0")
+        waitFor(persisted, value: "0")
+    }
+
+    /// Waits up to 5 s for a switch to read `value`; no wait at all when it already does.
+    @MainActor
+    private func waitFor(_ toggle: XCUIElement, value: String) {
+        expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: toggle)
+        waitForExpectations(timeout: 5)
     }
 
     // MARK: Helpers
