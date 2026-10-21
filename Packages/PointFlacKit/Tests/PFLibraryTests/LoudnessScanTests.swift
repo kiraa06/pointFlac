@@ -526,7 +526,8 @@ private func counting(_ library: Library) -> Counter {
             }
         }
     }
-    let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
+    let seen = Mutex<[Int]>([])
+    let first = Task { await library.scanLoudness(albums: [x]) { done, _ in seen.withLock { $0.append(done) } } }
     while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
     await library.scanLoudness(albums: [y]) { _, _ in }  // returns at once
     #expect(track(library, "y1.flac")?.loudness == nil)
@@ -537,6 +538,8 @@ private func counting(_ library: Library) -> Counter {
     await first.value
     #expect(track(library, "x1.flac")?.loudness?.measuredLufs != nil)
     #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by the running scan's follow-up")
+    let counts = seen.withLock { $0 }
+    #expect(counts == counts.sorted() && counts.last == 2, "one cumulative count across the passes: \(counts)")
 }
 
 /// Cancelled inside a track, between decode chunks.
@@ -565,4 +568,85 @@ private func counting(_ library: Library) -> Counter {
     library.loudnessChunkHook.withLock { $0 = nil }
     await library.scanLoudness { _, _ in }
     #expect(track(library, "long.flac")?.loudness?.measuredLufs != nil)
+}
+
+/// R2-1: a transient failure in the first pass must not keep the album from its value once it clears.
+@Test func aTransientFailureDoesNotBlockTheAlbumForever() async throws {
+    let box = try ScanSandbox()
+    for (index, level) in [-20.0, -23.0, -26.0].enumerated() {
+        try box.tone("t\(index + 1).flac", rmsDbfs: level, number: index + 1)
+    }
+    let library = try box.open()
+    await library.rescan()
+    let flaky = box.libraryFolder.appending(path: "t2.flac")
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: flaky.path)
+    await library.scanLoudness { _, _ in }
+    #expect(track(library, "t1.flac")?.loudness?.measuredLufs != nil)
+    #expect(track(library, "t2.flac")?.loudness == nil)
+    #expect(track(library, "t1.flac")?.loudness?.albumMeasuredLufs == nil)
+
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: flaky.path)
+    await library.scanLoudness { _, _ in }
+    #expect(track(library, "t2.flac")?.loudness?.measuredLufs != nil)
+    let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-23), try direct(-26)])
+    let value = try #require(track(library, "t1.flac")?.loudness?.albumMeasuredLufs, "the album gets its value")
+    #expect(abs(value - expected) <= 0.2)
+}
+
+/// R2-2: an album that cannot be pooled holds no meters; one that can holds them only until it is pooled.
+@Test func scanHoldsNoMetersForAnAlbumItCannotPool() async throws {
+    let box = try ScanSandbox()
+    for index in 0..<300 { try quick(box, "Huge", index) }
+    let library = try box.open()
+    await library.setMaxLoudnessAlbum(5)
+    await library.rescan()
+    await library.scanLoudness { _, _ in }
+    #expect(library.loudnessMeters.withLock { $0.peak } == 0, "none held for a capped album")
+    #expect(library.current.tracks.values.compactMap(\.loudness?.measuredPeak).count == 300)
+
+    for index in 0..<4 { try quick(box, "Small", index) }
+    await library.rescan()
+    await library.scanLoudness { _, _ in }
+    let meters = library.loudnessMeters.withLock { $0 }
+    #expect(meters.peak == 4 && meters.current == 0, "four held to pool, then released")
+}
+
+/// R2-3: a request merged into a scan survives the cancellation of the caller that was running it.
+@Test func aMergedRequestSurvivesTheFirstCallerBeingCancelled() async throws {
+    let box = try ScanSandbox()
+    try box.tone("x1.flac", rmsDbfs: -20, album: "X", number: 1)
+    try box.tone("y1.flac", rmsDbfs: -22, album: "Y", number: 1)
+    let library = try box.open()
+    await library.rescan()
+    let y = try #require(track(library, "y1.flac")?.albumID)
+    let x = try #require(track(library, "x1.flac")?.albumID)
+
+    let reached = Mutex(false)
+    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    library.loudnessHook.withLock {
+        $0 = { _ in
+            reached.withLock { $0 = true }
+            await withCheckedContinuation { continuation in
+                let proceed = gate.withLock { state in
+                    if state.open { return true }
+                    state.waiter = continuation
+                    return false
+                }
+                if proceed { continuation.resume() }
+            }
+        }
+    }
+    let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
+    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await library.scanLoudness(albums: [y]) { _, _ in }
+    first.cancel()
+    gate.withLock { state in
+        state.open = true
+        state.waiter?.resume()
+    }
+    await first.value
+    for _ in 0..<300 where track(library, "y1.flac")?.loudness == nil {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by a fresh scan")
 }

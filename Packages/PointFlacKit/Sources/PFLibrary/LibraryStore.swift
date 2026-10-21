@@ -133,7 +133,7 @@ final class LibraryStore {
         // state returns to 0 when its file's size or modification date changes (and goes with the track).
         // `album_loudness.members` is a hash of the album's sorted track IDs when it was measured; the catalog
         // serves the value only while the album's tracks still hash to it. `album_attempts` remembers, per album, the
-        // hash of the track set a pooling attempt failed or was blocked on, so it is not tried again until the set
+        // track set and states a second-phase pooling attempt failed on, so it is not tried again until the set
         // changes. (A same-length audio edit past ContentIdentity's first 64 KiB, by an
         // encoder that writes no MD5, also changes the date, so it too loses its measurement.)
         """
@@ -897,6 +897,9 @@ final class LibraryStore {
         var id: String
         var members: [Member]
         var hash: String
+        /// Covers the track set and each track's measurement state (`attemptKey`), so a change in either lifts a
+        /// recorded attempt's block.
+        var attemptKey: String
         var attempted: Bool
         var current: Bool
     }
@@ -926,8 +929,9 @@ final class LibraryStore {
         return order.compactMap { album in
             guard let all = members[album] else { return nil }
             let hash = Self.membersHash(all.map(\.id))
+            let key = Self.membersHash(all.map { "\($0.id):\($0.state)" })
             return AlbumState(
-                id: album, members: all, hash: hash, attempted: attempts[album] == hash,
+                id: album, members: all, hash: hash, attemptKey: key, attempted: attempts[album] == key,
                 current: values[album] == hash)
         }
     }
@@ -959,7 +963,8 @@ final class LibraryStore {
             jobs.append(
                 LoudnessJob(
                     albumID: album.id, tracks: todo.compactMap { m in m.url.map { .init(id: m.id, url: $0) } },
-                    membersHash: album.hash, pool: todo.count == album.members.count && !capped))
+                    membersHash: album.hash, attemptKey: album.attemptKey,
+                    pool: todo.count == album.members.count && !capped))
         }
         return jobs.sorted { ($0.tracks.count, $0.albumID) < ($1.tracks.count, $1.albumID) }
     }
@@ -969,14 +974,16 @@ final class LibraryStore {
     /// is missing or was taken over another set of tracks, and no attempt on this very set has failed. A fully
     /// tagged album never qualifies.
     func poolJobs(albums only: [String]?) throws -> [LoudnessJob] {
-        try albumStates(only: only).compactMap { album in
+        let jobs: [LoudnessJob] = try albumStates(only: only).compactMap { album in
             guard !album.members.allSatisfy(\.tagged), !album.current, !album.attempted,
                 album.members.count <= maxAlbumTracks, album.members.allSatisfy({ $0.state == 1 && $0.url != nil })
             else { return nil }
             return LoudnessJob(
                 albumID: album.id, tracks: album.members.compactMap { m in m.url.map { .init(id: m.id, url: $0) } },
-                membersHash: album.hash, pool: true)
+                membersHash: album.hash, attemptKey: album.attemptKey, pool: true)
         }
+        // Small albums first, like phase 1: one large stale album cannot keep the rest waiting.
+        return jobs.sorted { ($0.tracks.count, $0.albumID) < ($1.tracks.count, $1.albumID) }
     }
 
     /// Identifies an album's set of tracks, whatever order they come in.
@@ -1003,11 +1010,12 @@ final class LibraryStore {
             """, [.text(albumID), .optional(lufs), .real(peak), .text(members), .text(albumID)])
     }
 
-    /// Remembers that pooling `albumID` over the tracks hashing to `members` failed, so it is not tried again until
-    /// they change.
-    func recordPoolAttempt(albumID: String, members: String) throws {
+    /// Remembers that the second phase's pooling of `albumID` failed over the tracks and states `key` describes
+    /// (`AlbumState.attemptKey`), so it is not tried again until the set or any track's state changes. The first phase
+    /// records nothing: its failures are one track's, which the next scan retries on its own.
+    func recordPoolAttempt(albumID: String, key: String) throws {
         try database.query(
-            "INSERT OR REPLACE INTO album_attempts(album_id, members) VALUES (?, ?)", [.text(albumID), .text(members)])
+            "INSERT OR REPLACE INTO album_attempts(album_id, members) VALUES (?, ?)", [.text(albumID), .text(key)])
     }
 
     // MARK: Reading
@@ -1088,6 +1096,8 @@ struct LoudnessJob: Sendable {
     var tracks: [Track]
     /// `LibraryStore.membersHash` of every track of the album, stored with its value.
     var membersHash: String
+    /// What a failed second-phase attempt is recorded under.
+    var attemptKey: String
     /// Whether the album value is pooled from this job's decodes: `tracks` are all the album's tracks, it is
     /// not too big to pool, and (in the first phase) none was measured before.
     var pool: Bool

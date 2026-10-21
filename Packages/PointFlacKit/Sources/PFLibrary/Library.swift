@@ -46,6 +46,8 @@ public final class Library: Sendable {
     let loudnessDecodes = Mutex(0)
     /// A loudness scan is running (`scanLoudness` runs one at a time), and what was asked for meanwhile.
     let loudnessScan = Mutex<(running: Bool, pending: LoudnessRequest?)>((false, nil))
+    /// For tests: finished meters the scan holds to pool an album, now and at most.
+    let loudnessMeters = Mutex<(current: Int, peak: Int)>((0, 0))
     /// For tests: called after each decoded chunk of a loudness scan.
     let loudnessChunkHook = Mutex<(@Sendable () -> Void)?>(nil)
     /// For tests: awaited after each track's measurement, before it is stored.
