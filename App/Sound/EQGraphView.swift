@@ -153,6 +153,7 @@ struct EQGraphView: View {
                         gainDb: SoundFormat.tenth(db(atY: location.y, size.height)), q: 1))
             }
         }
+        .dynamicTypeSize(...DynamicTypeSize.xLarge)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("eqGraph")
     }
@@ -211,14 +212,18 @@ struct EQGraphView: View {
                 with: .color(ink.opacity(strength)))
         }
         let label = { (text: String) in
-            Text(text).font(.system(size: 8.5, weight: .medium, design: .monospaced)).foregroundStyle(ink.opacity(0.5))
+            Text(text).font(.caption2.monospaced().weight(.medium)).textScale(.secondary)
+                .foregroundStyle(ink.opacity(0.5))
         }
         for (hz, text) in [(100.0, "100"), (1000, "1k"), (10_000, "10k")] {
             context.draw(label(text), at: CGPoint(x: x(hz, size.width) + 3, y: size.height - 4), anchor: .bottomLeading)
         }
+        // The dB scale at the right-hand edge, where handles are rarest (above 16 kHz; a high-pass often sits at the
+        // left).
         for db in [12.0, 0, -12] {
             let text = db == 0 ? "0" : SoundFormat.signed(db, decimals: 0)
-            context.draw(label(text), at: CGPoint(x: 5, y: y(db, size.height) - 2), anchor: .bottomLeading)
+            context.draw(
+                label(text), at: CGPoint(x: size.width - 5, y: y(db, size.height) - 2), anchor: .bottomTrailing)
         }
     }
 
@@ -274,7 +279,8 @@ struct EQGraphView: View {
             }
             Spacer()
         }
-        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+        .font(.caption2.monospaced().weight(.semibold))
+        .textScale(.secondary)
         .tracking(0.8)
         .foregroundStyle(ink.opacity(0.62))
         .padding(.horizontal, 8)
@@ -323,7 +329,8 @@ struct EQGraphView: View {
                 )
                 .shadow(color: curveColour.opacity(selected ? 0.7 : 0), radius: 6)
             Text("\(index + 1)")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(.caption2.monospaced().weight(.bold))
+                .textScale(.secondary)
                 .foregroundStyle(selected ? theme.lcdBack : theme.ink)
         }
         .frame(width: 44, height: 44)

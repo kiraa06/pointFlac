@@ -81,14 +81,11 @@ struct SoundView: View {
                     store.setBlock(block, on: !block.isOn(in: s))
                 }
                 OutputMeter(meters: meters, player: player, theme: screen, polling: polling)
-                    .listRowInsets(EdgeInsets(top: 8, leading: 10, bottom: 10, trailing: 10))
+                    .listRowInsets(Self.screenInsets)
             } header: {
                 header("Signal flow")
             } footer: {
-                Text(
-                    s.pure
-                        ? "Pure: the signal goes straight through. Turn Pure off to switch blocks on."
-                        : "Tap a block to switch it. The limiter joins whenever any block is on.")
+                footerText(s.pure ? "Pure sends the signal straight through." : "Tap a block to switch it.")
             }
             .listRowBackground(glass)
             ForEach(SoundBlock.allCases) { block in
@@ -142,7 +139,7 @@ struct SoundView: View {
             }
             .disabled(s.pure)
         } footer: {
-            Text(footer(block, s))
+            footerText(footer(block, s))
         }
         .listRowBackground(glass)
     }
@@ -234,26 +231,24 @@ struct SoundView: View {
         }
     }
 
+    /// Short, as a pro tool's notes are.
     private func footer(_ block: SoundBlock, _ s: SoundSettings) -> String {
         switch block {
         case .eq:
-            let common =
-                "Filters are designed for the output's rate. Automatic headroom lowers the level by the curve's "
-                + "largest boost, so the EQ can't clip."
             return s.eq.mode == .parametric
-                ? "Drag a handle for frequency and gain, pinch the graph for the selected band's Q, and swipe a "
-                    + "band to delete it. " + common
-                : "Drag a slider; double-tap it for 0 dB. " + common
+                ? "Drag a handle; pinch for Q. Swipe a band to delete it. Headroom keeps boosts from clipping."
+                : "Double-tap a fader for 0 dB. Headroom keeps boosts from clipping."
         case .tone:
-            return "Bass and treble are shelves at 100 Hz and 10 kHz; tilt pivots the spectrum around 1 kHz. "
-                + "Warmth is Runout's curve: bass +2, treble \(SoundFormat.minus)1.5, tilt \(SoundFormat.minus)1."
+            return "Shelves at 100 Hz and 10 kHz; tilt pivots at 1 kHz."
         case .crossfeed:
-            return "For headphones: each ear hears a little of the other channel, low-passed, as with speakers "
-                + "(Bauer stereo-to-binaural)."
+            return "For headphones: a little of each channel, low-passed, reaches the other ear."
         case .limiter:
-            return "Look-ahead, true-peak. It runs whenever any block is on, and stays transparent until a peak "
-                + "would cross the ceiling."
+            return "Look-ahead, true-peak. Runs whenever a block is on."
         }
+    }
+
+    private func footerText(_ text: String) -> some View {
+        Text(text).foregroundStyle(theme.inkSecondary)
     }
 
     // MARK: Look
@@ -332,7 +327,7 @@ struct PureSwitch: View {
                         .fill(led)
                         .frame(width: 8, height: 8)
                         .shadow(color: led.opacity(isOn || !chain.isEmpty ? 0.8 : 0), radius: 4)
-                    Text(isOn ? "PURE" : chain.isEmpty ? "NOTHING ON" : "PROCESSING")
+                    Text(isOn ? "BYPASS ACTIVE" : chain.isEmpty ? "NOTHING ON" : "PROCESSING")
                         .font(Typeface.cellLabel)
                         .tracking(1.6)
                         .foregroundStyle(theme.inkSecondary)
@@ -400,8 +395,8 @@ private struct BigSwitch: View {
 // MARK: Flow
 
 /// The chain as a row of capsules, IN to OUT. Each switchable block's capsule toggles it; the limiter's shows whether
-/// it runs. In Pure the wires go straight through in green and the capsules are greyed and inert. The row scrolls
-/// sideways when Part B's blocks make it wider than the screen.
+/// it runs. In Pure one green line runs straight from IN to OUT behind the capsules, which are ghosted, all alike, and
+/// inert. The row scrolls sideways when Part B's blocks make it wider than the screen.
 struct SignalFlowRow: View {
     let settings: SoundSettings
     let theme: Theme
@@ -431,6 +426,16 @@ struct SignalFlowRow: View {
             wire(wireWidth)
             terminal("OUT")
         }
+        .background {
+            if settings.pure {
+                // The bypass: one unbroken line from IN to OUT, passing behind every block.
+                Rectangle()
+                    .fill(theme.ok)
+                    .frame(height: 2)
+                    .padding(.horizontal, 22)
+                    .accessibilityHidden(true)
+            }
+        }
     }
 
     private func terminal(_ text: String) -> some View {
@@ -444,9 +449,9 @@ struct SignalFlowRow: View {
 
     private func wire(_ width: CGFloat?) -> some View {
         Rectangle()
-            .fill(settings.pure ? theme.ok : theme.inkSecondary.opacity(0.45))
+            .fill(settings.pure ? Color.clear : theme.inkSecondary.opacity(0.45))
             .frame(minWidth: width ?? 8, idealWidth: width ?? 8, maxWidth: width ?? .infinity)
-            .frame(height: settings.pure ? 2 : 1.5)
+            .frame(height: 1.5)
             .accessibilityHidden(true)
     }
 
@@ -458,7 +463,8 @@ struct SignalFlowRow: View {
             } label: {
                 capsuleFace(block)
             }
-            .buttonStyle(.plain)
+            // A style of its own, so a disabled capsule is not dimmed a second time: Pure ghosts them all alike.
+            .buttonStyle(CapsuleButtonStyle())
             .disabled(settings.pure)
             .accessibilityAddTraits(.isToggle)
             .modifier(CapsuleAccessibility(block: block, settings: settings))
@@ -474,10 +480,11 @@ struct SignalFlowRow: View {
         let on = block.isOn(in: settings)
         let active = block.isActive(in: settings)
         let tint = theme.processingTint
+        let pure = settings.pure
         return HStack(spacing: 4) {
             Text(block.name.uppercased())
             if !block.isSwitchable {
-                Text("AUTO").font(.system(size: 7, weight: .bold, design: .monospaced)).opacity(0.75)
+                Text("AUTO").font(.caption2.monospaced().weight(.bold)).textScale(.secondary).opacity(0.75)
             }
         }
         .font(.caption2.monospaced().weight(.semibold))
@@ -486,14 +493,21 @@ struct SignalFlowRow: View {
         .fixedSize()
         .padding(.horizontal, 7)
         .padding(.vertical, 7)
-        .foregroundStyle(active ? theme.background : on ? tint : theme.inkSecondary)
-        .background(Capsule().fill(active ? tint : Color.clear))
+        .foregroundStyle(pure ? theme.inkSecondary : active ? theme.background : on ? tint : theme.inkSecondary)
+        // Under Pure the ghost is opaque, so the bypass line reads as passing behind it.
+        .background(Capsule().fill(pure ? theme.plinthTop : active ? tint : Color.clear))
         .overlay(
             Capsule().strokeBorder(
-                active ? Color.clear : on ? tint : theme.hairline,
-                style: StrokeStyle(lineWidth: 1, dash: settings.pure ? [3, 2] : []))
+                pure ? theme.inkSecondary.opacity(0.5) : active ? Color.clear : on ? tint : theme.hairline,
+                style: StrokeStyle(lineWidth: 1, dash: pure ? [3, 2] : []))
         )
-        .opacity(settings.pure ? 0.4 : 1)
+    }
+}
+
+/// The flow capsules' press: a slight dim while held, and no dimming of its own when disabled.
+private struct CapsuleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -535,6 +549,8 @@ struct EQControlsRow: View {
                 presets
             }
         }
+        // The separator below runs the full width, rather than from the first text the List finds in the row.
+        .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
     }
 
     private var modePicker: some View {

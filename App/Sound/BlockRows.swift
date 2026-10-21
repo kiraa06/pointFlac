@@ -316,10 +316,13 @@ struct GraphicEQBank: View {
             Spacer()
             Text(SoundFormat.signed(range.lowerBound, decimals: 0))
         }
-        .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+        .font(.caption2.monospaced().weight(.medium))
+        .textScale(.secondary)
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
         .foregroundStyle(theme.inkSecondary)
         .padding(.vertical, 16)
-        .frame(width: 22)
+        .frame(width: 20)
         .accessibilityHidden(true)
     }
 }
@@ -598,10 +601,17 @@ struct ToneRows: View {
         .accessibilityIdentifier("tiltSlider")
         .accessibilityHint("Above zero tilts toward the treble, below toward the bass, around 1 kilohertz.")
         HStack(spacing: 10) {
-            Button("Warmth", systemImage: "flame") { store.applyWarmth() }
-                .buttonStyle(.glass)
-                .accessibilityIdentifier("warmthButton")
-                .accessibilityHint("Bass plus 2, treble minus 1.5, tilt minus 1")
+            Button {
+                store.applyWarmth()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "flame")
+                    Text("Warmth")
+                }
+            }
+            .buttonStyle(.glass)
+            .accessibilityIdentifier("warmthButton")
+            .accessibilityHint("Bass plus 2, treble minus 1.5, tilt minus 1")
             Button("Flat") { store.flattenTone() }
                 .buttonStyle(.glass)
                 .disabled(tone.bassDb == 0 && tone.trebleDb == 0 && tone.tiltDb == 0)
@@ -656,5 +666,6 @@ struct LimiterRows: View {
         .accessibilityIdentifier("ceilingSlider")
         .pureDimmed()
         GainReductionMeter(meters: meters, source: player, theme: screen, polling: polling)
+            .listRowInsets(SoundView.screenInsets)
     }
 }
