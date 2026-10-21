@@ -113,9 +113,15 @@ Built from commit 0b88ecd4e2bef7cf69fd5d50f1d06fb586c10865.
 
 Licence: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0),
 https://creativecommons.org/licenses/by-sa/4.0/legalcode.en
-Each preset is credited to its author in the app ("EQ by <author> · OPRA"). The data was converted to a compact
-JSON form and presets the equaliser cannot represent were left out; the data is otherwise unmodified. The
-conversion script is scripts/build-opra.swift. Only the data is under CC BY-SA 4.0; pointFlac's own code is not.
+Each preset is credited to its author in the app ("EQ by <author> · OPRA").
+
+Changes made to the data: it was converted to a compact JSON form (App/Resources/OPRA/opra.json) by
+scripts/build-opra.swift. Presets derived from AutoEq (every preset whose author contains "AutoEQ") were omitted,
+as were presets the equaliser cannot represent (more than 20 bands, or a band type it has no filter for). A band
+with no gain value was given 0 dB, and one with no Q value was given Q 0.7071. Each preset's "details" text (its
+target or variant) was kept. The data is otherwise unmodified; the app limits values to its filters' ranges when it
+applies a preset (bands below 20 Hz play at 20 Hz). opra.json is that adapted data and is itself licensed under
+CC BY-SA 4.0. Only the data is under CC BY-SA 4.0; pointFlac's own code is not.
 
 
 pointFlac
