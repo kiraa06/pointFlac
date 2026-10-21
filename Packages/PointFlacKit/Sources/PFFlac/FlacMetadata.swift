@@ -27,7 +27,12 @@ public struct FlacMetadata: Sendable {
         self.pictures = pictures
     }
 
-    private func first(_ key: String) -> String? { tags[key]?.first }
+    /// The first value of `key` (given uppercased). The reader stores keys uppercased; a metadata built by hand with
+    /// other casing is matched case-insensitively too, as Vorbis comment field names are.
+    private func first(_ key: String) -> String? {
+        if let value = tags[key]?.first { return value }
+        return tags.first { $0.key.uppercased() == key }?.value.first
+    }
 
     public var title: String? { first("TITLE") }
     public var artist: String? { first("ARTIST") }
@@ -44,6 +49,11 @@ public struct FlacMetadata: Sendable {
 
     public var trackGainDb: Double? { first("REPLAYGAIN_TRACK_GAIN").flatMap(Self.gain) }
     public var albumGainDb: Double? { first("REPLAYGAIN_ALBUM_GAIN").flatMap(Self.gain) }
+    /// The track's sample peak as a linear amplitude (1.0 = full scale), from `REPLAYGAIN_TRACK_PEAK`. Nil unless
+    /// finite and greater than zero.
+    public var trackPeak: Double? { first("REPLAYGAIN_TRACK_PEAK").flatMap(Self.peak) }
+    /// As `trackPeak`, for the album (`REPLAYGAIN_ALBUM_PEAK`).
+    public var albumPeak: Double? { first("REPLAYGAIN_ALBUM_PEAK").flatMap(Self.peak) }
 
     /// The front cover (type 3), else the first picture.
     public var frontCover: FlacPicture? { pictures.first { $0.type == 3 } ?? pictures.first }
@@ -53,12 +63,22 @@ public struct FlacMetadata: Sendable {
         return Int(digits)
     }
 
-    /// A ReplayGain value in dB, with or without its "dB" unit. `Double` also parses "nan" and "inf"; a gain that is
-    /// not finite is treated as absent, like a missing tag, so playback can never scale audio by it (ledger T5).
+    /// A ReplayGain value in dB, with or without its "dB" unit ("-6.20 dB", "-6.2dB", "+1.5 dB"). `Double(_:)` is
+    /// locale-independent (a decimal point only) but also parses "nan" and "inf"; a gain that is not finite, or beyond
+    /// plus or minus 60 dB (no real measurement), is treated as absent, like a missing tag, so playback can never
+    /// scale audio by it (ledger T5).
     private static func gain(_ s: String) -> Double? {
         var t = s.trimmingCharacters(in: .whitespaces)
         if t.lowercased().hasSuffix("db") { t = String(t.dropLast(2)).trimmingCharacters(in: .whitespaces) }
-        guard let value = Double(t), value.isFinite else { return nil }
+        guard let value = Double(t), value.isFinite, abs(value) <= maxGainDb else { return nil }
+        return value
+    }
+
+    private static let maxGainDb = 60.0
+
+    /// A ReplayGain peak: a linear amplitude, finite and greater than zero.
+    private static func peak(_ s: String) -> Double? {
+        guard let value = Double(s.trimmingCharacters(in: .whitespaces)), value.isFinite, value > 0 else { return nil }
         return value
     }
 }

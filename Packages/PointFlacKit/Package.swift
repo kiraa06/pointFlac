@@ -80,7 +80,7 @@ let package = Package(
         ),
         .target(
             name: "PFLibrary",
-            dependencies: ["PFCore", "PFFlac"],
+            dependencies: ["PFCore", "PFFlac", "PFLoudness"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // Stream D: the player UI's maths (sides, spin, tonearm, jog, the hand-off timeline). Foundation only.
@@ -156,7 +156,7 @@ let package = Package(
         .testTarget(
             name: "PFLibraryTests",
             // PFSearch and PFAudio only for the end-to-end test of the path the app adapter takes.
-            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFTestSupport"],
+            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFLoudness", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

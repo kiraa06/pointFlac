@@ -42,6 +42,10 @@ public final class Library: Sendable {
         (catalog: LibraryCatalog, subscribers: [UUID: AsyncStream<LibraryCatalog>.Continuation])
     >((.empty, [:]))
     private let repairScheduled = Mutex(false)
+    /// For tests: how many files the loudness scan has opened to decode.
+    let loudnessDecodes = Mutex(0)
+    /// For tests: awaited after each track's measurement, before it is stored.
+    let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.
     private let publishedCount = Mutex(0)
     static let logger = Logger(subsystem: "io.github.kiraa06.pointflac", category: "library")
@@ -235,7 +239,7 @@ public final class Library: Sendable {
     }
 
     /// When a call publishes a catalog: never (reads), always (a folder removed), or if its scan changed something.
-    private enum Publish {
+    enum Publish {
         case never
         case always
         case ifChanged
@@ -243,7 +247,7 @@ public final class Library: Sendable {
 
     /// Runs `body` on the library's queue; then, when `rule` says the result changed the library, publishes the
     /// catalog before the caller resumes, so `current` already shows what the call did.
-    private func run<T: Sendable>(
+    func run<T: Sendable>(
         _ rule: Publish, _ body: @escaping @Sendable (LibraryStore) throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -280,7 +284,7 @@ public final class Library: Sendable {
         for subscriber in subscribers { subscriber.yield(catalog) }
     }
 
-    private static func log(_ error: any Error, during operation: String) {
+    static func log(_ error: any Error, during operation: String) {
         let code = (error as? LibraryDatabaseError).map { String($0.code) } ?? "-"
         logger.error(
             "\(operation, privacy: .public) failed (code \(code, privacy: .public)): \(String(describing: error), privacy: .private)"

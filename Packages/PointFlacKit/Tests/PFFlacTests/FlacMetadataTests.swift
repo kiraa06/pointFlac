@@ -70,3 +70,32 @@ import Testing
     #expect(gains("+0.00 dB").album == 0)
     #expect(gains("12").track == 12)
 }
+
+private func replayGain(_ tags: [String: [String]]) -> FlacMetadata {
+    FlacMetadata(
+        streamInfo: FlacStreamInfo(
+            minBlockSize: 16, maxBlockSize: 16, minFrameSize: 0, maxFrameSize: 0, sampleRate: 44_100, channels: 2,
+            bitsPerSample: 16, totalFrames: 0, md5: []),
+        tags: tags, pictures: [])
+}
+
+@Test func replayGainPeaksAndTolerantGains() {
+    let m = replayGain([
+        "replaygain_track_gain": ["-6.2dB"], "ReplayGain_Album_Gain": ["+1.5 dB"],
+        "REPLAYGAIN_TRACK_PEAK": ["0.977"], "REPLAYGAIN_ALBUM_PEAK": [" 1.02 "],
+    ])
+    #expect(m.trackGainDb == -6.2 && m.albumGainDb == 1.5)
+    #expect(m.trackPeak == 0.977 && m.albumPeak == 1.02)
+    #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": ["-6.20 dB"]]).trackGainDb == -6.2)
+}
+
+@Test func absurdReplayGainValuesAreAbsent() {
+    for raw in ["-61 dB", "60.5", "1e9", "nan"] {
+        #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": [raw]]).trackGainDb == nil, "\(raw)")
+    }
+    #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": ["-60 dB"]]).trackGainDb == -60)
+    for raw in ["0", "-0.5", "nan", "inf", "-inf", "loud", "0,9"] {
+        #expect(replayGain(["REPLAYGAIN_TRACK_PEAK": [raw]]).trackPeak == nil, "\(raw)")
+    }
+    #expect(replayGain([:]).albumPeak == nil)
+}

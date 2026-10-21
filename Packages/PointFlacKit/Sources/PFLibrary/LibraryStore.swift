@@ -126,6 +126,21 @@ final class LibraryStore {
             mtime REAL NOT NULL,
             PRIMARY KEY(folder_id, rel_path));
         """,
+        // v4: loudness. The ReplayGain tags (gains in dB, peaks linear), the scan's per-track measurement (LUFS and
+        // true peak, linear), and the scan's per-album measurement. Tags are re-read with the file; measurements stay
+        // until the track goes.
+        """
+        ALTER TABLE tracks ADD COLUMN rg_track_gain REAL;
+        ALTER TABLE tracks ADD COLUMN rg_track_peak REAL;
+        ALTER TABLE tracks ADD COLUMN rg_album_gain REAL;
+        ALTER TABLE tracks ADD COLUMN rg_album_peak REAL;
+        ALTER TABLE tracks ADD COLUMN r128_lufs REAL;
+        ALTER TABLE tracks ADD COLUMN r128_peak REAL;
+        CREATE TABLE album_loudness(
+            album_id TEXT PRIMARY KEY,
+            lufs REAL NOT NULL,
+            peak REAL NOT NULL);
+        """,
     ]
 
     /// Probed files per transaction: each batch is committed and published, so a scan killed part-way keeps what it
@@ -328,6 +343,7 @@ final class LibraryStore {
             }
             try database.query(
                 "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+            try dropOrphanAlbumLoudness()
         }
         let keep = Set(try database.query("SELECT id FROM artwork").compactMap { $0[0].string })
         artwork.removeAll(except: keep)
@@ -583,20 +599,24 @@ final class LibraryStore {
             .integer(Int64(probed.format.sampleRate)), .integer(Int64(probed.format.bitsPerSample)),
             .integer(Int64(probed.format.channels)), .integer(probed.totalFrames), .text(albumID),
             .optional(artworkID),
+            .optional(probed.trackGainDb), .optional(probed.trackPeak), .optional(probed.albumGainDb),
+            .optional(probed.albumPeak),
         ]
         if insert {
             try database.query(
                 """
                 INSERT INTO tracks(folder_id, rel_path, size, mtime, content_id, title, artist, album_artist, album,
-                    disc, track, year, sample_rate, bits, channels, total_frames, album_id, artwork_id, added_at, id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    disc, track, year, sample_rate, bits, channels, total_frames, album_id, artwork_id,
+                    rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, added_at, id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, values + [.real(Date().timeIntervalSince1970), .text(id)])
         } else {
             try database.query(
                 """
                 UPDATE tracks SET folder_id = ?, rel_path = ?, size = ?, mtime = ?, content_id = ?, title = ?,
                     artist = ?, album_artist = ?, album = ?, disc = ?, track = ?, year = ?, sample_rate = ?, bits = ?,
-                    channels = ?, total_frames = ?, album_id = ?, artwork_id = ?
+                    channels = ?, total_frames = ?, album_id = ?, artwork_id = ?, rg_track_gain = ?,
+                    rg_track_peak = ?, rg_album_gain = ?, rg_album_peak = ?
                 WHERE id = ?
                 """, values + [.text(id)])
         }
@@ -712,7 +732,7 @@ final class LibraryStore {
     }
 
     /// An iCloud file whose bytes are not on the device. Reading it would block on the download.
-    private static func isNotDownloaded(_ url: URL) -> Bool {
+    static func isNotDownloaded(_ url: URL) -> Bool {
         guard
             let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
             values.isUbiquitousItem == true, let status = values.ubiquitousItemDownloadingStatus
@@ -773,6 +793,7 @@ final class LibraryStore {
             // As `removeGone` does after a scan: the rows first, in the transaction, then the files.
             try database.query(
                 "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+            try dropOrphanAlbumLoudness()
         }
         // Committed: nothing below throws, so the removal is always published. Should the covers that stay be
         // unreadable, their files are left for the next scan's sweep rather than every cover deleted.
@@ -835,14 +856,77 @@ final class LibraryStore {
         }
     }
 
+    // MARK: Loudness
+
+    /// An album's measurements are meaningless once no track is in it.
+    private func dropOrphanAlbumLoudness() throws {
+        try database.query("DELETE FROM album_loudness WHERE album_id NOT IN (SELECT album_id FROM tracks)")
+    }
+
+    /// The albums the loudness scan should measure, with the tracks it can read. An album is measured when some track
+    /// has neither a ReplayGain tag nor a measurement and is on the device; then every track of the album that is on
+    /// the device is measured, so the album value pools them. `albums` limits the choice. Tracks whose folder is not
+    /// found this launch, or whose file is evicted to iCloud, are left out.
+    func loudnessJobs(albums only: [String]?) throws -> [LoudnessJob] {
+        let rows = try database.query(
+            """
+            SELECT id, folder_id, rel_path, album_id, rg_track_gain IS NOT NULL OR rg_album_gain IS NOT NULL,
+                r128_lufs IS NOT NULL, cloud_pending FROM tracks ORDER BY album_id, disc, track, id
+            """)
+        let filter = only.map(Set.init)
+        var order: [String] = []
+        var tracks: [String: [LoudnessJob.Track]] = [:]
+        var needed: Set<String> = []
+        var totals: [String: Int] = [:]
+        for row in rows {
+            guard let id = row[0].string, let folder = row[1].int, let path = row[2].string,
+                let album = row[3].string, filter?.contains(album) ?? true
+            else { continue }
+            if tracks[album] == nil { order.append(album) }
+            totals[album, default: 0] += 1
+            let evicted = row[6].int == 1
+            guard let root = roots[folder], !evicted else {
+                if tracks[album] == nil { tracks[album] = [] }
+                continue
+            }
+            let untouched = row[4].int != 1 && row[5].int != 1
+            if untouched { needed.insert(album) }
+            tracks[album, default: []].append(.init(id: id, url: root.appending(path: path)))
+        }
+        return order.compactMap { album in
+            guard needed.contains(album), let members = tracks[album] else { return nil }
+            // Complete only when no track of the album was left out (evicted, or its folder not found).
+            return LoudnessJob(albumID: album, tracks: members, complete: members.count == totals[album])
+        }
+    }
+
+    /// Stores one track's measurement. A track removed since the scan planned it has no row to update, so nothing is
+    /// written and nothing comes back: false. Never inserts.
+    func recordLoudness(trackID: String, lufs: Double, peak: Double) throws -> Bool {
+        try database.query(
+            "UPDATE tracks SET r128_lufs = ?, r128_peak = ? WHERE id = ?", [.real(lufs), .real(peak), .text(trackID)])
+        return try database.query("SELECT changes()").first?.first?.int == 1
+    }
+
+    /// Stores an album's measurement, only while the album still has tracks.
+    func recordAlbumLoudness(albumID: String, lufs: Double, peak: Double) throws {
+        try database.query(
+            """
+            INSERT OR REPLACE INTO album_loudness(album_id, lufs, peak)
+            SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE album_id = ?)
+            """, [.text(albumID), .real(lufs), .real(peak), .text(albumID)])
+    }
+
     // MARK: Reading
 
     /// Every track whose folder can be found this launch, as the catalog the UI and search see.
     func catalog() throws -> LibraryCatalog {
         let rows = try database.query(
             """
-            SELECT id, folder_id, rel_path, title, artist, album_artist, album, disc, track, year, sample_rate, bits,
-                channels, total_frames, album_id, artwork_id, cloud_pending FROM tracks
+            SELECT tracks.id, folder_id, rel_path, title, artist, album_artist, album, disc, track, year, sample_rate, bits,
+                channels, total_frames, tracks.album_id, artwork_id, cloud_pending, rg_track_gain, rg_track_peak,
+                rg_album_gain, rg_album_peak, r128_lufs, r128_peak, a.lufs, a.peak
+            FROM tracks LEFT JOIN album_loudness a ON a.album_id = tracks.album_id
             """)
         var tracks: [LibraryTrack] = []
         tracks.reserveCapacity(rows.count)
@@ -859,9 +943,19 @@ final class LibraryStore {
                         sampleRate: Int(row[10].int ?? 0), bitsPerSample: Int(row[11].int ?? 0),
                         channels: Int(row[12].int ?? 0)),
                     totalFrames: row[13].int ?? 0, artworkID: row[15].string, isCloudPending: row[16].int == 1,
-                    isInLibraryFolder: folder == Self.libraryFolderID))
+                    isInLibraryFolder: folder == Self.libraryFolderID,
+                    loudness: Self.loudness(row)))
         }
         return LibraryCatalog(tracks: tracks)
+    }
+
+    /// The loudness columns of a catalog row (indexes 17...24), or nil when all are empty.
+    private static func loudness(_ row: [SQLValue]) -> TrackLoudness? {
+        let value = TrackLoudness(
+            trackGainDb: row[17].double, trackPeak: row[18].double, albumGainDb: row[19].double,
+            albumPeak: row[20].double, measuredLufs: row[21].double, measuredPeak: row[22].double,
+            albumMeasuredLufs: row[23].double, albumMeasuredPeak: row[24].double)
+        return value.isEmpty ? nil : value
     }
 
     private static func describe(_ rejection: FlacRejection) -> String {
@@ -876,4 +970,18 @@ final class LibraryStore {
     private static func jsonArray(_ strings: Set<String>) -> String {
         (try? String(data: JSONEncoder().encode(Array(strings)), encoding: .utf8)) ?? "[]"
     }
+}
+
+/// An album for the loudness scan to measure (`LibraryStore.loudnessJobs`).
+struct LoudnessJob: Sendable {
+    struct Track: Sendable {
+        var id: String
+        var url: URL
+    }
+    var albumID: String
+    /// The tracks on the device, in playing order.
+    var tracks: [Track]
+    /// False when a track of the album is not on the device (evicted, or its folder not found), so the album value
+    /// would leave it out and is not stored.
+    var complete: Bool
 }

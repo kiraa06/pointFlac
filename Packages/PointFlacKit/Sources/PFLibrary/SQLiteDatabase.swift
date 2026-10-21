@@ -193,4 +193,5 @@ extension SQLValue {
     }
     static func optional(_ value: Int?) -> SQLValue { value.map { .integer(Int64($0)) } ?? .null }
     static func optional(_ value: String?) -> SQLValue { value.map { .text($0) } ?? .null }
+    static func optional(_ value: Double?) -> SQLValue { value.map { .real($0) } ?? .null }
 }
