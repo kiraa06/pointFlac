@@ -248,7 +248,7 @@ private let allStates: [SignalState] = [
     #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000, int32: true)) == ["HI-RES 32/192", "PURE"])
     // HDMI/CarPlay: no claim; the strip already says the output may alter the audio.
     #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .other("HDMI"))).isEmpty)
-    // Downmixed: PCM is still delivered, so the resolution pill stays, and Pure does not.
+    // Downmixed: PCM is still delivered, so the resolution text stays, and Pure does not.
     #expect(
         SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .wired("Mono"), hardwareChannels: 1))
             == ["HI-RES 24/96"])
@@ -276,4 +276,42 @@ private let allStates: [SignalState] = [
         SignalStrip.signalBadges(state(96_000, 24, hardware: 96_000)).map(\.displayText) == ["Hi-Res 24/96", "Pure"])
     #expect(SignalBadge.hiRes(bits: 24, rate: 352_800).displayText == "Hi-Res 24/352.8")
     #expect(SignalBadge.lossless(bits: 16, rate: 44_100).displayText == "Lossless 16/44.1")
+}
+
+@Test func cellKeepsItsWordsWhenThereIsNoResolutionToShow() {
+    let fallbacks: [(SignalState, String)] = [
+        (state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods")), "● Bluetooth (lossy)"),
+        (state(44_100, 16, hardware: 44_100, port: .airPlay("TV")), "● AirPlay (re-encoded)"),
+        (state(44_100, 16, hardware: 44_100, port: .other("HDMI")), "● Output may alter audio"),
+        (SignalState(source: fmt(96_000, 24), port: .usb("DAC")), "● Starting…"),
+    ]
+    for (signal, words) in fallbacks {
+        #expect(!SignalStrip.showsResolution(signal))
+        #expect(SignalStrip.text(signal).hasSuffix(words))
+        #expect(SignalStrip.titleNote(signal) == nil)
+    }
+    #expect(!SignalStrip.showsResolution(SignalState()))
+    #expect(SignalStrip.text(SignalState()) == "No record")
+    #expect(SignalStrip.showsResolution(state(96_000, 24, hardware: 96_000)))
+}
+
+@Test func titleNoteNeverRepeatsTheCellWords() {
+    let other = state(
+        48_000, 24, hardware: 48_000, port: .other("HDMI"), channels: 6, hardwareChannels: 2)
+    #expect(SignalStrip.text(other).hasSuffix("● Downmixed 6→2"))
+    #expect(SignalStrip.titleNote(other) == nil)
+    // Scrubbing on a lossy route: the cell says Scrubbing, the note stays quiet.
+    let scrub = state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"), scrubbing: true)
+    #expect(SignalStrip.titleNote(scrub) == nil)
+}
+
+@Test func titleNoteIsSpokenWithoutArrows() {
+    #expect(
+        SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 48_000, port: .builtIn))
+            == "Resampled 96 to 48 kilohertz")
+    #expect(
+        SignalStrip.titleNoteSpoken(state(44_100, 16, hardware: 48_000, port: .builtIn))
+            == "Resampled 44.1 to 48 kilohertz")
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 32, hardware: 96_000)) == "Reduced from 32-bit to 24-bit")
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 96_000)) == nil)
 }

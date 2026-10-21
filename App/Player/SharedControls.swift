@@ -72,7 +72,7 @@ struct SharedControls: View {
                             .lineLimit(1)
                             .fixedSize()
                             .layoutPriority(1)
-                            .accessibilityLabel("Signal note: \(note)")
+                            .accessibilityLabel("Signal note: \(SignalStrip.titleNoteSpoken(player.signal) ?? note)")
                             .accessibilityIdentifier("titleNote")
                     }
                 }
@@ -303,7 +303,7 @@ struct SignalCells: View {
     private func spoken(_ text: String) -> String {
         let badges = SignalStrip.signalBadges(signal)
         let parts = text.components(separatedBy: " · ")
-        guard signal.resolution != nil, parts.count >= 4, parts[0] == "FLAC" else { return text }
+        guard SignalStrip.showsResolution(signal), parts.count >= 4, parts[0] == "FLAC" else { return text }
         var spoken = parts[0...2].joined(separator: ", ")
         spoken += ". Signal: " + badges.map(\.accessibilityLabel).joined(separator: ", ")
         if parts.count > 4 { spoken += ". " + parts[4...].joined(separator: " ") }
@@ -355,11 +355,11 @@ struct SignalCells: View {
                 HStack(alignment: .top, spacing: 8) {
                     // With the resolution text the first three cells size to their content, so the SIGNAL cell gets
                     // the leftover width.
-                    let hugging = signal.resolution != nil
+                    let hugging = SignalStrip.showsResolution(signal)
                     cell("FORMAT", parts[0], fixed: hugging)
                     cell("DEPTH", parts[1], fixed: hugging)
                     cell("DAC", parts[2], fixed: hugging)
-                    if signal.resolution != nil {
+                    if hugging {
                         resolutionCell
                     } else {
                         cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)

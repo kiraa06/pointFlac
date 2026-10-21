@@ -18,7 +18,7 @@ public enum SignalStrip {
         return text
     }
 
-    /// The pills beside the strip, typed: the delivered resolution (never for a lossy or unknown route), then Pure
+    /// The SIGNAL cell's resolution runs, typed: the delivered resolution (never for a lossy or unknown route), then Pure
     /// only when the indicator is `.pure`.
     public static func signalBadges(_ s: SignalState) -> [SignalBadge] {
         var badges: [SignalBadge] = []
@@ -31,20 +31,38 @@ public enum SignalStrip {
         return badges
     }
 
-    /// The pills' words, e.g. `["HI-RES 24/96", "PURE"]`.
+    /// The same runs as upper-case text, e.g. `["HI-RES 24/96", "PURE"]` (the brief's interface; the cell itself shows
+    /// `SignalBadge.displayText`).
     public static func badges(_ s: SignalState) -> [String] { signalBadges(s).map(\.text) }
 
-    /// The small note beside the song title for the altered or transient states (the pills in the cell cover the
+    /// Whether the SIGNAL cell shows the resolution runs. False on Bluetooth, AirPlay, an unknown route, idle and
+    /// pending, where the cell keeps the indicator words: those are the warnings, and must never go blank.
+    public static func showsResolution(_ s: SignalState) -> Bool { !signalBadges(s).isEmpty }
+
+    /// The small note beside the song title for the altered or transient states (the resolution text in the cell covers the
     /// rest): the rate change, the depth reduction, processing, a downmix, scrubbing. Nil for pure, for the route
     /// warnings (Bluetooth, AirPlay, other, which stay in the cell), and for idle and pending.
     public static func titleNote(_ s: SignalState) -> String? {
+        // When the cell shows the indicator words, they already say this state: never repeat it.
+        guard showsResolution(s) else { return nil }
         switch s.indicator {
-        case .resampled(let change): "Resampled \(shortRate(change.from))→\(shortRate(change.to))"
-        case .depthReduced(let from, let to): "\(from)→\(to)-bit"
-        case .processing: "Processing"
-        case .downmixed(let from, let to): "Downmixed \(from)→\(to)"
-        case .scrubbing: "Scrubbing"
-        case .idle, .pending, .pure, .bluetoothLossy, .airPlay, .otherRoute: nil
+        case .resampled(let change): return "Resampled \(shortRate(change.from))→\(shortRate(change.to))"
+        case .depthReduced(let from, let to): return "\(from)→\(to)-bit"
+        case .processing: return "Processing"
+        case .downmixed(let from, let to): return "Downmixed \(from)→\(to)"
+        case .scrubbing: return "Scrubbing"
+        case .idle, .pending, .pure, .bluetoothLossy, .airPlay, .otherRoute: return nil
+        }
+    }
+
+    /// What VoiceOver reads for the title note: "to" for the arrow, and the units spelled out.
+    public static func titleNoteSpoken(_ s: SignalState) -> String? {
+        guard showsResolution(s) else { return nil }
+        switch s.indicator {
+        case .resampled(let change): return "Resampled \(shortRate(change.from)) to \(shortRate(change.to)) kilohertz"
+        case .depthReduced(let from, let to): return "Reduced from \(from)-bit to \(to)-bit"
+        case .downmixed(let from, let to): return "Downmixed from \(from) to \(to) channels"
+        default: return titleNote(s)
         }
     }
 
@@ -73,7 +91,7 @@ public enum SignalStrip {
     }
 }
 
-/// One pill beside the strip: what it says, and what it means to a screen reader.
+/// One run of the SIGNAL cell's resolution text: what it says, and what it means to a screen reader.
 public enum SignalBadge: Hashable, Sendable {
     case hiRes(bits: Int, rate: Int)
     case lossless(bits: Int, rate: Int)
@@ -87,7 +105,7 @@ public enum SignalBadge: Hashable, Sendable {
         }
     }
 
-    /// The same pill in mixed case, for the SIGNAL cell's plain text: `Hi-Res 24/96`, `Lossless 16/44.1`, `Pure`.
+    /// Mixed case, for the SIGNAL cell's plain text: `Hi-Res 24/96`, `Lossless 16/44.1`, `Pure`.
     public var displayText: String {
         switch self {
         case .hiRes(let bits, let rate): "Hi-Res \(bits)/\(SignalStrip.shortRate(rate))"
