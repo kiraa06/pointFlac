@@ -498,7 +498,13 @@ struct SignalFlowRow: View {
         .padding(.vertical, 7)
         .foregroundStyle(pure ? theme.inkSecondary : active ? theme.background : on ? tint : theme.inkSecondary)
         // Under Pure the ghost is opaque, so the bypass line reads as passing behind it.
-        .background(Capsule().fill(pure ? theme.plinthTop : active ? tint : Color.clear))
+        .background {
+            if pure {
+                Capsule().fill(theme.background).overlay(Capsule().fill(theme.plinthTop))
+            } else {
+                Capsule().fill(active ? tint : Color.clear)
+            }
+        }
         .overlay(
             Capsule().strokeBorder(
                 pure ? theme.inkSecondary.opacity(0.5) : active ? Color.clear : on ? tint : theme.hairline,

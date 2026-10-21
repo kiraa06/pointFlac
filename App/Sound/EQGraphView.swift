@@ -223,7 +223,7 @@ struct EQGraphView: View {
         for db in [12.0, 0, -12] {
             let text = db == 0 ? "0" : SoundFormat.signed(db, decimals: 0)
             context.draw(
-                label(text), at: CGPoint(x: size.width - 5, y: y(db, size.height) - 2), anchor: .bottomTrailing)
+                label(text), at: CGPoint(x: size.width - 5, y: y(db, size.height) - 5), anchor: .bottomTrailing)
         }
     }
 
