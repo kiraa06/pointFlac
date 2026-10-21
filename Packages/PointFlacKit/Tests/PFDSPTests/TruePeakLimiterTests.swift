@@ -164,8 +164,8 @@ struct TruePeakLimiterTests {
         // Audio-band tones get 0.05 dB. Ultrasonic tones at 176.4 and 192 kHz (0.4 × the rate, like a DSD-sourced
         // file's noise-shaped hash) are read on the 8× grid and get 0.1 dB (ruling R4-T4e).
         let tones: [(rate: Double, hz: [Double], tolerance: Double)] = [
-            (44_100, [997, 44_100 / 4, 44_100 / 3, 0.4 * 44_100], 0.05),
-            (48_000, [997, 48_000 / 4, 48_000 / 3, 0.4 * 48_000], 0.05),
+            (44_100, [997, 44_100 / 4, 44_100 / 3, 0.4 * 44_100, 8 * 44_100 / 19, 20_000], 0.05),
+            (48_000, [997, 48_000 / 4, 48_000 / 3, 0.4 * 48_000, 8 * 48_000 / 19, 20_000], 0.05),
             (96_000, [20_000], 0.05),
             (176_400, [20_000], 0.05),
             (192_000, [20_000], 0.05),

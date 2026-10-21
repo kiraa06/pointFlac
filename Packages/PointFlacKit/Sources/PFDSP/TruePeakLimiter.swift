@@ -13,8 +13,8 @@ import Synchronization
 ///
 /// ## What it guarantees
 /// Content up to 0.45 × the rate, steady or broadband, holds the ceiling within these measured bounds:
-/// - **44.1 and 48 kHz (16×): +0.014 dB.**
-/// - **Higher rates (8×): +0.09 dB.** Up to 20 kHz the bound is the grid's 0.035 dB, and a 20 kHz tone measures under
+/// - **44.1 and 48 kHz (16×): +0.03 dB.**
+/// - **Higher rates (8×): +0.1 dB.** Up to 20 kHz the bound is the grid's 0.035 dB, and a 20 kHz tone measures under
 ///   the ceiling. The rest is ultrasonic content, read on the coarser grid.
 ///
 /// **Energy above 0.45 × the rate is not guaranteed.** It is under-read, as with any finite true-peak detector,
@@ -26,9 +26,9 @@ import Synchronization
 ///
 /// Measured details, as the applied gain times a steady tone's amplitude over 128 crest positions, and for noise on an
 /// FFT-exact reconstruction (five 65 536-frame runs per rate, driven 13 dB in):
-/// - 16×: tones within +0.014 dB up to 0.45 × the rate; noise band-limited to 0.45 × within +0.002 dB.
+/// - 16×: tones within +0.03 dB up to 0.45 × the rate (the worst, +0.029 dB, at 8/19 of it); noise band-limited to 0.45 × within +0.002 dB.
 /// - 8×: tones up to 20 kHz under the ceiling; ultrasonic tones +0.044 dB at fs/4, +0.059 dB at fs/3, +0.087 dB at
-///   0.4 fs; noise band-limited to 0.45 × within +0.065 dB.
+///   0.4 fs, +0.1 dB at 4/9 fs; noise band-limited to 0.45 × within +0.065 dB.
 ///
 /// ## Detector
 /// Each frame, every channel is read at the sample and at `oversampling − 1` evenly spaced points before the next
@@ -38,8 +38,9 @@ import Synchronization
 /// can pass the ceiling.
 ///
 /// Each interpolating phase is a 32-tap Kaiser-windowed sinc (16 frames either side, β 5, normalised to unity at DC).
-/// The low β accepts about ±0.02 dB of passband ripple to carry the passband out to 0.47 × the rate; reading high only
-/// makes the limiter act a little early. The frame's peak is the largest across channels.
+/// The low β trades passband ripple (+0.04 / −0.03 dB up to 0.45 × the rate; the response falls away above it, −1.6 dB
+/// at 0.47 ×) for a passband that reaches that far. Reading high only makes the limiter act a little early: up to
+/// 0.025 dB below the ceiling on tones to 0.4 × the rate, 0.04 dB at 0.44 ×, and 0.065 dB on full-band noise. The frame's peak is the largest across channels.
 ///
 /// ## Gain envelope
 /// Channels share one gain, so a limited channel never shifts the stereo image. Per frame:
@@ -67,8 +68,9 @@ public final class TruePeakLimiter: @unchecked Sendable {
     /// Taps per interpolating phase: 16 frames either side of the point. A multiple of 4, for `process`'s unrolling.
     static let tapsPerPhase = 32
     static let beta = 5.0
-    /// Within this of its target, a releasing gain takes the target exactly.
-    static let snap = 1e-9
+    /// Within this of its target, a releasing gain takes the target exactly. Computed, not stored: `process` reads it,
+    /// and a stored static's lazy initialiser would first run on the render thread.
+    static var snap: Double { 1e-9 }
 
     /// Detection points per sample interval, the sample itself included: see `oversampling(atRate:)`.
     let oversampling: Int
@@ -81,7 +83,7 @@ public final class TruePeakLimiter: @unchecked Sendable {
     private let releaseCoefficient: Double
 
     /// Each channel's recent input in a ring of `historyFrames` (a power of two), written twice, at `i` and
-    /// `i + historyFrames`, so the detector's twelve taps are always contiguous. Channel `c` starts at
+    /// `i + historyFrames`, so each detector phase's taps are always contiguous. Channel `c` starts at
     /// `c * 2 * historyFrames`.
     private let history: UnsafeMutablePointer<Double>
     private let historyFrames: Int
