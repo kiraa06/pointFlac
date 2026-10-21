@@ -333,7 +333,7 @@ private final class FrameProxy: NSObject {
 
 /// The blocks the Sound tab shows, in chain order (`SoundSettings.activeBlockNames`): ReplayGain and the preamp, then
 /// headphone correction, the EQ, tone and crossfeed, the limiter, and crossfade last. Each case brings its capsule in
-/// the flow row and its section in the list.
+/// the flow row and its section in the list, which puts the EQ first (`pageOrder`).
 enum SoundBlock: String, CaseIterable, Identifiable {
     case replayGain, preamp, correction, eq, tone, crossfeed, limiter, crossfade
 
@@ -355,6 +355,18 @@ enum SoundBlock: String, CaseIterable, Identifiable {
 
     /// The flow capsule's word: the name, short enough for the row.
     var capsuleName: String { self == .correction ? "Correction" : name }
+
+    /// The order of the Sound tab's sections (ruling R4-UI-a): the EQ first, as the block used most, then the rest in
+    /// chain order. The flow row and the Pure card keep chain order (`allCases`), since they describe the signal path.
+    static let pageOrder: [SoundBlock] = [.eq] + allCases.filter { $0 != .eq }
+
+    /// The block in a sentence: "Show headphone correction settings".
+    var settingsName: String {
+        switch self {
+        case .eq, .replayGain: name
+        default: name.lowercased()
+        }
+    }
 
     /// The limiter and the preamp have no switch: the limiter joins the chain whenever another block is on, and the
     /// preamp whenever its trim is not 0 dB (its automatic headroom runs with any chain).

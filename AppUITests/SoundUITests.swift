@@ -36,7 +36,7 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
 
-        // The EQ comes after ReplayGain, the preamp and headphone correction, in chain order.
+        // The EQ is the first block, under the meter: on screen, or just below it.
         let eq = app.descendants(matching: .any)["eqToggle"]
         Self.reveal(eq, in: app)
         XCTAssertTrue(eq.exists)
@@ -63,7 +63,7 @@ final class SoundUITests: XCTestCase {
         let open = app.buttons["openSoundButton"]
         XCTAssertTrue(open.waitForExistence(timeout: 3))
         open.tap()
-        // The tab keeps its place, down at the EQ: back up to Pure.
+        // The tab keeps its place: back up to Pure if the EQ scrolled it away.
         XCTAssertTrue(app.navigationBars["Sound"].waitForExistence(timeout: 3))
         Self.reveal(pure, in: app, up: true)
         XCTAssertTrue(pure.exists)
@@ -128,7 +128,10 @@ final class SoundUITests: XCTestCase {
         from.press(forDuration: 0.1, thenDragTo: to)
         expectation(for: NSPredicate(format: "value BEGINSWITH 'plus'"), evaluatedWith: fader)
         waitForExpectations(timeout: 2)
-        XCTAssertTrue(app.buttons["eqPresetMenu"].label.contains("Custom"))
+        // The preset menu sits above the graph, which the scrolls above may have taken off screen.
+        let presets = app.buttons["eqPresetMenu"]
+        Self.reveal(presets, in: app, up: true)
+        XCTAssertTrue(presets.label.contains("Custom"), "the preset menu reads \"\(presets.label)\"")
 
         // Parametric: add a band, then drag its handle up and to the right.
         let parametric = app.descendants(matching: .any)["eqModePicker"].buttons["Parametric"]
@@ -251,9 +254,27 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
 
-        // The correction block sits below ReplayGain and the preamp.
+        // A tap on a capsule still switches its block.
+        let tone = app.descendants(matching: .any)["block-Tone"]
+        XCTAssertTrue(tone.waitForExistence(timeout: 2))
+        XCTAssertEqual(tone.value as? String, "Off")
+        tone.tap()
+        expectation(for: NSPredicate(format: "value == 'On'"), evaluatedWith: tone)
+        waitForExpectations(timeout: 2)
+        tone.tap()
+        expectation(for: NSPredicate(format: "value == 'Off'"), evaluatedWith: tone)
+        waitForExpectations(timeout: 2)
+
+        // The correction block sits far below the EQ: its capsule's menu scrolls there.
+        let capsule = app.descendants(matching: .any)["block-Headphone correction"]
+        XCTAssertTrue(capsule.waitForExistence(timeout: 2))
+        capsule.press(forDuration: 1.2)
+        let show = app.buttons["Show headphone correction settings"]
+        XCTAssertTrue(show.waitForExistence(timeout: 3))
+        show.tap()
         let choose = app.buttons["chooseCorrectionButton"]
-        Self.reveal(choose, in: app)
+        XCTAssertTrue(choose.waitForExistence(timeout: 3))
+        Self.scrollClear(choose, in: app)
         XCTAssertTrue(choose.isHittable)
         choose.tap()
 

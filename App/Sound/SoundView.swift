@@ -4,7 +4,9 @@ import PFDSP
 import SwiftUI
 
 /// The Sound tab (spec §4.8), laid out like a pro tool: the Pure master switch, the signal flow with a capsule per
-/// block, the output meter and its clip LED, then each block in chain order with its own switch.
+/// block, the output meter and its clip LED, then each block with its own switch: the EQ first, as the block used
+/// most, then the rest in chain order (`SoundBlock.pageOrder`, ruling R4-UI-a). The flow row and the Pure card keep
+/// the chain's own order, since they describe the signal path; a capsule's menu scrolls to its block.
 ///
 /// Pure is the master. While it is on, every block row and capsule is greyed and inert, and the graph shows what Pure
 /// bypasses; the blocks keep their own switches, so turning Pure off brings them back as they were.
@@ -50,7 +52,7 @@ struct SoundView: View {
         let s = store.settings
         NavigationStack {
             ScrollViewReader { proxy in
-                list(s)
+                list(s, proxy)
                     .onAppear { scrollForScreenshots(proxy) }
             }
             .navigationTitle("Sound")
@@ -77,25 +79,28 @@ struct SoundView: View {
         }
     }
 
-    private func list(_ s: SoundSettings) -> some View {
+    private func list(_ s: SoundSettings, _ proxy: ScrollViewProxy) -> some View {
         List {
             Section {
                 PureSwitch(settings: s, theme: theme) { store.setPure($0) }
             }
             .listRowBackground(glass)
             Section {
-                SignalFlowRow(settings: s, theme: theme) { block in
-                    setBlock(block, on: !block.isOn(in: s))
-                }
+                SignalFlowRow(
+                    settings: s, theme: theme, toggle: { block in setBlock(block, on: !block.isOn(in: s)) },
+                    show: { block in withAnimation(.snappy(duration: 0.35)) { proxy.scrollTo(block, anchor: .top) } })
                 OutputMeter(meters: meters, player: player, theme: screen, polling: polling)
                     .listRowInsets(Self.screenInsets)
             } header: {
                 header("Signal flow")
             } footer: {
-                footerText(s.pure ? "Pure sends the signal straight through." : "Tap a block to switch it.")
+                footerText(
+                    s.pure
+                        ? "Pure sends the signal straight through."
+                        : "Tap a block to switch it; touch and hold it for its settings.")
             }
             .listRowBackground(glass)
-            ForEach(SoundBlock.allCases) { block in
+            ForEach(SoundBlock.pageOrder) { block in
                 section(block, s)
             }
         }
@@ -460,12 +465,15 @@ private struct BigSwitch: View {
 /// The chain as capsules, IN to OUT, joined by a wire. It wraps when the chain is wider than the row: rows as even as
 /// they can be, each spread across the width, and the wire turning down at a row's end and back to the next row's
 /// start, so the whole chain stays in view at every text size. Each switchable block's capsule toggles it; the
-/// limiter's and the preamp's report what they do. In Pure the wire is one green line from IN to OUT behind the
-/// capsules, which are ghosted, all alike, and inert.
+/// limiter's and the preamp's report what they do. Every capsule's menu (touch and hold), and its VoiceOver action,
+/// "Show <block> settings", scrolls to the block's section. In Pure the wire is one green line from IN to OUT behind
+/// the capsules, which are ghosted, all alike, and inert.
 struct SignalFlowRow: View {
     let settings: SoundSettings
     let theme: Theme
     let toggle: (SoundBlock) -> Void
+    /// Scrolls the page to the block's section.
+    let show: (SoundBlock) -> Void
 
     /// The radius of the wire's turns between rows; a wrapped row keeps twice it clear at its turning ends.
     private static let turn: CGFloat = 5
@@ -505,25 +513,38 @@ struct SignalFlowRow: View {
             .accessibilityHidden(true)
     }
 
-    @ViewBuilder
+    /// A capsule is a menu with a primary action: a tap switches a switchable block, and a touch and hold opens "Show
+    /// <block> settings". A menu rather than a context menu: a List row merges its rows' context menus into one, so
+    /// every capsule would offer the first one's item. The limiter's and the preamp's capsules have no switch, so a tap
+    /// opens their menu.
     private func capsule(_ block: SoundBlock) -> some View {
-        if block.isSwitchable {
-            Button {
-                toggle(block)
-            } label: {
-                capsuleFace(block)
+        let title = "Show \(block.settingsName) settings"
+        let item = Button(title, systemImage: "arrow.down.to.line") { show(block) }
+        return Group {
+            if block.isSwitchable {
+                Menu {
+                    item
+                } label: {
+                    capsuleFace(block)
+                } primaryAction: {
+                    toggle(block)
+                }
+                .accessibilityAddTraits(.isToggle)
+            } else {
+                Menu {
+                    item
+                } label: {
+                    capsuleFace(block)
+                }
             }
-            // A style of its own, so a disabled capsule is not dimmed a second time: Pure ghosts them all alike.
-            .buttonStyle(CapsuleButtonStyle())
-            .disabled(settings.pure)
-            .accessibilityAddTraits(.isToggle)
-            .modifier(CapsuleAccessibility(block: block, settings: settings))
-        } else {
-            // The limiter's and the preamp's capsules only report: they have no switch, so they are not buttons.
-            capsuleFace(block)
-                .accessibilityElement(children: .ignore)
-                .modifier(CapsuleAccessibility(block: block, settings: settings))
         }
+        .menuStyle(.button)
+        // A style of its own, so a disabled capsule is not dimmed a second time: Pure ghosts them all alike.
+        .buttonStyle(CapsuleButtonStyle())
+        .menuIndicator(.hidden)
+        .disabled(settings.pure)
+        .modifier(CapsuleAccessibility(block: block, settings: settings))
+        .accessibilityAction(named: title) { show(block) }
     }
 
     private func capsuleFace(_ block: SoundBlock) -> some View {
