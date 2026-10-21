@@ -290,44 +290,37 @@ struct SignalCells: View {
     }
 
     /// The Hi-Res / Lossless and Pure pills, under the strip: four cells and the signal words already fill the row at
-    /// iPhone width, so the pills take their own line rather than crowd it. Each is its own accessibility element,
-    /// apart from the strip's.
-    @ViewBuilder
+    /// iPhone width, so the pills take their own line rather than crowd it. The row keeps its height when there is
+    /// nothing to show (Bluetooth, AirPlay, idle), so the controls below never jump. Each pill is its own
+    /// accessibility element, apart from the strip's.
     private var pills: some View {
-        let badges = SignalStrip.badges(signal)
-        if !badges.isEmpty {
-            HStack(spacing: 6) {
-                ForEach(badges, id: \.self) { badge in
-                    Text(badge)
-                        .font(Typeface.monoSmall)
-                        .foregroundStyle(pillColor(badge))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(Capsule().strokeBorder(pillColor(badge).opacity(0.7), lineWidth: 1))
-                        .lineLimit(1).fixedSize()
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(pillLabel(badge))
-                        .accessibilityIdentifier(badge == "PURE" ? "pill.pure" : "pill.resolution")
-                }
+        let badges = SignalStrip.signalBadges(signal)
+        return HStack(spacing: 6) {
+            ForEach(badges, id: \.self) { badge in
+                Text(badge.text)
+                    .font(Typeface.monoSmall)
+                    .foregroundStyle(color(badge))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().strokeBorder(color(badge).opacity(0.7), lineWidth: 1))
+                    .lineLimit(1).fixedSize()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(badge.accessibilityLabel)
+                    .accessibilityIdentifier(badge == .pure ? "pill.pure" : "pill.resolution")
             }
         }
+        .frame(minHeight: Self.pillRowHeight)
+        .animation(.easeOut(duration: 0.15), value: badges)
     }
 
-    private func pillColor(_ badge: String) -> Color {
-        if badge == "PURE" { return theme.ok }
-        return badge.hasPrefix("HI-RES") ? theme.hiRes : theme.inkSecondary
-    }
+    /// A pill: 10 pt text, 3 pt padding above and below, 1 pt border.
+    private static let pillRowHeight: CGFloat = 20
 
-    private func pillLabel(_ badge: String) -> String {
-        if badge == "PURE" { return "Pure: untouched by pointFlac" }
-        switch signal.resolution {
-        case .hiRes(let bits, let rate): return "Hi-Res output, \(bits)-bit \(Self.kHz(rate))"
-        case .lossless(let bits, let rate): return "Lossless output, \(bits)-bit \(Self.kHz(rate))"
-        case .lossy, nil: return badge
+    private func color(_ badge: SignalBadge) -> Color {
+        switch badge {
+        case .pure: theme.ok
+        case .hiRes: theme.hiRes
+        case .lossless: theme.inkSecondary
         }
-    }
-
-    private static func kHz(_ rate: Int) -> String {
-        AudioFormat(sampleRate: rate, bitsPerSample: 0, channels: 0).formattedRate
     }
 
     private func strip(_ text: String) -> some View {

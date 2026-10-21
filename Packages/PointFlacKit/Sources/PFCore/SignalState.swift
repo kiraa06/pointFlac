@@ -113,6 +113,9 @@ public struct SignalState: Sendable, Equatable {
         guard let plan else { return nil }
         switch port {
         case .bluetooth, .airPlay: return .lossy
+        // A route pointFlac knows nothing about (HDMI, CarPlay): the strip says it may alter the audio, so no
+        // Hi-Res or Lossless claim is made for it either.
+        case .other: return nil
         default: break
         }
         let bits: Int

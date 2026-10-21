@@ -243,4 +243,13 @@ private let allStates: [SignalState] = [
     #expect(state(96_000, 24, hardware: 96_000, port: .airPlay("TV")).resolution == .lossy)
     #expect(SignalState().resolution == nil)
     #expect(SignalStrip.badges(SignalState()).isEmpty)
+    #expect(SignalStrip.badges(state(88_200, 24, hardware: 88_200)) == ["HI-RES 24/88.2", "PURE"])
+    #expect(SignalStrip.badges(state(96_000, 16, hardware: 96_000)) == ["LOSSLESS 16/96", "PURE"])
+    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000, int32: true)) == ["HI-RES 32/192", "PURE"])
+    // HDMI/CarPlay: no claim; the strip already says the output may alter the audio.
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .other("HDMI"))).isEmpty)
+    // Downmixed: PCM is still delivered, so the resolution pill stays, and Pure does not.
+    #expect(
+        SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .wired("Mono"), hardwareChannels: 1))
+            == ["HI-RES 24/96"])
 }

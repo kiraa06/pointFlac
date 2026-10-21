@@ -69,7 +69,7 @@ struct Theme {
                 isDark: false, background: Color(red: 0.953, green: 0.949, blue: 0.937), ink: Color(white: 0.08),
                 inkSecondary: Color(white: 0.45), hairline: .black.opacity(0.15),
                 ok: Color(red: 0.12, green: 0.62, blue: 0.39), altered: Color(red: 0.48, green: 0.25, blue: 0.95),
-                warn: Color(red: 0.78, green: 0.45, blue: 0.05), hiRes: Color(red: 0.62, green: 0.45, blue: 0.0),
+                warn: Color(red: 0.78, green: 0.45, blue: 0.05), hiRes: Color(red: 0.55, green: 0.39, blue: 0.0),
                 playFill: Color(white: 0.07), playGlyph: .white,
                 plinthTop: .white.opacity(0.8), plinthBottom: Color(red: 0.92, green: 0.93, blue: 0.96).opacity(0.5),
                 plinthEdge: .white.opacity(0.95), strobe: Color(red: 0.54, green: 0.55, blue: 0.58),
@@ -91,7 +91,7 @@ struct Theme {
                 isDark: false, background: Color(red: 0.985, green: 0.98, blue: 0.97), ink: Color(white: 0.06),
                 inkSecondary: Color(white: 0.38), hairline: .black.opacity(0.14),
                 ok: Color(red: 0.12, green: 0.62, blue: 0.39), altered: Color(red: 0.48, green: 0.25, blue: 0.95),
-                warn: Color(red: 0.78, green: 0.45, blue: 0.05), hiRes: Color(red: 0.62, green: 0.45, blue: 0.0),
+                warn: Color(red: 0.78, green: 0.45, blue: 0.05), hiRes: Color(red: 0.55, green: 0.39, blue: 0.0),
                 playFill: Color(white: 0.07), playGlyph: .white, plinthTop: .clear, plinthBottom: .clear,
                 plinthEdge: .clear, strobe: .clear, lcdBack: .clear, lcdInk: .clear, glow: 0.32)
     }

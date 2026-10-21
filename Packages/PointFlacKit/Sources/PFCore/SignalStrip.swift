@@ -18,18 +18,21 @@ public enum SignalStrip {
         return text
     }
 
-    /// The pills beside the strip: the delivered resolution (never for a lossy route), then "PURE" only when the
-    /// indicator is `.pure`.
-    public static func badges(_ s: SignalState) -> [String] {
-        var badges: [String] = []
+    /// The pills beside the strip, typed: the delivered resolution (never for a lossy or unknown route), then Pure
+    /// only when the indicator is `.pure`.
+    public static func signalBadges(_ s: SignalState) -> [SignalBadge] {
+        var badges: [SignalBadge] = []
         switch s.resolution {
-        case .hiRes(let bits, let rate): badges.append("HI-RES \(bits)/\(shortRate(rate))")
-        case .lossless(let bits, let rate): badges.append("LOSSLESS \(bits)/\(shortRate(rate))")
+        case .hiRes(let bits, let rate): badges.append(.hiRes(bits: bits, rate: rate))
+        case .lossless(let bits, let rate): badges.append(.lossless(bits: bits, rate: rate))
         case .lossy, nil: break
         }
-        if s.indicator == .pure { badges.append("PURE") }
+        if s.indicator == .pure { badges.append(.pure) }
         return badges
     }
+
+    /// The pills' words, e.g. `["HI-RES 24/96", "PURE"]`.
+    public static func badges(_ s: SignalState) -> [String] { signalBadges(s).map(\.text) }
 
     /// The words for one indicator. `.idle` reads as the idle strip, never as "● Pure": with no track there is
     /// nothing to call pure.
@@ -50,8 +53,31 @@ public enum SignalStrip {
     }
 
     /// kHz shorthand without the unit, as exact as `AudioFormat.formattedRate`: 44.1, 48, 88.2, 22.05, 11.025.
-    private static func shortRate(_ hz: Int) -> String {
-        let formatted = AudioFormat(sampleRate: hz, bitsPerSample: 0, channels: 0).formattedRate
+    static func shortRate(_ hz: Int) -> String {
+        let formatted = AudioFormat.formatRate(hz)
         return String(formatted.dropLast(" kHz".count))
+    }
+}
+
+/// One pill beside the strip: what it says, and what it means to a screen reader.
+public enum SignalBadge: Hashable, Sendable {
+    case hiRes(bits: Int, rate: Int)
+    case lossless(bits: Int, rate: Int)
+    case pure
+
+    public var text: String {
+        switch self {
+        case .hiRes(let bits, let rate): "HI-RES \(bits)/\(SignalStrip.shortRate(rate))"
+        case .lossless(let bits, let rate): "LOSSLESS \(bits)/\(SignalStrip.shortRate(rate))"
+        case .pure: "PURE"
+        }
+    }
+
+    public var accessibilityLabel: String {
+        switch self {
+        case .hiRes(let bits, let rate): "Hi-Res output, \(bits)-bit \(AudioFormat.formatRate(rate))"
+        case .lossless(let bits, let rate): "Lossless output, \(bits)-bit \(AudioFormat.formatRate(rate))"
+        case .pure: "Pure: untouched by pointFlac"
+        }
     }
 }

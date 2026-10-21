@@ -15,7 +15,7 @@ struct SignalDetailsSheet: View {
                 } footer: {
                     Text(summary)
                 }
-                if case .processing = signal.indicator, !signal.activeProcessing.isEmpty {
+                if !signal.activeProcessing.isEmpty {
                     Section("Processing, in order") {
                         ForEach(Array(signal.activeProcessing.enumerated()), id: \.offset) { index, name in
                             Text("\(index + 1). \(name)").font(.body.monospacedDigit())
@@ -95,19 +95,19 @@ struct SignalDetailsSheet: View {
     private var handed: String {
         guard let plan = signal.plan else { return "—" }
         let client = plan.client == .float32 ? "32-bit float" : "32-bit integer"
-        let rate = AudioFormat(sampleRate: plan.clientSampleRate, bitsPerSample: 0, channels: 0).formattedRate
+        let rate = AudioFormat.formatRate(plan.clientSampleRate)
         return "\(client) · \(rate)"
     }
 
     private var hardware: String {
-        signal.hardwareRate.map { AudioFormat(sampleRate: $0, bitsPerSample: 0, channels: 0).formattedRate } ?? "—"
+        signal.hardwareRate.map { AudioFormat.formatRate($0) } ?? "—"
     }
 
     /// The rate change the strip shows, and who makes it: pointFlac before the output, or iOS after it.
     private var rateChange: String {
         guard case .resampled(let change) = signal.indicator else { return "None" }
-        let from = AudioFormat(sampleRate: change.from, bitsPerSample: 0, channels: 0).formattedRate
-        let to = AudioFormat(sampleRate: change.to, bitsPerSample: 0, channels: 0).formattedRate
+        let from = AudioFormat.formatRate(change.from)
+        let to = AudioFormat.formatRate(change.to)
         let byPointFlac = signal.plan?.resample.map { $0 == change } ?? false
         return "\(from) → \(to), by \(byPointFlac ? "pointFlac" : "iOS, after pointFlac's output")"
     }
