@@ -255,8 +255,8 @@ private final class TaskBox: Sendable {
     #expect(reopened.current.tracks.count == 2)
     #expect(track(library, "r1.flac")?.loudness?.measuredLufs != nil)
     #expect(track(library, "r3.flac")?.loudness?.measuredLufs != nil)
-    // The pass that lost the track writes no value for the old set of three (its pool is recorded as an attempt on
-    // that set), and the second phase of the same pass pools the two that are left.
+    // The pass that lost the track writes no value for the old set of three (and records nothing), and the second
+    // phase of the same pass pools the two that are left.
     let r1 = try #require(track(library, "r1.flac")?.loudness)
     let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-26)])
     #expect(abs(try #require(r1.albumMeasuredLufs) - expected) <= 0.2)
@@ -649,4 +649,276 @@ private func counting(_ library: Library) -> Counter {
         try await Task.sleep(for: .milliseconds(20))
     }
     #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by a fresh scan")
+}
+
+/// How many albums have a failed second-phase attempt recorded against them.
+private func attempts(_ library: Library) async -> Int {
+    let rows = try? await library.run(.never) { try $0.database.query("SELECT count(*) FROM album_attempts") }
+    return rows?.first?.first?.int.map(Int.init) ?? -1
+}
+
+private func setMode(_ mode: Int, _ url: URL) throws {
+    try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+}
+
+/// R3-1 (P13): a read failing inside the second phase's pool sends that track back to the first phase, alone, and
+/// records nothing against the album: the album is pooled as soon as the track reads again.
+@Test func aTransientFailureInThePoolDoesNotBlockTheAlbum() async throws {
+    let box = try ScanSandbox()
+    for (index, level) in [-20.0, -23.0, -26.0].enumerated() {
+        try box.tone("t\(index + 1).flac", rmsDbfs: level, number: index + 1)
+    }
+    let library = try box.open()
+    await library.rescan()
+    let t1File = box.libraryFolder.appending(path: "t1.flac")
+    let t3File = box.libraryFolder.appending(path: "t3.flac")
+    // Pass 1: t3 cannot be read, so the album is left to the second phase.
+    try setMode(0o000, t3File)
+    await library.scanLoudness { _, _ in }
+    try setMode(0o644, t3File)
+
+    // Pass 2: the first phase measures t3, and meanwhile t1 becomes unreadable, so the pool fails on t1.
+    let t1 = try #require(track(library, "t1.flac")?.id)
+    let t3 = try #require(track(library, "t3.flac")?.id)
+    library.loudnessHook.withLock {
+        $0 = { id in
+            if id == t3 { try? setMode(0o000, t1File) }
+        }
+    }
+    var before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    library.loudnessHook.withLock { $0 = nil }
+    try setMode(0o644, t1File)
+    #expect(decodes(library) - before == 2, "t3, then the pool stops at t1")
+    #expect(track(library, "t1.flac")?.loudness?.albumMeasuredLufs == nil)
+    #expect(await library.loudnessStates()[t1] == 0, "t1 goes back to the first phase")
+    #expect(track(library, "t1.flac")?.loudness?.measuredLufs != nil, "and keeps its own value meanwhile")
+    #expect(await attempts(library) == 0, "a track's failure records nothing against its album")
+
+    // Readable again: the first phase measures t1 alone, and the second pools the album in the same scan.
+    before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1 + 3)
+    let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-23), try direct(-26)])
+    let value = try #require(track(library, "t1.flac")?.loudness?.albumMeasuredLufs, "the album gets its value")
+    #expect(abs(value - expected) <= 0.2)
+    before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) == before, "and nothing is decoded again")
+}
+
+/// R3-1: a file evicted to iCloud while the second phase pools its album. The track goes back to the first phase, is
+/// not opened while it is in the cloud (nor is its album pooled), and once it is back the album is pooled.
+@Test func aFileEvictedDuringThePoolIsMeasuredAgainOnceItIsBack() async throws {
+    let box = try ScanSandbox()
+    try box.tone("e1.flac", rmsDbfs: -20, album: "Evict", number: 1, in: box.external)
+    try box.tone("e2.flac", rmsDbfs: -23, album: "Evict", number: 2, in: box.external)
+    let library = try box.open()
+    _ = try await library.addFolder(box.external)
+    await library.scanLoudness { _, _ in }
+    // A third track joins, so the second phase pools the album again: e3 is the scan's first decode, e1 its second.
+    try box.tone("e3.flac", rmsDbfs: -26, album: "Evict", number: 3, in: box.external)
+    await library.rescan()
+    let e2 = try #require(track(library, "e2.flac")?.id)
+    let real = box.external.appending(path: "e2.flac")
+    let placeholder = box.external.appending(path: ".e2.flac.icloud")
+    let start = decodes(library)
+    library.loudnessChunkHook.withLock {
+        $0 = {
+            guard library.loudnessDecodes.withLock({ $0 }) == start + 2,
+                FileManager.default.fileExists(atPath: real.path)
+            else { return }
+            try? FileManager.default.moveItem(at: real, to: placeholder)  // evicted while the pool reads e1
+        }
+    }
+    await library.scanLoudness { _, _ in }
+    library.loudnessChunkHook.withLock { $0 = nil }
+    #expect(decodes(library) - start == 3, "e3, e1, then e2 cannot be opened and the pool stops")
+    #expect(track(library, "e1.flac")?.loudness?.albumMeasuredLufs == nil)
+    #expect(await library.loudnessStates()[e2] == 0)
+    #expect(await attempts(library) == 0)
+
+    // In the cloud: never opened, and the album is not pooled without it.
+    await library.rescan()
+    #expect(track(library, "e2.flac")?.isCloudPending == true)
+    var before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) == before)
+
+    // Downloaded again, as it was: measured alone, then the album is pooled.
+    try FileManager.default.moveItem(at: placeholder, to: real)
+    await library.rescan()
+    #expect(track(library, "e2.flac")?.isCloudPending == false)
+    before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1 + 3)
+    let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-23), try direct(-26)])
+    #expect(abs(try #require(track(library, "e1.flac")?.loudness?.albumMeasuredLufs) - expected) <= 0.2)
+}
+
+/// M4: a file that stays unreadable costs one failed open per scan, and its album is never decoded again for it.
+@Test func aPersistentlyUnreadableFileCostsOneOpenPerScan() async throws {
+    let box = try ScanSandbox()
+    for (index, level) in [-20.0, -23.0, -26.0].enumerated() {
+        try box.tone("u\(index + 1).flac", rmsDbfs: level, number: index + 1)
+    }
+    let library = try box.open()
+    await library.rescan()
+    await library.scanLoudness { _, _ in }
+    // A fourth track joins, and u2, measured before, can no longer be read: the second phase's pool fails on it.
+    try box.tone("u4.flac", rmsDbfs: -18, number: 4)
+    await library.rescan()
+    let u2File = box.libraryFolder.appending(path: "u2.flac")
+    try setMode(0o000, u2File)
+    defer { try? setMode(0o644, u2File) }
+    var before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1 + 2, "u4, then the pool reads u1 and stops at u2")
+    for _ in 0..<3 {
+        before = decodes(library)
+        await library.scanLoudness { _, _ in }
+        #expect(decodes(library) - before == 1, "one failed open of u2, and no pool")
+    }
+    #expect(track(library, "u1.flac")?.loudness?.albumMeasuredLufs == nil)
+    #expect(await attempts(library) == 0)
+}
+
+/// R3-2 (P14): the first caller is cancelled while its follow-up pass is serving another caller's request. That
+/// request is still served in full, by a fresh scan.
+@Test func aMergedRequestSurvivesACancelDuringItsFollowUp() async throws {
+    let box = try ScanSandbox()
+    try box.tone("x1.flac", rmsDbfs: -20, album: "X", number: 1)
+    try box.tone("y1.flac", rmsDbfs: -22, album: "Y", number: 1)
+    try box.tone("y2.flac", rmsDbfs: -24, album: "Y", number: 2)
+    let library = try box.open()
+    await library.rescan()
+    let x = try #require(track(library, "x1.flac")?.albumID)
+    let y = try #require(track(library, "y1.flac")?.albumID)
+    let x1 = try #require(track(library, "x1.flac")?.id)
+    let y1 = try #require(track(library, "y1.flac")?.id)
+
+    let holder = TaskBox()
+    let reached = Mutex(false)
+    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    library.loudnessHook.withLock {
+        $0 = { id in
+            if id == y1 { holder.task.withLock { $0 }?.cancel() }  // the follow-up is serving Y
+            guard id == x1 else { return }
+            reached.withLock { $0 = true }
+            await withCheckedContinuation { continuation in
+                let proceed = gate.withLock { state in
+                    if state.open { return true }
+                    state.waiter = continuation
+                    return false
+                }
+                if proceed { continuation.resume() }
+            }
+        }
+    }
+    let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
+    holder.task.withLock { $0 = first }
+    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await library.scanLoudness(albums: [y]) { _, _ in }  // merged into the running scan
+    gate.withLock { state in
+        state.open = true
+        state.waiter?.resume()
+    }
+    await first.value
+    func served() -> Bool { track(library, "y2.flac")?.loudness?.albumMeasuredLufs != nil }
+    func idle() -> Bool { library.loudnessScan.withLock { !$0.running && $0.pending == nil } }
+    for _ in 0..<400 where !served() || !idle() { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(track(library, "y2.flac")?.loudness?.measuredLufs != nil, "y2, not reached by the cancelled pass")
+    #expect(served(), "Y gets its album value")
+    #expect(idle())
+}
+
+/// R3-4: the meters a cancelled scan held are released, in either phase.
+@Test func aCancelledScanReleasesTheMetersItHeld() async throws {
+    let box = try ScanSandbox()
+    for index in 0..<4 { try quick(box, "Pool", index) }
+    let library = try box.open()
+    await library.rescan()
+
+    // The first phase, cancelled after two of the four tracks of an album it can pool.
+    let first = TaskBox()
+    let scan = Task {
+        await library.scanLoudness { done, _ in
+            if done == 2 { first.task.withLock { $0 }?.cancel() }
+        }
+    }
+    first.task.withLock { $0 = scan }
+    await scan.value
+    var meters = library.loudnessMeters.withLock { $0 }
+    #expect(meters.peak == 2 && meters.current == 0, "two held, then released: \(meters)")
+
+    // The second phase, cancelled two tracks into its pool (the first phase measures the two left, then it pools).
+    let second = TaskBox()
+    let pool = Task {
+        await library.scanLoudness { done, total in
+            if total == 6, done == 4 { second.task.withLock { $0 }?.cancel() }
+        }
+    }
+    second.task.withLock { $0 = pool }
+    await pool.value
+    meters = library.loudnessMeters.withLock { $0 }
+    #expect(meters.current == 0, "released: \(meters)")
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil })
+}
+
+/// R2-6 and R3-3: which failures are retried. Only the file's format is deterministic. Everything libFLAC reports
+/// while reading a file from start to end is transient, its fatal states (an allocation failure, a failed seek back
+/// to a frame sync) included.
+@Test(arguments: [
+    (LoudnessScanner.MeasureError.notDownloaded, LoudnessScanner.TrackOutcome.unreadable),
+    (.decoder(.openFailed), .unreadable),
+    (.decoder(.ioError), .unreadable),
+    (.decoder(.seekFailed), .unreadable),
+    (.decoder(.decodeFailed("FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR")), .unreadable),
+    (.decoder(.decodeFailed("FLAC__STREAM_DECODER_SEEK_ERROR")), .unreadable),
+    (.meter(.initFailed), .unreadable),
+    (.meter(.invalidFormat), .unmeasurable),
+    (.noSamples, .unmeasurable),
+])
+func failuresAreRetriedUnlessTheFormatIsTheCause(
+    error: LoudnessScanner.MeasureError, expected: LoudnessScanner.TrackOutcome
+) {
+    #expect(LoudnessScanner.outcome(for: error) == expected)
+}
+
+@Test func aFailureSetsTheTrackState() {
+    #expect(LoudnessScanner.TrackOutcome.unmeasurable.state == 2)
+    #expect(LoudnessScanner.TrackOutcome.unreadable.state == 0)
+}
+
+/// The one failure recorded against an album: a second-phase pool that fails with every track read. The same files
+/// would fail it again, so it is not retried until a track or a file changes.
+@Test func aFailedPoolIsNotRetriedUntilAFileChanges() async throws {
+    let box = try ScanSandbox()
+    try box.tone("f1.flac", rmsDbfs: -20, album: "Fail", number: 1)
+    try box.tone("f2.flac", rmsDbfs: -26, album: "Fail", number: 2)
+    let library = try box.open()
+    await library.rescan()
+    library.loudnessPoolFault.withLock { $0 = true }
+    var before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 2 + 2, "the first phase's pool fails and records nothing; the second's too")
+    #expect(await attempts(library) == 1)
+    #expect(track(library, "f1.flac")?.loudness?.albumMeasuredLufs == nil)
+    #expect(track(library, "f1.flac")?.loudness?.measuredLufs != nil)
+    library.loudnessPoolFault.withLock { $0 = false }
+    before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) == before, "the same files are not pooled again")
+
+    // One file changes, only its date: it is measured again (1 -> 0 -> 1), and that lifts the record.
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date(timeIntervalSinceNow: 3600)],
+        ofItemAtPath: box.libraryFolder.appending(path: "f2.flac").path)
+    await library.rescan()
+    before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1 + 2)
+    let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-26)])
+    #expect(abs(try #require(track(library, "f1.flac")?.loudness?.albumMeasuredLufs) - expected) <= 0.2)
+    #expect(await attempts(library) == 0, "the album value replaces the record")
 }

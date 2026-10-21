@@ -50,6 +50,8 @@ public final class Library: Sendable {
     let loudnessMeters = Mutex<(current: Int, peak: Int)>((0, 0))
     /// For tests: called after each decoded chunk of a loudness scan.
     let loudnessChunkHook = Mutex<(@Sendable () -> Void)?>(nil)
+    /// For tests: every album pool fails, as libebur128's would if it could not pool the meters.
+    let loudnessPoolFault = Mutex(false)
     /// For tests: awaited after each track's measurement, before it is stored.
     let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.

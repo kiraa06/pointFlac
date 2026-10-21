@@ -133,8 +133,9 @@ final class LibraryStore {
         // state returns to 0 when its file's size or modification date changes (and goes with the track).
         // `album_loudness.members` is a hash of the album's sorted track IDs when it was measured; the catalog
         // serves the value only while the album's tracks still hash to it. `album_attempts` remembers, per album, the
-        // track set and states a second-phase pooling attempt failed on, so it is not tried again until the set
-        // changes. (A same-length audio edit past ContentIdentity's first 64 KiB, by an
+        // tracks and files (sizes and dates) a second-phase pool failed on with every track read, so it is not tried
+        // again until a track or a file changes. A track's own failure is never recorded there: the track goes back
+        // to state 0 (or to 2). (A same-length audio edit past ContentIdentity's first 64 KiB, by an
         // encoder that writes no MD5, also changes the date, so it too loses its measurement.)
         """
         ALTER TABLE tracks ADD COLUMN rg_track_gain REAL;
@@ -893,12 +894,15 @@ final class LibraryStore {
             var url: URL?
             var tagged: Bool
             var state: Int
+            /// The file's size and date, as the library last saw them.
+            var file: String
         }
         var id: String
         var members: [Member]
         var hash: String
-        /// Covers the track set and each track's measurement state (`attemptKey`), so a change in either lifts a
-        /// recorded attempt's block.
+        /// Covers the track set and each track's file, size and date (`attemptKey`), so a change in either lifts a
+        /// recorded attempt's block. Not the states: the second phase only runs, and so only records or checks a
+        /// key, when every track is measured, so they would always read the same.
         var attemptKey: String
         var attempted: Bool
         var current: Bool
@@ -908,7 +912,7 @@ final class LibraryStore {
         let rows = try database.query(
             """
             SELECT id, folder_id, rel_path, album_id, rg_track_gain IS NOT NULL OR rg_album_gain IS NOT NULL,
-                r128_state, cloud_pending FROM tracks ORDER BY album_id, disc, track, id
+                r128_state, cloud_pending, size, mtime FROM tracks ORDER BY album_id, disc, track, id
             """)
         let filter = only.map(Set.init)
         var order: [String] = []
@@ -922,14 +926,14 @@ final class LibraryStore {
             members[album, default: []].append(
                 AlbumState.Member(
                     id: id, url: onDevice ? roots[folder]?.appending(path: path) : nil, tagged: row[4].int == 1,
-                    state: Int(row[5].int ?? 0)))
+                    state: Int(row[5].int ?? 0), file: "\(row[7].int ?? -1):\(row[8].double ?? -1)"))
         }
         let values = try storedAlbumHashes("album_loudness")
         let attempts = try storedAlbumHashes("album_attempts")
         return order.compactMap { album in
             guard let all = members[album] else { return nil }
             let hash = Self.membersHash(all.map(\.id))
-            let key = Self.membersHash(all.map { "\($0.id):\($0.state)" })
+            let key = Self.membersHash(all.map { "\($0.id):\($0.file)" })
             return AlbumState(
                 id: album, members: all, hash: hash, attemptKey: key, attempted: attempts[album] == key,
                 current: values[album] == hash)
@@ -970,9 +974,9 @@ final class LibraryStore {
     }
 
     /// Phase 2: the albums to pool by decoding their tracks again, because some were measured by an earlier scan.
-    /// An album qualifies when every track is measured and readable now, it is within `maxAlbumTracks`, its value
-    /// is missing or was taken over another set of tracks, and no attempt on this very set has failed. A fully
-    /// tagged album never qualifies.
+    /// An album qualifies when every track is measured and readable now, it is within `maxAlbumTracks` (the cap
+    /// is checked here, each time, so an album over it needs no record), its value is missing or was taken over
+    /// another set of tracks, and no pool over these very files has failed. A fully tagged album never qualifies.
     func poolJobs(albums only: [String]?) throws -> [LoudnessJob] {
         let jobs: [LoudnessJob] = try albumStates(only: only).compactMap { album in
             guard !album.members.allSatisfy(\.tagged), !album.current, !album.attempted,
@@ -1001,21 +1005,33 @@ final class LibraryStore {
         return try database.query("SELECT changes()").first?.first?.int == 1
     }
 
-    /// Stores an album's measurement, only while the album still has tracks.
+    /// Puts a measured track back to state 0, keeping its values: the second phase could not read it, so the next
+    /// scan's first phase measures it again, and its album is pooled once it has been.
+    func recordUnread(trackID: String) throws {
+        try database.query("UPDATE tracks SET r128_state = 0 WHERE id = ? AND r128_state = 1", [.text(trackID)])
+    }
+
+    /// Stores an album's measurement, only while the album still has tracks. An attempt recorded against the album
+    /// before goes: it was over other tracks or files.
     func recordAlbumLoudness(albumID: String, lufs: Double?, peak: Double, members: String) throws {
         try database.query(
             """
             INSERT OR REPLACE INTO album_loudness(album_id, lufs, peak, members)
             SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE album_id = ?)
             """, [.text(albumID), .optional(lufs), .real(peak), .text(members), .text(albumID)])
+        try database.query("DELETE FROM album_attempts WHERE album_id = ?", [.text(albumID)])
     }
 
-    /// Remembers that the second phase's pooling of `albumID` failed over the tracks and states `key` describes
-    /// (`AlbumState.attemptKey`), so it is not tried again until the set or any track's state changes. The first phase
-    /// records nothing: its failures are one track's, which the next scan retries on its own.
+    /// Remembers that the second phase read every track of `albumID` but could not pool them, over the tracks and
+    /// files `key` describes (`AlbumState.attemptKey`), so it is not tried again until a track or a file changes.
+    /// Nothing else is recorded: a track that fails goes back to the first phase on its own, and the cap is checked
+    /// when planning. Only while the album still has tracks.
     func recordPoolAttempt(albumID: String, key: String) throws {
         try database.query(
-            "INSERT OR REPLACE INTO album_attempts(album_id, members) VALUES (?, ?)", [.text(albumID), .text(key)])
+            """
+            INSERT OR REPLACE INTO album_attempts(album_id, members)
+            SELECT ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE album_id = ?)
+            """, [.text(albumID), .text(key), .text(albumID)])
     }
 
     // MARK: Reading
@@ -1096,7 +1112,7 @@ struct LoudnessJob: Sendable {
     var tracks: [Track]
     /// `LibraryStore.membersHash` of every track of the album, stored with its value.
     var membersHash: String
-    /// What a failed second-phase attempt is recorded under.
+    /// What a second-phase pool that failed with every track read is recorded under (`AlbumState.attemptKey`).
     var attemptKey: String
     /// Whether the album value is pooled from this job's decodes: `tracks` are all the album's tracks, it is
     /// not too big to pool, and (in the first phase) none was measured before.
