@@ -101,6 +101,55 @@ private final class RemovalSandbox {
     #expect(library.current.tracks[track.id]?.title == "In Place")
 }
 
+/// Review fix: iOS evicts files from iCloud Drive folders under storage pressure, leaving a ".Name.flac.icloud"
+/// placeholder. A scan that sees only the placeholder must keep the file's `removed` entry, or the file comes back
+/// once it is downloaded again, unchanged.
+@Test func aRemovedTrackStaysRemovedThroughAnICloudEviction() async throws {
+    let box = try RemovalSandbox()
+    let library = try box.open()
+    let file = box.external.appending(path: "Album/01.flac")
+    let placeholder = box.external.appending(path: "Album/.01.flac.icloud")
+    try TaggedFlac.write("s24-96000", to: file, tags: [("TITLE", "Evicted"), ("ALBUM", "Cloud")])
+    _ = try await library.addFolder(box.external)
+    let track = try #require(library.current.tracks.values.first)
+    _ = try await library.remove(trackIDs: [track.id])
+
+    // Evicted: only the placeholder is left. A move keeps the file's size and date.
+    try FileManager.default.moveItem(at: file, to: placeholder)
+    let evicted = await library.rescan()
+    #expect(evicted.added.isEmpty)
+    // Downloaded again, unchanged: still removed.
+    try FileManager.default.moveItem(at: placeholder, to: file)
+    let back = await library.rescan()
+    #expect(back.added.isEmpty)
+    #expect(library.current.tracks.isEmpty)
+}
+
+/// Nor does a scan ask iCloud to download a file the user removed; it fetches only what the library still holds.
+@Test func aRemovedEvictedFileIsNotFetched() throws {
+    let box = try RemovalSandbox()
+    let store = try LibraryStore(
+        databaseURL: box.database, libraryFolder: box.libraryFolder, artworkFolder: box.artwork, maxFileBytes: 1 << 30)
+    var fetched: [String] = []
+    store.startDownload = { fetched.append($0.lastPathComponent) }
+    try TaggedFlac.write("s24-96000", to: box.external.appending(path: "gone.flac"), tags: [("TITLE", "Gone")])
+    try TaggedFlac.write("s16-44100", to: box.external.appending(path: "kept.flac"), tags: [("TITLE", "Kept")])
+    let folder = try store.addFolder(box.external)
+    var report = ScanReport()
+    try store.scan(folder: folder, into: &report)
+    let gone = try #require(try store.trackID(folder: folder, relativePath: "gone.flac"))
+    _ = try store.remove(trackIDs: [gone])
+
+    for name in ["gone.flac", "kept.flac"] {
+        try FileManager.default.moveItem(
+            at: box.external.appending(path: name), to: box.external.appending(path: ".\(name).icloud"))
+    }
+    let evicted = try store.scanAll()
+
+    #expect(fetched == ["kept.flac"])
+    #expect(evicted.pendingDownloads == 1)
+}
+
 /// An album split between the library folder and a folder added in place: the app's copies are deleted, the user's
 /// file only leaves the library, and the album is gone from the shelf.
 @Test func removingAnAlbumRemovesEveryTrack() async throws {

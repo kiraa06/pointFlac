@@ -144,6 +144,8 @@ final class LibraryStore {
     private var scoped: [Int64: URL] = [:]
     /// For tests: how many files have been read in full (validated, tags, identity, cover).
     private(set) var probes = 0
+    /// Asks iCloud to download an evicted file. A stand-in for tests, which have no iCloud.
+    var startDownload: (URL) -> Void = { try? FileManager.default.startDownloadingUbiquitousItem(at: $0) }
 
     init(databaseURL: URL, libraryFolder: URL, artworkFolder: URL, maxFileBytes: Int64) throws {
         database = try SQLiteDatabase(url: databaseURL)
@@ -340,9 +342,12 @@ final class LibraryStore {
     private func scan(folder: Int64, into report: inout ScanReport, gone: inout [String: KnownTrack]) throws {
         guard let root = roots[folder] else { return }
         let name = root.lastPathComponent
+        // Read before the listing, so the listing never asks iCloud for a file the user removed.
+        let removed = try rememberedFiles("removed", in: folder)
         let listing: Listing
         do {
-            listing = try enumerate(root: root, external: folder != Self.libraryFolderID)
+            listing = try enumerate(
+                root: root, external: folder != Self.libraryFolderID, leaveInCloud: Set(removed.keys))
         } catch {
             // The library folder before the first import does not exist yet, and holds nothing: not a fault.
             let empty = folder == Self.libraryFolderID && !FileManager.default.fileExists(atPath: root.path)
@@ -352,13 +357,12 @@ final class LibraryStore {
             return
         }
         if !listing.complete { report.incompleteFolders.append(name) }
-        report.pendingDownloads += listing.cloudPending.count
+        report.pendingDownloads += listing.cloudPending.subtracting(removed.keys).count
         let disk = listing.files
 
         let known = try knownTracks()
         let here = Dictionary(known.filter { $0.folderID == folder }.map { ($0.relativePath, $0) }) { a, _ in a }
         let skipped = try rememberedFiles("skipped", in: folder)
-        let removed = try rememberedFiles("removed", in: folder)
         let onDisk = Set(disk.map(\.relativePath))
         // Gone from this folder: candidates for a move, else removed at the end of the pass. Only a complete listing
         // proves a file gone, and an evicted iCloud file is not gone.
@@ -417,8 +421,9 @@ final class LibraryStore {
                 report.cloudChanged.append(track.id)
             }
             if listing.complete {
-                // Files gone from the folder are forgotten: refused and removed alike.
-                let present = Self.jsonArray(onDisk)
+                // Files gone from the folder are forgotten: refused and removed alike. An evicted iCloud file is not
+                // gone: forgetting it would bring a removed file back once it downloads again.
+                let present = Self.jsonArray(onDisk.union(listing.cloudPending))
                 try database.query(
                     "DELETE FROM skipped WHERE folder_id = ? AND rel_path NOT IN (SELECT value FROM json_each(?))",
                     [.integer(folder), .text(present)])
@@ -632,12 +637,13 @@ final class LibraryStore {
     }
 
     /// The `.flac` files under `root` (not hidden, not inside hidden folders or packages), with size and date, and the
-    /// iCloud files still to download (whose download is started here). Only names and attributes are read, never file
+    /// iCloud files still to download (whose download is started here, except for the paths in `leaveInCloud`: files
+    /// the user removed, which only need to be known as present). Only names and attributes are read, never file
     /// contents.
     ///
     /// Throws when `root` itself cannot be listed (missing, offline provider, no security scope). Any error below the
     /// root, or reaching `maxFilesPerFolder`, marks the listing incomplete, so the scan removes nothing from it.
-    private func enumerate(root: URL, external: Bool) throws -> Listing {
+    private func enumerate(root: URL, external: Bool, leaveInCloud: Set<String>) throws -> Listing {
         do {
             _ = try FileManager.default.contentsOfDirectory(atPath: root.path)
         } catch {
@@ -671,20 +677,21 @@ final class LibraryStore {
             }
             if name.hasPrefix(".") {
                 // "._Song.flac" AppleDouble files and other hidden names are never music. ".Song.flac.icloud" is an
-                // iCloud placeholder for "Song.flac": start its download, and a later scan reads it.
+                // iCloud placeholder for "Song.flac": start its download, and a later scan reads it. A file the user
+                // removed is left in the cloud.
                 let placeholder = name.dropFirst().dropLast(".icloud".count)
                 if name.hasSuffix(".icloud"), placeholder.lowercased().hasSuffix(".flac"), !placeholder.hasPrefix(".") {
                     let directory = (relative as NSString).deletingLastPathComponent
                     let real = directory.isEmpty ? String(placeholder) : "\(directory)/\(placeholder)"
                     listing.cloudPending.insert(real)
-                    try? FileManager.default.startDownloadingUbiquitousItem(at: root.appending(path: real))
+                    if !leaveInCloud.contains(real) { startDownload(root.appending(path: real)) }
                 }
                 continue
             }
             guard values?.isRegularFile == true, name.lowercased().hasSuffix(".flac") else { continue }
             if external, Self.isNotDownloaded(url) {
                 listing.cloudPending.insert(relative)
-                try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+                if !leaveInCloud.contains(relative) { startDownload(url) }
                 continue
             }
             let size = Int64(values?.fileSize ?? 0)
