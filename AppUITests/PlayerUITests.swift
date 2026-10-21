@@ -242,6 +242,8 @@ final class PlayerUITests: XCTestCase {
         XCTAssertTrue(next.waitForExistence(timeout: 3))
         XCTAssertNotEqual(next.label, deleted)
         XCTAssertTrue(app.descendants(matching: .any)["sleeve-1"].exists)
+        // Everything went, so the shelf has nothing to report as left behind.
+        XCTAssertFalse(app.staticTexts["importNote"].exists)
     }
 
     /// Deleting the record that is playing stops it and empties the platter, so nothing tries to play a deleted file.

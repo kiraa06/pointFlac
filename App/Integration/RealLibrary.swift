@@ -142,14 +142,24 @@ final class RealLibrary: LibraryBrowsing {
         return (result.added.count, lines)
     }
 
-    /// Counted from the catalog, which knows each track's folder, so the dialog says exactly what `remove` will do:
-    /// the album's songs are the ones the shelf lists, which are the ones the Delete passes on.
-    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> (deletes: Int, removes: Int) {
-        var ids = album.map { self.tracks(of: $0).map(\.id) } ?? []
+    /// Counted from the catalog, which knows each track's folder, so the dialog says exactly what `remove` will do. An
+    /// album is its whole catalog track list, not only the playable songs the shelf shows (controller ruling RD-1):
+    /// "delete the album" is asked to free the space, and a multichannel file left behind could never be reached.
+    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan {
+        var ids = album.map { snapshot.tracks(of: $0).map(\.id) } ?? []
         ids += tracks.filter { !ids.contains($0) }
-        let found = snapshot.tracks(ids: ids)
-        let deletes = found.count(where: \.isInLibraryFolder)
-        return (deletes, found.count - deletes)
+        var plan = RemovalPlan()
+        for track in snapshot.tracks(ids: ids) {
+            plan.tracks.append(track.id)
+            if track.isInLibraryFolder {
+                plan.deletes += 1
+                if !track.isSupported { plan.unplayableDeletes += 1 }
+            } else {
+                plan.removes += 1
+                if !track.isSupported { plan.unplayableRemoves += 1 }
+            }
+        }
+        return plan
     }
 
     func remove(tracks: [TrackRow.ID]) async {

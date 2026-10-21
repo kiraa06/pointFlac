@@ -255,6 +255,8 @@ final class PlaybackController {
     /// that is gone. When the record on the platter, or the queue the player holds, has any of them, playback stops
     /// and the platter is left empty: the deck shows no record. An Up Next entry goes when its album goes entirely;
     /// one that keeps some songs stays, and starts from its first song if its chosen one went.
+    ///
+    /// Idempotent, so the shelf calls it again once the removal is done, in case the record went back on meanwhile.
     func willRemove(tracks removed: Set<TrackRow.ID>) async {
         upNext.removeAll { entry in
             library.tracks(of: entry.album.id).allSatisfy { removed.contains($0.id) }
