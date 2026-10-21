@@ -18,6 +18,14 @@ struct GetMusicView: View {
     @State private var request: Request?
     @State private var importing = false
     @State private var importNote: String?
+    @AppStorage(AppModel.lookupNamesKey) private var lookupNames = true
+    /// Ruling R26: the MusicBrainz note shows under the field until the person has seen it once, then lives behind
+    /// an info button.
+    @AppStorage("musicBrainzNoteSeen") private var noteSeen = false
+    @State private var showingNote = false
+
+    static let musicBrainzNote =
+        "Suggestions use MusicBrainz: what you type is sent to musicbrainz.org. Change in Settings."
 
     private static let flac = UTType(filenameExtension: "flac") ?? .audio
 
@@ -29,6 +37,13 @@ struct GetMusicView: View {
     var body: some View {
         NavigationStack {
             List {
+                if lookupNames, !noteSeen {
+                    Text(Self.musicBrainzNote)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .listRowBackground(Color.clear)
+                        .accessibilityIdentifier("musicBrainzNote")
+                        .onDisappear { noteSeen = true }
+                }
                 Section {
                     Picker("Source", selection: $provider) {
                         ForEach(finder.providers, id: \.id) { Text($0.name).tag($0.id) }
@@ -76,6 +91,19 @@ struct GetMusicView: View {
                 }
             }
             .navigationTitle("Get Music")
+            .toolbar {
+                if lookupNames, noteSeen {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("About suggestions", systemImage: "info.circle") { showingNote = true }
+                            .accessibilityIdentifier("musicBrainzInfo")
+                    }
+                }
+            }
+            .alert("Suggestions", isPresented: $showingNote) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(Self.musicBrainzNote)
+            }
             .searchable(
                 text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Artist, album or song"
             )
