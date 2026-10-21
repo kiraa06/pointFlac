@@ -35,7 +35,7 @@ struct RootView: View {
         .preferredColorScheme(appearance.colorScheme)
         // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
         // colour of their own read the flag. The look switches live, over a short fade.
-        .tint(monochrome ? Theme.monochromeInk : nil)
+        .tint(monochrome ? Theme.monochromeTint : nil)
         .environment(\.isMonochrome, monochrome)
         .animation(.easeInOut(duration: 0.3), value: monochrome)
         .onChange(of: monochrome, initial: true) { _, on in Self.tintWindows(on) }
@@ -62,7 +62,7 @@ struct RootView: View {
 
     /// UIKit-hosted pieces (alerts) take their tint from the window, not from SwiftUI's `.tint`.
     private static func tintWindows(_ monochrome: Bool) {
-        let tint = monochrome ? UIColor(Theme.monochromeInk) : nil
+        let tint = monochrome ? UIColor(Theme.monochromeTint) : nil
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
             for window in scene.windows { window.tintColor = tint }
         }

@@ -170,10 +170,12 @@ extension Theme {
         return looks
     }()
 
-    /// The ink of the Deck look in either style, as one dynamic colour: the root tint under Monochrome.
-    static let monochromeInk = Color(
+    /// Monochrome's control tint: near-black on light, a mid grey on dark. Not the dark ink itself: an on switch fills
+    /// its track with the tint, and a white track would swallow the white knob. 0.62 keeps the knob visible (2.7:1) and
+    /// tinted text readable on the dark background (7:1).
+    static let monochromeTint = Color(
         uiColor: UIColor {
-            UIColor(Theme.deck(dark: $0.userInterfaceStyle == .dark).ink)
+            UIColor(white: $0.userInterfaceStyle == .dark ? 0.62 : 0.08, alpha: 1)
         })
 }
 
