@@ -3,7 +3,7 @@ import PFAudio
 
 // Contracts 2 and 3 of the overnight build (owned by stream D). The UI codes only against these protocols, never
 // against the library's or the downloaders' concrete types, so each side can change without the other noticing. The
-// controller writes the adapters; until then `MockLibrary` and `MockMusicFinder` stand in.
+// controller writes the adapters; `RealLibrary` and `RealMusicFinder` (App/Integration) are those adapters; `MockMusicFinder` remains for UI tests.
 
 /// An album as the shelf shows it.
 struct AlbumCard: Identifiable, Hashable {

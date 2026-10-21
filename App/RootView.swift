@@ -11,6 +11,7 @@ struct RootView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
     @State private var tab: AppTab = Self.launchTab
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView(selection: $tab) {
@@ -30,6 +31,11 @@ struct RootView: View {
         }
         .preferredColorScheme(appearance.colorScheme)
         .task { await model.load() }
+        .onChange(of: scenePhase) { old, new in
+            // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
+            // foreground). Launch already scans in `load()`.
+            if old == .background, new != .background { Task { await model.reload() } }
+        }
         .onChange(of: model.player.status) { _, status in
             model.playback.playerStatusChanged(to: status)
         }

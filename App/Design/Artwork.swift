@@ -51,9 +51,13 @@ final class ArtworkCache {
         return cache
     }()
 
+    /// Reads an album's cover when its sleeve is first drawn and the card carries none (`RealLibrary`): covers are
+    /// loaded lazily, never all at once.
+    var loader: ((String) -> Data?)?
+
     func image(for id: String, data: Data?) -> UIImage? {
-        guard let data else { return nil }
         if let hit = cache.object(forKey: id as NSString) { return hit }
+        guard let data = data ?? loader?(id) else { return nil }
         guard let image = UIImage(data: data)?.preparingThumbnail(of: CGSize(width: 800, height: 800)) else {
             return nil
         }

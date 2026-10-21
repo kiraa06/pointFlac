@@ -5,24 +5,21 @@ import PFCore
 import PFFlac
 import PFLibrary
 
-/// The app's state: the library inbox and the player, wired to the real iOS audio stack, plus (from Plan 3) the
-/// protocol-typed library and music finder the UI codes against, and the playback controller over the player.
+/// The app's state: the player, wired to the real iOS audio stack; the library (stream A's `Library`, through
+/// `RealLibrary`); the music finder (the real providers, through `RealMusicFinder`); and the playback controller.
 ///
-/// Plan 1's app is a debug harness for the audio core, so the model is deliberately thin. The library is whatever the
-/// inbox lists from `Documents/Library`. Tapping a track plays that track alone, and Play All queues the whole
-/// library. A tap does not queue the rest of the library after the track, because the fixtures last 85 ms: playback
-/// would race through to the last one, and the strip, which keeps describing the last track played, would never show
-/// the one tapped.
+/// There is one library over `Documents/Library`, and so one import inbox: `Library` owns it. Diagnostics (Plan 1's
+/// debug views) reads the same library rather than a second inbox, since two inboxes over one folder would race.
 ///
-/// Launch arguments, both DEBUG only and ignored in Release builds:
+/// Launch arguments, all DEBUG only and ignored in Release builds:
 /// - `-PFPreloadFixtures` imports the fixtures bundled under `Fixtures/` on launch (ruling R4).
 /// - `-PFMuteOutput` puts the output in capture mode, which mutes the speaker, so UI tests play nothing aloud
 ///   (ruling R22).
+/// - `-PFMockFinder`, and `-PFPreloadFixtures` too, keep the demo `MockMusicFinder`, so UI tests never touch the
+///   network and stay deterministic.
 @MainActor
 @Observable
 final class AppModel {
-    /// The library, as the inbox last listed it.
-    private(set) var files: [ImportedFile] = []
     /// What the latest import refused.
     private(set) var rejections: [ImportRejection] = []
     /// One line about the latest import, or why the picker failed.
@@ -31,30 +28,42 @@ final class AppModel {
     /// Should that fail, the player's status says "Audio output unavailable: …", and the library still works.
     let player: Player
 
-    /// What the Shelf browses and searches. `MockLibrary` over the inbox until the controller swaps in stream A's.
+    /// What the Shelf browses and searches.
     @ObservationIgnored private(set) var library: any LibraryBrowsing
-    /// Get Music and Downloads. `MockMusicFinder` until the controller swaps in the real providers.
+    /// Get Music and Downloads.
     @ObservationIgnored private(set) var finder: any MusicFinding
     /// The record on the deck, its sides, Up Next and repeat.
     @ObservationIgnored private(set) var playback: PlaybackController
+    /// The real library behind `library`.
+    let realLibrary: RealLibrary
+    /// The real finder, unless a DEBUG launch asked for the mock.
+    @ObservationIgnored private(set) var realFinder: RealMusicFinder?
+    #if SOULSEEK
+        /// The one Soulseek session (Settings → Soulseek).
+        let soulseek: SoulseekAccount
+    #endif
 
-    private let inbox: ImportInbox
     #if DEBUG
         private let preloadFixtures: Bool
         /// `-PFDemoPlay`: plays the demo album "Night Drive" once the library is listed, for screenshots and UI tests.
         private let demoPlay: Bool
     #endif
 
+    /// Settings keys for the privacy switches (spec §5.8): MusicBrainz name lookups on by default (ruling R26),
+    /// artwork lookups off.
+    static let lookupNamesKey = "lookupNamesOnline"
+    static let lookupArtworkKey = "lookupArtworkOnline"
+
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
-        let folder = URL.documentsDirectory.appending(path: "Library", directoryHint: .isDirectory)
-        // Created now rather than on the first import, so it shows in the Files app from the first launch. The inbox
-        // creates it too, should this fail.
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        inbox = ImportInbox(libraryFolder: folder)
+        UserDefaults.standard.register(defaults: [Self.lookupNamesKey: true, Self.lookupArtworkKey: false])
+        realLibrary = RealLibrary(library: Self.openLibrary())
         #if DEBUG
             preloadFixtures = arguments.contains("-PFPreloadFixtures")
             demoPlay = arguments.contains("-PFDemoPlay")
             let mute = arguments.contains("-PFMuteOutput")
+            let useMock = preloadFixtures || arguments.contains("-PFMockFinder")
+        #else
+            let useMock = false
         #endif
         player = Player(
             session: SystemAudioSession(),
@@ -70,22 +79,67 @@ final class AppModel {
                 return output
             },
             capabilities: .current, nowPlaying: SystemNowPlaying(), makeDecoder: { try FlacDecoder(url: $0.url) })
-        let mock = MockLibrary()
-        library = mock
-        finder = MockMusicFinder(library: mock)
-        playback = PlaybackController(player: player, library: mock)
-        mock.importer = { [weak self] urls in await self?.importFiles(urls) }
+        let names = UserDefaults.standard.bool(forKey: Self.lookupNamesKey)
+        let artwork = UserDefaults.standard.bool(forKey: Self.lookupArtworkKey)
+        #if SOULSEEK
+            soulseek = SoulseekAccount()
+            let real =
+                useMock
+                ? nil
+                : RealMusicFinder(
+                    library: realLibrary, soulseek: soulseek.client, registryEnabled: names, artworkEnabled: artwork)
+        #else
+            let real =
+                useMock ? nil : RealMusicFinder(library: realLibrary, registryEnabled: names, artworkEnabled: artwork)
+        #endif
+        realFinder = real
+        library = realLibrary
+        finder = real ?? MockMusicFinder(library: realLibrary)
+        playback = PlaybackController(player: player, library: realLibrary)
     }
 
-    /// Swaps in other implementations of the UI's contracts: the controller's adapters at integration.
+    /// The library database and covers live in Application Support (never Caches, which the system purges; the
+    /// library refuses it). Should the database not open, a temporary one keeps the app usable, and the next launch
+    /// tries the real one again.
+    private static func openLibrary() -> Library {
+        let folder = URL.documentsDirectory.appending(path: "Library", directoryHint: .isDirectory)
+        // Created now rather than on the first import, so it shows in the Files app from the first launch.
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for base in [URL.applicationSupportDirectory, FileManager.default.temporaryDirectory] {
+            let root = base.appending(path: "PointFlacLibrary", directoryHint: .isDirectory)
+            let artwork = root.appending(path: "Artwork", directoryHint: .isDirectory)
+            try? FileManager.default.createDirectory(at: artwork, withIntermediateDirectories: true)
+            if let library = try? Library(
+                databaseURL: root.appending(path: "library.sqlite"), libraryFolder: folder, artworkFolder: artwork)
+            {
+                return library
+            }
+        }
+        fatalError("pointFlac could not open a library database in Application Support or the temporary folder")
+    }
+
+    /// Swaps in other implementations of the UI's contracts.
     func use(library: any LibraryBrowsing, finder: any MusicFinding) {
         self.library = library
         self.finder = finder
         playback = PlaybackController(player: player, library: library)
     }
 
-    /// Lists the library, after importing the bundled fixtures when asked to.
+    /// The privacy switches changed in Settings: applied at once.
+    func lookupsChanged() {
+        realFinder?.setLookups(
+            registry: UserDefaults.standard.bool(forKey: Self.lookupNamesKey),
+            artwork: UserDefaults.standard.bool(forKey: Self.lookupArtworkKey))
+    }
+
+    /// Starts the library and the download queue, and lists the library, after importing the bundled fixtures when
+    /// asked to.
     func load() async {
+        realLibrary.start()
+        if let realFinder { Task { await realFinder.start() } }
+        #if SOULSEEK
+            if realFinder != nil { Task { await soulseek.resume() } }
+        #endif
         #if DEBUG
             if preloadFixtures {
                 await importFiles(Self.bundledFixtures())
@@ -101,38 +155,46 @@ final class AppModel {
         #endif
     }
 
+    /// Rescans the library folders: at launch, on pull-to-refresh and when the app returns to the foreground.
     func reload() async {
-        files = await inbox.list()
-        (library as? MockLibrary)?.update(from: files)
+        await realLibrary.rescan()
     }
 
-    /// Imports files picked in the Files picker (or the bundled fixtures), then lists the library again.
+    /// Every track in the library, for Diagnostics.
+    var files: [LibraryTrack] {
+        Array(realLibrary.snapshot.catalog.tracks.values)
+    }
+
+    /// Imports files picked in the Files picker (or the bundled fixtures) into the library.
     @discardableResult
     func importFiles(_ urls: [URL]) async -> (added: Int, rejected: [String]) {
-        let result = await inbox.importFiles(urls)
+        let result = await realLibrary.library.importFiles(urls)
+        await realLibrary.sync()
         rejections = result.rejected
-        let skipped = urls.count - result.added.count - result.rejected.count
         importSummary =
-            "Last import: \(result.added.count) added, \(skipped) already in the library, "
-            + "\(result.rejected.count) not added"
-        await reload()
-        return (result.added.count, result.rejected.map { "\($0.fileName): \($0.message)" })
+            "Last import: \(result.added.count) added, \(result.duplicates) already in the library, "
+            + "\(result.rejected.count) not added" + (result.error.map { ". Library error: \($0)" } ?? "")
+        var lines = result.rejected.map { "\($0.fileName): \($0.message)" }
+        if let error = result.error { lines.append("Library: \(error)") }
+        return (result.added.count, lines)
     }
 
     func importFailed(_ error: any Error) {
         importSummary = "The picker failed: \(error.localizedDescription)"
     }
 
-    /// Plays `file` alone, if v1 can play it.
-    func play(_ file: ImportedFile) async {
-        guard file.isSupported else { return }
-        await player.play([QueueItem(file)], startingAt: 0)
+    /// Plays `track` alone, if v1 can play it.
+    func play(_ track: LibraryTrack) async {
+        guard track.isSupported else { return }
+        await player.play(
+            [QueueItem(track: track, artwork: realLibrary.library.artwork(track.artworkID))], startingAt: 0)
     }
 
-    /// Plays the whole library, in order, from the first track, leaving out what v1 cannot play (multichannel files,
-    /// which would only fail one by one).
+    /// Plays the whole library, in Diagnostics order, leaving out what v1 cannot play (multichannel files, which would
+    /// only fail one by one).
     func playAll() async {
-        await player.play(files.filter(\.isSupported).map { QueueItem($0) }, startingAt: 0)
+        let tracks = files.filter(\.isSupported).sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+        await player.play(tracks.map { QueueItem(track: $0) }, startingAt: 0)
     }
 
     #if DEBUG
@@ -144,17 +206,9 @@ final class AppModel {
     #endif
 }
 
-extension ImportedFile {
-    /// The file name without its extension. Unique in the library, unlike the title (ruling R20).
+extension LibraryTrack {
+    /// The file name without its extension: unique in the library folder, unlike the title (ruling R20).
     var stem: String {
-        (id as NSString).deletingPathExtension
-    }
-}
-
-extension QueueItem {
-    init(_ file: ImportedFile) {
-        self.init(
-            id: file.id, url: file.url, title: file.title, artist: file.artist, album: file.album, format: file.format,
-            totalFrames: file.totalFrames)
+        url.deletingPathExtension().lastPathComponent
     }
 }

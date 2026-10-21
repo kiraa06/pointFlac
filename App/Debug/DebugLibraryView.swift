@@ -3,7 +3,7 @@ import PFLibrary
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Plan 1's stand-in for the library: the imported tracks, what the latest import refused, and an Add button that
+/// Plan 1's debug view of the library (Settings → Diagnostics), over the same `Library` the Shelf uses: every track, what the latest import refused, and an Add button that
 /// opens the Files picker. Tapping a track plays it alone; Play All queues the library, for next, previous and gapless
 /// joins. A track v1 cannot play (multichannel, spec §5.3) is listed as "Not supported in v1" and cannot be tapped.
 /// Now Playing sits at the bottom.
@@ -15,8 +15,10 @@ struct DebugLibraryView: View {
     let model: AppModel
     @State private var picking = false
 
-    private var listed: [ImportedFile] {
-        model.files.sorted { ($0.id.hasPrefix("demo-") ? 1 : 0, $0.id) < ($1.id.hasPrefix("demo-") ? 1 : 0, $1.id) }
+    private var listed: [LibraryTrack] {
+        model.files.sorted {
+            ($0.stem.hasPrefix("demo-") ? 1 : 0, $0.stem) < ($1.stem.hasPrefix("demo-") ? 1 : 0, $1.stem)
+        }
     }
 
     var body: some View {
@@ -117,7 +119,7 @@ struct LicencesView: View {
 
 /// A track's title, with its artist and format under it, and a note when v1 cannot play it.
 private struct DebugTrackRow: View {
-    let file: ImportedFile
+    let file: LibraryTrack
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -131,6 +133,7 @@ private struct DebugTrackRow: View {
 
     private var details: String {
         let format = "\(file.format.formattedDepth) · \(file.format.formattedRate)"
-        return file.artist.isEmpty ? "\(file.id) · \(format)" : "\(file.artist) · \(file.id) · \(format)"
+        let name = file.url.lastPathComponent
+        return file.artist.isEmpty ? "\(name) · \(format)" : "\(file.artist) · \(name) · \(format)"
     }
 }
