@@ -107,6 +107,50 @@ struct AutoEqParserTests {
         }
     }
 
+    @Test("a UTF-8 byte-order mark, as Windows editors write one, is not part of the first line")
+    func byteOrderMark() throws {
+        let r = try AutoEqParser.parse("\u{FEFF}Preamp: -6.2 dB\r\nFilter 1: ON PK Fc 100 Hz Gain 1 dB Q 1.0\r\n")
+        #expect(r.preampDb == -6.2)
+        #expect(r.bands.count == 1)
+        // From the bytes too, as the importer reads a file.
+        let bytes: [UInt8] = [0xEF, 0xBB, 0xBF] + Array("Filter 1: ON PK Fc 100 Hz Gain 1 dB Q 1.0".utf8)
+        #expect(try AutoEqParser.parse(String(decoding: bytes, as: UTF8.self)).bands.count == 1)
+        // Only a leading mark is skipped: one inside a line is still an unreadable token.
+        #expect(throws: AutoEqParser.ParseError.unsupportedLine(2)) {
+            try AutoEqParser.parse("Preamp: -1 dB\nFilter 1: ON PK Fc 100 Hz Gain \u{FEFF}1 dB Q 1.0")
+        }
+    }
+
+    @Test("comment lines starting with # are skipped, and later lines keep their numbers")
+    func comments() throws {
+        let text = """
+            # AutoEq ParametricEQ for Sennheiser HD 600
+            Preamp: -6.2 dB
+              # an indented note
+            #Filter 2: ON PK Fc 200 Hz Gain 2 dB Q 1.0
+            Filter 1: ON PK Fc 100 Hz Gain 1 dB Q 1.0
+            """
+        let r = try AutoEqParser.parse(text)
+        #expect(r.preampDb == -6.2)
+        #expect(r.bands.map(\.frequency) == [100])
+        #expect(throws: AutoEqParser.ParseError.unsupportedLine(3)) {
+            try AutoEqParser.parse("# note\nPreamp: -1 dB\nFilter 1: ON PK Fc x Hz Gain 1 dB Q 1.0")
+        }
+        // A comment is a whole line: text after a filter is still refused.
+        #expect(throws: AutoEqParser.ParseError.unsupportedLine(1)) {
+            try AutoEqParser.parse("Filter 1: ON PK Fc 100 Hz Gain 1 dB Q 1.0 # note")
+        }
+    }
+
+    @Test("a low-pass or high-pass without a Q gets the Butterworth Q, and ignores a gain")
+    func passDefaults() throws {
+        let r = try AutoEqParser.parse(
+            "Filter 1: ON LP Fc 18000 Hz\nFilter 2: ON HP Fc 25 Hz Gain 3 dB\nFilter 3: ON NO Fc 1000 Hz")
+        #expect(r.bands.map(\.q) == [0.7071, 0.7071, 0.7071])
+        #expect(r.bands.map(\.gainDb) == [0, 0, 0])
+        #expect(r.bands.map(\.type) == [.lowPass, .highPass, .notch])
+    }
+
     @Test("more than 20 filters throws tooManyBands, and exactly 20 is fine")
     func bandLimit() throws {
         func file(_ n: Int) -> String {

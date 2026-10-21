@@ -82,6 +82,32 @@ enum SoundFormat {
         "Q \(SoundFormat.q(q))"
     }
 
+    /// "4.7 dB": a size of change, without its sign.
+    static func magnitude(_ db: Double) -> String {
+        "\(String(format: "%.1f", abs(db))) dB"
+    }
+
+    /// "−18 LUFS".
+    static func lufs(_ value: Double) -> String {
+        let text = trimmed(abs(tenth(value)))
+        return (value < 0 && text != "0" ? minus : "") + text + " LUFS"
+    }
+
+    static func lufsSpoken(_ value: Double) -> String {
+        let text = trimmed(abs(tenth(value)))
+        return (value < 0 && text != "0" ? "minus " : "") + text + " LUFS"
+    }
+
+    /// "6 s", "6.5 s".
+    static func seconds(_ value: Double) -> String {
+        "\(trimmed(tenth(value))) s"
+    }
+
+    static func secondsSpoken(_ value: Double) -> String {
+        let text = trimmed(tenth(value))
+        return "\(text) \(text == "1" ? "second" : "seconds")"
+    }
+
     /// A meter level: "−12.3", or "−∞" at the floor.
     static func level(_ dbfs: Double) -> String {
         dbfs <= -119.95 ? "\(minus)∞" : signed(dbfs)
@@ -105,6 +131,26 @@ extension FilterType {
         switch self {
         case .peak, .lowShelf, .highShelf: true
         case .lowPass, .highPass, .notch: false
+        }
+    }
+}
+
+extension ReplayGainMode {
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .track: "Track"
+        case .album: "Album"
+        }
+    }
+}
+
+extension CrossfadeMode {
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .betweenAlbums: "Between albums"
+        case .always: "Always"
         }
     }
 }

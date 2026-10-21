@@ -356,7 +356,15 @@ public final class Player {
     /// A value that is not finite (a NaN setting) counts as absent; the result is always finite, and within
     /// ±`maxGainDb`.
     public nonisolated static func replayGainDb(for item: QueueItem, settings: ReplayGainSettings) -> Double {
-        guard settings.mode != .off else { return 0 }
+        replayGain(for: item, settings: settings).gainDb
+    }
+
+    /// `replayGainDb(for:settings:)`, with what it was worked out from (step 2 above), so the Sound tab can say where
+    /// a gain comes from by the one rule that makes it. `.off` gives 0 from `.none`.
+    public nonisolated static func replayGain(
+        for item: QueueItem, settings: ReplayGainSettings
+    ) -> (gainDb: Double, basis: ReplayGainBasis) {
+        guard settings.mode != .off else { return (0, .none) }
         let loudness = item.loudness ?? TrackLoudness()
         let reference = settings.referenceLufs.isFinite ? settings.referenceLufs : ReplayGainSettings().referenceLufs
         /// `reference − lufs` for a usable measurement. Integrated loudness is gated at −70 LUFS, so a real one is
@@ -366,24 +374,31 @@ public final class Player {
             return reference - lufs
         }
         func finite(_ value: Double?) -> Double? { value.flatMap { $0.isFinite ? $0 : nil } }
-        let trackGain = finite(loudness.trackGainDb) ?? measured(loudness.measuredLufs)
         let trackPeak = finite(loudness.trackPeak) ?? finite(loudness.measuredPeak)
         var gain: Double
         var peak: Double?
-        if settings.mode == .album,
-            let albumGain = finite(loudness.albumGainDb) ?? measured(loudness.albumMeasuredLufs)
-        {
-            gain = albumGain
+        let basis: ReplayGainBasis
+        if settings.mode == .album, let tag = finite(loudness.albumGainDb) {
+            (gain, basis) = (tag, .albumTag)
             peak = finite(loudness.albumPeak) ?? finite(loudness.albumMeasuredPeak) ?? trackPeak
+        } else if settings.mode == .album, let scan = measured(loudness.albumMeasuredLufs) {
+            (gain, basis) = (scan, .albumScan)
+            peak = finite(loudness.albumPeak) ?? finite(loudness.albumMeasuredPeak) ?? trackPeak
+        } else if let tag = finite(loudness.trackGainDb) {
+            (gain, basis) = (tag, .trackTag)
+            peak = trackPeak
+        } else if let scan = measured(loudness.measuredLufs) {
+            (gain, basis) = (scan, .trackScan)
+            peak = trackPeak
         } else {
-            gain = trackGain ?? 0
+            (gain, basis) = (0, .none)
             peak = trackPeak
         }
         if settings.preampDb.isFinite { gain += settings.preampDb }
         if settings.preventClipping, let peak, peak > 0 {
             gain = min(gain, -20 * log10(peak))
         }
-        return gain.isFinite ? min(max(gain, -maxGainDb), maxGainDb) : 0
+        return (gain.isFinite ? min(max(gain, -maxGainDb), maxGainDb) : 0, basis)
     }
 
     /// The largest ReplayGain, either way, in dB: the largest tag gain the library reads (±60 dB) plus the largest

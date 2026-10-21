@@ -67,3 +67,10 @@ public struct QueueItem: Sendable, Hashable, Identifiable {
         return totalFrames > 0 ? min(frame, totalFrames) : frame
     }
 }
+
+/// What a track's ReplayGain is worked out from (`Player.replayGain(for:settings:)`): the tag for the mode, else the
+/// scan's measurement (in album mode the album's, measured as a whole), else nothing, when the track plays at the
+/// preamp alone.
+public enum ReplayGainBasis: Sendable, Equatable {
+    case albumTag, albumScan, trackTag, trackScan, none
+}

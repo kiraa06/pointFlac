@@ -10,6 +10,10 @@ import Foundation
 /// one band: the one being dragged when there is one, else the band the view picks (the selected one, else the
 /// nearest). A pinch that takes over a drag hands back the band as the drag found it, to undo the first finger's stray
 /// move, and holds the drag inert until that drag's own finger lifts.
+///
+/// A reset while a finger is still down (the bands changed under it) cuts its drag short: that finger's later moves,
+/// known by where it touched down, are ignored, so it cannot start a fresh drag from a grab measured against a band
+/// that has since moved. Any other touch starts clean.
 public struct BandGestureSession<Band: Sendable>: Sendable {
     public struct Drag: Sendable {
         public let index: Int
@@ -18,6 +22,19 @@ public struct BandGestureSession<Band: Sendable>: Sendable {
         /// Where the finger took hold, relative to the band's centre, in points.
         public let grabX: Double
         public let grabY: Double
+        /// Where the finger touched down, in the graph's space: the touch's identity, when the view gives one.
+        public let touch: Touch?
+    }
+
+    /// Where a finger touched down. A drag gesture reports the same start for every move of one touch.
+    public struct Touch: Sendable, Equatable {
+        public let x: Double
+        public let y: Double
+
+        public init(x: Double, y: Double) {
+            self.x = x
+            self.y = y
+        }
     }
 
     public struct Pinch: Sendable, Equatable {
@@ -30,16 +47,24 @@ public struct BandGestureSession<Band: Sendable>: Sendable {
     public private(set) var pinch: Pinch?
     /// A pinch happened during the current drag, which stays inert until its finger lifts.
     public private(set) var pinched = false
+    /// The touch whose drag a reset cut short, ignored until it lifts or another touch drags.
+    public private(set) var cutShort: Touch?
 
     public init() {}
 
     /// A drag on the handle of band `index` moved. Its first call starts the drag, from `band` and the grab offset;
-    /// later calls from the same handle keep that start. Returns the drag to apply, or nil while a pinch holds it inert
-    /// or while another handle's drag is running.
-    public mutating func dragChanged(index: Int, band: Band, grabX: Double, grabY: Double) -> Drag? {
+    /// later calls from the same handle keep that start. Returns the drag to apply, or nil while a pinch holds it inert,
+    /// while another handle's drag is running, or for the `touch` a reset cut short.
+    public mutating func dragChanged(
+        index: Int, band: Band, grabX: Double, grabY: Double, touch: Touch? = nil
+    ) -> Drag? {
+        if let touch, touch == cutShort { return nil }
         if let drag, drag.index != index { return nil }
         guard !pinched else { return nil }
-        if drag == nil { drag = Drag(index: index, origin: band, grabX: grabX, grabY: grabY) }
+        if drag == nil {
+            drag = Drag(index: index, origin: band, grabX: grabX, grabY: grabY, touch: touch)
+            cutShort = nil
+        }
         return drag
     }
 
@@ -47,6 +72,7 @@ public struct BandGestureSession<Band: Sendable>: Sendable {
     /// other handle leaves the running drag alone.
     public mutating func dragStopped(index: Int) {
         if let drag, drag.index != index { return }
+        if drag == nil { cutShort = nil }
         drag = nil
         pinched = false
     }
@@ -74,8 +100,10 @@ public struct BandGestureSession<Band: Sendable>: Sendable {
         if drag == nil { pinched = false }
     }
 
-    /// The app left the foreground or the graph went away: nothing a gesture held survives.
+    /// The app left the foreground, the graph went away, or its bands changed: nothing a gesture held survives, and a
+    /// finger still down is ignored until it lifts.
     public mutating func reset() {
+        cutShort = drag?.touch
         drag = nil
         pinch = nil
         pinched = false

@@ -5,6 +5,8 @@
 //     git -C /some/scratch/dir/opra checkout 0b88ecd4e2bef7cf69fd5d50f1d06fb586c10865
 //     swift scripts/build-opra.swift /some/scratch/dir/opra [--exclude-author <name>]...
 //
+// The checkout must be at the pinned commit with no local changes (git status --porcelain --ignored is empty).
+//
 // AutoEq results are never bundled (spec 4.8; only the user's own import of a ParametricEQ.txt is allowed), so every
 // preset whose author contains "AutoEQ" (case-insensitive, e.g. "AutoEQ", "Rtings/AutoEQ") is dropped BY DEFAULT.
 // --exclude-author additionally drops every preset by that exact author (repeatable).
@@ -57,17 +59,26 @@ let checkout = URL(fileURLWithPath: args[0], isDirectory: true)
 let repoRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
 let outDir = repoRoot.appendingPathComponent("App/Resources/OPRA", isDirectory: true)
 
-// The checkout must be the pinned commit, so the output is reproducible.
-let git = Process()
-git.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-git.arguments = ["-C", checkout.path, "rev-parse", "HEAD"]
-let pipe = Pipe()
-git.standardOutput = pipe
-try git.run()
-let head = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-    .trimmingCharacters(in: .whitespacesAndNewlines)
-git.waitUntilExit()
+/// Runs git in the checkout and returns its output, trimmed; fails the build if git does.
+func git(_ arguments: String...) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["-C", checkout.path] + arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    try process.run()
+    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else { fail("git \(arguments.joined(separator: " ")) failed") }
+    return output.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+// The checkout must be the pinned commit, and exactly it: a locally edited or added file (say, an edited
+// dist/database_v1.jsonl) would pass the commit check but not give the pinned data. Ignored files count too.
+let head = try git("rev-parse", "HEAD")
 guard head == pinnedCommit else { fail("checkout is at \(head), expected \(pinnedCommit)") }
+let changes = try git("status", "--porcelain", "--ignored")
+guard changes.isEmpty else { fail("checkout has local changes; use a clean clone of \(pinnedCommit):\n\(changes)") }
 
 let dump = checkout.appendingPathComponent("dist/database_v1.jsonl")
 guard let data = FileManager.default.contents(atPath: dump.path) else { fail("cannot read \(dump.path)") }

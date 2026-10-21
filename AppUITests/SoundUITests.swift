@@ -36,14 +36,17 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
 
+        // The EQ is the first block, under the meter: on screen, or just below it.
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         Self.flip(eq)
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
         waitForExpectations(timeout: 2)
 
         let presets = app.buttons["eqPresetMenu"]
-        XCTAssertTrue(presets.waitForExistence(timeout: 2))
+        Self.reveal(presets, in: app)
+        XCTAssertTrue(presets.exists)
         presets.tap()
         let bassBoost = app.buttons["Bass Boost"]
         XCTAssertTrue(bassBoost.waitForExistence(timeout: 2))
@@ -60,12 +63,16 @@ final class SoundUITests: XCTestCase {
         let open = app.buttons["openSoundButton"]
         XCTAssertTrue(open.waitForExistence(timeout: 3))
         open.tap()
-        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        // The tab keeps its place: back up to Pure if the EQ scrolled it away.
+        XCTAssertTrue(app.navigationBars["Sound"].waitForExistence(timeout: 3))
+        Self.reveal(pure, in: app, up: true)
+        XCTAssertTrue(pure.exists)
         XCTAssertEqual(pure.value as? String, "0")
         pure.tap()
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: pure)
         waitForExpectations(timeout: 2)
         // Pure bypasses the EQ without switching it off, so turning Pure off again brings it back.
+        Self.reveal(eq, in: app)
         XCTAssertEqual(eq.value as? String, "1")
 
         app.tabBars.buttons["Player"].tap()
@@ -95,14 +102,15 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pure.waitForExistence(timeout: 5))
         pure.tap()
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         Self.flip(eq)
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
         waitForExpectations(timeout: 2)
 
         // Graphic: a scroll that starts on the bank, below the caps, scrolls the list and moves no fader.
         let fader = app.descendants(matching: .any)["graphicBand-0"]
-        if !fader.waitForExistence(timeout: 2) { Self.scroll(app) }
+        Self.reveal(fader, in: app)
         XCTAssertTrue(fader.waitForExistence(timeout: 2))
         Self.scrollClear(fader, in: app)
         XCTAssertEqual(fader.value as? String, "0 decibels")
@@ -120,7 +128,10 @@ final class SoundUITests: XCTestCase {
         from.press(forDuration: 0.1, thenDragTo: to)
         expectation(for: NSPredicate(format: "value BEGINSWITH 'plus'"), evaluatedWith: fader)
         waitForExpectations(timeout: 2)
-        XCTAssertTrue(app.buttons["eqPresetMenu"].label.contains("Custom"))
+        // The preset menu sits above the graph, which the scrolls above may have taken off screen.
+        let presets = app.buttons["eqPresetMenu"]
+        Self.reveal(presets, in: app, up: true)
+        XCTAssertTrue(presets.label.contains("Custom"), "the preset menu reads \"\(presets.label)\"")
 
         // Parametric: add a band, then drag its handle up and to the right.
         let parametric = app.descendants(matching: .any)["eqModePicker"].buttons["Parametric"]
@@ -179,13 +190,13 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pureAgain.waitForExistence(timeout: 5))
         XCTAssertEqual(pureAgain.value as? String, "0")
         let handleAgain = again.descendants(matching: .any)["eqHandle-0"]
-        if !handleAgain.waitForExistence(timeout: 2) { Self.scroll(again) }
+        Self.reveal(handleAgain, in: again)
         XCTAssertTrue(handleAgain.waitForExistence(timeout: 2))
         XCTAssertEqual(handleAgain.value as? String, moved)
 
         // Swiping the band's row deletes it, handle and all.
         let row = again.descendants(matching: .any)["bandRow-0"]
-        if !row.waitForExistence(timeout: 2) { Self.scroll(again) }
+        Self.reveal(row, in: again)
         XCTAssertTrue(row.waitForExistence(timeout: 2))
         Self.scrollClear(row, in: again)
         let middle = row.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
@@ -202,7 +213,7 @@ final class SoundUITests: XCTestCase {
         let third = relaunch()
         XCTAssertTrue(third.descendants(matching: .any)["pureSwitch"].waitForExistence(timeout: 5))
         let empty = third.buttons["copyGraphicButton"]
-        for _ in 0..<4 where !empty.waitForExistence(timeout: 1) { Self.scroll(third) }
+        Self.reveal(empty, in: third)
         XCTAssertTrue(empty.exists, "the deleted band came back: the flush on leaving the foreground was lost")
     }
 
@@ -210,8 +221,9 @@ final class SoundUITests: XCTestCase {
     /// off: `SoundSettings.decode` falls back to the defaults rather than half-reading it.
     @MainActor
     func testCorruptSoundFileLoadsAsPure() {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFCorruptSound", "-PFStage", "deck"]
+        // Not reset: this launch starts from the corrupt file `-PFCorruptSound` writes.
+        let app = XCUIApplication.pointFlac(
+            ["-PFPreloadFixtures", "-PFCorruptSound", "-PFStage", "deck"], freshSound: false)
         app.launch()
         addTeardownBlock { @MainActor in Self.resetSound() }
         app.tabBars.buttons["Sound"].tap()
@@ -219,8 +231,76 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(pure.waitForExistence(timeout: 5))
         XCTAssertEqual(pure.value as? String, "1")
         let eq = app.descendants(matching: .any)["eqToggle"]
-        XCTAssertTrue(eq.waitForExistence(timeout: 2))
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
         XCTAssertEqual(eq.value as? String, "0")
+    }
+
+    /// Headphone correction from OPRA: the picker finds the HD 600 by searching, picking it switches correction on
+    /// with the author's credit in the row ("EQ by oratory1990", OPRA's terms), and the strip says Processing.
+    @MainActor
+    func testCorrectionPickerAppliesAPreset() {
+        let app = launch()
+        addTeardownBlock { @MainActor in Self.resetSound() }
+        let strip = app.descendants(matching: .any)["signalStrip"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 8))
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(Self.saysProcessing(app), "Pure by default, the strip reads \"\(strip.label)\"")
+
+        app.tabBars.buttons["Sound"].tap()
+        let pure = app.descendants(matching: .any)["pureSwitch"]
+        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        pure.tap()
+        expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
+        waitForExpectations(timeout: 2)
+
+        // A tap on a capsule still switches its block.
+        let tone = app.descendants(matching: .any)["block-Tone"]
+        XCTAssertTrue(tone.waitForExistence(timeout: 2))
+        XCTAssertEqual(tone.value as? String, "Off")
+        tone.tap()
+        expectation(for: NSPredicate(format: "value == 'On'"), evaluatedWith: tone)
+        waitForExpectations(timeout: 2)
+        tone.tap()
+        expectation(for: NSPredicate(format: "value == 'Off'"), evaluatedWith: tone)
+        waitForExpectations(timeout: 2)
+
+        // The correction block sits below the EQ and Tone: its capsule's menu scrolls there.
+        let capsule = app.descendants(matching: .any)["block-Headphone correction"]
+        XCTAssertTrue(capsule.waitForExistence(timeout: 2))
+        capsule.press(forDuration: 1.2)
+        let show = app.buttons["Show headphone correction settings"]
+        XCTAssertTrue(show.waitForExistence(timeout: 3))
+        show.tap()
+        let choose = app.buttons["chooseCorrectionButton"]
+        XCTAssertTrue(choose.waitForExistence(timeout: 3))
+        Self.scrollClear(choose, in: app)
+        XCTAssertTrue(choose.isHittable)
+        choose.tap()
+
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["opraHeader"].exists, "the picker shows OPRA's logo and link")
+        search.tap()
+        search.typeText("HD 600")
+        let hd600 = app.buttons["opraPreset-sennheiser:hd_600::oratory1990_harman_target"]
+        XCTAssertTrue(hd600.waitForExistence(timeout: 5))
+        XCTAssertTrue(hd600.label.contains("EQ by oratory1990"), "the row reads \"\(hd600.label)\"")
+        hd600.tap()
+
+        // The sheet closes onto the correction row, switched on, crediting the author.
+        let preset = app.descendants(matching: .any)["correctionPreset"]
+        XCTAssertTrue(preset.waitForExistence(timeout: 5))
+        XCTAssertTrue(preset.label.contains("Sennheiser HD 600"), "the row reads \"\(preset.label)\"")
+        XCTAssertTrue(preset.label.contains("EQ by oratory1990"), "the row reads \"\(preset.label)\"")
+        let toggle = app.descendants(matching: .any)["correctionToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 2))
+        XCTAssertEqual(toggle.value as? String, "1")
+
+        app.tabBars.buttons["Player"].tap()
+        expectation(for: NSPredicate { _, _ in Self.saysProcessing(app) }, evaluatedWith: nil)
+        waitForExpectations(timeout: 5)
     }
 
     // MARK: Helpers
@@ -231,6 +311,17 @@ final class SoundUITests: XCTestCase {
     private static func scroll(_ app: XCUIApplication, by distance: CGFloat = -180) {
         let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: distance < 0 ? 0.7 : 0.3))
         from.press(forDuration: 0.05, thenDragTo: from.withOffset(CGVector(dx: 0, dy: distance)))
+    }
+
+    /// Scrolls the list down (`up`: up) until `element` is on screen, then clear of the floating tab bar. The list is
+    /// lazy, so a row far away does not exist until it is near.
+    @MainActor
+    private static func reveal(_ element: XCUIElement, in app: XCUIApplication, up: Bool = false) {
+        for _ in 0..<14 {
+            if element.exists, element.isHittable { break }
+            scroll(app, by: up ? 220 : -220)
+        }
+        scrollClear(element, in: app)
     }
 
     /// Scrolls until `element` sits above the floating tab bar.
@@ -247,8 +338,7 @@ final class SoundUITests: XCTestCase {
     /// The app again, keeping the saved Sound settings, on the Sound tab.
     @MainActor
     private func relaunch(_ extra: [String] = []) -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"] + extra
+        let app = XCUIApplication.pointFlac(["-PFPreloadFixtures", "-PFStage", "deck"] + extra, freshSound: false)
         app.launch()
         app.tabBars.buttons["Sound"].tap()
         return app
@@ -277,8 +367,7 @@ final class SoundUITests: XCTestCase {
     /// Puts the Pure defaults back for the tests that follow.
     @MainActor
     private static func resetSound() {
-        let reset = XCUIApplication()
-        reset.launchArguments = ["-PFResetSound", "-PFMuteOutput"]
+        let reset = XCUIApplication.pointFlac()
         reset.launch()
         reset.terminate()
     }
@@ -305,11 +394,9 @@ final class SoundUITests: XCTestCase {
     /// Plays Copper Garden, the 48 kHz demo album, so a 48 kHz Mac output can show Pure.
     @MainActor
     private func launch() -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-PFPreloadFixtures", "-PFMuteOutput", "-PFDemoPlay", "-PFDemoAlbum", "Copper Garden", "-PFResetSound",
-            "-PFStage", "deck",
-        ]
+        let app = XCUIApplication.pointFlac([
+            "-PFPreloadFixtures", "-PFDemoPlay", "-PFDemoAlbum", "Copper Garden", "-PFStage", "deck",
+        ])
         app.launch()
         return app
     }
