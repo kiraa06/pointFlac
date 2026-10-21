@@ -47,6 +47,10 @@ import Synchronization
 /// 32-bit word's low bits never take a Float32 round trip. In Pure the runner leaves every word alone: the output is
 /// bit-identical to the path without it. The chain's latency (its look-ahead) delays the audio, so the last few
 /// milliseconds before a format change, or a stop, stay in it unheard; `renderedFrames` still counts ring frames.
+/// `lastBlockIsSilent` tells the output when a block with no real frames is silent all the same: with the chain at
+/// work it may carry the chain's tail, so it is not. Known limitation: the runner takes Float32, so with a chain on,
+/// an Int32 client's samples take a Float32 hop either side of the Float64 chain (over 140 dB down), and a scrub
+/// voice on an Int32 client is converted to words before the chain and back.
 ///
 /// ## Scrubbing
 /// While a finger is on the record (`ScrubTap`), `render` plays the tap's `ScrubVoice` instead of the ring: the ring is
@@ -83,6 +87,10 @@ public final class RenderSource: @unchecked Sendable {
     /// The pipeline's Sound chain runner, one for all its sources, unretained for `render`; `sound` keeps it alive.
     private let sound: ChainRunner?
     private let unretainedSound: Unmanaged<ChainRunner>?
+    /// Render thread only: whether the latest block is silence through and through, no real frames and no chain at
+    /// work that could ring out into them. The output reads it right after `render`, on the same thread. Unchecked: a
+    /// debug build's exclusivity check would allocate on the render thread's first call.
+    @exclusivity(unchecked) private(set) var lastBlockIsSilent = true
     /// The client rate and sample format, which the scrub voice needs and the ring does not.
     private let clientRate: Int
     private let floatClient: Bool
@@ -146,21 +154,32 @@ public final class RenderSource: @unchecked Sendable {
     /// ring cannot supply is zero-filled (silence in both client formats), then the whole block runs through the Sound
     /// chain, whose look-ahead and filters may ring out into that silence. Returns the frames of real audio, which are
     /// always a prefix of the buffer.
+    ///
+    /// No closure here captures a class reference, so a debug build does no reference counting either: the runner is
+    /// reached through `Unmanaged`, by free functions given only pointers and integers.
     public func render(into buffer: UnsafeMutableRawPointer, frames: Int) -> Int {
         guard frames > 0 else { return 0 }
         let words = buffer.bindMemory(to: UInt32.self, capacity: frames * channels)
         let real = produce(into: words, frames: frames)
+        var silent = real == 0
         if let unretainedSound {
-            unretainedSound._withUnsafeGuaranteedRef { applySound($0, to: words, frames: frames) }
+            // Read before the chain runs: an idle runner leaves the block as it is.
+            if !soundIsIdle(unretainedSound) { silent = false }
+            runSound(
+                unretainedSound, on: buffer, frames: frames, channels: channels, floatClient: floatClient,
+                scratch: scratch, scratchFrames: Self.scratchFrames)
         }
+        lastBlockIsSilent = silent
         return real
     }
 
     /// The block before the Sound chain: the ring's words, the scrub voice's, or silence. Returns the real frames.
     private func produce(into words: UnsafeMutablePointer<UInt32>, frames: Int) -> Int {
         let count = frames * channels
-        if let unretainedScrub,
-            let scrubbed = unretainedScrub._withUnsafeGuaranteedRef({ renderScrub($0, into: words, frames: frames) })
+        // The window is looked at first, without a closure that holds this source: only a scrub pays the debug
+        // build's reference counting of `renderScrubbed` (a follow-up), not every call.
+        if let unretainedScrub, scrubWindowIsOpen(unretainedScrub),
+            let scrubbed = renderScrubbed(unretainedScrub, into: words, frames: frames)
         {
             return scrubbed
         }
@@ -194,34 +213,15 @@ public final class RenderSource: @unchecked Sendable {
 
     // MARK: The Sound chain (render thread)
 
-    /// Runs the block through the chain, in place, after the ring or the scrub voice and before iOS (see "The Sound
-    /// chain"). In Pure the runner returns without touching a word.
-    @inline(__always)
-    private func applySound(_ runner: ChainRunner, to words: UnsafeMutablePointer<UInt32>, frames: Int) {
-        let count = frames * channels
-        if floatClient {
-            // The words are Float32 bit patterns: the samples themselves.
-            words.withMemoryRebound(to: Float.self, capacity: count) {
-                runner.process($0, frames: frames, channels: channels)
-            }
-            return
-        }
-        guard !runner.isIdle else { return }
-        var done = 0
-        while done < frames {
-            let n = min(Self.scratchFrames, frames - done)
-            let block = words + done * channels
-            for i in 0..<(n * channels) { scratch[i] = sample(block[i]) }
-            runner.process(scratch, frames: n, channels: channels)
-            // A sample the runner left alone keeps its word: a 32-bit word does not survive a Float32 round trip.
-            for i in 0..<(n * channels) where scratch[i].bitPattern != sample(block[i]).bitPattern {
-                block[i] = word(scratch[i])
-            }
-            done += n
-        }
-    }
-
     // MARK: Scrubbing (render thread)
+
+    /// `renderScrub` with the tap. Its closure holds this source, which a debug build retains: that is why `produce`
+    /// first checks the window without one.
+    private func renderScrubbed(
+        _ tap: Unmanaged<ScrubTap>, into words: UnsafeMutablePointer<UInt32>, frames: Int
+    ) -> Int? {
+        tap._withUnsafeGuaranteedRef { renderScrub($0, into: words, frames: frames) }
+    }
 
     /// Plays the scrub voice for this call, or returns nil when no finger is on the record and the ring plays.
     private func renderScrub(_ tap: ScrubTap, into words: UnsafeMutablePointer<UInt32>, frames: Int) -> Int? {
@@ -436,16 +436,13 @@ public final class RenderSource: @unchecked Sendable {
     /// A Float32 sample as a client word.
     @inline(__always)
     private func word(_ x: Float) -> UInt32 {
-        guard x.isFinite else { return 0 }
-        if floatClient { return x.bitPattern }
-        let clipped = min(max(Double(x), -1), 1 - 1 / 2_147_483_648)
-        return UInt32(bitPattern: Int32((clipped * 2_147_483_648).rounded()))
+        floatClient ? (x.isFinite ? x.bitPattern : 0) : int32Word(x)
     }
 
     /// A client word as a Float32 sample.
     @inline(__always)
     private func sample(_ w: UInt32) -> Float {
-        floatClient ? Float(bitPattern: w) : Float(Double(Int32(bitPattern: w)) / 2_147_483_648)
+        floatClient ? Float(bitPattern: w) : int32Sample(w)
     }
 
     // MARK: Producer side (the decode thread)
@@ -505,4 +502,72 @@ public final class RenderSource: @unchecked Sendable {
     func releaseSeekHolds(through ticket: UInt64) {
         seeksServed.store(ticket, ordering: .releasing)
     }
+}
+
+// MARK: - The Sound chain, render thread
+
+// Free functions, not methods: a static method needs the class's metadata, and a closure holding a class reference
+// retains it in a debug build. These take the runner unretained, and their closures capture only pointers and integers.
+
+/// Whether the runner would leave a block untouched now (Pure, nothing in flight).
+@inline(__always)
+private func soundIsIdle(_ runner: Unmanaged<ChainRunner>) -> Bool {
+    runner._withUnsafeGuaranteedRef { $0.isIdle }
+}
+
+/// Whether a scrub window is in place. It loads the pointer only, never what it points to, so it needs no
+/// `ScrubTap.rendering` announcement: `renderScrub` announces itself before it loads the window again.
+@inline(__always)
+private func scrubWindowIsOpen(_ tap: Unmanaged<ScrubTap>) -> Bool {
+    tap._withUnsafeGuaranteedRef { $0.window.load(ordering: .sequentiallyConsistent) != nil }
+}
+
+/// Runs the block in `buffer` through the chain, in place, after the ring or the scrub voice and before iOS (see "The
+/// Sound chain"). In Pure the runner returns without touching a word.
+private func runSound(
+    _ runner: Unmanaged<ChainRunner>, on buffer: UnsafeMutableRawPointer, frames: Int, channels: Int,
+    floatClient: Bool, scratch: UnsafeMutablePointer<Float>, scratchFrames: Int
+) {
+    let count = frames * channels
+    if floatClient {
+        // The words are Float32 bit patterns: the samples themselves.
+        let samples = buffer.bindMemory(to: Float.self, capacity: count)
+        runner._withUnsafeGuaranteedRef { $0.process(samples, frames: frames, channels: channels) }
+        return
+    }
+    guard !soundIsIdle(runner) else { return }
+    let words = buffer.bindMemory(to: UInt32.self, capacity: count)
+    var done = 0
+    while done < frames {
+        let n = frames - done < scratchFrames ? frames - done : scratchFrames
+        let block = words + done * channels
+        let samples = n * channels
+        var i = 0
+        while i < samples {
+            scratch[i] = int32Sample(block[i])
+            i += 1
+        }
+        runner._withUnsafeGuaranteedRef { $0.process(scratch, frames: n, channels: channels) }
+        // A sample the runner left alone keeps its word: a 32-bit word does not survive a Float32 round trip.
+        i = 0
+        while i < samples {
+            if scratch[i].bitPattern != int32Sample(block[i]).bitPattern { block[i] = int32Word(scratch[i]) }
+            i += 1
+        }
+        done += n
+    }
+}
+
+/// A Float32 sample as an Int32 client's word, clipped to full scale.
+@inline(__always)
+private func int32Word(_ x: Float) -> UInt32 {
+    guard x.isFinite else { return 0 }
+    let clipped = min(max(Double(x), -1), 1 - 1 / 2_147_483_648)
+    return UInt32(bitPattern: Int32((clipped * 2_147_483_648).rounded()))
+}
+
+/// An Int32 client's word as a Float32 sample.
+@inline(__always)
+private func int32Sample(_ w: UInt32) -> Float {
+    Float(Double(Int32(bitPattern: w)) / 2_147_483_648)
 }

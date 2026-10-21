@@ -21,11 +21,14 @@ private struct Tone: Sendable {
     var rate: Int
     var partials: [Partial]
     var frames: Int64
+    /// Where in the endless tone this item starts, so two items can join into one.
+    var offset: Int64 = 0
 
     var format: AudioFormat { AudioFormat(sampleRate: rate, bitsPerSample: 24, channels: 2) }
 
     func value(_ frame: Int64) -> Int32 {
         var x = 0.0
+        let frame = frame + offset
         for p in partials { x += p.amplitude * sin(2 * .pi * p.hz * Double(frame) / Double(rate)) }
         return Int32(min(max((x * 8_388_608).rounded(), -8_388_608), 8_388_607))
     }
@@ -47,6 +50,10 @@ private let tones: [String: Tone] = [
     "rate-96k": Tone(rate: 96_000, partials: [.init(hz: 10_000, amplitude: 0.125)], frames: 48_000),
     // A loud first track, whose tail must not reach the next.
     "loud-44k": Tone(rate: 44_100, partials: [.init(hz: 1_000, amplitude: 0.5)], frames: 11_025),
+    // Two halves of one tone, which join gaplessly, and the whole.
+    "join-a": Tone(rate: 48_000, partials: [.init(hz: 1_000, amplitude: 0.25)], frames: 30_000),
+    "join-b": Tone(rate: 48_000, partials: [.init(hz: 1_000, amplitude: 0.25)], frames: 30_000, offset: 30_000),
+    "join-whole": Tone(rate: 48_000, partials: [.init(hz: 1_000, amplitude: 0.25)], frames: 60_000),
     // The stress run's items, two seconds each.
     "stress-44k": Tone(rate: 44_100, partials: [.init(hz: 440, amplitude: 0.25)], frames: 88_200),
     "stress-96k": Tone(rate: 96_000, partials: [.init(hz: 440, amplitude: 0.25)], frames: 192_000),
@@ -525,6 +532,100 @@ private final class Flag: Sendable {
         let latency = SoundChain(settings, sampleRate: 96_000, channels: 2).latencyFrames
         #expect(second.prefix(2 * latency).allSatisfy { $0 == 0 })
         #expect(second[2 * latency..<(2 * latency + 64)].contains { $0 != 0 })
+    }
+
+    /// Review M-3: a gapless join with the chain on keeps the chain running (no fresh start at the boundary): two
+    /// halves of a tone render exactly as the whole does.
+    @Test func gaplessJoinKeepsTheChainRunning() async {
+        let settings = peak(1_000, 6)
+        let joined = SoundRig()
+        let halves = await joined.render([toneItem("join-a"), toneItem("join-b")], with: settings)
+        #expect(joined.output.plans.count == 1, "one plan: a gapless join")
+        let single = SoundRig()
+        let whole = await single.render([toneItem("join-whole")], with: settings)
+        #expect(halves.count == whole.count)
+        let first = firstDifference(halves, whole) { $0.bitPattern == $1.bitPattern }
+        #expect(first == nil, "first difference at sample \(first ?? -1)")
+        #expect(joined.underruns == 0)
+    }
+
+    /// Review M-3: Pure through the scrub path (the voice under the hand, the motor, and the cross-fade back to the
+    /// ring), on Float32 and Int32 clients: a source given the pipeline's runner in Pure hands out exactly what one
+    /// with no runner does. Driven by hand on one thread, so both runs are the same run.
+    @Test(arguments: [true, false])
+    func pureStaysBitExactThroughAScrub(floatClient: Bool) {
+        let rate = 44_100
+        func value(_ frame: Int64) -> Float { Float(0.25 * sin(2 * .pi * 1_000 * Double(frame) / Double(rate))) }
+        /// The ring's word for `frame`. An Int32 client's carries noise in its low bits, as a 32-bit source's does, so
+        /// a Float32 round trip anywhere would show.
+        func word(_ frame: Int64) -> UInt32 {
+            let x = value(frame)
+            guard !floatClient else { return x.bitPattern }
+            let noise = Int32(truncatingIfNeeded: (frame &* 2_654_435_761) & 0xFF)
+            return UInt32(bitPattern: Int32((Double(x) * 2_147_483_648).rounded()) &+ noise)
+        }
+        func run(sound: ChainRunner?) -> (words: [UInt32], scrubbed: Bool) {
+            let format = AudioFormat(sampleRate: rate, bitsPerSample: 16, channels: 2)
+            let tap = ScrubTap()
+            let window = ScrubWindow(format: format, totalFrames: 441_000, at: 0)
+            let filled: Int64 = 200_000
+            for frame in 0..<filled {
+                let slot = window.storage + Int(frame & Int64(window.mask)) * 2
+                slot[0] = value(frame)
+                slot[1] = value(frame)
+            }
+            window.validStart.store(0, ordering: .releasing)
+            window.validEnd.store(filled, ordering: .releasing)
+            let source = RenderSource(
+                channels: 2, capacityFrames: 1 << 15, renderedFrames: 0, inheritingHoldsFrom: nil, clientRate: rate,
+                floatClient: floatClient, scrub: tap, sound: sound)
+            func feed(from frame: Int64, count: Int) {
+                let words = (0..<(count * 2)).map { word(frame + Int64($0 / 2)) }
+                _ = words.withUnsafeBufferPointer { source.write($0) }
+            }
+            let buffer = UnsafeMutableRawPointer.allocate(byteCount: 512 * 2 * 4, alignment: 16)
+            defer { buffer.deallocate() }
+            var out: [UInt32] = []
+            func pull() {
+                _ = source.render(into: buffer, frames: 512)
+                out += UnsafeBufferPointer(start: buffer.bindMemory(to: UInt32.self, capacity: 1_024), count: 1_024)
+            }
+            feed(from: 0, count: 16_384)
+            for _ in 0..<4 { pull() }
+            // The hand lands on a playing record and turns it at normal speed.
+            tap.begin(window: window, anchorFrame: 2_048, anchorRendered: 2_048, startSpeed: 1, ringAllowed: true)
+            let generation = tap.generation.load(ordering: .acquiring)
+            for i in 0..<40 {
+                tap.setHand(offsetFrames: Double(i + 1) * 512, speed: 1)
+                pull()
+            }
+            // Let go: the motor, then the ring lined up 0.15 s ahead of the needle, as the player's seek does.
+            tap.motorSecondsBits.store(0.05.bitPattern, ordering: .relaxed)
+            tap.phase.store(ScrubTap.Phase.motor.rawValue, ordering: .releasing)
+            for _ in 0..<20 { pull() }
+            _ = source.requestFlush()
+            pull()
+            let target = Int64(tap.voicePosition.rounded(.down)) + 6_615
+            feed(from: target, count: 16_384)
+            tap.handoverFrame.store(target, ordering: .releasing)
+            var calls = 0
+            while tap.handedOver.load(ordering: .acquiring) != generation, calls < 200 {
+                pull()
+                calls += 1
+            }
+            for _ in 0..<8 { pull() }
+            let scrubbed =
+                tap.voiceStarted.load(ordering: .acquiring) == generation
+                && tap.handedOver.load(ordering: .acquiring) == generation
+            tap.retireWindow()
+            return (out, scrubbed)
+        }
+        let with = run(sound: ChainRunner())
+        let without = run(sound: nil)
+        #expect(with.scrubbed && without.scrubbed, "the voice played and handed back to the ring")
+        #expect(with.words.count == without.words.count)
+        let first = firstDifference(with.words, without.words) { $0 == $1 }
+        #expect(first == nil, "first difference at word \(first ?? -1)")
     }
 
     /// The meters read the chain: its peak since the last read, and nothing in Pure or with nothing playing.

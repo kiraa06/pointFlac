@@ -11,7 +11,9 @@ import PFDSP
 /// drain both wait on render callbacks. So `pause()` remembers where playback was, `(index, frame)` from the
 /// pipeline's rendered position, and stops the pipeline. `resume()` starts a new one there. That re-opens the file and
 /// re-negotiates the rate, ~20–100 ms, and so also keeps the client rate equal to the hardware rate after a route
-/// change made while paused. A seek while paused only moves the remembered frame.
+/// change made while paused. A seek while paused only moves the remembered frame. With a Sound chain on, the
+/// remembered frame is the ring's, and the listener has heard up to one chain latency less (1.8–3.3 ms): that much is
+/// skipped at the resume, whose fresh chain opens on as much silence. The position shown runs that far ahead too.
 ///
 /// ## One pipeline per start, and stale events
 /// Every start builds a fresh pipeline: play, resume, a track change, a restart after a route change, a restart after

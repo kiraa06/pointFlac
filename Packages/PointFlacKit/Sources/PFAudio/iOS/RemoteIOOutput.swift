@@ -333,7 +333,9 @@
                     return
                 }
             #endif
-            if realBytes == 0 {
+            // No real frames is not always silence: with the Sound chain at work, its look-ahead and filters ring out
+            // into the gap, so only a block the source calls silent is flagged.
+            if realBytes == 0, current._withUnsafeGuaranteedRef({ $0.lastBlockIsSilent }) {
                 flags.pointee.insert(.unitRenderAction_OutputIsSilence)
             }
         }

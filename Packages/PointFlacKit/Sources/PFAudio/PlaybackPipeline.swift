@@ -51,7 +51,9 @@ public enum PipelineEvent: Sendable, Equatable {
 /// - A decoder error emits `.itemFailed` and playback moves to the next item.
 /// - The Sound chain (`setSound`) runs on the render thread over everything the output is handed, after the ring or
 ///   the scrub voice. It is compiled for the plan's client rate and channel count, afresh at every configure, before
-///   the output starts. Pure (the default) leaves the output bit-identical.
+///   the output starts, and from rest: what its look-ahead still held (1.8–3.3 ms, the chain's latency) of the track
+///   before is dropped, and the new track opens on that much silence. A gapless join keeps the chain running. Pure
+///   (the default) leaves the output bit-identical and has no latency.
 ///
 /// Dropping the pipeline stops playback.
 public final class PlaybackPipeline: @unchecked Sendable {
@@ -176,7 +178,7 @@ public final class PlaybackPipeline: @unchecked Sendable {
 /// State shared by the facade, the live decode session and readers of `position`.
 ///
 /// Split from `PlaybackPipeline` so that a decode thread never keeps the facade alive: dropping the pipeline stops
-/// playback. Lock order: `outputGate`, then `soundFormat`, then `shared`. The render thread takes none of them.
+/// playback. Lock order: `outputGate`, then `sound`, then `shared`. The render thread takes none of them.
 final class PipelineCore: @unchecked Sendable {
     struct Shared {
         /// The live session. Any other session's thread is on its way out and may not touch shared state.
@@ -198,6 +200,15 @@ final class PipelineCore: @unchecked Sendable {
         var channels: Int
     }
 
+    /// What `setSound` and `configureSound` serialise on.
+    struct SoundState: Sendable {
+        /// Nil until a session first configures the output.
+        var format: SoundFormat?
+        /// Bumped by every `setSound` and every configure: a chain compiled outside the lock is installed only if
+        /// nothing newer came meanwhile.
+        var stamp: UInt64 = 0
+    }
+
     let capabilities: OutputCapabilities
     let negotiateRate: @Sendable (Int) async -> Int
     let makeDecoder: @Sendable (PlaybackItem) throws -> PCMDecoding
@@ -206,9 +217,9 @@ final class PipelineCore: @unchecked Sendable {
     let scrubTap = ScrubTap()
     /// The one Sound chain runner, handed to every render source this pipeline makes; it outlives them all.
     let soundRunner = ChainRunner()
-    /// The format the chain is compiled for, nil until a session first configures the output. Its lock also
-    /// serialises every compile and install, so the latest settings at the latest format always win.
-    private let soundFormat = Mutex<SoundFormat?>(nil)
+    /// The format the chain is compiled for, and the stamp that keeps the latest settings at the latest format the
+    /// ones installed (see `setSound`).
+    private let sound = Mutex(SoundState())
     /// Decode threads that have not returned yet, including stopped sessions still unwinding. For tests.
     let liveDecodeThreads = Atomic<Int>(0)
     private let continuation: AsyncStream<PipelineEvent>.Continuation
@@ -299,12 +310,23 @@ final class PipelineCore: @unchecked Sendable {
 
     /// Stores `settings` (clamped) and, once there is a format, compiles them for it and installs the chain, which the
     /// runner cross-fades in at the render thread's next call. Any thread but the render thread.
+    ///
+    /// The compile runs outside the lock, so a configure on the decode thread never waits behind it (review M-6). The
+    /// chain is installed only if nothing newer came meanwhile: a later `setSound` installs its own, and a configure
+    /// compiled the stored settings (these, or later ones) for its new format itself.
     func setSound(_ settings: SoundSettings) {
         let settings = settings.clamped()
-        soundFormat.withLock { format in
+        let stamped = sound.withLock { state -> (format: SoundFormat, stamp: UInt64)? in
+            state.stamp &+= 1
             shared.withLock { $0.soundSettings = settings }
-            guard let format else { return }
-            soundRunner.install(Self.chain(settings, for: format))
+            guard let format = state.format else { return nil }
+            return (format, state.stamp)
+        }
+        guard let stamped else { return }
+        let chain = Self.chain(settings, for: stamped.format)
+        sound.withLock { state in
+            guard state.stamp == stamped.stamp else { return }
+            soundRunner.install(chain)
         }
     }
 
@@ -312,9 +334,10 @@ final class PipelineCore: @unchecked Sendable {
     /// client rate and channel count and cuts over to them at once (`ChainRunner.reset(to:)`), so nothing of the
     /// previous track's tail, held in the old chain, plays through into the new one (Review Focus 1).
     func configureSound(sampleRate: Int, channels: Int) {
-        soundFormat.withLock { format in
+        sound.withLock { state in
             let fresh = SoundFormat(sampleRate: sampleRate, channels: channels)
-            format = fresh
+            state.format = fresh
+            state.stamp &+= 1
             let settings = shared.withLock { $0.soundSettings }
             soundRunner.reset(to: Self.chain(settings, for: fresh))
         }

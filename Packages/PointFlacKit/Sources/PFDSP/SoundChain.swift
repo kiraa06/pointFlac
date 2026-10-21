@@ -498,6 +498,7 @@ public final class ChainRunner: @unchecked Sendable {
     /// Serialised with `install`. The chains it lets go are freed on the runner's queue, like every retired chain
     /// (`waitForFrees()` waits for them); no render call can be inside, so the handshake passes at once.
     public func reset(to chain: SoundChain?) {
+        assert(!rendering.load(ordering: .sequentiallyConsistent), "reset(to:) while a render call is in flight")
         let chain = chain.map(Self.claim)
         let retired = control.withLock { control -> Retired in
             // The ring's chains first (this takes them off `outstanding`), then whatever the render state still holds.
@@ -636,12 +637,14 @@ public final class ChainRunner: @unchecked Sendable {
 
     /// Whether `process` would return at once, leaving the block untouched: Pure, with no fade in flight, nothing
     /// waiting to be handed back and nothing in the mailbox (a relaxed load). Render thread only, as it reads the
-    /// render state. A caller that has to convert samples for `process` (an Int32 client) skips the conversion then.
+    /// render state (so `package`, not public). A caller that has to convert samples for `process` (an Int32 client)
+    /// skips the conversion then. One guard of loads in turn, not `&&`: `&&`'s right-hand side is an autoclosure,
+    /// which a debug build makes capture, and so retain, the runner.
     @inline(__always)
-    public var isIdle: Bool {
+    package var isIdle: Bool {
         let state = state
-        return state.pointee.current == nil && !state.pointee.fading && state.pointee.unreturned == nil
-            && mailbox.load(ordering: .relaxed) == nil
+        guard state.pointee.current == nil, !state.pointee.fading, state.pointee.unreturned == nil else { return false }
+        return mailbox.load(ordering: .relaxed) == nil
     }
 
     /// Runs `frames` interleaved Float32 frames of `channels` channels through the installed chain, in place. Render
