@@ -165,8 +165,8 @@ private func fmt(_ x: Double) -> String { String(format: "%.6f", x) }
 func passbandRippleWithinTenthOfADecibel(rate: Int) async throws {
     let m = try await Sweeps.shared.get(rate)
     let worst = m.passband.max { abs($0.gainDB) < abs($1.gainDB) }!
-    print("PASSBAND \(rate)->48k worst \(worst.gainDB) dB @ \(Int(worst.freq)) Hz")
-    for p in m.passband { print("  \(rate) \(Int(p.freq)) Hz \(fmt(p.gainDB)) dB") }
+    report("PASSBAND \(rate)->48k worst \(worst.gainDB) dB @ \(Int(worst.freq)) Hz")
+    for p in m.passband { report("  \(rate) \(Int(p.freq)) Hz \(fmt(p.gainDB)) dB") }
     #expect(abs(worst.gainDB) < 0.1, "\(rate): \(worst.gainDB) dB at \(worst.freq) Hz")
 }
 
@@ -175,8 +175,8 @@ func stopbandBelowMinus100dB(rate: Int) async throws {
     let m = try await Sweeps.shared.get(rate)
     guard !m.stopband.isEmpty else { return }  // no source content above 24.5 kHz
     let worst = m.stopband.max { $0.levelDB < $1.levelDB }!
-    print("STOPBAND \(rate)->48k worst \(fmt(worst.levelDB)) dB @ \(Int(worst.freq)) Hz")
-    for p in m.stopband { print("  \(rate) \(Int(p.freq)) Hz \(fmt(p.levelDB)) dB") }
+    report("STOPBAND \(rate)->48k worst \(fmt(worst.levelDB)) dB @ \(Int(worst.freq)) Hz")
+    for p in m.stopband { report("  \(rate) \(Int(p.freq)) Hz \(fmt(p.levelDB)) dB") }
     #expect(worst.levelDB < -100, "\(rate): \(worst.levelDB) dB from \(worst.freq) Hz")
 }
 
@@ -187,8 +187,8 @@ func delayIsConstantWithinOneSample(rate: Int) async throws {
     let median = band.sorted()[band.count / 2]
     let spread = band.map { abs($0 - median) }.max()!
     let range = band.max()! - band.min()!
-    print("DELAY \(rate)->48k median \(fmt(median)) samples, max dev \(fmt(spread)), range \(fmt(range))")
-    for d in m.delays { print("  \(rate) \(Int(d.freq)) Hz \(fmt(d.samples)) smp") }
+    report("DELAY \(rate)->48k median \(fmt(median)) samples, max dev \(fmt(spread)), range \(fmt(range))")
+    for d in m.delays { report("  \(rate) \(Int(d.freq)) Hz \(fmt(d.samples)) smp") }
     #expect(spread <= 1, "\(rate): delay deviates \(spread) samples from median \(median)")
 }
 
@@ -202,4 +202,10 @@ func delayIsConstantWithinOneSample(rate: Int) async throws {
     #expect(abs(20 * log10(amp / amplitude) - 20 * log10(0.9)) < 0.001)
     let w = 2 * Double.pi * f / Double(outRate)
     #expect(abs(-phase / w - delay) < 0.001 || abs(-phase / w + 2 * Double.pi / w - delay) < 0.001)
+}
+
+/// The measurements print only when `PF_SRC_REPORT` is set (for example `PF_SRC_REPORT=1 swift test --filter
+/// SampleRateConverterQualityTests`), so a normal test run stays quiet.
+private func report(_ line: @autoclosure () -> String) {
+    if ProcessInfo.processInfo.environment["PF_SRC_REPORT"] != nil { print(line()) }
 }
