@@ -117,13 +117,17 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(add.waitForExistence(timeout: 2))
         Self.scrollClear(add, in: app)
         add.tap()
+        // The graph sits above the band list: scroll back to it if the list has moved it off screen.
         let handle = app.descendants(matching: .any)["eqHandle-0"]
-        XCTAssertTrue(handle.waitForExistence(timeout: 2))
+        for _ in 0..<4 where !handle.waitForExistence(timeout: 1) { Self.scroll(app, by: 180) }
+        XCTAssertTrue(handle.exists)
         // Clear of the floating tab bar, which would take the press.
         Self.scrollClear(handle, in: app)
         XCTAssertEqual(handle.value as? String, "1 kilohertz, 0 decibels, Q 1.00")
         let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 40, dy: -40)))
+        // Well to the right, so the pinch below (at the graph's centre) starts clear of the handle: a finger that lands
+        // on a handle drags it.
+        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 110, dy: -40)))
         expectation(
             for: NSPredicate(format: "NOT (value BEGINSWITH '1 kilohertz') AND value CONTAINS 'plus'"),
             evaluatedWith: handle)
@@ -182,11 +186,12 @@ final class SoundUITests: XCTestCase {
 
     // MARK: Helpers
 
-    /// Scrolls the list up by a little, dragging in the margin beside the cards so no control is touched.
+    /// Scrolls the list by `distance` points (negative moves the content up), dragging in the margin beside the
+    /// cards so no control is touched.
     @MainActor
-    private static func scroll(_ app: XCUIApplication) {
-        let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.7))
-        from.press(forDuration: 0.05, thenDragTo: from.withOffset(CGVector(dx: 0, dy: -180)))
+    private static func scroll(_ app: XCUIApplication, by distance: CGFloat = -180) {
+        let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: distance < 0 ? 0.7 : 0.3))
+        from.press(forDuration: 0.05, thenDragTo: from.withOffset(CGVector(dx: 0, dy: distance)))
     }
 
     /// Scrolls until `element` sits above the floating tab bar.
