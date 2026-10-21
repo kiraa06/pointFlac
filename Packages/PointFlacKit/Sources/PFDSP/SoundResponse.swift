@@ -72,13 +72,25 @@ public enum SoundResponse {
         return min(0, -peak)
     }
 
-    private static func bands(_ s: SoundSettings) -> [EQBand] {
+    /// The bands ``filters(_:sampleRate:)`` designs, in the same order, each with the place it comes from. Takes
+    /// clamped settings. A recompiled ``SoundChain`` carries each filter's state over to the filter in the same place,
+    /// so dragging one band never restarts the others.
+    static func placedBands(_ s: SoundSettings) -> [(place: FilterPlace, band: EQBand)] {
         guard !s.pure else { return [] }
-        var all: [EQBand] = []
-        if s.correction.enabled { all += s.correction.bands }
-        if s.eq.enabled { all += s.eq.effectiveBands }
-        if s.tone.enabled { all += s.tone.effectiveBands }
-        return all.filter(\.enabled)
+        var all: [(place: FilterPlace, band: EQBand)] = []
+        func add(_ block: FilterPlace.Block, _ bands: [EQBand]) {
+            for (index, band) in bands.enumerated() where band.enabled {
+                all.append((FilterPlace(block: block, index: index, type: band.type), band))
+            }
+        }
+        if s.correction.enabled { add(.correction, s.correction.bands) }
+        if s.eq.enabled { add(s.eq.mode == .graphic ? .graphicEQ : .parametricEQ, s.eq.effectiveBands) }
+        if s.tone.enabled { add(.tone, s.tone.effectiveBands) }
+        return all
+    }
+
+    private static func bands(_ s: SoundSettings) -> [EQBand] {
+        placedBands(s).map(\.band)
     }
 
     /// The correction preset's own pre-gain, which is part of the curve while the correction is in the chain.
@@ -101,5 +113,31 @@ public enum SoundResponse {
         return (0..<points).map { i in
             i == points - 1 ? hi : lo * pow(ratio, Double(i) / Double(points - 1))
         }
+    }
+}
+
+/// Where a filter sits in the Sound chain: its block, its index in that block's band list (disabled bands counted, so
+/// switching one off moves no other), and its shape.
+struct FilterPlace: Equatable, Sendable {
+    enum Block: UInt64 {
+        case correction, graphicEQ, parametricEQ, tone
+    }
+
+    var block: Block
+    var index: Int
+    var type: FilterType
+
+    /// The place as one word, which the render thread compares without touching an array.
+    var key: UInt64 {
+        let shape: UInt64 =
+            switch type {
+            case .peak: 0
+            case .lowShelf: 1
+            case .highShelf: 2
+            case .lowPass: 3
+            case .highPass: 4
+            case .notch: 5
+            }
+        return block.rawValue << 56 | UInt64(truncatingIfNeeded: index) << 8 | shape
     }
 }
