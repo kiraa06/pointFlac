@@ -23,6 +23,7 @@
         @ObservationIgnored let client = SoulseekClient()
         @ObservationIgnored private var watcher: Task<Void, Never>?
         @ObservationIgnored private let defaults: UserDefaults
+        @ObservationIgnored private var lastState: SoulseekConnectionState = .disconnected
         private static let autoSignInKey = "soulseekAutoSignIn"
 
         init(defaults: UserDefaults = .standard) {
@@ -56,7 +57,23 @@
                 savedUsername = name
                 defaults.set(true, forKey: Self.autoSignInKey)
             } catch {
-                defaults.set(false, forKey: Self.autoSignInKey)
+                // Only a refusal of the account stops signing in at launch. A network failure (no signal yet, the
+                // server briefly down) keeps it on, and returning to the app tries again.
+                if !Self.isNetworkFailure(error) { defaults.set(false, forKey: Self.autoSignInKey) }
+            }
+        }
+
+        /// Back in the foreground: if the last sign-in failed for a network reason, try again. A dropped session
+        /// needs nothing here; the client reconnects by itself.
+        func returnedToForeground() async {
+            guard case .failed(let error) = lastState, Self.isNetworkFailure(error), !isBusy else { return }
+            await resume()
+        }
+
+        static func isNetworkFailure(_ error: SoulseekError) -> Bool {
+            switch error {
+            case .serverUnavailable, .timeout, .connectionLost: true
+            default: false
             }
         }
 
@@ -68,6 +85,7 @@
         }
 
         private func show(_ state: SoulseekConnectionState) {
+            lastState = state
             isSignedIn = false
             switch state {
             case .disconnected: status = "Signed out"

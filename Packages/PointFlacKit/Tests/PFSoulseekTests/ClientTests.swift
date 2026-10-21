@@ -354,3 +354,62 @@ struct StateUpdateTests {
         #expect(await recorder.value == [.disconnected, .connecting, .loggedIn(username: "alice"), .disconnected])
     }
 }
+
+@Suite("Waiting for sign-in", .timeLimit(.minutes(1)))
+struct WaitForLoginTests {
+    @Test("Signed in already: returns at once")
+    func alreadySignedIn() async throws {
+        let (client, _, _) = try await loggedInClient()
+        #expect(await client.waitUntilLoggedIn(timeout: .milliseconds(10)))
+    }
+
+    @Test("A drop then a reconnect: returns once signed in again (the app came back from the background)")
+    func afterReconnect() async throws {
+        let (client, link, server) = try await loggedInClient {
+            $0.autoReconnect = true
+            $0.reconnectDelays = [.milliseconds(200)]
+        }
+        link.close()
+        #expect(await eventually { await !client.isLoggedIn })
+        async let waited = client.waitUntilLoggedIn(timeout: .seconds(5))
+        let second = try await server.accept()
+        _ = try await second.expect(code: 1)
+        try await second.send(Mock.loginSuccess())
+        #expect(await waited)
+    }
+
+    @Test("Never signed in: gives up after the timeout")
+    func timesOut() async {
+        let client = SoulseekClient(configuration: testConfiguration(serverPort: 9))
+        let start = ContinuousClock.now
+        #expect(await !client.waitUntilLoggedIn(timeout: .milliseconds(200)))
+        #expect(ContinuousClock.now - start >= .milliseconds(200))
+    }
+
+    @Test("Signed in elsewhere: gives up at once instead of waiting out the timeout")
+    func kickedGivesUp() async throws {
+        let (client, link, _) = try await loggedInClient()
+        try await link.send(Mock.relogged)
+        #expect(await eventually { await client.state == .kicked })
+        let start = ContinuousClock.now
+        #expect(await !client.waitUntilLoggedIn(timeout: .seconds(10)))
+        #expect(ContinuousClock.now - start < .seconds(2))
+    }
+}
+
+@Suite("Transfer failures")
+struct TransferFailureTests {
+    @Test("Network and session trouble is worth retrying; a bad or refused file is not")
+    func transience() {
+        let transient: [SoulseekTransferFailure] = [
+            .notLoggedIn, .peerOffline, .peerUnreachable, .uploadFailed, .timeout,
+            .incomplete(received: 1, expected: 2),
+        ]
+        let final: [SoulseekTransferFailure] = [
+            .notFLAC, .denied("Banned"), .sizeMismatch(expected: 1, announced: 2), .cancelled, .alreadyInProgress,
+            .fileTooLarge, .insufficientStorage, .io("disk"), .protocolViolation("bad"),
+        ]
+        for failure in transient { #expect(failure.isTransient, "\(failure)") }
+        for failure in final { #expect(!failure.isTransient, "\(failure)") }
+    }
+}

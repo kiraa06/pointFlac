@@ -137,6 +137,8 @@ public actor DownloadManager {
             return existing.id
         }
         let item = DownloadItem(id: UUID().uuidString, track: track)
+        Self.log.info(
+            "download \(item.id.prefix(8), privacy: .public) queued (\(track.provider, privacy: .public))")
         queue.append(item)
         changed(persist: true)
         pump()
@@ -401,6 +403,9 @@ public actor DownloadManager {
             throw CancellationError()
         }
         queue[index].state = state
+        // States only, never names or paths (§5.8): enough to follow a job in a device log.
+        Self.log.info(
+            "download \(id.prefix(8), privacy: .public) → \(String(describing: state).prefix(160), privacy: .public)")
         changed(persist: true)
     }
 

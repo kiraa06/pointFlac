@@ -12,6 +12,7 @@ struct RootView: View {
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
     @State private var tab: AppTab = Self.launchTab
     @Environment(\.scenePhase) private var scenePhase
+    @State private var grace = BackgroundGrace()
 
     var body: some View {
         TabView(selection: $tab) {
@@ -35,6 +36,13 @@ struct RootView: View {
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
             // foreground). Launch already scans in `load()`.
             if old == .background, new != .background { Task { await model.reload() } }
+            if new == .background, activeDownloads > 0 { grace.begin() }
+            if new == .active {
+                grace.end()
+                #if SOULSEEK
+                    Task { await model.soulseek.returnedToForeground() }
+                #endif
+            }
         }
         .onChange(of: model.player.status) { _, status in
             model.playback.playerStatusChanged(to: status)

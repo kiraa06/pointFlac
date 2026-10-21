@@ -83,7 +83,19 @@ extension SoulseekClient {
         }
         flush(token)
         if let session = searches.removeValue(forKey: token) {
-            logger.info("Soulseek: search finished with \(session.delivered, privacy: .public) files")
+            // Counts only (spec §5.8): enough to tell, from a device log, where results were lost.
+            let d = diagnostics
+            logger.info(
+                """
+                Soulseek: search finished with \(session.delivered, privacy: .public) files; totals: \
+                connect requests \(d.connectRequests, privacy: .public), refused addresses \(d.refusedAddresses, privacy: .public), \
+                dropped at cap \(d.droppedAtCap, privacy: .public), dropped per peer \(d.droppedPerPeer, privacy: .public), \
+                connect failures \(d.peerConnectFailures, privacy: .public), responses \(d.searchResponses, privacy: .public), \
+                inactive \(d.inactiveResponses, privacy: .public), malformed \(d.malformedMessages, privacy: .public), \
+                peak connections \(d.peakPeerConnections, privacy: .public)
+                """)
+            let reasons = failureReasons.sorted { $0.value > $1.value }.prefix(5).map { "\($0.value)× \($0.key)" }
+            logger.info("Soulseek: connect failure reasons: \(reasons.joined(separator: " | "), privacy: .public)")
         }
         continuation.finish()
     }

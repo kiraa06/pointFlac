@@ -98,6 +98,18 @@ extension SoulseekTransferFailure {
         case .protocolViolation: "The peer broke the protocol"
         }
     }
+
+    /// Whether trying the same download again could help: the connection or the session went away (on iOS, every
+    /// time the app is suspended), and a retry resumes from the `.part` file. A refused, wrong or oversized file, a
+    /// full disk, a cancel, or the same file already downloading would fail the same way again.
+    public var isTransient: Bool {
+        switch self {
+        case .notLoggedIn, .peerOffline, .peerUnreachable, .uploadFailed, .timeout, .incomplete: true
+        case .notFLAC, .denied, .sizeMismatch, .cancelled, .alreadyInProgress, .fileTooLarge, .insufficientStorage,
+            .io, .protocolViolation:
+            false
+        }
+    }
 }
 
 extension PathSanitizer {

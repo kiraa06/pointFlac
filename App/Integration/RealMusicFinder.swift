@@ -5,6 +5,7 @@ import PFDownloads
 import PFFind
 import PFLibrary
 import PFSearch
+import os
 
 #if SOULSEEK
     import PFSoulseek
@@ -23,6 +24,9 @@ import PFSearch
 @MainActor
 @Observable
 final class RealMusicFinder: MusicFinding {
+    /// Counts and kinds only, never titles, names or paths (spec §5.8).
+    private static let log = Logger(subsystem: "app.pointflac", category: "finder")
+
     let providers: [(id: String, name: String)]
 
     @ObservationIgnored private let library: RealLibrary
@@ -100,7 +104,12 @@ final class RealMusicFinder: MusicFinding {
     }
 
     func download(_ row: RemoteResultRow) {
-        guard let tracks = rowTracks[row.id], !tracks.isEmpty else { return }
+        guard let tracks = rowTracks[row.id], !tracks.isEmpty else {
+            Self.log.error("Download pressed, but no tracks are known for this row (\(row.provider, privacy: .public))")
+            return
+        }
+        Self.log.info(
+            "Download pressed: \(tracks.count, privacy: .public) track(s) (\(row.provider, privacy: .public))")
         let manager = manager
         Task {
             for track in tracks { await manager.enqueue(track) }
@@ -368,7 +377,10 @@ final class RealMusicFinder: MusicFinding {
             stagingRoot: URL.cachesDirectory.appending(path: "Downloads", directoryHint: .isDirectory),
             stateFile: support.appending(path: "downloads.json"),
             // Two at once, whichever the source: the Archive's politeness and the Soulseek cap of two transfers.
-            maxConcurrent: 2)
+            maxConcurrent: 2,
+            // On a phone every connection dies whenever iOS suspends the app, so one long transfer can be cut short
+            // several times; each retry resumes from the part file. Backoff 1, 2, 4, 8, 16 s.
+            maxAttempts: 6)
         return DownloadManager(providers: providers, configuration: configuration) { file in
             let result = await library.importFiles([file])
             if let rejection = result.rejected.first {

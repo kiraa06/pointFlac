@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// What the network side tells a running download.
 enum TransferSignal: @unchecked Sendable {
@@ -89,9 +90,14 @@ extension SoulseekClient {
         else { return .failed(.alreadyInProgress) }
 
         let outcome: SoulseekTransferEvent = await {
+            client.logger.info("Soulseek dl: resolving peer address")
             guard let address = await client.resolvePeerAddress(file.peer, timeout: config.peerAddressTimeout),
                 let port = UInt16(exactly: address.port)
-            else { return .failed(.peerOffline) }
+            else {
+                client.logger.info("Soulseek dl: peer address unknown (offline)")
+                return .failed(.peerOffline)
+            }
+            client.logger.info("Soulseek dl: peer address resolved, connecting directly")
             guard let slot = await client.reservePeerSlot(for: file.peer, bypassGlobalCap: true) else {
                 return .failed(.peerUnreachable)
             }
@@ -104,9 +110,12 @@ extension SoulseekClient {
                 try await framed.send(Outgoing.peerInit(username: me, type: "P"))
                 try await framed.send(Outgoing.queueUpload(path: file.path))
             } catch {
+                client.logger.info(
+                    "Soulseek dl: direct connect failed: \(String(describing: error).prefix(100), privacy: .public)")
                 await client.releasePeerSlot(slot)
                 return .failed(.peerUnreachable)
             }
+            client.logger.info("Soulseek dl: connected, QueueUpload sent; waiting for the peer")
             Task {
                 await servePeer(framed, peer: file.peer, client: client, readTimeout: config.transferRequestTimeout)
                 await client.releasePeerSlot(slot)
@@ -119,10 +128,13 @@ extension SoulseekClient {
         // Unregistering closes the control link and any forwarded links to this peer that are now idle.
         await client.unregisterTransfer(id)
         if case .failed(let failure) = outcome {
-            client.logger.info("Soulseek: download failed (\(failure.reason, privacy: .private))")
+            client.logger.info("Soulseek: download failed (\(failure.reason, privacy: .public))")
         }
         return outcome
     }
+
+    /// Download steps by state only (no peers, paths or names; spec §5.8), for device logs.
+    nonisolated static let downloadLog = Logger(subsystem: "app.pointflac", category: "soulseek")
 
     private nonisolated static func timer(
         _ duration: Duration, _ signals: AsyncStream<TransferSignal>.Continuation
@@ -143,8 +155,10 @@ extension SoulseekClient {
         for await signal in signals {
             switch signal {
             case .placeInQueue(let place):
+                Self.downloadLog.info("Soulseek dl: remotely queued at place \(place, privacy: .public)")
                 events.yield(.remotelyQueued(place: place))
             case .accepted:
+                Self.downloadLog.info("Soulseek dl: peer accepted, waiting for the file connection")
                 deadline.cancel()
                 deadline = timer(config.fileConnectionTimeout, signalContinuation)
             case .denied(let reason):
@@ -154,10 +168,12 @@ extension SoulseekClient {
             case .sizeMismatch(let expected, let announced):
                 return .failed(.sizeMismatch(expected: expected, announced: announced))
             case .fileConnection(let framed, let size):
+                Self.downloadLog.info("Soulseek dl: file connection arrived, receiving")
                 deadline.cancel()
                 return await receiveFile(
                     framed, size: size, part: part, destination: destination, config: config, events: events)
             case .timeout:
+                Self.downloadLog.info("Soulseek dl: timed out waiting for the peer")
                 return .failed(.timeout)
             case .cancelled:
                 return .failed(.cancelled)

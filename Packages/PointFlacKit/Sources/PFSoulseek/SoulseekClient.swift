@@ -88,6 +88,34 @@ public actor SoulseekClient {
         return false
     }
 
+    /// Waits until the client is signed in, for up to `timeout`. On iOS every connection dies while the app is
+    /// suspended, so a download started just after the app returns finds the server link still reconnecting; this
+    /// lets it wait out the reconnect instead of failing. Gives up at once when waiting cannot help: the account was
+    /// signed in elsewhere, or the client has stopped trying (`.failed` means no reconnect is pending).
+    public func waitUntilLoggedIn(timeout: Duration) async -> Bool {
+        if isLoggedIn { return true }
+        let updates = stateUpdates()
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await state in updates {
+                    switch state {
+                    case .loggedIn: return true
+                    case .kicked, .failed: return false
+                    case .disconnected, .connecting, .reconnecting: continue
+                    }
+                }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return false
+            }
+            let signedIn = await group.next() ?? false
+            group.cancelAll()
+            return signedIn
+        }
+    }
+
     var username: String? { credentials?.username }
 
     func makeToken() -> UInt32 {
@@ -446,7 +474,13 @@ public actor SoulseekClient {
         for entry in peerSlots.values where entry.peer == peer { entry.link?.close() }
     }
 
-    func notePeerConnectFailure() { diagnostics.peerConnectFailures += 1 }
+    func notePeerConnectFailure(_ reason: String = "unknown") {
+        diagnostics.peerConnectFailures += 1
+        if failureReasons.count < 12 || failureReasons[reason] != nil { failureReasons[reason, default: 0] += 1 }
+    }
+
+    /// Connect-failure reasons by count (error descriptions only, never addresses), for the device log.
+    var failureReasons: [String: Int] = [:]
 
     func noteInactiveResponse() { diagnostics.inactiveResponses += 1 }
 
@@ -463,7 +497,7 @@ public actor SoulseekClient {
             await client.attach(framed, to: slot)
             try await framed.send(Outgoing.pierceFireWall(token: request.token))
         } catch {
-            await client.notePeerConnectFailure()
+            await client.notePeerConnectFailure(String(describing: error).prefix(120).description)
             return
         }
         await servePeer(framed, peer: request.username, client: client, readTimeout: readTimeout, deadline: deadline)

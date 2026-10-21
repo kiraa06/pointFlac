@@ -51,6 +51,12 @@
                 // listening to the client's: nothing can keep a finished download waiting.
                 let task = Task {
                     try? FileManager.default.createDirectory(at: partialsRoot, withIntermediateDirectories: true)
+                    // iOS closes every connection while the app is suspended. A job started or retried just after
+                    // the app comes back waits out the server reconnect instead of failing.
+                    guard await client.waitUntilLoggedIn(timeout: Self.signInWait) else {
+                        continuation.finish(throwing: Self.retryable(.notLoggedIn))
+                        return
+                    }
                     for await event in client.download(file, into: partialsRoot) {
                         switch event {
                         case .requested, .remotelyQueued:
@@ -60,6 +66,10 @@
                         case .finished(let url):
                             continuation.yield(Self.handOver(url, into: staging))
                             continuation.finish()
+                            return
+                        case .failed(let failure) where failure.isTransient:
+                            // Thrown, so the manager retries with backoff; the client resumes from the part file.
+                            continuation.finish(throwing: Self.retryable(failure))
                             return
                         case .failed(let failure):
                             continuation.yield(.failed(failure.reason))
@@ -71,6 +81,14 @@
                 }
                 continuation.onTermination = { _ in task.cancel() }
             }
+        }
+
+        /// How long a download waits for the server link to come back (the client's first reconnects are 2 s and 5 s
+        /// apart) before the attempt counts as failed.
+        static let signInWait: Duration = .seconds(30)
+
+        static func retryable(_ failure: SoulseekTransferFailure) -> DownloadFailure {
+            DownloadFailure(failure.reason, retryable: true)
         }
 
         /// Moves the finished file out of its `slsk-<hash>` folder into the job's staging folder, where admission
