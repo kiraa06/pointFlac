@@ -19,9 +19,9 @@ if grep -rIlE "$LICENCE_PATTERN" Packages/PointFlacKit/Sources/CFLAC; then
     echo "licence guard: the files above carry a GPL or LGPL notice; remove them from CFLAC" >&2
     exit 1
 fi
-# The app's bundled notice must carry both licences word for word.
+# The app's bundled notice must carry all three licences word for word.
 NOTICES=App/ThirdPartyNotices.txt
-for licence in Packages/PointFlacKit/Sources/CFLAC/COPYING.Xiph LICENSE; do
+for licence in Packages/PointFlacKit/Sources/CFLAC/COPYING.Xiph Packages/PointFlacKit/Licenses/LICENSE.bs2b LICENSE; do
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         grep -qF -- "$line" "$NOTICES" || {
