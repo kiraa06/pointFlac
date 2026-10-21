@@ -463,11 +463,9 @@ struct ShelfPanel: View {
             await library.remove(tracks: tracks)
             await playback.willRemove(tracks: Set(tracks))
             runSearch()
-            let left = library.removalPlan(album: nil, tracks: tracks).tracks.count
-            if left > 0 {
-                let verb = removal.plan.deletes == 0 ? "removed" : "deleted"
-                importNote = "\(PendingRemoval.songs(left)) could not be \(verb)."
-            }
+            let left = library.removalPlan(album: nil, tracks: tracks)
+            let verb = left.deletes == 0 ? "removed" : "deleted"
+            importNote = left.tracks.isEmpty ? nil : "\(PendingRemoval.songs(left.tracks.count)) could not be \(verb)."
         }
     }
 
