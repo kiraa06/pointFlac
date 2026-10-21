@@ -54,8 +54,10 @@ import Testing
     }
 
     @Test func cancellationReturnsTheSlot() async throws {
-        let bucket = TokenBucket(interval: .milliseconds(800))
-        try await bucket.acquire()  // Takes the free slot; the next one is 800 ms out.
+        // A minute between slots, so the waiter has to sleep however late a loaded machine runs it (with 800 ms, a
+        // CI runner once started the waiter after its slot had come, and it never slept to be cancelled).
+        let bucket = TokenBucket(interval: .seconds(60))
+        try await bucket.acquire()  // Takes the free slot; the next one is a minute out.
         let reservedBefore = await bucket.nextSlotForTesting
         let waiter = Task { try await bucket.acquire() }
         // Wait (bounded) until the waiter has actually reserved its slot, then cancel it.
@@ -63,15 +65,12 @@ import Testing
         while await bucket.nextSlotForTesting == reservedBefore, ContinuousClock.now < deadline {
             await Task.yield()
         }
+        #expect(await bucket.nextSlotForTesting == reservedBefore + .seconds(60))
         waiter.cancel()
         let result = await waiter.result
         #expect(throws: CancellationError.self) { try result.get() }
-        // The cancelled waiter's slot went back, so the next caller waits for that slot (under 800 ms from now),
-        // not the one after it (about 1.5 s from now).
-        let clock = ContinuousClock()
-        let start = clock.now
-        try await bucket.acquire()
-        #expect(clock.now - start < .milliseconds(1_200))
+        // The cancelled waiter's slot went back: the next caller gets that slot, not the one after it.
+        #expect(await bucket.nextSlotForTesting == reservedBefore)
     }
 
     @Test func penaltyHoldsTheNextRequestBack() async throws {
