@@ -76,11 +76,16 @@ final class SoundUITests: XCTestCase {
         let label = strip.label
         if label.contains("48 kHz") {
             XCTAssertTrue(label.contains("Pure"), "the signal strip reads \"\(label)\"")
+        } else {
+            // Not a failure, but never a silent one: the report shows the check was skipped, and why.
+            XCTContext.runActivity(named: "Pure check skipped: this Mac's output resamples. Strip: \(label)") { _ in }
         }
         XCTAssertFalse(label.contains("Processing"), "the signal strip reads \"\(label)\"")
     }
 
-    /// The faders and handles take a drag inside the scrolling list, and the edits are saved: a relaunch finds them.
+    /// The faders and handles take a drag inside the scrolling list, a scroll that starts on the fader bank scrolls
+    /// rather than moving a fader, a handle follows the finger, a pinch over a handle sets its Q without moving it, and
+    /// the edits are saved both ways: after the half-second debounce, and at once when the app leaves the foreground.
     @MainActor
     func testEQDragsMoveTheControlsAndSurviveARelaunch() {
         let app = launch()
@@ -95,12 +100,21 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
         waitForExpectations(timeout: 2)
 
-        // Graphic: drag the 31 Hz fader up.
+        // Graphic: a scroll that starts on the bank, below the caps, scrolls the list and moves no fader.
         let fader = app.descendants(matching: .any)["graphicBand-0"]
         if !fader.waitForExistence(timeout: 2) { Self.scroll(app) }
         XCTAssertTrue(fader.waitForExistence(timeout: 2))
         Self.scrollClear(fader, in: app)
         XCTAssertEqual(fader.value as? String, "0 decibels")
+        let top = fader.frame.minY
+        let low = fader.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.86))
+        low.press(forDuration: 0.05, thenDragTo: low.withOffset(CGVector(dx: 0, dy: -90)))
+        XCTAssertEqual(fader.value as? String, "0 decibels", "a scroll on the bank moved the fader")
+        XCTAssertLessThan(fader.frame.minY, top - 40, "a scroll on the bank did not scroll the list")
+        Self.scroll(app, by: 90)
+        Self.scrollClear(fader, in: app)
+
+        // The cap itself (at 0 dB, the middle of the strip) takes the drag.
         let from = fader.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         let to = fader.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.15))
         from.press(forDuration: 0.1, thenDragTo: to)
@@ -124,27 +138,42 @@ final class SoundUITests: XCTestCase {
         // Clear of the floating tab bar, which would take the press.
         Self.scrollClear(handle, in: app)
         XCTAssertEqual(handle.value as? String, "1 kilohertz, 0 decibels, Q 1.00")
+
+        // The handle lands where the finger does: 110 pt right and 40 pt up on the log axis and ±24 dB scale.
+        let graph = app.descendants(matching: .any)["eqGraph"].frame
+        let (dx, dy) = (110.0, -40.0)
         let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        // Well to the right, so the pinch below (at the graph's centre) starts clear of the handle: a finger that lands
-        // on a handle drags it.
-        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 110, dy: -40)))
-        expectation(
-            for: NSPredicate(format: "NOT (value BEGINSWITH '1 kilohertz') AND value CONTAINS 'plus'"),
-            evaluatedWith: handle)
+        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: dx, dy: dy)))
+        let startX = graph.width * log10(1000 / 20.0) / 3
+        let expectedHz = 20 * pow(1000, (startX + dx) / graph.width)
+        let expectedDb = -dy / graph.height * 48
+        expectation(for: NSPredicate(format: "NOT (value BEGINSWITH '1 kilohertz')"), evaluatedWith: handle)
         waitForExpectations(timeout: 2)
-        // Pinching the graph sets the selected band's Q: spread the fingers to widen it.
-        app.descendants(matching: .any)["eqGraph"].pinch(withScale: 2.5, velocity: 2)
+        let dragged = Self.band(handle.value as? String)
+        XCTAssertNotNil(dragged, "handle reads \(String(describing: handle.value))")
+        if let dragged {
+            XCTAssertLessThan(
+                abs(log2(dragged.hz / expectedHz)), 0.25,
+                "the handle is at \(dragged.hz) Hz, the finger at \(expectedHz) Hz")
+            XCTAssertLessThan(
+                abs((dragged.db ?? 0) - expectedDb), 1.2,
+                "the handle is at \(dragged.db ?? 0) dB, the finger at \(expectedDb) dB")
+        }
+
+        // A pinch over the handle itself sets its Q, spread to widen it, and leaves its frequency and gain alone.
+        let beforePinch = handle.value as? String
+        handle.pinch(withScale: 2.5, velocity: 2)
         expectation(for: NSPredicate(format: "value CONTAINS 'Q 0.'"), evaluatedWith: handle)
         waitForExpectations(timeout: 3)
         let moved = handle.value as? String
+        XCTAssertEqual(
+            moved?.components(separatedBy: ", ").prefix(2), beforePinch?.components(separatedBy: ", ").prefix(2),
+            "the pinch moved the band")
 
         // The save follows half a second after the last change; a relaunch loads it.
         Thread.sleep(forTimeInterval: 1.2)
         app.terminate()
-        let again = XCUIApplication()
-        again.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
-        again.launch()
-        again.tabBars.buttons["Sound"].tap()
+        let again = relaunch()
         let pureAgain = again.descendants(matching: .any)["pureSwitch"]
         XCTAssertTrue(pureAgain.waitForExistence(timeout: 5))
         XCTAssertEqual(pureAgain.value as? String, "0")
@@ -153,18 +182,27 @@ final class SoundUITests: XCTestCase {
         XCTAssertTrue(handleAgain.waitForExistence(timeout: 2))
         XCTAssertEqual(handleAgain.value as? String, moved)
 
-        // Swiping the band's row deletes it, handle and all. The swipe starts on the row's header line, clear of the
-        // sliders, which would take it as a drag.
+        // Swiping the band's row deletes it, handle and all.
         let row = again.descendants(matching: .any)["bandRow-0"]
         if !row.waitForExistence(timeout: 2) { Self.scroll(again) }
         XCTAssertTrue(row.waitForExistence(timeout: 2))
         Self.scrollClear(row, in: again)
-        let header = row.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.08))
-        header.press(forDuration: 0.05, thenDragTo: row.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.08)))
+        let middle = row.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
+        middle.press(forDuration: 0.05, thenDragTo: row.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)))
         let delete = again.buttons["Delete"]
         if delete.waitForExistence(timeout: 2) { delete.tap() }
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: handleAgain)
         waitForExpectations(timeout: 3)
+
+        // Home straight after the edit, well inside the debounce: leaving the foreground writes it at once.
+        XCUIDevice.shared.press(.home)
+        Thread.sleep(forTimeInterval: 0.5)
+        again.terminate()
+        let third = relaunch()
+        XCTAssertTrue(third.descendants(matching: .any)["pureSwitch"].waitForExistence(timeout: 5))
+        let empty = third.buttons["copyGraphicButton"]
+        for _ in 0..<4 where !empty.waitForExistence(timeout: 1) { Self.scroll(third) }
+        XCTAssertTrue(empty.exists, "the deleted band came back: the flush on leaving the foreground was lost")
     }
 
     /// A corrupt `sound.json` (here, Pure off and the EQ on under an unknown EQ mode) loads as Pure, with every block
@@ -203,6 +241,36 @@ final class SoundUITests: XCTestCase {
             guard element.exists, element.frame.maxY > limit else { return }
             scroll(app)
         }
+    }
+
+    /// The app again, keeping the saved Sound settings, on the Sound tab.
+    @MainActor
+    private func relaunch() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
+        app.launch()
+        app.tabBars.buttons["Sound"].tap()
+        return app
+    }
+
+    /// A handle's spoken value, "8.77 kilohertz, plus 9.6 decibels, Q 1.00", as numbers. No gain for the types that
+    /// ignore it.
+    private static func band(_ value: String?) -> (hz: Double, db: Double?, q: Double)? {
+        guard let parts = value?.components(separatedBy: ", "), parts.count >= 2 else { return nil }
+        let f = parts[0].split(separator: " ")
+        guard f.count == 2, let n = Double(f[0]) else { return nil }
+        let hz = f[1] == "kilohertz" ? n * 1000 : n
+        var db: Double?
+        if parts.count == 3 {
+            let g = parts[1].split(separator: " ")
+            if g.count == 3, let v = Double(g[1]) {
+                db = g[0] == "minus" ? -v : v
+            } else if g.count == 2, let v = Double(g[0]) {
+                db = v
+            }
+        }
+        guard let last = parts.last?.split(separator: " ").last, let q = Double(last) else { return nil }
+        return (hz, db, q)
     }
 
     /// Puts the Pure defaults back for the tests that follow.
