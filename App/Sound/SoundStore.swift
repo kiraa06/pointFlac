@@ -25,6 +25,9 @@ import SwiftUI
 final class SoundStore {
     /// What the controls show, clamped. The player is at most a display frame behind it.
     private(set) var settings: SoundSettings
+    /// One stable id per parametric band, parallel to `settings.eq.bands`, so the band rows and handles keep their
+    /// identity: a deleted row animates away as itself, not as the last one.
+    private(set) var bandIDs: [UUID] = []
 
     @ObservationIgnored private let player: Player
     @ObservationIgnored private let fileURL: URL
@@ -43,6 +46,7 @@ final class SoundStore {
         let loaded = Self.load(from: fileURL)
         settings = loaded
         applied = loaded
+        bandIDs = loaded.eq.bands.map { _ in UUID() }
         player.setSound(loaded)
         gate.action = { [weak self] in self?.applyNow() }
     }
@@ -67,8 +71,20 @@ final class SoundStore {
         next = next.clamped()
         guard next != settings else { return }
         settings = next
+        matchBandIDs()
         gate.request()
         scheduleSave()
+    }
+
+    /// New ids for bands added at the end, and none for bands gone from it. Deletions in the middle and wholesale
+    /// replacements fix the ids themselves first.
+    private func matchBandIDs() {
+        let count = settings.eq.bands.count
+        if bandIDs.count < count {
+            bandIDs += (bandIDs.count..<count).map { _ in UUID() }
+        } else if bandIDs.count > count {
+            bandIDs.removeLast(bandIDs.count - count)
+        }
     }
 
     /// A binding to one value of the settings, for a control.
@@ -128,15 +144,16 @@ final class SoundStore {
         return settings.eq.bands.count - 1
     }
 
+    /// Deletes a band. Pure makes the EQ inert, so it deletes nothing then.
     func removeBand(at index: Int) {
-        update {
-            guard $0.eq.bands.indices.contains(index) else { return }
-            $0.eq.bands.remove(at: index)
-        }
+        guard !settings.pure, settings.eq.bands.indices.contains(index) else { return }
+        bandIDs.remove(at: index)
+        update { $0.eq.bands.remove(at: index) }
     }
 
     /// The graphic EQ's ten peaks as parametric bands, to fine-tune a preset.
     func copyGraphicToBands() {
+        bandIDs = []
         update {
             var graphic = $0.eq
             graphic.mode = .graphic

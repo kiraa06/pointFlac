@@ -83,6 +83,8 @@ struct EQGraphView: View {
     }
 
     let eq: EQSettings
+    /// One stable id per band, parallel to `eq.bands` (`SoundStore.bandIDs`).
+    let bandIDs: [UUID]
     let curve: [(hz: Double, db: Double)]
     /// The automatic headroom, or nil when it is switched off.
     let headroomDb: Double?
@@ -135,8 +137,8 @@ struct EQGraphView: View {
                 .accessibilityValue(curveSummary)
                 captions
                 if eq.mode == .parametric {
-                    ForEach(Array(eq.bands.enumerated()), id: \.offset) { index, band in
-                        handle(index, band, size)
+                    ForEach(Array(zip(bandIDs, eq.bands).enumerated()), id: \.element.0) { index, pair in
+                        handle(index, pair.1, size)
                     }
                 }
             }

@@ -136,7 +136,8 @@ struct SoundView: View {
             .pureDimmed()
         // The graph keeps its screen bright under Pure: it draws the bypass itself.
         LiveEQGraph(
-            model: curve, eq: s.eq, autoHeadroom: s.preamp.autoHeadroom, sampleRate: sampleRate,
+            model: curve, eq: s.eq, bandIDs: store.bandIDs, autoHeadroom: s.preamp.autoHeadroom,
+            sampleRate: sampleRate,
             look: s.pure ? .bypassed : s.eq.enabled ? .live : .eqOff, selection: $selectedBand, theme: screen,
             setBand: { store.setBand($0, $1) },
             addBand: { band in
@@ -166,18 +167,22 @@ struct SoundView: View {
                 .padding(.vertical, 4)
                 .pureDimmed()
             }
-            ForEach(Array(s.eq.bands.enumerated()), id: \.offset) { index, band in
+            ForEach(Array(zip(store.bandIDs, s.eq.bands).enumerated()), id: \.element.0) { index, pair in
                 BandRow(
-                    index: index, band: band, selected: selectedBand == index, theme: theme,
-                    set: { store.setBand(index, $0) }, select: { selectedBand = index }
+                    index: index, band: pair.1, selected: selectedBand == index, theme: theme,
+                    set: { store.setBand(index, $0) },
+                    select: { withAnimation(.snappy(duration: 0.25)) { selectedBand = index } }
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) {
-                        delete(index)
-                    } label: {
-                        Label("Delete", systemImage: "trash")
+                    // Nothing to swipe while Pure makes the EQ inert (List swipes ignore `.disabled`).
+                    if !s.pure {
+                        Button(role: .destructive) {
+                            delete(index)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .monoDestructive()
                     }
-                    .monoDestructive()
                 }
                 .pureDimmed()
                 .accessibilityIdentifier("bandRow-\(index)")
@@ -199,6 +204,7 @@ struct SoundView: View {
     }
 
     private func delete(_ index: Int) {
+        guard !store.settings.pure else { return }
         store.removeBand(at: index)
         guard let selected = selectedBand else { return }
         if selected == index {
@@ -269,6 +275,7 @@ struct SoundView: View {
 private struct LiveEQGraph: View {
     let model: EQCurveModel
     let eq: EQSettings
+    let bandIDs: [UUID]
     let autoHeadroom: Bool
     let sampleRate: Double
     let look: EQGraphView.Look
@@ -279,7 +286,8 @@ private struct LiveEQGraph: View {
 
     var body: some View {
         EQGraphView(
-            eq: eq, curve: model.curve, headroomDb: autoHeadroom ? model.headroomDb : nil, sampleRate: sampleRate,
+            eq: eq, bandIDs: bandIDs, curve: model.curve, headroomDb: autoHeadroom ? model.headroomDb : nil,
+            sampleRate: sampleRate,
             look: look, selection: $selection, theme: theme, setBand: setBand, addBand: addBand)
     }
 }

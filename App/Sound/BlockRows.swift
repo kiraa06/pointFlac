@@ -410,8 +410,9 @@ struct BlockHeaderRow: View {
     }
 }
 
-/// The parametric band list: one row per band, with its shape, frequency, gain and Q, and a switch. Swipe a row to
-/// delete it.
+/// The parametric band list: one compact row per band (its shape, frequency, gain and Q at a glance, and its switch),
+/// and the full editor, with a slider for each, only for the selected band, the one highlighted on the graph. Tap a
+/// row to edit it; swipe it to delete it.
 struct BandRow: View {
     let index: Int
     let band: EQBand
@@ -423,39 +424,33 @@ struct BandRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Text("\(index + 1)")
-                    .font(.caption.monospacedDigit().weight(.bold))
-                    .frame(minWidth: 22, minHeight: 22)
-                    .foregroundStyle(selected ? theme.background : theme.ink)
-                    .background(Circle().fill(selected ? theme.processingTint : .clear))
-                    .overlay(Circle().strokeBorder(selected ? .clear : theme.hairline))
-                    .accessibilityHidden(true)
-                Menu {
-                    Picker("Filter type", selection: Binding(get: { band.type }, set: { t in update { $0.type = t } }))
-                    {
-                        ForEach(FilterType.allCases, id: \.self) { type in
-                            Text(type.title).tag(type)
+                badge
+                if selected {
+                    typeMenu
+                } else {
+                    Button(action: select) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 7) {
+                                shapeIcon
+                                Text(band.type.title)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(theme.ink)
+                            }
+                            Text(summary)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(theme.inkSecondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
-                } label: {
-                    HStack(spacing: 7) {
-                        FilterShapeIcon(type: band.type)
-                            .stroke(theme.processingTint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                            .frame(width: 22, height: 12)
-                        Text(band.type.title)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(theme.ink)
-                        Image(systemName: "chevron.up.chevron.down")
-                            .imageScale(.small)
-                            .foregroundStyle(theme.inkSecondary)
-                    }
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Band \(index + 1), \(band.type.title)")
+                    .accessibilityValue(spokenSummary)
+                    .accessibilityHint("Shows the band's controls")
+                    .accessibilityIdentifier("bandSummary-\(index)")
                 }
-                .fixedSize()
-                .accessibilityLabel("Filter type")
-                .accessibilityValue(band.type.title)
-                .accessibilityIdentifier("bandType-\(index)")
                 Spacer(minLength: 0)
                 Toggle(
                     "Band \(index + 1) on",
@@ -465,32 +460,90 @@ struct BandRow: View {
                 .tint(theme.processingTint)
                 .accessibilityIdentifier("bandToggle-\(index)")
             }
-            .contentShape(Rectangle())
-            .onTapGesture(perform: select)
-            SoundSlider(
-                title: "Freq", value: band.frequency, range: SoundRanges.bandFrequency, logarithmic: true,
-                step: pow(2, 1.0 / 6), format: SoundFormat.frequency, spoken: SoundFormat.frequencySpoken,
-                set: { v in update { $0.frequency = SoundFormat.rounded(v) } }
-            )
-            .accessibilityIdentifier("bandFrequency-\(index)")
-            SoundSlider(
-                title: "Gain", value: band.gainDb, range: SoundRanges.bandGain, neutral: 0, step: 0.5,
-                format: { band.type.usesGain ? SoundFormat.gain($0) : "—" }, spoken: SoundFormat.gainSpoken,
-                set: { v in update { $0.gainDb = SoundFormat.tenth(v) } }
-            )
-            .disabled(!band.type.usesGain)
-            .accessibilityIdentifier("bandGain-\(index)")
-            SoundSlider(
-                title: "Q", value: band.q, range: SoundRanges.bandQ, logarithmic: true, step: pow(2, 1.0 / 4),
-                format: SoundFormat.q, spoken: SoundFormat.qSpoken,
-                set: { v in update { $0.q = SoundFormat.roundedQ(v) } }
-            )
-            .accessibilityIdentifier("bandQ-\(index)")
+            if selected {
+                SoundSlider(
+                    title: "Freq", value: band.frequency, range: SoundRanges.bandFrequency, logarithmic: true,
+                    step: pow(2, 1.0 / 6), format: SoundFormat.frequency, spoken: SoundFormat.frequencySpoken,
+                    set: { v in update { $0.frequency = SoundFormat.rounded(v) } }
+                )
+                .accessibilityIdentifier("bandFrequency-\(index)")
+                SoundSlider(
+                    title: "Gain", value: band.gainDb, range: SoundRanges.bandGain, neutral: 0, step: 0.5,
+                    format: { band.type.usesGain ? SoundFormat.gain($0) : "—" }, spoken: SoundFormat.gainSpoken,
+                    set: { v in update { $0.gainDb = SoundFormat.tenth(v) } }
+                )
+                .disabled(!band.type.usesGain)
+                .accessibilityIdentifier("bandGain-\(index)")
+                SoundSlider(
+                    title: "Q", value: band.q, range: SoundRanges.bandQ, logarithmic: true, step: pow(2, 1.0 / 4),
+                    format: SoundFormat.q, spoken: SoundFormat.qSpoken,
+                    set: { v in update { $0.q = SoundFormat.roundedQ(v) } }
+                )
+                .accessibilityIdentifier("bandQ-\(index)")
+            }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, selected ? 4 : 2)
         .opacity(band.enabled ? 1 : 0.55)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Band \(index + 1), \(band.type.title)")
+    }
+
+    private var badge: some View {
+        Text("\(index + 1)")
+            .font(.caption.monospacedDigit().weight(.bold))
+            .frame(minWidth: 22, minHeight: 22)
+            .foregroundStyle(selected ? theme.background : theme.ink)
+            .background(Circle().fill(selected ? theme.processingTint : .clear))
+            .overlay(Circle().strokeBorder(selected ? .clear : theme.hairline))
+            .accessibilityHidden(true)
+    }
+
+    private var shapeIcon: some View {
+        FilterShapeIcon(type: band.type)
+            .stroke(theme.processingTint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+            .frame(width: 22, height: 12)
+            .accessibilityHidden(true)
+    }
+
+    private var typeMenu: some View {
+        Menu {
+            Picker("Filter type", selection: Binding(get: { band.type }, set: { t in update { $0.type = t } })) {
+                ForEach(FilterType.allCases, id: \.self) { type in
+                    Text(type.title).tag(type)
+                }
+            }
+        } label: {
+            HStack(spacing: 7) {
+                shapeIcon
+                Text(band.type.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(theme.ink)
+                Image(systemName: "chevron.up.chevron.down")
+                    .imageScale(.small)
+                    .foregroundStyle(theme.inkSecondary)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .fixedSize()
+        .accessibilityLabel("Filter type")
+        .accessibilityValue(band.type.title)
+        .accessibilityIdentifier("bandType-\(index)")
+    }
+
+    /// "2.6 kHz · +2.5 dB · Q 1.80"; no gain for the types that ignore it.
+    private var summary: String {
+        var parts = [SoundFormat.frequency(band.frequency)]
+        if band.type.usesGain { parts.append(SoundFormat.gain(band.gainDb)) }
+        parts.append("Q \(SoundFormat.q(band.q))")
+        return parts.joined(separator: " · ")
+    }
+
+    private var spokenSummary: String {
+        var parts = [SoundFormat.frequencySpoken(band.frequency)]
+        if band.type.usesGain { parts.append(SoundFormat.gainSpoken(band.gainDb)) }
+        parts.append(SoundFormat.qSpoken(band.q))
+        return parts.joined(separator: ", ")
     }
 
     /// Edits this band, and selects it so the graph shows which one moves.
