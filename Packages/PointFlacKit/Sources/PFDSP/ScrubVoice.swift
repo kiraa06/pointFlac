@@ -9,7 +9,7 @@ import Foundation
 /// - ``PlatterFollower`` turns hand positions, which arrive at the touch rate (60 or 120 Hz), into smooth motion: the
 ///   read speed (and so the pitch) glides instead of stepping, and lands where the hand stopped.
 /// - ``ScrubVoice`` runs them per output frame, extrapolating the hand between touches, with a motor mode for the
-///   spin-up after release, and the stylus's behaviour at rest: a still record is silent.
+///   spin-up after release, and the stylus's behaviour near rest: the level fades out, so a still record is silent.
 
 /// Kaiser-windowed sinc interpolation over a ring of interleaved Float32 frames.
 public struct ScrubKernel: @unchecked Sendable {
@@ -174,13 +174,11 @@ public struct ScrubVoice: Sendable {
     private var motorVelocity = 0.0
     private var motorStep = 0.0
 
-    /// The stylus's level, which falls away as the record slows to a stop, so a hand's tiny tremors make no sound.
+    /// The stylus's level, which falls away as the record slows to a stop: a record held still is silent, not a held
+    /// sample, and a hand's tiny tremors make no sound. (No DC blocker: its start-up transient would thump when a hand
+    /// lands on a playing record, where the voice takes over mid-signal.)
     private var level: Float = 0
     private let levelCoefficient: Float
-    /// The cartridge's low-frequency limit (a 5 Hz DC blocker): a record held still is silent, not a held sample.
-    private let dcPole: Float
-    private var dcIn = SIMD8<Float>()
-    private var dcOut = SIMD8<Float>()
 
     /// Below this platter speed the level fades toward silence.
     static let quietBelow = 0.15
@@ -204,7 +202,6 @@ public struct ScrubVoice: Sendable {
         extrapolationLeft = maxExtrapolation
         level = Float(min(1, abs(speed) / Self.quietBelow))
         levelCoefficient = Float(1 - exp(-1 / (0.005 * outputRate)))
-        dcPole = Float(1 - 2 * Double.pi * 5 / outputRate)
     }
 
     /// The source frame under the needle now.
@@ -248,13 +245,7 @@ public struct ScrubVoice: Sendable {
             }
             let target = Float(min(1, abs(advance / nominal) / Self.quietBelow))
             level += (target - level) * levelCoefficient
-            for c in 0..<channels {
-                let x = frame[c]
-                let y = x - dcIn[c] + dcPole * dcOut[c]
-                dcIn[c] = x
-                dcOut[c] = y
-                frame[c] = y * level
-            }
+            for c in 0..<channels { frame[c] *= level }
             step()
         }
     }
