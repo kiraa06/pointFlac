@@ -2,6 +2,7 @@ import Foundation
 import PFCore
 import PFFlac
 import PFLoudness
+import Synchronization
 
 /// Decodes one file and measures it (EBU R128 integrated loudness and true peak) without holding it in memory:
 /// `FlacDecoder` reads a chunk of native-range integers, which become Float32 and go to the meter, chunk by chunk.
@@ -9,10 +10,17 @@ enum LoudnessScanner {
     /// Frames per decode chunk: about 190 ms at 44.1 kHz, short enough to yield and to notice a cancellation.
     static let chunkFrames = 8192
 
+    /// An album of more than this many tracks (a folder of untagged files grouped as one album, or a very large box
+    /// set) is measured track by track but gets no album value. Each finished meter pooled into an album value
+    /// holds about 25 KB (`LoudnessMeter.finish`), so 400 tracks hold about 10 MB.
+    static let maxAlbumTracks = 400
+
     struct Measurement {
-        /// Kept for the album value (`LoudnessMeter.albumLufs`). Not `Sendable`: stays on the scan's task.
+        /// Finished (`LoudnessMeter.finish`), kept only to pool into the album value (`LoudnessMeter.albumLufs`). Not
+        /// `Sendable`: stays on the scan's task.
         var meter: LoudnessMeter
-        var lufs: Double
+        /// Nil when there is no usable integrated loudness: silence, or shorter than one 400 ms gating block.
+        var lufs: Double?
         var truePeak: Double
     }
 
@@ -48,8 +56,8 @@ enum LoudnessScanner {
         }
         let lufs = meter.integratedLufs
         let peak = pow(10, meter.truePeakDbTP / 20)
-        return Measurement(
-            meter: meter, lufs: lufs.isFinite ? lufs : TrackLoudness.silenceLufs, truePeak: peak.isFinite ? peak : 0)
+        meter.finish()
+        return Measurement(meter: meter, lufs: lufs.isFinite ? lufs : nil, truePeak: peak.isFinite ? peak : 0)
     }
 }
 
@@ -57,19 +65,28 @@ extension Library {
     /// Measures the loudness of albums that carry no ReplayGain tag, in the background (EBU R128), and stores each
     /// track's LUFS and true peak, then the album's LUFS (all its tracks pooled) and peak (the largest track peak).
     ///
-    /// Which albums: every album with a track that has neither a ReplayGain tag nor a measurement (`albums` narrows
-    /// it to those IDs). A measured or fully tagged album is never decoded. A track evicted to iCloud is left alone
-    /// (nothing is downloaded), as is one that is missing or unreadable; an album that loses a track this way gets
-    /// its tracks' values but no album value.
+    /// Which albums: see `LibraryStore.loudnessJobs`. A measured, current or fully tagged album is never decoded. A
+    /// track evicted to iCloud is left alone (nothing is downloaded), as is one that is missing or unreadable; an
+    /// album that loses a track this way gets its tracks' values but no album value. `albums` narrows the scan to
+    /// those IDs. Only one scan runs at a time; a second call returns at once.
     ///
-    /// How: the plan is read on the library's queue; each file is decoded on a background-priority task, outside the
-    /// queue, so playback and other library calls never wait on a decode; each result is then written on the queue,
-    /// as its own short call. A track's row is only ever updated, never inserted, so a track removed meanwhile stays
-    /// removed. A cancelled scan stops at the next chunk and keeps what it stored. The catalog is published once per
-    /// album. `progress(done, total)` counts tracks and is called from the scan's task.
+    /// How: the plan is read on the library's queue; each file is decoded on a `.background` task, outside the queue,
+    /// so playback and other library calls never wait on a decode; each result is then written on the queue, as its
+    /// own short call. The caller is resumed through a continuation, not by awaiting the task, because awaiting a
+    /// task raises it to the awaiter's priority: a scan started from the UI would otherwise decode at user-initiated
+    /// priority. A track's row is only ever updated, never inserted, so a track removed meanwhile stays removed. A
+    /// cancelled scan stops at the next chunk and keeps what it stored. The catalog is published when an album is
+    /// done, at most every few seconds, and at the end. `progress(done, total)` counts tracks and is called from
+    /// the scan's task.
     public func scanLoudness(
         albums: [String]? = nil, progress: @escaping @Sendable (Int, Int) -> Void
     ) async {
+        let started = loudnessScanning.withLock { running in
+            defer { running = true }
+            return !running
+        }
+        guard started else { return }
+        defer { loudnessScanning.withLock { $0 = false } }
         let jobs: [LoudnessJob]
         do {
             jobs = try await run(.never) { try $0.loudnessJobs(albums: albums) }
@@ -79,56 +96,82 @@ extension Library {
         }
         let total = jobs.reduce(0) { $0 + $1.tracks.count }
         guard total > 0 else { return }
-        let work = Task.detached(priority: .background) { [self] in
-            var done = 0
-            progress(0, total)
-            var unpublished = false
-            // A cancelled scan stops at the next chunk but still publishes what it stored.
-            jobsLoop: for job in jobs {
-                if Task.isCancelled { break }
-                var meters: [LoudnessMeter] = []
-                var peaks: [Double] = []
-                var allStored = job.complete
-                for track in job.tracks {
-                    if Task.isCancelled { break jobsLoop }
-                    loudnessDecodes.withLock { $0 += 1 }
-                    guard let measured = await LoudnessScanner.measure(track.url) else {
-                        // Cancelled, or unreadable: no value; the album then has none either.
-                        if Task.isCancelled { break jobsLoop }
-                        allStored = false
-                        done += 1
-                        progress(done, total)
-                        continue
-                    }
-                    if let hook = loudnessHook.withLock({ $0 }) { await hook(track.id) }
-                    let stored = await store(track: track.id, lufs: measured.lufs, peak: measured.truePeak)
-                    allStored = allStored && stored
-                    unpublished = unpublished || stored
-                    meters.append(measured.meter)
-                    peaks.append(measured.truePeak)
-                    done += 1
-                    progress(done, total)
-                }
-                if allStored, let peak = peaks.max() {
-                    let lufs = LoudnessMeter.albumLufs(meters)
-                    await storeAlbum(job.albumID, lufs: lufs.isFinite ? lufs : TrackLoudness.silenceLufs, peak: peak)
-                }
-                // One publish per album, however many tracks it wrote.
-                if unpublished {
-                    try? await run(.always) { _ in () }
-                    unpublished = false
-                }
-            }
-            if unpublished { try? await run(.always) { _ in () } }
-        }
+
+        let handle = Mutex<(task: Task<Void, Never>?, cancelled: Bool)>((nil, false))
         await withTaskCancellationHandler {
-            await work.value
+            await withCheckedContinuation { (finished: CheckedContinuation<Void, Never>) in
+                let task = Task.detached(priority: .background) { [self] in
+                    await measureAlbums(jobs, total: total, progress: progress)
+                    finished.resume()
+                }
+                let cancelled = handle.withLock { state in
+                    state.task = task
+                    return state.cancelled
+                }
+                if cancelled { task.cancel() }
+            }
         } onCancel: {
-            work.cancel()
+            let task = handle.withLock { state in
+                state.cancelled = true
+                return state.task
+            }
+            task?.cancel()
         }
     }
 
-    private func store(track id: String, lufs: Double, peak: Double) async -> Bool {
+    private func measureAlbums(
+        _ jobs: [LoudnessJob], total: Int, progress: @Sendable (Int, Int) -> Void
+    ) async {
+        var done = 0
+        var unpublished = false
+        var lastPublish = ContinuousClock.now
+        progress(0, total)
+        jobsLoop: for job in jobs {
+            if Task.isCancelled { break }
+            if job.tracks.count > LoudnessScanner.maxAlbumTracks {
+                Self.logger.info(
+                    "Loudness: album of \(job.tracks.count, privacy: .public) tracks measured per track, no album value"
+                )
+            }
+            var meters: [LoudnessMeter] = []
+            var peaks: [Double] = []
+            var allStored = job.complete
+            for track in job.tracks {
+                if Task.isCancelled { break jobsLoop }
+                loudnessDecodes.withLock { $0 += 1 }
+                guard let measured = await LoudnessScanner.measure(track.url) else {
+                    // Cancelled, or unreadable: no value; the album then has none either.
+                    if Task.isCancelled { break jobsLoop }
+                    allStored = false
+                    done += 1
+                    progress(done, total)
+                    continue
+                }
+                if let hook = loudnessHook.withLock({ $0 }) { await hook(track.id) }
+                let stored = await store(track: track.id, lufs: measured.lufs, peak: measured.truePeak)
+                allStored = allStored && stored
+                unpublished = unpublished || stored
+                if job.complete { meters.append(measured.meter) }
+                peaks.append(measured.truePeak)
+                done += 1
+                progress(done, total)
+            }
+            if allStored, let peak = peaks.max() {
+                let lufs = LoudnessMeter.albumLufs(meters)
+                await storeAlbum(job.albumID, lufs: lufs.isFinite ? lufs : nil, peak: peak, members: job.membersHash)
+                unpublished = true
+            }
+            if unpublished, ContinuousClock.now - lastPublish >= .seconds(5) {
+                try? await run(.always) { _ in () }
+                unpublished = false
+                lastPublish = .now
+            }
+        }
+        // The end, and a cancelled scan, publish what was stored.
+        if unpublished { try? await run(.always) { _ in () } }
+    }
+
+    private func store(track id: String, lufs: Double?, peak: Double) async -> Bool {
         do {
             return try await run(.never) { try $0.recordLoudness(trackID: id, lufs: lufs, peak: peak) }
         } catch {
@@ -137,9 +180,11 @@ extension Library {
         }
     }
 
-    private func storeAlbum(_ id: String, lufs: Double, peak: Double) async {
+    private func storeAlbum(_ id: String, lufs: Double?, peak: Double, members: String) async {
         do {
-            try await run(.never) { try $0.recordAlbumLoudness(albumID: id, lufs: lufs, peak: peak) }
+            try await run(.never) {
+                try $0.recordAlbumLoudness(albumID: id, lufs: lufs, peak: peak, members: members)
+            }
         } catch {
             Self.log(error, during: "album loudness write")
         }

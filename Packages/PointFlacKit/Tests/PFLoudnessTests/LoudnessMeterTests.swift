@@ -107,4 +107,21 @@ struct LoudnessMeterTests {
             #expect(abs((s - f) - 10 * log10(1.41)) < 0.01)
         }
     }
+
+    @Test("a finished meter keeps its answers, ignores more audio and still pools")
+    func finishFreesMemory() throws {
+        let samples = Self.stereoSine(hz: 1000, dbfs: -20, seconds: 20, rate: 96_000)
+        let meter = try Self.measure(samples, rate: 96_000)
+        let lufs = meter.integratedLufs
+        let peak = meter.truePeakDbTP
+        meter.finish()
+        #expect(meter.integratedLufs == lufs && meter.truePeakDbTP == peak)
+        // (The memory it gives back is measured outside the suite: parallel tests make heap counts meaningless here.)
+        // A finished meter still pools into an album value, and ignores further audio.
+        samples.withUnsafeBufferPointer { meter.add($0, frames: samples.count / 2) }
+        #expect(meter.integratedLufs == lufs)
+        let other = try Self.measure(Self.stereoSine(hz: 1000, dbfs: -26, seconds: 20, rate: 96_000), rate: 96_000)
+        other.finish()
+        #expect(abs(LoudnessMeter.albumLufs([meter, other]) - -22.0) <= 0.2)
+    }
 }

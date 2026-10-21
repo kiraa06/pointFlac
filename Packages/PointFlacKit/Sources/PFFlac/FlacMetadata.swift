@@ -50,7 +50,7 @@ public struct FlacMetadata: Sendable {
     public var trackGainDb: Double? { first("REPLAYGAIN_TRACK_GAIN").flatMap(Self.gain) }
     public var albumGainDb: Double? { first("REPLAYGAIN_ALBUM_GAIN").flatMap(Self.gain) }
     /// The track's sample peak as a linear amplitude (1.0 = full scale), from `REPLAYGAIN_TRACK_PEAK`. Nil unless
-    /// finite and greater than zero.
+    /// finite, greater than zero and at most 10 (+20 dBFS).
     public var trackPeak: Double? { first("REPLAYGAIN_TRACK_PEAK").flatMap(Self.peak) }
     /// As `trackPeak`, for the album (`REPLAYGAIN_ALBUM_PEAK`).
     public var albumPeak: Double? { first("REPLAYGAIN_ALBUM_PEAK").flatMap(Self.peak) }
@@ -68,17 +68,22 @@ public struct FlacMetadata: Sendable {
     /// plus or minus 60 dB (no real measurement), is treated as absent, like a missing tag, so playback can never
     /// scale audio by it (ledger T5).
     private static func gain(_ s: String) -> Double? {
-        var t = s.trimmingCharacters(in: .whitespaces)
-        if t.lowercased().hasSuffix("db") { t = String(t.dropLast(2)).trimmingCharacters(in: .whitespaces) }
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.lowercased().hasSuffix("db") { t = String(t.dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines) }
         guard let value = Double(t), value.isFinite, abs(value) <= maxGainDb else { return nil }
         return value
     }
 
     private static let maxGainDb = 60.0
+    /// +20 dBFS. Some old taggers wrote the peak as a sample value ("32767"); read as linear it would silence the
+    /// track through a clip guard.
+    private static let maxPeak = 10.0
 
     /// A ReplayGain peak: a linear amplitude, finite and greater than zero.
     private static func peak(_ s: String) -> Double? {
-        guard let value = Double(s.trimmingCharacters(in: .whitespaces)), value.isFinite, value > 0 else { return nil }
+        guard let value = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite, value > 0,
+            value <= maxPeak
+        else { return nil }
         return value
     }
 }

@@ -86,16 +86,15 @@ public struct TrackLoudness: Sendable, Hashable {
     public var trackPeak: Double?
     public var albumGainDb: Double?
     public var albumPeak: Double?
-    /// The scan's integrated loudness of the track, in LUFS. A silent track reads `silenceLufs`.
+    /// The scan's integrated loudness of the track, in LUFS. Nil with `measuredPeak` set means measured, but there is
+    /// no usable loudness (silent, or shorter than one 400 ms gating block): apply no gain from it.
     public var measuredLufs: Double?
-    /// The scan's true peak of the track, linear (1.0 = full scale).
+    /// The scan's true peak of the track, linear (1.0 = full scale; 0 for silence). Set once the track is measured.
     public var measuredPeak: Double?
-    /// The scan's loudness of the whole album, in LUFS, and its peak (the largest track peak), linear.
+    /// The scan's loudness of the whole album, in LUFS (nil when it has no usable loudness), and its peak (the largest
+    /// track peak), linear. Both nil when the album was not measured as a whole.
     public var albumMeasuredLufs: Double?
     public var albumMeasuredPeak: Double?
-
-    /// What the scan stores for a track with nothing above the gate (silence, or shorter than one 400 ms block).
-    public static let silenceLufs = -70.0
 
     public init(
         trackGainDb: Double? = nil, trackPeak: Double? = nil, albumGainDb: Double? = nil, albumPeak: Double? = nil,

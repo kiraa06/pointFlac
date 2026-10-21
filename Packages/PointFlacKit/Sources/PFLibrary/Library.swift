@@ -44,6 +44,8 @@ public final class Library: Sendable {
     private let repairScheduled = Mutex(false)
     /// For tests: how many files the loudness scan has opened to decode.
     let loudnessDecodes = Mutex(0)
+    /// A loudness scan is running (`scanLoudness` runs one at a time).
+    let loudnessScanning = Mutex(false)
     /// For tests: awaited after each track's measurement, before it is stored.
     let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.

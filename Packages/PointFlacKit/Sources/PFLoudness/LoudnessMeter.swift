@@ -14,12 +14,16 @@ public final class LoudnessMeter {
     }
 
     private var state: UnsafeMutablePointer<ebur128_state>?
+    private var finished = false
 
     public init(channels: Int, sampleRate: Int) throws {
         guard channels >= 1, channels <= Int(UInt32.max), sampleRate >= 16, sampleRate <= Int(UInt32.max) else {
             throw Failure.invalidFormat
         }
-        let mode = Int32(EBUR128_MODE_I.rawValue | EBUR128_MODE_TRUE_PEAK.rawValue)
+        // Histogram mode keeps the gating blocks in one 1000-bin histogram (0.1 LU bins) instead of a list that grows
+        // with the track; `ebur128_loudness_global_multiple` pools histogram states as it pools block lists.
+        let mode = Int32(
+            EBUR128_MODE_I.rawValue | EBUR128_MODE_TRUE_PEAK.rawValue | EBUR128_MODE_HISTOGRAM.rawValue)
         guard let made = ebur128_init(UInt32(channels), UInt(sampleRate), mode) else { throw Failure.initFailed }
         state = made
         Self.applyChannelMap(made, channels: channels)
@@ -56,9 +60,22 @@ public final class LoudnessMeter {
 
     /// Feeds `frames` interleaved frames. `interleaved` must hold at least `frames * channels` samples.
     public func add(_ interleaved: UnsafeBufferPointer<Float>, frames: Int) {
-        guard let state, frames > 0, let base = interleaved.baseAddress else { return }
+        guard let state, !finished, frames > 0, let base = interleaved.baseAddress else { return }
         precondition(interleaved.count >= frames * Int(state.pointee.channels), "short buffer")
         _ = ebur128_add_frames_float(state, base, frames)
+    }
+
+    /// Ends the measurement and gives back the memory a long-lived meter would otherwise hold. libebur128 allocates
+    /// about 1 to 4.5 MB per meter at init (the 400 ms K-weighting window, the true-peak resampler), whatever the
+    /// track length; a meter kept only so its gating blocks can be pooled into an album value
+    /// (`albumLufs`) needs none of it. Afterwards `add` does nothing, and `integratedLufs`, `truePeakDbTP` and
+    /// `albumLufs` still answer, from the histogram and the peaks, which survive (the channel count is unchanged).
+    public func finish() {
+        guard let state, !finished else { return }
+        finished = true
+        // Changing only the sample rate frees and re-creates the window and the resampler at the smallest rate
+        // libebur128 accepts, and keeps the histogram and the peaks.
+        _ = ebur128_change_parameters(state, state.pointee.channels, 16)
     }
 
     /// Gated integrated loudness in LUFS. Silence (nothing above the -70 LUFS absolute gate) is `-.infinity`, which is

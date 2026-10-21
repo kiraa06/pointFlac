@@ -94,8 +94,11 @@ private func replayGain(_ tags: [String: [String]]) -> FlacMetadata {
         #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": [raw]]).trackGainDb == nil, "\(raw)")
     }
     #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": ["-60 dB"]]).trackGainDb == -60)
-    for raw in ["0", "-0.5", "nan", "inf", "-inf", "loud", "0,9"] {
+    for raw in ["0", "-0.5", "nan", "inf", "-inf", "loud", "0,9", "32767", "10.5"] {
         #expect(replayGain(["REPLAYGAIN_TRACK_PEAK": [raw]]).trackPeak == nil, "\(raw)")
     }
     #expect(replayGain([:]).albumPeak == nil)
+    // Taggers that end their lines with CR LF.
+    #expect(replayGain(["REPLAYGAIN_TRACK_GAIN": ["-6.2 dB\r\n"]]).trackGainDb == -6.2)
+    #expect(replayGain(["REPLAYGAIN_TRACK_PEAK": ["0.98\n"]]).trackPeak == 0.98)
 }

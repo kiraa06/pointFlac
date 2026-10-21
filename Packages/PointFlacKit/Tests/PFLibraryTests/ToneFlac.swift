@@ -1,39 +1,53 @@
 import Foundation
 
-/// A real FLAC file of a generated stereo sine, written here (verbatim subframes, CRCs included) so loudness tests
-/// need no bundled audio and can run long enough for the 400 ms gating blocks of EBU R128. 16-bit, 48 kHz.
+/// A real FLAC file of a generated sine, written here (verbatim subframes, CRCs included) so loudness tests need no
+/// bundled audio and run long enough for several 400 ms gating blocks of EBU R128: about 3.2 seconds.
 enum ToneFlac {
-    static let rate = 48_000
-    static let block = 4096
-    /// Whole blocks, so every frame has the same header: about 20 seconds.
-    static let frames = block * 235
+    struct Spec {
+        var rate = 48_000
+        var bits = 16
+        var channels = 2
+        static let block = 4096
 
-    /// The samples a file made with `rmsDbfs` holds, interleaved L R, as the decoder will give them back (16-bit
-    /// quantised, scaled to ±1).
-    static func samples(rmsDbfs: Double, hz: Double = 1000) -> [Int16] {
-        let amp = pow(10, rmsDbfs / 20) * 2.0.squareRoot() * 32768
-        var out = [Int16](repeating: 0, count: frames * 2)
-        for i in 0..<frames {
-            let v = Int16(max(-32768, min(32767, (amp * sin(2 * .pi * hz * Double(i) / Double(rate))).rounded())))
-            out[2 * i] = v
-            out[2 * i + 1] = v
+        /// Whole blocks, so every frame has the same header.
+        var frames: Int { Self.block * Int((3.2 * Double(rate) / Double(Self.block)).rounded(.up)) }
+        static let stereo16 = Spec()
+    }
+
+    /// The samples of a sine at `rmsDbfs` (per channel), interleaved, in native range, as the decoder gives them back.
+    static func samples(rmsDbfs: Double, hz: Double = 1000, _ spec: Spec = .stereo16) -> [Int32] {
+        let full = pow(2.0, Double(spec.bits - 1))
+        let amp = pow(10, rmsDbfs / 20) * 2.0.squareRoot() * full
+        var out = [Int32](repeating: 0, count: spec.frames * spec.channels)
+        for i in 0..<spec.frames {
+            let v = Int32(
+                max(-full, min(full - 1, (amp * sin(2 * .pi * hz * Double(i) / Double(spec.rate))).rounded())))
+            for c in 0..<spec.channels { out[i * spec.channels + c] = v }
         }
         return out
     }
 
-    static func floats(_ samples: [Int16]) -> [Float] { samples.map { Float($0) / 32768 } }
-
-    static func write(to url: URL, rmsDbfs: Double, tags: [(String, String)]) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try make(samples(rmsDbfs: rmsDbfs), tags: tags).write(to: url)
+    static func floats(_ samples: [Int32], _ spec: Spec = .stereo16) -> [Float] {
+        let full = Float(pow(2.0, Double(spec.bits - 1)))
+        return samples.map { Float($0) / full }
     }
 
-    static func make(_ samples: [Int16], tags: [(String, String)]) -> Data {
+    static func write(
+        to url: URL, rmsDbfs: Double, _ spec: Spec = .stereo16, tags: [(String, String)]
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try make(samples(rmsDbfs: rmsDbfs, spec), spec, tags: tags).write(to: url)
+    }
+
+    static func make(_ samples: [Int32], _ spec: Spec, tags: [(String, String)]) -> Data {
+        let block = Spec.block
         var out: [UInt8] = [0x66, 0x4C, 0x61, 0x43]
-        // STREAMINFO: block sizes, frame sizes (unknown), 48000 Hz / 2 channels / 16 bits / total frames, no MD5.
+        // STREAMINFO: block sizes, frame sizes (unknown), rate / channels / bits / total frames, no MD5.
         var info: [UInt8] = TaggedFlac.be32(block).suffix(2) + TaggedFlac.be32(block).suffix(2) + [0, 0, 0, 0, 0, 0]
-        let packed: UInt64 = UInt64(rate) << 44 | UInt64(1) << 41 | UInt64(15) << 36 | UInt64(frames)
+        let packed: UInt64 =
+            UInt64(spec.rate) << 44 | UInt64(spec.channels - 1) << 41 | UInt64(spec.bits - 1) << 36
+            | UInt64(spec.frames)
         for shift in stride(from: 56, through: 0, by: -8) {
             info.append(UInt8(truncatingIfNeeded: packed >> UInt64(shift)))
         }
@@ -42,15 +56,21 @@ enum ToneFlac {
         let comment = TaggedFlac.comment(vendor: "pointFlac tests", tags: tags)
         let n = comment.count
         out += [0x84, UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)] + comment
-        for index in 0..<(frames / block) {
-            var frame: [UInt8] = [0xFF, 0xF8, 0xCA, 0x18]  // fixed size, 4096, 48 kHz, stereo, 16 bits
+        let rateCode: UInt8 = spec.rate == 96_000 ? 0b1011 : 0b1010
+        let sizeCode: UInt8 = spec.bits == 24 ? 0b110 : 0b100
+        let bytes = spec.bits / 8
+        for index in 0..<(spec.frames / block) {
+            // Fixed size, 4096 frames, rate, independent channels, bit depth.
+            var frame: [UInt8] = [0xFF, 0xF8, 0xC0 | rateCode, UInt8(spec.channels - 1) << 4 | sizeCode << 1]
             frame += utf8(index)
             frame.append(crc8(frame))
-            for channel in 0..<2 {
+            for channel in 0..<spec.channels {
                 frame.append(0x02)  // verbatim subframe
                 for i in 0..<block {
-                    let v = UInt16(bitPattern: samples[(index * block + i) * 2 + channel])
-                    frame += [UInt8(v >> 8), UInt8(v & 0xFF)]
+                    let v = UInt32(bitPattern: samples[(index * block + i) * spec.channels + channel])
+                    for byte in stride(from: bytes - 1, through: 0, by: -1) {
+                        frame.append(UInt8(truncatingIfNeeded: v >> UInt32(8 * byte)))
+                    }
                 }
             }
             let crc = crc16(frame)
