@@ -146,6 +146,9 @@ final class LibraryStore {
     private(set) var probes = 0
     /// Asks iCloud to download an evicted file. A stand-in for tests, which have no iCloud.
     var startDownload: (URL) -> Void = { try? FileManager.default.startDownloadingUbiquitousItem(at: $0) }
+    /// For tests: thrown once inside the next removal's transaction, after its files are deleted, standing in for a
+    /// database failure.
+    var removalFault: (any Error)?
 
     init(databaseURL: URL, libraryFolder: URL, artworkFolder: URL, maxFileBytes: Int64) throws {
         database = try SQLiteDatabase(url: databaseURL)
@@ -731,7 +734,8 @@ final class LibraryStore {
     ///   changes.
     ///
     /// Covers no track uses any more go too, rows and files, as after a scan. Files are deleted inside the database
-    /// transaction; should it roll back, the rows of files already deleted stay until the next scan finds them gone.
+    /// transaction; should it roll back, the rows of files already deleted stay until a scan finds them gone, which
+    /// `Library.remove` runs at once. Only the transaction throws: once it commits, the removal is reported.
     func remove(trackIDs ids: [String]) throws -> LibraryRemoval {
         var removal = LibraryRemoval(deletedFiles: 0, removedFromLibrary: 0)
         var emptied: Set<URL> = []
@@ -762,12 +766,19 @@ final class LibraryStore {
                     removal.removedFromLibrary += 1
                 }
             }
+            if let fault = removalFault {
+                removalFault = nil
+                throw fault
+            }
             // As `removeGone` does after a scan: the rows first, in the transaction, then the files.
             try database.query(
                 "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
         }
-        let keep = Set(try database.query("SELECT id FROM artwork").compactMap { $0[0].string })
-        artwork.removeAll(except: keep)
+        // Committed: nothing below throws, so the removal is always published. Should the covers that stay be
+        // unreadable, their files are left for the next scan's sweep rather than every cover deleted.
+        if let covers = try? database.query("SELECT id FROM artwork") {
+            artwork.removeAll(except: Set(covers.compactMap { $0[0].string }))
+        }
         if let root = roots[Self.libraryFolderID] {
             for folder in emptied { Self.removeEmptyFolders(from: folder, below: root) }
         }

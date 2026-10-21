@@ -170,11 +170,15 @@ public final class Library: Sendable {
     /// that leaves empty below the library folder. A track in a folder added in place only leaves the library: its
     /// file is the user's and is never touched, and rescans leave it out until it changes. Covers no track uses any
     /// more are deleted. Unknown IDs are ignored.
+    ///
+    /// Should it fail, the database rolls back but a file already deleted stays deleted, so the library rescans
+    /// before throwing: its catalog, and the shelf, never list a file that is gone.
     public func remove(trackIDs: [String]) async throws -> LibraryRemoval {
         do {
             return try await run(.ifChanged) { try $0.remove(trackIDs: trackIDs) }
         } catch {
             Self.log(error, during: "remove")
+            await rescan()
             throw error
         }
     }
@@ -206,6 +210,11 @@ public final class Library: Sendable {
     /// For tests: lowers the per-folder file cap.
     func setMaxFilesPerFolder(_ cap: Int) async {
         _ = try? await run(.never) { $0.maxFilesPerFolder = cap }
+    }
+
+    /// For tests: the next removal fails inside its transaction, after deleting its files.
+    func failNextRemoval() async {
+        _ = try? await run(.never) { $0.removalFault = LibraryDatabaseError(code: 1, message: "injected failure") }
     }
 
     /// For tests: waits until everything queued before it has run.

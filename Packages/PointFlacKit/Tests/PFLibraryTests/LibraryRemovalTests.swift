@@ -228,6 +228,24 @@ private final class RemovalSandbox {
     #expect(box.exists(box.root.appending(path: "Documents")))
 }
 
+/// Review fix: should the database fail part-way, the rows roll back but a file already deleted stays deleted. The
+/// library rescans before it reports the failure, so its catalog never lists a file that is gone.
+@Test func aFailedRemovalLeavesTheCatalogMatchingTheDisk() async throws {
+    let box = try RemovalSandbox()
+    let library = try box.open()
+    _ = await library.importFiles([
+        try box.picked("s16-44100", as: "keep.flac", tags: [("TITLE", "Keep")]),
+        try box.picked("s24-48000", as: "gone.flac", tags: [("TITLE", "Gone")]),
+    ])
+    let gone = try #require(library.current.tracks.values.first { $0.title == "Gone" })
+    await library.failNextRemoval()
+
+    await #expect(throws: LibraryDatabaseError.self) { _ = try await library.remove(trackIDs: [gone.id]) }
+
+    #expect(!box.exists(gone.url))
+    #expect(library.current.tracks.values.map(\.title) == ["Keep"])
+}
+
 /// A file deleted in the Files app before any rescan: its track still leaves, and counts as deleted.
 @Test func aFileAlreadyGoneStillLeaves() async throws {
     let box = try RemovalSandbox()
