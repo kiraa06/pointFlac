@@ -49,18 +49,18 @@ public enum SignalStrip {
     public static func showsResolution(_ s: SignalState) -> Bool { !signalBadges(s).isEmpty }
 
     /// The small note beside the song title for the altered or transient states (the resolution text in the cell covers the
-    /// rest): the rate change, the depth reduction, processing, a downmix, scrubbing. Nil for pure, for the route
-    /// warnings (Bluetooth, AirPlay, other, which stay in the cell), and for idle and pending.
+    /// rest): the depth reduction, processing, a downmix, scrubbing. Nil for pure, for the route warnings (Bluetooth,
+    /// AirPlay, other, which stay in the cell), and for idle and pending. A rate change gets no note either (Kiran's
+    /// call): the details sheet's Rate change row states it, and who made it.
     public static func titleNote(_ s: SignalState) -> String? {
         // When the cell shows the indicator words, they already say this state: never repeat it.
         guard showsResolution(s) else { return nil }
         switch s.indicator {
-        case .resampled(let change): return "Resampled \(shortRate(change.from))→\(shortRate(change.to))"
         case .depthReduced(let from, let to): return "\(from)→\(to)-bit"
         case .processing: return "Processing"
         case .downmixed(let from, let to): return "Downmixed \(from)→\(to)"
         case .scrubbing: return "Scrubbing"
-        case .idle, .pending, .pure, .bluetoothLossy, .airPlay, .otherRoute: return nil
+        case .idle, .pending, .pure, .resampled, .bluetoothLossy, .airPlay, .otherRoute: return nil
         }
     }
 
@@ -68,7 +68,6 @@ public enum SignalStrip {
     public static func titleNoteSpoken(_ s: SignalState) -> String? {
         guard showsResolution(s) else { return nil }
         switch s.indicator {
-        case .resampled(let change): return "Resampled \(shortRate(change.from)) to \(shortRate(change.to)) kilohertz"
         case .depthReduced(let from, let to): return "Reduced from \(from)-bit to \(to)-bit"
         case .downmixed(let from, let to): return "Downmixed from \(from) to \(to) channels"
         default: return titleNote(s)
