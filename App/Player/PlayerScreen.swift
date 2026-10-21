@@ -16,6 +16,7 @@ struct PlayerScreen: View {
     let model: AppModel
     @Binding var tab: AppTab
     @AppStorage("playerView") private var stage: PlayerStage = .deck
+    @AppStorage("monochrome") private var monochrome = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shelfOpen = false
@@ -25,8 +26,9 @@ struct PlayerScreen: View {
     @Namespace private var discSpace
 
     private var playback: PlaybackController { model.playback }
-    private var theme: Theme { stage == .deck ? .deck(dark: scheme == .dark) : .cover(dark: scheme == .dark) }
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac") }
+    private var theme: Theme { .look(stage: stage, dark: scheme == .dark, monochrome: monochrome) }
+    /// What tints the glass: the record's colours, in greys under Monochrome (the sleeve and art keep theirs).
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
 
     var body: some View {
         GeometryReader { proxy in

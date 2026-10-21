@@ -1,5 +1,6 @@
 import PFAudio
 import SwiftUI
+import UIKit
 
 enum AppTab: Hashable {
     case player, getMusic, downloads, settings
@@ -10,6 +11,7 @@ enum AppTab: Hashable {
 struct RootView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
+    @AppStorage("monochrome") private var monochrome = false
     @State private var tab: AppTab = Self.launchTab
     @Environment(\.scenePhase) private var scenePhase
     @State private var grace = BackgroundGrace()
@@ -31,6 +33,11 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(appearance.colorScheme)
+        // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
+        // colour of their own read the flag. The look switches live, over a short fade.
+        .tint(monochrome ? Self.monochromeInk : nil)
+        .environment(\.isMonochrome, monochrome)
+        .animation(.easeInOut(duration: 0.3), value: monochrome)
         .task { await model.load() }
         .onChange(of: scenePhase) { old, new in
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
@@ -51,6 +58,10 @@ struct RootView: View {
             model.playback.playerTrackChanged(from: old, to: new)
         }
     }
+
+    /// The ink of the Deck and Cover looks, whichever style is showing.
+    private static let monochromeInk = Color(
+        uiColor: UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.08, alpha: 1) })
 
     /// `-PFTab getMusic|downloads|settings` (DEBUG only) opens on that tab, for screenshots.
     private static var launchTab: AppTab {

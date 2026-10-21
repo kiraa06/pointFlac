@@ -204,7 +204,44 @@ final class PlayerUITests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testMonochromeToggle() {
+        let app = launch(demoPlay: true)
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 5))
+        let toggle = openMonochromeToggle(app)
+        // Start from a known state: the setting survives launches, so an earlier run may have left it on.
+        if toggle.value as? String == "1" { flip(toggle) }
+        XCTAssertEqual(toggle.value as? String, "0")
+        flip(toggle)
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.tabBars.buttons["Player"].tap()
+        XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
+        app.terminate()
+
+        let relaunched = launch()
+        XCTAssertTrue(relaunched.buttons["shelfButton"].waitForExistence(timeout: 5))
+        let persisted = openMonochromeToggle(relaunched)
+        XCTAssertEqual(persisted.value as? String, "1")
+        // Leave the app as found.
+        flip(persisted)
+        XCTAssertEqual(persisted.value as? String, "0")
+    }
+
     // MARK: Helpers
+
+    /// A Form row's switch is the right-hand end of the row; a tap in the middle only hits the label.
+    @MainActor
+    private func flip(_ toggle: XCUIElement) {
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+    }
+
+    @MainActor
+    private func openMonochromeToggle(_ app: XCUIApplication) -> XCUIElement {
+        app.tabBars.buttons["Settings"].tap()
+        let toggle = app.switches["monochromeToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        return toggle
+    }
 
     @MainActor
     private func launch(demoPlay: Bool = false) -> XCUIApplication {

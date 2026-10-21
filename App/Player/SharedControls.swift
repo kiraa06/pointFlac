@@ -185,7 +185,7 @@ struct ProgressRow: View {
     private var player: Player { playback.player }
 
     /// The playing record's colours: the played part of the bar is drawn in them.
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac") }
+    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
 
     var body: some View { progress }
 
@@ -465,7 +465,7 @@ struct AlbumLine: View {
             }
             Spacer()
             Text(album.bestFormat.replacingOccurrences(of: "FLAC ", with: ""))
-                .font(Typeface.mono).foregroundStyle(.green)
+                .font(Typeface.mono).monoForeground(.green)
         }
     }
 }
