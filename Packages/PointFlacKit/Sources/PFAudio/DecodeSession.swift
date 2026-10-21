@@ -299,8 +299,8 @@ final class DecodeSession: @unchecked Sendable {
         return nil
     }
 
-    /// Stop, negotiate, re-plan, configure, start, `.planChanged`. The ring must be drained. The new source starts
-    /// counting at `written` (all of it rendered), so markers stay valid.
+    /// Stop, negotiate, re-plan, configure, compile the Sound chain for the new format, start, `.planChanged`. The ring
+    /// must be drained. The new source starts counting at `written` (all of it rendered), so markers stay valid.
     ///
     /// A rate ≤ 0 from `negotiateRate` means the session has no usable output rate. That fails the item: assuming the
     /// source rate instead would break "client rate == hardware rate" and let iOS resample silently.
@@ -324,13 +324,16 @@ final class DecodeSession: @unchecked Sendable {
                         channels: channels, capacityFrames: max(newPlan.clientSampleRate / 2, 1),
                         renderedFrames: rendered, inheritingHoldsFrom: s.source,
                         clientRate: newPlan.clientSampleRate, floatClient: newPlan.client == .float32,
-                        scrub: core.scrubTap)
+                        scrub: core.scrubTap, sound: core.soundRunner)
                     s.source = fresh
                     return fresh
                 }
                 source = fresh
                 output.source = fresh
                 try output.configure(newPlan, channels: channels)
+                // While the output is stopped: the chain for the new rate and channels, from rest, before any of the
+                // new format renders.
+                core.configureSound(sampleRate: newPlan.clientSampleRate, channels: channels)
                 try output.start()
                 return true
             }

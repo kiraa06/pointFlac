@@ -11,8 +11,8 @@ import Testing
 /// the limiter's delay). Clicks are the largest sample step against the tone's own slope. True peaks are read on an
 /// FFT-exact reconstruction of a periodic output, which shares no code or filter with the limiter's detector.
 ///
-/// Serialised: `SoundChain.liveInstances` counts every chain in the process, so no other test here may make chains
-/// while `retiredChainsAreFreed` counts them.
+/// Serialised: the counting tests count the chains made in their own task (`SoundChain.liveCounter`), and the
+/// suite's timing-sensitive runs are kept apart.
 @Suite("Sound chain", .serialized)
 struct SoundChainTests {
     static let rate = 48_000.0
@@ -326,25 +326,68 @@ struct SoundChainTests {
     #if DEBUG
         @Test("After that run and three installs of Pure, every chain is freed")
         func retiredChainsAreFreed() {
-            #expect(SoundChain.liveInstances == 0, "no chain alive before")
-            let runner = ChainRunner()
-            _ = Self.sweep("eq", pureEvery: 40, on: runner)
-            // The runner is still alive, so the retire path freed them, not its deinit.
-            withExtendedLifetime(runner) {
-                #expect(SoundChain.liveInstances == 0, "\(SoundChain.liveInstances) chains still alive")
+            let live = SoundChain.LiveCounter()
+            SoundChain.$liveCounter.withValue(live) {
+                let runner = ChainRunner()
+                _ = Self.sweep("eq", pureEvery: 40, on: runner)
+                // The runner is still alive, so the retire path freed them, not its deinit.
+                withExtendedLifetime(runner) {
+                    #expect(live.value == 0, "\(live.value) chains still alive")
+                }
             }
         }
 
         @Test("A runner frees the chain it is playing, and the one in its mailbox, when it goes")
         func runnerFreesItsChainsWhenItGoes() {
-            do {
-                let runner = ChainRunner()
-                runner.install(SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2))
-                _ = Self.run(runner, Self.tone(1_000, amplitude: 0.5, frames: 1_024))
-                runner.install(SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2))
-                withExtendedLifetime(runner) { #expect(SoundChain.liveInstances == 2) }
+            let live = SoundChain.LiveCounter()
+            SoundChain.$liveCounter.withValue(live) {
+                do {
+                    let runner = ChainRunner()
+                    runner.install(SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2))
+                    _ = Self.run(runner, Self.tone(1_000, amplitude: 0.5, frames: 1_024))
+                    runner.install(
+                        SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2))
+                    withExtendedLifetime(runner) { #expect(live.value == 2) }
+                }
             }
-            #expect(SoundChain.liveInstances == 0)
+            #expect(live.value == 0)
+        }
+
+        @Test("A reset releases every chain the runner held, and the fresh chain plays from rest at once")
+        func resetReleasesEverythingAndStartsFresh() {
+            let live = SoundChain.LiveCounter()
+            SoundChain.$liveCounter.withValue(live) {
+                let runner = ChainRunner()
+                let tone = Self.tone(1_000, amplitude: 0.5, frames: 4_096)
+                // A chain playing, a second mid-fade and a third waiting: the output stops with all three held.
+                runner.install(SoundChain(Self.settings(), sampleRate: Self.rate, channels: 2))
+                _ = Self.run(runner, tone)
+                runner.install(SoundChain(Self.settings { $0.preamp.trimDb = -3 }, sampleRate: Self.rate, channels: 2))
+                _ = Self.run(runner, Array(tone.prefix(2 * 200)))
+                runner.install(SoundChain(Self.settings { $0.preamp.trimDb = -6 }, sampleRate: Self.rate, channels: 2))
+                #expect(live.value == 3)
+
+                // A new format: 96 kHz. It is heard from the first frame, with no fade and nothing of the old tone.
+                let fresh = Self.settings { $0.preamp.trimDb = -6 }
+                runner.reset(to: SoundChain(fresh, sampleRate: 96_000, channels: 2))
+                #expect(live.value == 1)
+                let reference = ChainRunner()
+                reference.reset(to: SoundChain(fresh, sampleRate: 96_000, channels: 2))
+                let input = Self.tone(10_000, amplitude: 0.25, frames: 2_048, rate: 96_000)
+                let got = Self.run(runner, input)
+                let want = Self.run(reference, input)
+                #expect(Self.identical(got[...], want[...]))
+                let latency = SoundChain(fresh, sampleRate: 96_000, channels: 2).latencyFrames
+                #expect(got.prefix(2 * latency).allSatisfy { $0 == 0 }, "the look-ahead starts empty")
+
+                // Back to Pure the same way: bit-identical at once.
+                runner.reset(to: nil)
+                let pure = Self.run(runner, input)
+                #expect(Self.identical(pure[...], input[...]))
+                withExtendedLifetime(reference) { #expect(live.value == 1, "only the reference's chain") }
+                withExtendedLifetime(runner) { #expect(runner.isIdle) }
+            }
+            #expect(live.value == 0)
         }
     #endif
 

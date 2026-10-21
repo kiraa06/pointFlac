@@ -1,5 +1,6 @@
 import Foundation
 import PFCore
+import PFDSP
 import Synchronization
 
 /// One entry of the play queue, as the pipeline sees it.
@@ -48,6 +49,9 @@ public enum PipelineEvent: Sendable, Equatable {
 /// - A seek holds the output silent at once, then the decode thread flushes the ring through `RenderSource`'s
 ///   handshake (never `reset()` while the output runs), seeks the decoder and refills. The newest request wins.
 /// - A decoder error emits `.itemFailed` and playback moves to the next item.
+/// - The Sound chain (`setSound`) runs on the render thread over everything the output is handed, after the ring or
+///   the scrub voice. It is compiled for the plan's client rate and channel count, afresh at every configure, before
+///   the output starts. Pure (the default) leaves the output bit-identical.
 ///
 /// Dropping the pipeline stops playback.
 public final class PlaybackPipeline: @unchecked Sendable {
@@ -122,6 +126,25 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.position
     }
 
+    /// Plays `settings` (clamped) from the render thread's next call: compiled here, on the calling thread, for the
+    /// current plan's client rate and channel count, and cross-faded in by the chain runner after the new chain's
+    /// look-ahead (a few milliseconds). A change made while the previous one is still fading waits for that fade, at
+    /// most a latency plus 10 ms. Before the first plan it is only stored, and the configure compiles it. Pure, or
+    /// nothing active, is no chain at all. Any thread but the render thread.
+    public func setSound(_ settings: SoundSettings) {
+        core.setSound(settings)
+    }
+
+    /// The settings `setSound` was last given, clamped.
+    public var soundSettings: SoundSettings {
+        core.soundSettings
+    }
+
+    /// The chain runner's meters (see `SoundMeters`). Reading starts a new peak interval, so keep to one reader.
+    public var soundMeters: SoundMeters {
+        core.soundRunner.meters
+    }
+
     /// The finger on the record, shared with every render source this pipeline makes.
     var scrubTap: ScrubTap { core.scrubTap }
 
@@ -153,7 +176,7 @@ public final class PlaybackPipeline: @unchecked Sendable {
 /// State shared by the facade, the live decode session and readers of `position`.
 ///
 /// Split from `PlaybackPipeline` so that a decode thread never keeps the facade alive: dropping the pipeline stops
-/// playback. Lock order: `outputGate`, then `shared`. The render thread takes neither.
+/// playback. Lock order: `outputGate`, then `soundFormat`, then `shared`. The render thread takes none of them.
 final class PipelineCore: @unchecked Sendable {
     struct Shared {
         /// The live session. Any other session's thread is on its way out and may not touch shared state.
@@ -165,6 +188,14 @@ final class PipelineCore: @unchecked Sendable {
         var requestedSeek: Int64?
         /// `requestedSeek`'s signpost interval, taken by the decode thread with it.
         var seekInterval: FirstFrameInterval?
+        /// The Sound settings, clamped: compiled whenever they change, and at every configure for the new format.
+        var soundSettings = SoundSettings()
+    }
+
+    /// The client rate and channel count the Sound chain is compiled for.
+    struct SoundFormat: Sendable {
+        var sampleRate: Int
+        var channels: Int
     }
 
     let capabilities: OutputCapabilities
@@ -173,6 +204,11 @@ final class PipelineCore: @unchecked Sendable {
     let ditherSeed: UInt64
     let shared = Mutex(Shared())
     let scrubTap = ScrubTap()
+    /// The one Sound chain runner, handed to every render source this pipeline makes; it outlives them all.
+    let soundRunner = ChainRunner()
+    /// The format the chain is compiled for, nil until a session first configures the output. Its lock also
+    /// serialises every compile and install, so the latest settings at the latest format always win.
+    private let soundFormat = Mutex<SoundFormat?>(nil)
     /// Decode threads that have not returned yet, including stopped sessions still unwinding. For tests.
     let liveDecodeThreads = Atomic<Int>(0)
     private let continuation: AsyncStream<PipelineEvent>.Continuation
@@ -253,6 +289,41 @@ final class PipelineCore: @unchecked Sendable {
 
     var position: (index: Int, frame: Int64) {
         shared.withLock { s in s.timeline.position(rendered: s.source?.renderedFrames ?? 0) }
+    }
+
+    // MARK: Sound
+
+    var soundSettings: SoundSettings {
+        shared.withLock { $0.soundSettings }
+    }
+
+    /// Stores `settings` (clamped) and, once there is a format, compiles them for it and installs the chain, which the
+    /// runner cross-fades in at the render thread's next call. Any thread but the render thread.
+    func setSound(_ settings: SoundSettings) {
+        let settings = settings.clamped()
+        soundFormat.withLock { format in
+            shared.withLock { $0.soundSettings = settings }
+            guard let format else { return }
+            soundRunner.install(Self.chain(settings, for: format))
+        }
+    }
+
+    /// The live session's configure, with the output stopped and before it starts: compiles the settings for the new
+    /// client rate and channel count and cuts over to them at once (`ChainRunner.reset(to:)`), so nothing of the
+    /// previous track's tail, held in the old chain, plays through into the new one (Review Focus 1).
+    func configureSound(sampleRate: Int, channels: Int) {
+        soundFormat.withLock { format in
+            let fresh = SoundFormat(sampleRate: sampleRate, channels: channels)
+            format = fresh
+            let settings = shared.withLock { $0.soundSettings }
+            soundRunner.reset(to: Self.chain(settings, for: fresh))
+        }
+    }
+
+    /// The chain for `settings` at `format`; nil (Pure, bit-exact) when no block is on.
+    private static func chain(_ settings: SoundSettings, for format: SoundFormat) -> SoundChain? {
+        guard !settings.activeBlockNames.isEmpty else { return nil }
+        return SoundChain(settings, sampleRate: Double(format.sampleRate), channels: format.channels)
     }
 
     // MARK: For the live session

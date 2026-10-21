@@ -86,9 +86,21 @@ public final class SoundChain: @unchecked Sendable {
     let claimed = Atomic<Bool>(false)
 
     #if DEBUG
-        private static let live = Atomic<Int>(0)
-        /// Chains alive in the process. Debug builds only, for tests that check every retired chain is freed.
-        static var liveInstances: Int { live.load(ordering: .acquiring) }
+        /// Counts the chains made while it is the task's ``liveCounter`` that are still alive. Debug builds only, for
+        /// tests that check every retired chain is freed.
+        final class LiveCounter: Sendable {
+            private let count = Atomic<Int>(0)
+            var value: Int { count.load(ordering: .acquiring) }
+            fileprivate func add() { count.add(1, ordering: .relaxed) }
+            fileprivate func remove() { count.subtract(1, ordering: .relaxed) }
+        }
+
+        /// The counter chains made in this task (or synchronously inside its `withValue`) count themselves in. Scoped
+        /// rather than process-wide, so a test counting its own chains is not thrown by other suites making chains in
+        /// parallel in the same test process (Task 7's pipeline tests do).
+        @TaskLocal static var liveCounter: LiveCounter?
+        /// The counter this chain counted itself in, read once in `init`: `deinit` may run on another thread.
+        private let counter: LiveCounter?
     #endif
 
     /// Compiles `s` for `channels` interleaved channels at `sampleRate`. Allocates: call it off the render thread.
@@ -138,7 +150,8 @@ public final class SoundChain: @unchecked Sendable {
         latencyFrames = limiter.latencyFrames
         fadeFrames = max(1, Int((ChainRunner.fadeSeconds * sampleRate).rounded()))
         #if DEBUG
-            Self.live.add(1, ordering: .relaxed)
+            counter = Self.liveCounter
+            counter?.add()
         #endif
     }
 
@@ -156,7 +169,7 @@ public final class SoundChain: @unchecked Sendable {
             crossfeed.deallocate()
         }
         #if DEBUG
-            Self.live.subtract(1, ordering: .relaxed)
+            counter?.remove()
         #endif
     }
 
@@ -284,6 +297,10 @@ public final class SoundChain: @unchecked Sendable {
 ///    chain is never freed under the call that handed it back. If a call is still inside after that (a stalled render
 ///    thread), the chains are stranded: kept, not freed, until the runner itself goes.
 ///
+/// ## Format changes
+/// `reset(to:)` replaces everything at once, with no fade and no state carried over, while the output is stopped: a
+/// chain compiled for a new rate or channel count starts from rest (Task 7, Review Focus 1).
+///
 /// ## Pure
 /// With no chain and no fade in flight, `process` returns without touching `io`: the output is bit-identical.
 ///
@@ -407,12 +424,7 @@ public final class ChainRunner: @unchecked Sendable {
     /// render thread. A chain already installed (here or in another runner) is recompiled, so no two runs ever share
     /// filter state; the copy picks up the playing chain's state, so this is seamless.
     public func install(_ chain: SoundChain?) {
-        var chain = chain
-        if let installed = chain, installed.claimed.exchange(true, ordering: .relaxed) {
-            let copy = SoundChain(recompiling: installed)
-            copy.claimed.store(true, ordering: .relaxed)
-            chain = copy
-        }
+        let chain = chain.map(Self.claim)
         let pointer = chain.map { Unmanaged.passRetained($0).toOpaque() } ?? Self.pure
         control.withLock { control in
             let displaced = mailbox.exchange(pointer, ordering: .acquiringAndReleasing)
@@ -427,6 +439,46 @@ public final class ChainRunner: @unchecked Sendable {
             control.idleTicks = 0
             updateTimer(&control)
         }
+    }
+
+    /// Plays `chain` from the next render call at once, with no fade and nothing of what played before: every chain
+    /// the runner holds (playing, fading out, waiting in the mailbox or handed back) is released, and the new one
+    /// starts from rest, its look-ahead empty. nil is Pure. For a format change, where the old chain's filters and
+    /// look-ahead hold the previous track, at another rate or channel count: a fade from it would play that tail into
+    /// the new track, through filters designed for the wrong rate.
+    ///
+    /// Only while no render call can run: the output is stopped (`AudioOutput.stop()` returns once no render call is
+    /// in flight) and not started again until this returns, as for `RenderSource.flushWhileStopped`. It writes the
+    /// render thread's own state, which the output's stop and start order against the render calls either side.
+    /// Serialised with `install`.
+    public func reset(to chain: SoundChain?) {
+        let chain = chain.map(Self.claim)
+        control.withLock { control in
+            var held: [UnsafeMutableRawPointer] = []
+            if let waiting = mailbox.exchange(nil, ordering: .acquiringAndReleasing), waiting != Self.pure {
+                held.append(waiting)
+            }
+            held += [state.pointee.current, state.pointee.leaving, state.pointee.unreturned].compactMap { $0 }
+            // No render call is inside, so the handshake passes at once.
+            drain(&control)
+            state.pointee = RenderState()
+            state.pointee.current = chain.map { Unmanaged.passRetained($0).toOpaque() }
+            reductionBits.store(0, ordering: .relaxed)
+            for old in held { Unmanaged<SoundChain>.fromOpaque(old).release() }
+            control.outstanding += (chain == nil ? 0 : 1) - held.count
+            control.keepsOne = chain != nil
+            control.idleTicks = 0
+            updateTimer(&control)
+        }
+    }
+
+    /// `chain`, or a fresh compile of it if it was ever installed (here or in another runner), so no two runs share
+    /// filter state.
+    private static func claim(_ chain: SoundChain) -> SoundChain {
+        guard chain.claimed.exchange(true, ordering: .relaxed) else { return chain }
+        let copy = SoundChain(recompiling: chain)
+        copy.claimed.store(true, ordering: .relaxed)
+        return copy
     }
 
     /// The meters (see ``SoundMeters``). Reading starts a new peak interval. Any thread.
@@ -492,16 +544,21 @@ public final class ChainRunner: @unchecked Sendable {
 
     // MARK: Render thread
 
+    /// Whether `process` would return at once, leaving the block untouched: Pure, with no fade in flight, nothing
+    /// waiting to be handed back and nothing in the mailbox (a relaxed load). Render thread only, as it reads the
+    /// render state. A caller that has to convert samples for `process` (an Int32 client) skips the conversion then.
+    @inline(__always)
+    public var isIdle: Bool {
+        let state = state
+        return state.pointee.current == nil && !state.pointee.fading && state.pointee.unreturned == nil
+            && mailbox.load(ordering: .relaxed) == nil
+    }
+
     /// Runs `frames` interleaved Float32 frames of `channels` channels through the installed chain, in place. Render
     /// thread only, one call at a time; real-time safe.
     public func process(_ io: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
-        guard frames > 0, channels > 0 else { return }
+        guard frames > 0, channels > 0, !isIdle else { return }
         let state = state
-        if state.pointee.current == nil, !state.pointee.fading, state.pointee.unreturned == nil,
-            mailbox.load(ordering: .relaxed) == nil
-        {
-            return
-        }
         // Announce the call before touching any chain (sequentially consistent with `drain`).
         rendering.store(true, ordering: .sequentiallyConsistent)
         defer { rendering.store(false, ordering: .releasing) }
