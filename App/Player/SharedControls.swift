@@ -283,6 +283,54 @@ struct SignalCells: View {
 
     var body: some View {
         let text = SignalStrip.text(signal)
+        VStack(alignment: .leading, spacing: 6) {
+            strip(text)
+            pills
+        }
+    }
+
+    /// The Hi-Res / Lossless and Pure pills, under the strip: four cells and the signal words already fill the row at
+    /// iPhone width, so the pills take their own line rather than crowd it. Each is its own accessibility element,
+    /// apart from the strip's.
+    @ViewBuilder
+    private var pills: some View {
+        let badges = SignalStrip.badges(signal)
+        if !badges.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(badges, id: \.self) { badge in
+                    Text(badge)
+                        .font(Typeface.monoSmall)
+                        .foregroundStyle(pillColor(badge))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Capsule().strokeBorder(pillColor(badge).opacity(0.7), lineWidth: 1))
+                        .lineLimit(1).fixedSize()
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(pillLabel(badge))
+                        .accessibilityIdentifier(badge == "PURE" ? "pill.pure" : "pill.resolution")
+                }
+            }
+        }
+    }
+
+    private func pillColor(_ badge: String) -> Color {
+        if badge == "PURE" { return theme.ok }
+        return badge.hasPrefix("HI-RES") ? theme.hiRes : theme.inkSecondary
+    }
+
+    private func pillLabel(_ badge: String) -> String {
+        if badge == "PURE" { return "Pure: untouched by pointFlac" }
+        switch signal.resolution {
+        case .hiRes(let bits, let rate): return "Hi-Res output, \(bits)-bit \(Self.kHz(rate))"
+        case .lossless(let bits, let rate): return "Lossless output, \(bits)-bit \(Self.kHz(rate))"
+        case .lossy, nil: return badge
+        }
+    }
+
+    private static func kHz(_ rate: Int) -> String {
+        AudioFormat(sampleRate: rate, bitsPerSample: 0, channels: 0).formattedRate
+    }
+
+    private func strip(_ text: String) -> some View {
         cells(text)
             .contentShape(Rectangle())
             .onTapGesture { details = true }

@@ -226,3 +226,21 @@ private let allStates: [SignalState] = [
         }
     }
 }
+
+@Test func resolutionTable() {
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000)) == ["HI-RES 24/96", "PURE"])
+    #expect(SignalStrip.badges(state(192_000, 24, hardware: 48_000, port: .builtIn)) == ["LOSSLESS 24/48"])
+    #expect(
+        SignalStrip.badges(state(44_100, 16, hardware: 44_100, port: .wired("EarPods"))) == [
+            "LOSSLESS 16/44.1", "PURE",
+        ])
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"))).isEmpty)
+    #expect(SignalStrip.badges(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == ["HI-RES 24/96"])
+    #expect(SignalStrip.badges(state(192_000, 32, hardware: 192_000)) == ["HI-RES 24/192"])
+    // Int32 client delivers 32 bits.
+    #expect(
+        state(192_000, 32, hardware: 192_000, int32: true).resolution == .hiRes(bits: 32, rate: 192_000))
+    #expect(state(96_000, 24, hardware: 96_000, port: .airPlay("TV")).resolution == .lossy)
+    #expect(SignalState().resolution == nil)
+    #expect(SignalStrip.badges(SignalState()).isEmpty)
+}

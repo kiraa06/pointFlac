@@ -19,6 +19,14 @@ public enum SignalIndicator: Equatable, Sendable {
     case otherRoute
 }
 
+/// What the hardware is handed, as Apple Music draws the line: Hi-Res is at least 24 bits at a rate above 48 kHz,
+/// Lossless is anything at or below it, and a lossy route is neither.
+public enum DeliveredResolution: Equatable, Sendable {
+    case hiRes(bits: Int, rate: Int)
+    case lossless(bits: Int, rate: Int)
+    case lossy
+}
+
 /// Everything the signal strip needs to describe, honestly, what happens to the audio.
 public struct SignalState: Sendable, Equatable {
     public var source: AudioFormat?
@@ -95,6 +103,28 @@ public struct SignalState: Sendable, Equatable {
         }
         if case .other = port { return .otherRoute }
         return nil
+    }
+
+    /// What reaches the output, never just what the file holds: nil with no plan, `.lossy` over Bluetooth or AirPlay,
+    /// otherwise the delivered depth (32 on an Int32 client, 24 when pointFlac reduces to 24, else the source's depth
+    /// capped at 24) and rate (the hardware's, else the negotiated client rate). Hi-Res is at least 24 bits above
+    /// 48 kHz (ruling R4-3).
+    public var resolution: DeliveredResolution? {
+        guard let plan else { return nil }
+        switch port {
+        case .bluetooth, .airPlay: return .lossy
+        default: break
+        }
+        let bits: Int
+        if plan.client == .int32 {
+            bits = 32
+        } else if plan.reduceTo24 {
+            bits = 24
+        } else {
+            bits = min(source?.bitsPerSample ?? 24, 24)
+        }
+        let rate = hardwareRate ?? plan.clientSampleRate
+        return bits >= 24 && rate > 48_000 ? .hiRes(bits: bits, rate: rate) : .lossless(bits: bits, rate: rate)
     }
 
     /// Set only for a USB port with the system volume below full scale.

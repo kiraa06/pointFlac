@@ -15,6 +15,19 @@ struct SignalDetailsSheet: View {
                 } footer: {
                     Text(summary)
                 }
+                if case .processing = signal.indicator, !signal.activeProcessing.isEmpty {
+                    Section("Processing, in order") {
+                        ForEach(Array(signal.activeProcessing.enumerated()), id: \.offset) { index, name in
+                            Text("\(index + 1). \(name)").font(.body.monospacedDigit())
+                        }
+                    }
+                }
+                Section {
+                    Text(
+                        "Hi-Res means the output receives at least 24 bits at a rate above 48 kHz. Lossless is "
+                            + "anything up to 48 kHz, kept intact. Both describe what reaches the output, not just "
+                            + "the file: a resampled file is Lossless, and Bluetooth and AirPlay are neither.")
+                }
                 Section("Path") {
                     row("Source", source, "The file as decoded: depth, rate and channels.")
                     row("Processing", processing, "pointFlac's own processing. Pure means none.")

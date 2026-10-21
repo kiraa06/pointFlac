@@ -18,6 +18,19 @@ public enum SignalStrip {
         return text
     }
 
+    /// The pills beside the strip: the delivered resolution (never for a lossy route), then "PURE" only when the
+    /// indicator is `.pure`.
+    public static func badges(_ s: SignalState) -> [String] {
+        var badges: [String] = []
+        switch s.resolution {
+        case .hiRes(let bits, let rate): badges.append("HI-RES \(bits)/\(shortRate(rate))")
+        case .lossless(let bits, let rate): badges.append("LOSSLESS \(bits)/\(shortRate(rate))")
+        case .lossy, nil: break
+        }
+        if s.indicator == .pure { badges.append("PURE") }
+        return badges
+    }
+
     /// The words for one indicator. `.idle` reads as the idle strip, never as "● Pure": with no track there is
     /// nothing to call pure.
     static func label(_ indicator: SignalIndicator) -> String {
