@@ -159,16 +159,21 @@ struct TruePeakLimiterTests {
         }
     }
 
-    @Test("Steady tones at any phase, up to 0.4 × the rate, come out within 0.05 dB of a −0.3 or 0 dBTP ceiling")
+    @Test("Steady tones at any phase come out within 0.05 dB of a −0.3 or 0 dBTP ceiling, 0.1 dB if ultrasonic")
     func steadyTonesHoldAtAnyPhase() {
-        let tones: [(rate: Double, hz: [Double])] = [
-            (44_100, [997, 44_100 / 4, 44_100 / 3, 0.4 * 44_100]),
-            (48_000, [997, 48_000 / 4, 48_000 / 3, 0.4 * 48_000]),
-            (96_000, [20_000]),
-            (192_000, [20_000]),
+        // Audio-band tones get 0.05 dB. Ultrasonic tones at 176.4 and 192 kHz (0.4 × the rate, like a DSD-sourced
+        // file's noise-shaped hash) are read on the 8× grid and get 0.1 dB (ruling R4-T4e).
+        let tones: [(rate: Double, hz: [Double], tolerance: Double)] = [
+            (44_100, [997, 44_100 / 4, 44_100 / 3, 0.4 * 44_100], 0.05),
+            (48_000, [997, 48_000 / 4, 48_000 / 3, 0.4 * 48_000], 0.05),
+            (96_000, [20_000], 0.05),
+            (176_400, [20_000], 0.05),
+            (192_000, [20_000], 0.05),
+            (176_400, [0.4 * 176_400], 0.1),
+            (192_000, [0.4 * 192_000], 0.1),
         ]
         let amplitude = 2.0
-        for (rate, frequencies) in tones {
+        for (rate, frequencies, tolerance) in tones {
             for hz in frequencies {
                 for ceilingDb in [-0.3, 0] {
                     // Crests at k/32 of a sample, which includes the midpoint between detection points, the worst
@@ -189,7 +194,7 @@ struct TruePeakLimiterTests {
                         }
                         let over = Self.db(gain * amplitude) - ceilingDb
                         let tone = "\(hz) Hz at \(rate) Hz, crest \(crest), ceiling \(ceilingDb)"
-                        #expect(over <= 0.05, "\(tone): \(over) dB over")
+                        #expect(over <= tolerance, "\(tone): \(over) dB over")
                         #expect(over >= -0.1, "\(tone): \(-over) dB under, more than it needs")
                     }
                 }

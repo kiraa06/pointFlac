@@ -11,24 +11,35 @@ import Synchronization
 /// ceiling. Below the ceiling the output is the input, bit for bit, `latencyFrames` later. The oversampling is for
 /// detection only; the audio itself is never resampled or filtered.
 ///
-/// ## Detector
-/// Each frame, every channel is read at the sample and at `oversampling − 1` evenly spaced points before the next one:
-/// 16× up to 48 kHz, 8× up to 96 kHz and 4× above, so the grid is at least 705.6 kHz (ruling R4-T4b). A BS.1770-style
-/// 4× grid let steady tones through 0.17 dB over at fs/4 and 0.44 dB at 0.4 fs: a crest between two points is
-/// under-read by up to cos(π f / grid). The points sit on the sample grid, so a sample peak is read exactly and no
-/// output sample can pass the ceiling. Each interpolating phase is a 32-tap Kaiser-windowed sinc (16 frames either
-/// side, β 5, normalised to unity at DC). The low β trades a passband ripple of about ±0.02 dB (reading high only
-/// makes it limit a little early) for a passband reaching 0.47 × the rate. The frame's peak is the largest across
-/// channels.
+/// ## What it guarantees
+/// Content up to 0.45 × the rate, steady or broadband, holds the ceiling within these measured bounds:
+/// - **44.1 and 48 kHz (16×): +0.014 dB.**
+/// - **Higher rates (8×): +0.09 dB.** Up to 20 kHz the bound is the grid's 0.035 dB, and a 20 kHz tone measures under
+///   the ceiling. The rest is ultrasonic content, read on the coarser grid.
 ///
-/// Measured, as the applied gain times a steady tone's amplitude, over 128 crest positions:
-/// - 44.1 and 48 kHz (16×): within +0.014 dB of the ceiling for any tone up to 0.45 × the rate.
-/// - 88.2 kHz and up (8× and 4×): 20 kHz tones stay under the ceiling. Any tone up to 20 kHz is bounded by the
-///   grid's cos(π f / grid), at most 0.035 dB. Ultrasonic tones read the coarser grids' bound: at 8×, +0.044 dB at
-///   fs/4 and +0.087 dB at 0.4 fs; at 4×, +0.17 dB at fs/4 and +0.42 dB at 0.4 fs.
-/// - Noise, on an FFT-exact reconstruction: within +0.003 dB when band-limited to 0.45 × the rate. Energy at the very
-///   top of the band (0.48–0.5 ×), which no finite filter reads in full, is under-read: twenty +24 dB peaks up to
-///   21.65 kHz at 44.1 kHz come out +0.30 dB over, and full-band white noise driven 12 dB into the limiter +1.0 dB.
+/// **Energy above 0.45 × the rate is not guaranteed.** It is under-read, as with any finite true-peak detector,
+/// BS.1770 meters included: near fs/2 a finite interpolator cannot reconstruct the signal (the half-sample phase has a
+/// zero at fs/2). For example, twenty +24 dB peaks reaching 21.65 kHz at 44.1 kHz come out +0.30 dB over, and white
+/// noise reaching fs/2 driven 12 dB in comes out +1.0 dB over. Music at 44.1 and 48 kHz carries little there (an
+/// anti-alias filter stops it). The EQ's bands stop at 20 kHz, which is 0.454 × 44.1 kHz, and a tone there still
+/// measures +0.003 dB.
+///
+/// Measured details, as the applied gain times a steady tone's amplitude over 128 crest positions, and for noise on an
+/// FFT-exact reconstruction (five 65 536-frame runs per rate, driven 13 dB in):
+/// - 16×: tones within +0.014 dB up to 0.45 × the rate; noise band-limited to 0.45 × within +0.002 dB.
+/// - 8×: tones up to 20 kHz under the ceiling; ultrasonic tones +0.044 dB at fs/4, +0.059 dB at fs/3, +0.087 dB at
+///   0.4 fs; noise band-limited to 0.45 × within +0.065 dB.
+///
+/// ## Detector
+/// Each frame, every channel is read at the sample and at `oversampling − 1` evenly spaced points before the next
+/// one: 16× up to 48 kHz and 8× above, so the grid is at least 705.6 kHz (rulings R4-T4b, R4-T4e). A BS.1770-style 4×
+/// grid let steady tones through 0.17 dB over at fs/4 and 0.44 dB at 0.4 fs: a crest between two points is under-read
+/// by up to cos(π f / grid). The points sit on the sample grid, so a sample peak is read exactly and no output sample
+/// can pass the ceiling.
+///
+/// Each interpolating phase is a 32-tap Kaiser-windowed sinc (16 frames either side, β 5, normalised to unity at DC).
+/// The low β accepts about ±0.02 dB of passband ripple to carry the passband out to 0.47 × the rate; reading high only
+/// makes the limiter act a little early. The frame's peak is the largest across channels.
 ///
 /// ## Gain envelope
 /// Channels share one gain, so a limited channel never shifts the stereo image. Per frame:
@@ -295,11 +306,12 @@ public final class TruePeakLimiter: @unchecked Sendable {
         reduction.store(db.bitPattern, ordering: .relaxed)
     }
 
-    /// Detection points per sample interval at `sampleRate`, chosen so the grid is at least 705.6 kHz (ruling R4-T4b):
-    /// 16 up to 48 kHz, 8 up to 96 kHz, 4 above. A crest between two points is then under-read by at most
-    /// cos(π f / grid), 0.035 dB at 20 kHz.
+    /// Detection points per sample interval at `sampleRate`: 16 up to 48 kHz and 8 above, so the grid is at least
+    /// 705.6 kHz (rulings R4-T4b, R4-T4e). A crest between two points is then under-read by at most
+    /// cos(π f / grid), which is 0.035 dB at 20 kHz. Using 8× (not 4×) at the highest rates keeps ultrasonic content,
+    /// such as a DSD-sourced file's noise-shaped hash, within 0.09 dB.
     static func oversampling(atRate sampleRate: Double) -> Int {
-        sampleRate <= 48_000 ? 16 : sampleRate <= 96_000 ? 8 : 4
+        sampleRate <= 48_000 ? 16 : 8
     }
 
     static func powerOfTwo(atLeast n: Int) -> Int {
