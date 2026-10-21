@@ -70,6 +70,12 @@ struct LoudnessMeterTests {
         #expect(throws: LoudnessMeter.Failure.self) { try LoudnessMeter(channels: 0, sampleRate: 48_000) }
         #expect(throws: LoudnessMeter.Failure.self) { try LoudnessMeter(channels: 2, sampleRate: 0) }
         #expect(throws: LoudnessMeter.Failure.self) { try LoudnessMeter(channels: 2, sampleRate: -44_100) }
+        // 16 and 17 Hz overrun libebur128's buffers; below 8 kHz is no music.
+        for rate in [16, 17, 100, 7_999, 2_822_401] {
+            #expect(throws: LoudnessMeter.Failure.self) { try LoudnessMeter(channels: 2, sampleRate: rate) }
+        }
+        #expect(throws: LoudnessMeter.Failure.self) { try LoudnessMeter(channels: 65, sampleRate: 48_000) }
+        #expect((try? LoudnessMeter(channels: 2, sampleRate: 8_000)) != nil)
     }
 
     @Test("5.1 and 7.1 ignore the LFE channel")

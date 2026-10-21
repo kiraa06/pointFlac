@@ -7,17 +7,26 @@ import Foundation
 /// library scan runs one meter per track on a background task); never from the render thread, since `add` allocates.
 public final class LoudnessMeter {
     public enum Failure: Error, Equatable {
-        /// The channel count or sample rate is out of range (libebur128 takes 1... channels and rates >= 16 Hz).
+        /// The channel count or sample rate is out of range (`minSampleRate`, `maxSampleRate`, `maxChannels`).
         case invalidFormat
         /// libebur128 could not allocate its state.
         case initFailed
     }
 
+    /// libebur128 takes 16 Hz upwards, but at 16 and 17 Hz its 400 ms window is smaller than the 4 hops it needs, and
+    /// it overruns its buffer on the first frames. No audio file is slower than telephony, so the floor is 8 kHz; a
+    /// FLAC that says less (a damaged or hostile header) is unmeasurable here, not a crash.
+    public static let minSampleRate = 8_000
+    /// libebur128's own limit.
+    public static let maxSampleRate = 2_822_400
+    public static let maxChannels = 64
+
     private var state: UnsafeMutablePointer<ebur128_state>?
     private var finished = false
 
     public init(channels: Int, sampleRate: Int) throws {
-        guard channels >= 1, channels <= Int(UInt32.max), sampleRate >= 16, sampleRate <= Int(UInt32.max) else {
+        guard (1...Self.maxChannels).contains(channels), (Self.minSampleRate...Self.maxSampleRate).contains(sampleRate)
+        else {
             throw Failure.invalidFormat
         }
         // Histogram mode keeps the gating blocks in one 1000-bin histogram (0.1 LU bins) instead of a list that grows
@@ -73,9 +82,11 @@ public final class LoudnessMeter {
     public func finish() {
         guard let state, !finished else { return }
         finished = true
-        // Changing only the sample rate frees and re-creates the window and the resampler at the smallest rate
-        // libebur128 accepts, and keeps the histogram and the peaks.
-        _ = ebur128_change_parameters(state, state.pointee.channels, 16)
+        // Changing only the sample rate frees and re-creates the window and the resampler at a tiny rate, and keeps
+        // the histogram and the peaks. 20 Hz, not the 16 Hz minimum: at 16 and 17 Hz libebur128's window (floor of
+        // 0.4 s of frames) is smaller than the 4 hops of 100 ms its first block needs, so its buffers are
+        // inconsistent. From 18 Hz they agree. Nothing is ever added at this rate (`add` returns early).
+        _ = ebur128_change_parameters(state, state.pointee.channels, 20)
     }
 
     /// Gated integrated loudness in LUFS. Silence (nothing above the -70 LUFS absolute gate) is `-.infinity`, which is

@@ -44,8 +44,10 @@ public final class Library: Sendable {
     private let repairScheduled = Mutex(false)
     /// For tests: how many files the loudness scan has opened to decode.
     let loudnessDecodes = Mutex(0)
-    /// A loudness scan is running (`scanLoudness` runs one at a time).
-    let loudnessScanning = Mutex(false)
+    /// A loudness scan is running (`scanLoudness` runs one at a time), and what was asked for meanwhile.
+    let loudnessScan = Mutex<(running: Bool, pending: LoudnessRequest?)>((false, nil))
+    /// For tests: called after each decoded chunk of a loudness scan.
+    let loudnessChunkHook = Mutex<(@Sendable () -> Void)?>(nil)
     /// For tests: awaited after each track's measurement, before it is stored.
     let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.
@@ -212,6 +214,18 @@ public final class Library: Sendable {
 
     /// For tests: how many catalogs have been published since the library opened.
     var publishCount: Int { publishedCount.withLock { $0 } }
+
+    /// For tests: every track's `r128_state` (0 not measured, 1 measured, 2 unmeasurable), by track ID.
+    func loudnessStates() async -> [String: Int] {
+        let rows = (try? await run(.never) { try $0.database.query("SELECT id, r128_state FROM tracks") }) ?? []
+        return Dictionary(
+            uniqueKeysWithValues: rows.compactMap { row in row[0].string.map { ($0, Int(row[1].int ?? -1)) } })
+    }
+
+    /// For tests: lowers the largest album the loudness scan pools.
+    func setMaxLoudnessAlbum(_ cap: Int) async {
+        _ = try? await run(.never) { $0.maxAlbumTracks = cap }
+    }
 
     /// For tests: lowers the per-folder file cap.
     func setMaxFilesPerFolder(_ cap: Int) async {

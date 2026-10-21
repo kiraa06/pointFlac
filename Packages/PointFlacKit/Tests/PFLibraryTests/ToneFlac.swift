@@ -56,7 +56,8 @@ enum ToneFlac {
         let comment = TaggedFlac.comment(vendor: "pointFlac tests", tags: tags)
         let n = comment.count
         out += [0x84, UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)] + comment
-        let rateCode: UInt8 = spec.rate == 96_000 ? 0b1011 : 0b1010
+        // Any other rate is 0b0000: the rate is in STREAMINFO.
+        let rateCode: UInt8 = spec.rate == 96_000 ? 0b1011 : spec.rate == 48_000 ? 0b1010 : 0
         let sizeCode: UInt8 = spec.bits == 24 ? 0b110 : 0b100
         let bytes = spec.bits / 8
         for index in 0..<(spec.frames / block) {

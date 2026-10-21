@@ -226,7 +226,7 @@ private final class TaskBox: Sendable {
     }.value
     let seen = observed.withLock { $0 }
     #expect(!seen.isEmpty)
-    #expect(seen.allSatisfy { $0 <= .utility }, "ran at \(seen)")
+    #expect(seen.allSatisfy { $0 == .background }, "ran at \(seen)")
 }
 
 /// The track is removed from the library after it was measured and before its measurement is stored, from a folder
@@ -255,16 +255,15 @@ private final class TaskBox: Sendable {
     #expect(reopened.current.tracks.count == 2)
     #expect(track(library, "r1.flac")?.loudness?.measuredLufs != nil)
     #expect(track(library, "r3.flac")?.loudness?.measuredLufs != nil)
-    #expect(track(library, "r1.flac")?.loudness?.albumMeasuredLufs == nil, "no value for an album that lost a track")
-
-    library.loudnessHook.withLock { $0 = nil }
-    await library.scanLoudness { _, _ in }
+    // The pass that lost the track writes no value for the old set of three (its pool is recorded as an attempt on
+    // that set), and the second phase of the same pass pools the two that are left.
     let r1 = try #require(track(library, "r1.flac")?.loudness)
     let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-26)])
     #expect(abs(try #require(r1.albumMeasuredLufs) - expected) <= 0.2)
     let after = decodes(library)
     await library.scanLoudness { _, _ in }
     #expect(decodes(library) == after, "a current album is left alone")
+    #expect(track(library, "r3.flac")?.loudness?.albumMeasuredLufs == r1.albumMeasuredLufs)
 }
 
 /// A file whose size or date changed loses its measurement; an album retagged into a new album gets a value there.
@@ -335,22 +334,235 @@ private final class TaskBox: Sendable {
     #expect(decodes(library) == before, "an album with an evicted track is not retried on every scan")
 }
 
+/// A fixture copy as a track of `album`; the audio is the same for all, which is fine here: a copy gets an ID from its
+/// location.
+private func quick(
+    _ box: ScanSandbox, _ album: String, _ index: Int, in folder: URL? = nil, tags: [(String, String)] = []
+)
+    throws
+{
+    try TaggedFlac.write(
+        "s16-44100", to: (folder ?? box.libraryFolder).appending(path: "\(album)/\(index).flac"),
+        tags: [("TITLE", "\(album)\(index)"), ("ALBUM", album), ("TRACKNUMBER", String(index + 1))] + tags)
+}
+
+private final class Counter: Sendable {
+    private let count = Mutex(0)
+    var value: Int { count.withLock { $0 } }
+    func bump() { count.withLock { $0 += 1 } }
+}
+
+/// Counts the tracks the first phase measures (the hook runs once for each).
+private func counting(_ library: Library) -> Counter {
+    let counter = Counter()
+    library.loudnessHook.withLock { $0 = { _ in counter.bump() } }
+    return counter
+}
+
 /// An "album" of untagged files can be huge: it is measured track by track, with no album value and no retry.
 @Test func aHugeAlbumIsMeasuredWithoutAnAlbumValue() async throws {
     let box = try ScanSandbox()
-    let count = LoudnessScanner.maxAlbumTracks + 1
-    for index in 0..<count {
-        try TaggedFlac.write(
-            "s16-44100", to: box.libraryFolder.appending(path: "big/\(index).flac"),
-            tags: [("TITLE", "t\(index)"), ("ALBUM", "Big"), ("TRACKNUMBER", String(index + 1))])
-    }
+    for index in 0..<6 { try quick(box, "Big", index) }
     let library = try box.open()
+    await library.setMaxLoudnessAlbum(5)
     await library.rescan()
     await library.scanLoudness { _, _ in }
-    let measured = library.current.tracks.values.compactMap(\.loudness?.measuredPeak)
-    #expect(measured.count == count)
+    #expect(library.current.tracks.values.compactMap(\.loudness?.measuredPeak).count == 6)
     #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil })
     let before = decodes(library)
     await library.scanLoudness { _, _ in }
     #expect(decodes(library) == before)
+}
+
+/// N1: an album value is served only while the album still has the tracks it was measured over.
+@Test func anAlbumGrowingPastTheCapLosesItsValue() async throws {
+    let box = try ScanSandbox()
+    for index in 0..<5 { try quick(box, "Edge", index) }
+    let library = try box.open()
+    await library.setMaxLoudnessAlbum(5)
+    await library.rescan()
+    await library.scanLoudness { _, _ in }
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak != nil })
+
+    try quick(box, "Edge", 5)
+    await library.rescan()
+    #expect(library.current.tracks.count == 6)
+    #expect(
+        library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil },
+        "a value over five tracks is not the album's now")
+    let hook = counting(library)
+    let before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(hook.value == 1 && decodes(library) - before == 1, "only the new track is decoded")
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil })
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1, "the blocked pool is not retried")
+}
+
+@Test func anAlbumChangingWhileATrackIsEvictedLosesItsValue() async throws {
+    let box = try ScanSandbox()
+    // Different audio each, or a new file would be taken for the evicted one moved.
+    try box.tone("c0.flac", rmsDbfs: -20, album: "Cloud", number: 1, in: box.external)
+    try box.tone("c1.flac", rmsDbfs: -23, album: "Cloud", number: 2, in: box.external)
+    let library = try box.open()
+    _ = try await library.addFolder(box.external)
+    await library.scanLoudness { _, _ in }
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak != nil })
+
+    try FileManager.default.moveItem(
+        at: box.external.appending(path: "c1.flac"), to: box.external.appending(path: ".c1.flac.icloud"))
+    try box.tone("c2.flac", rmsDbfs: -26, album: "Cloud", number: 3, in: box.external)
+    await library.rescan()
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil })
+    let before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1, "the new track only; the album cannot be pooled with one evicted")
+    #expect(library.current.tracks.values.allSatisfy { $0.loudness?.albumMeasuredPeak == nil })
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 1)
+}
+
+/// N1 and N2: a track joining a measured album, tagged or not, is the only track decoded in the first phase; the
+/// album is then pooled once.
+@Test func aJoiningTrackIsMeasuredAloneAndTheAlbumPooledOnce() async throws {
+    for tagged in [false, true] {
+        let box = try ScanSandbox()
+        try box.tone("j1.flac", rmsDbfs: -20, album: "Join", number: 1)
+        try box.tone("j2.flac", rmsDbfs: -26, album: "Join", number: 2)
+        let library = try box.open()
+        await library.rescan()
+        await library.scanLoudness { _, _ in }
+        let old = try #require(track(library, "j1.flac")?.loudness?.albumMeasuredLufs)
+
+        try box.tone(
+            "j3.flac", rmsDbfs: -10, album: "Join", number: 3,
+            extra: tagged ? [("REPLAYGAIN_TRACK_GAIN", "-2.0 dB")] : [])
+        await library.rescan()
+        #expect(track(library, "j1.flac")?.loudness?.albumMeasuredLufs == nil, "stale until it is pooled again")
+
+        let hook = counting(library)
+        let before = decodes(library)
+        await library.scanLoudness { _, _ in }
+        #expect(hook.value == 1, "phase 1 decodes the new track alone (tagged: \(tagged))")
+        #expect(decodes(library) - before == 1 + 3, "then one pooling over the three")
+        let pooled = try #require(track(library, "j1.flac")?.loudness?.albumMeasuredLufs)
+        let expected = LoudnessMeter.albumLufs([try direct(-20), try direct(-26), try direct(-10)])
+        #expect(abs(pooled - expected) <= 0.2 && abs(pooled - old) > 0.5)
+        await library.scanLoudness { _, _ in }
+        #expect(decodes(library) - before == 4, "nothing more")
+    }
+}
+
+/// N2: a scan interrupted inside a huge album keeps what it measured, picks up where it stopped, and the small albums
+/// are not behind it.
+@Test func anInterruptedHugeAlbumDoesNotStarveOrRestart() async throws {
+    let box = try ScanSandbox()
+    for index in 0..<6 { try quick(box, "Big", index) }
+    for index in 0..<2 { try quick(box, "Small", index) }
+    let library = try box.open()
+    await library.setMaxLoudnessAlbum(5)
+    await library.rescan()
+
+    let holder = TaskBox()
+    let scan = Task {
+        await library.scanLoudness { done, _ in
+            if done == 3 { holder.task.withLock { $0 }?.cancel() }
+        }
+    }
+    holder.task.withLock { $0 = scan }
+    await scan.value
+    let states = await library.loudnessStates()
+    #expect(states.values.filter { $0 == 1 }.count == 3)
+    #expect(track(library, "Small0")?.loudness?.measuredPeak != nil, "the small album went first")
+    #expect(track(library, "Small1")?.loudness?.albumMeasuredPeak != nil)
+
+    let before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) - before == 5, "the five tracks left, none again")
+    #expect(library.current.tracks.values.compactMap(\.loudness?.measuredPeak).count == 8)
+}
+
+/// A FLAC that says 16 Hz overran libebur128's buffers. It is unmeasurable, recorded as such, and left alone.
+@Test func aLowSampleRateFileIsUnmeasurableNotACrash() async throws {
+    let box = try ScanSandbox()
+    try box.tone(
+        "slow.flac", rmsDbfs: -20, album: "Slow", number: 1, spec: ToneFlac.Spec(rate: 16, bits: 16, channels: 2))
+    try box.tone("fine.flac", rmsDbfs: -20, album: "Fine", number: 1)
+    let library = try box.open()
+    await library.rescan()
+    #expect(track(library, "slow.flac")?.format.sampleRate == 16)
+    await library.scanLoudness { _, _ in }
+    let slow = try #require(track(library, "slow.flac"))
+    #expect(await library.loudnessStates()[slow.id] == 2)
+    #expect(slow.loudness == nil)
+    #expect(track(library, "fine.flac")?.loudness?.measuredLufs != nil)
+    let before = decodes(library)
+    await library.scanLoudness { _, _ in }
+    #expect(decodes(library) == before, "never retried until the file changes")
+}
+
+/// A scan asked for while another runs is merged into it, not dropped.
+@Test func aScanRequestedDuringAScanIsServed() async throws {
+    let box = try ScanSandbox()
+    try box.tone("x1.flac", rmsDbfs: -20, album: "X", number: 1)
+    try box.tone("y1.flac", rmsDbfs: -22, album: "Y", number: 1)
+    let library = try box.open()
+    await library.rescan()
+    let y = try #require(track(library, "y1.flac")?.albumID)
+    let x = try #require(track(library, "x1.flac")?.albumID)
+
+    let reached = Mutex(false)
+    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    library.loudnessHook.withLock {
+        $0 = { _ in
+            reached.withLock { $0 = true }
+            await withCheckedContinuation { continuation in
+                let proceed = gate.withLock { state in
+                    if state.open { return true }
+                    state.waiter = continuation
+                    return false
+                }
+                if proceed { continuation.resume() }
+            }
+        }
+    }
+    let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
+    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await library.scanLoudness(albums: [y]) { _, _ in }  // returns at once
+    #expect(track(library, "y1.flac")?.loudness == nil)
+    gate.withLock { state in
+        state.open = true
+        state.waiter?.resume()
+    }
+    await first.value
+    #expect(track(library, "x1.flac")?.loudness?.measuredLufs != nil)
+    #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by the running scan's follow-up")
+}
+
+/// Cancelled inside a track, between decode chunks.
+@Test func cancellingInsideATrackStopsAtTheNextChunk() async throws {
+    let box = try ScanSandbox()
+    try box.tone("long.flac", rmsDbfs: -20, number: 1)  // 18 chunks
+    let library = try box.open()
+    await library.rescan()
+    let holder = TaskBox()
+    let chunks = Mutex(0)
+    library.loudnessChunkHook.withLock {
+        $0 = {
+            if chunks.withLock({
+                $0 += 1
+                return $0
+            }) == 3 {
+                holder.task.withLock { $0 }?.cancel()
+            }
+        }
+    }
+    let scan = Task { await library.scanLoudness { _, _ in } }
+    holder.task.withLock { $0 = scan }
+    await scan.value
+    #expect(chunks.withLock { $0 } <= 4, "stopped within a chunk of the cancel, not after all 18")
+    #expect(track(library, "long.flac")?.loudness == nil)
+    library.loudnessChunkHook.withLock { $0 = nil }
+    await library.scanLoudness { _, _ in }
+    #expect(track(library, "long.flac")?.loudness?.measuredLufs != nil)
 }
