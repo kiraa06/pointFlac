@@ -440,10 +440,12 @@ final class DecodeSession: @unchecked Sendable {
     /// - Float32 reduced to 24 bits: shifted to full 32-bit range, TPDF-dithered in place to multiples of 256, then
     ///   divided by 2^31. Also exact, as 24 significant bits fit a Float32.
     ///
-    /// `gain` (linear) is the item's ReplayGain, folded into the Float32 scale: one multiply per sample, as without
-    /// it, rounded once. At exactly 1 (0 dB) the scale is untouched, so the bits are too. On the reduced path it
-    /// applies after the dither, which keeps to the 24-bit grid of the source. It never reaches an Int32 client: a
-    /// gain puts a 32-bit source on Float32 (`OutputFormatPolicy.plan(source:hardwareRate:capabilities:gainDb:)`).
+    /// `gain` (linear) is the item's ReplayGain, folded into the scale. At exactly 1 (0 dB) the Float32 loops above
+    /// run untouched, so the bits are too. Any other gain takes the product in Double, from the integer sample and
+    /// the scale times the gain, and rounds it to Float32 at the end: within about half an ulp of the exact gained
+    /// value, where a Float32 scale would round twice. On the reduced path it applies after the dither, which keeps
+    /// to the 24-bit grid of the source. It never reaches an Int32 client: a gain puts a 32-bit source on Float32
+    /// (`OutputFormatPolicy.plan(source:hardwareRate:capabilities:gainDb:)`).
     private static func convert(
         _ samples: UnsafeMutableBufferPointer<Int32>, count: Int, bits: Int, plan: OutputPlan, gain: Double,
         dither: inout TPDFDither, into words: UnsafeMutableBufferPointer<UInt32>
@@ -460,15 +462,28 @@ final class DecodeSession: @unchecked Sendable {
                 samples[i] <<= shift
             }
             dither.reduce32To24(UnsafeMutableBufferPointer(rebasing: samples[0..<count]))
-            let scale: Float = gain == 1 ? 0x1p-31 : Float(0x1p-31 * gain)
-            for i in 0..<count {
-                words[i] = (Float(samples[i]) * scale).bitPattern
+            if gain == 1 {
+                let scale: Float = 0x1p-31
+                for i in 0..<count {
+                    words[i] = (Float(samples[i]) * scale).bitPattern
+                }
+            } else {
+                let scale = 0x1p-31 * gain
+                for i in 0..<count {
+                    words[i] = Float(Double(samples[i]) * scale).bitPattern
+                }
             }
         case .float32:
-            let exact = Float(sign: .plus, exponent: 1 - bits, significand: 1)
-            let scale = gain == 1 ? exact : Float(Double(exact) * gain)
-            for i in 0..<count {
-                words[i] = (Float(samples[i]) * scale).bitPattern
+            if gain == 1 {
+                let scale = Float(sign: .plus, exponent: 1 - bits, significand: 1)
+                for i in 0..<count {
+                    words[i] = (Float(samples[i]) * scale).bitPattern
+                }
+            } else {
+                let scale = Double(sign: .plus, exponent: 1 - bits, significand: 1) * gain
+                for i in 0..<count {
+                    words[i] = Float(Double(samples[i]) * scale).bitPattern
+                }
             }
         }
     }

@@ -93,6 +93,12 @@ private func mismatch(_ got: [Float], _ want: [Float]) -> String? {
     return "first difference at sample \(i): \(got[i]) ≠ \(want[i])"
 }
 
+/// Waits until every call queued on the player's engine has run, a switch's re-cue check among them.
+@MainActor
+private func drained(_ player: Player) async {
+    await player.currentEngine?.enqueue { _ in }.value
+}
+
 // MARK: - Rigs
 
 @MainActor
@@ -300,9 +306,12 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         let bothPeaks = track(TrackLoudness(trackGainDb: 6, trackPeak: 0.9, measuredLufs: -24, measuredPeak: 0.5))
         #expect(abs(Player.replayGainDb(for: bothPeaks, settings: ReplayGainSettings(mode: .track)) - capped) < 1e-12)
 
-        // Album mode caps by the album's peak.
+        // Album mode caps by the album's peak, and by the track's when the album has none.
         let album = track(TrackLoudness(trackGainDb: 6, trackPeak: 0.5, albumGainDb: 6, albumPeak: 0.9))
         #expect(abs(Player.replayGainDb(for: album, settings: ReplayGainSettings(mode: .album)) - capped) < 1e-12)
+        let albumWithoutPeak = track(TrackLoudness(trackGainDb: 0, trackPeak: 0.9, albumGainDb: 6))
+        let fallback = Player.replayGainDb(for: albumWithoutPeak, settings: ReplayGainSettings(mode: .album))
+        #expect(abs(fallback - capped) < 1e-12)
 
         // A quiet gain is never raised to the cap, and no peak means no cap.
         let quiet = track(TrackLoudness(trackGainDb: -3, trackPeak: 1.2))
@@ -414,7 +423,8 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
         rig.player.setSound(sound(.album))
-        #expect(rig.player.currentEngine?.seeksInFlight == 0, "a change of mode is no switch: no re-cue")
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 0, "a change of mode is no switch: no re-cue")
         #expect(await rig.puller.pull(upTo: 16_384))
         // The limiter that joins ReplayGain only delays here, by its look-ahead: the level stays far below its
         // ceiling. Swapping it for the album mode's chain (the same blocks) cross-fades two equal outputs.
@@ -451,9 +461,9 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
         rig.player.setSound(SoundSettings())
-        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
         // The re-cue reaches the pipeline through the engine's queue; nothing renders meanwhile.
-        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
         #expect(await rig.puller.pull(upTo: 4096 + 8192))
         let captured = rig.output.capturedFloat
         var got: [Float] = []
@@ -481,8 +491,8 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.pull(upTo: 4096))
         let settings = sound(.track)
         rig.player.setSound(settings)
-        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
-        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
         #expect(await rig.puller.pull(upTo: 4096 + 8192))
         let latency = SoundChain(settings, sampleRate: 48_000, channels: 2).latencyFrames
         let captured = rig.output.capturedFloat
@@ -496,8 +506,8 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.signal.activeProcessing == ["ReplayGain", "Limiter"] })
 
         rig.player.setSound(sound(.off))
-        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
-        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 2)
         #expect(await rig.puller.pull(upTo: rig.puller.pulled + 2048))
         #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
         rig.player.pause()
@@ -513,10 +523,11 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
         rig.player.setSound(SoundSettings())
-        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        await drained(rig.player)
         #expect(await rig.puller.pull(upTo: 8192))
         rig.player.setSound(sound(.off))
-        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 0)
         #expect(await rig.puller.pull(upTo: 16_384))
         var want: [Float] = []
         for n in Int64(0)..<16_384 { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
@@ -525,9 +536,10 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         await rig.player.play([hashItem("hash-z", loudness: nil)], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         rig.player.setSound(sound(.track))
-        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        await drained(rig.player)
         rig.player.setSound(sound(.off))
-        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 0)
         rig.player.pause()
     }
 
@@ -553,6 +565,114 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
             }
         }
         #expect(mismatch(rig.output.capturedFloat, want) == nil)
+    }
+
+    /// Values that are not finite count as absent, and the gain is bounded at ±`Player.maxGainDb` (75 dB, the
+    /// largest tag plus the largest preamp): a corrupt saved reference can never overflow the scale.
+    @Test func gainsStayFiniteAndBounded() {
+        let measured = track(TrackLoudness(measuredLufs: -14, measuredPeak: 0.8))
+        let unguarded = ReplayGainSettings(mode: .track, preventClipping: false, referenceLufs: 900)
+        #expect(Player.replayGainDb(for: measured, settings: unguarded) == Player.maxGainDb)
+        let negative = ReplayGainSettings(mode: .track, referenceLufs: -900)
+        #expect(Player.replayGainDb(for: measured, settings: negative) == -Player.maxGainDb)
+        #expect(Player.maxGainDb == 75)
+        // A reference that is not finite is the default's, and a preamp that is not finite adds nothing.
+        #expect(
+            Player.replayGainDb(for: measured, settings: ReplayGainSettings(mode: .track, referenceLufs: .nan)) == -4)
+        #expect(Player.replayGainDb(for: measured, settings: ReplayGainSettings(mode: .track, preampDb: .nan)) == -4)
+        // Loudness values that are not finite are no values.
+        let odd = track(TrackLoudness(trackGainDb: .nan, trackPeak: .infinity, measuredLufs: -14, measuredPeak: 0.8))
+        #expect(Player.replayGainDb(for: odd, settings: ReplayGainSettings(mode: .track)) == -4)
+        let infinite = track(TrackLoudness(trackGainDb: .infinity, albumGainDb: -.infinity, measuredLufs: -.infinity))
+        #expect(Player.replayGainDb(for: infinite, settings: ReplayGainSettings(mode: .track)) == 0)
+        #expect(Player.replayGainDb(for: infinite, settings: ReplayGainSettings(mode: .album)) == 0)
+    }
+
+    /// Ruling R4-T12b: a switch reaches an item already joined behind the playing one in the ring, not only the one
+    /// rendering. Two items, the second halved; Pure is set in the first item's last half second, once the decode
+    /// thread has entered the second. Playback is re-cued (the ring flushed, the second item with it), and the second
+    /// item plays bit-exact with its ungained source. The first item is halved too in one case and gets 0 dB in the
+    /// other, where it alone would need no re-cue.
+    @Test(arguments: [halfDb, 0])
+    func aSwitchReachesAJoinedItem(firstGainDb: Double) async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.track))
+        let items = [
+            hashItem("hash-1", loudness: TrackLoudness(trackGainDb: firstGainDb)),
+            hashItem("hash-2", loudness: TrackLoudness(trackGainDb: halfDb)),
+        ]
+        await rig.player.play(items, startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        let frames = Int(HashDecoder.frames)
+        #expect(await rig.puller.pull(upTo: frames - 12_000))
+        // The ring holds half a second: the decode thread runs on into the second item.
+        #expect(await rig.puller.eventually { rig.player.pipeline?.enteredGains.map(\.index) == [0, 1] })
+        #expect(rig.player.pipeline?.enteredGains.map(\.gainDb) == [firstGainDb, halfDb])
+        #expect(rig.player.pipeline?.renderingGain?.index == 0)
+        rig.player.setSound(SoundSettings())
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
+        #expect(await rig.puller.pump { rig.player.status == .ended })
+        let captured = rig.output.capturedFloat
+        #expect(captured.count == 2 * 2 * frames)
+        var want: [Float] = []
+        for n in Int64(0)..<HashDecoder.frames { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
+        #expect(mismatch(Array(captured[(2 * frames)...]), want) == nil)
+    }
+
+    /// Review M2: a switch while a seek is still counted as on its way (the decode thread may have taken it at the old
+    /// gains before the main actor heard back) is checked behind it on the engine's queue, not dropped.
+    @Test func aSwitchWhileASeekIsInFlightIsStillChecked() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.track))
+        await rig.player.play([hashItem("hash-f", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 4096))
+        guard let engine = rig.player.currentEngine else {
+            Issue.record("no engine")
+            return
+        }
+        // The seek's count, as `seek(to:)` holds it until its call returns.
+        engine.seeksInFlight += 1
+        rig.player.setSound(SoundSettings())
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
+        engine.seeksInFlight -= 1
+        #expect(await rig.puller.pull(upTo: 4096 + 2048))
+        #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        rig.player.pause()
+    }
+
+    /// Review M3: a switch while a finger is on the record re-cues nothing under the finger; at the let-go it is
+    /// checked again. Let go before any render call, no voice ever started and the let-go seeks nothing, so the check
+    /// re-cues: from one buffer after it, the item plays bit-exact with its ungained source.
+    @Test func aSwitchDuringAScrubIsCheckedAtTheLetGo() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.track))
+        await rig.player.play([hashItem("hash-c", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 8192))
+        #expect(rig.player.beginScrub())
+        rig.player.setSound(SoundSettings())
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 0, "nothing is re-cued under the finger")
+        await rig.player.endScrub(spinUpSeconds: 0.01).value
+        #expect(!rig.player.isScrubbing)
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
+        #expect(await rig.puller.pull(upTo: 8192 + 4096))
+        #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        let captured = rig.output.capturedFloat
+        var got: [Float] = []
+        var want: [Float] = []
+        for n in Int64(512)..<4096 {
+            for c in 0..<2 {
+                got.append(captured[2 * (8192 + Int(n)) + c])
+                want.append(HashDecoder.float(8192 + n, channel: c))
+            }
+        }
+        #expect(mismatch(got, want) == nil)
+        rig.player.pause()
     }
 
     // MARK: The strip
@@ -588,7 +708,8 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(rig.player.signal.activeProcessing == ["ReplayGain"])
         #expect(rig.player.signal.indicator == .processing(1))
         // Some audio after the re-cue, then the position updates (10 Hz) show what the decode thread took.
-        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        await drained(rig.player)
+        #expect(rig.player.recueCount == 1)
         #expect(await rig.puller.pull(upTo: rig.puller.pulled + 2048))
         #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
         #expect(await rig.puller.eventually { rig.player.signal.indicator == .pure })

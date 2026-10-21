@@ -175,6 +175,15 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.shared.withLock { s in s.timeline.gain(rendered: s.source?.renderedFrames ?? 0) }
     }
 
+    /// The ReplayGain of every item the decode thread has entered that is still to be heard, in order: the one
+    /// rendering, and any joined behind it in the ring (the decode thread runs up to half a second ahead). Empty before
+    /// the first item, and while a seek waits for the decode thread, which then re-enters at the gains set by then.
+    public var enteredGains: [(index: Int, gainDb: Double)] {
+        core.shared.withLock { s in
+            s.requestedSeek != nil ? [] : s.timeline.gains(from: s.source?.renderedFrames ?? 0)
+        }
+    }
+
     /// The chain runner's meters (see `SoundMeters`). Reading starts a new peak interval, so keep to one reader.
     public var soundMeters: SoundMeters {
         core.soundRunner.meters
@@ -435,6 +444,12 @@ struct Timeline {
     func gain(rendered: Int64) -> (index: Int, gainDb: Double)? {
         guard let segment = segments.last(where: { $0.renderedStart <= rendered }) ?? segments.first else { return nil }
         return (segment.index, segment.gainDb)
+    }
+
+    /// The ReplayGain of the segment being rendered and of every segment after it, with their items.
+    func gains(from rendered: Int64) -> [(index: Int, gainDb: Double)] {
+        let current = segments.lastIndex(where: { $0.renderedStart <= rendered }) ?? 0
+        return segments[current...].map { ($0.index, $0.gainDb) }
     }
 
     /// Pulls segment starts predicted past the true end of the stream back to it (see `clampBoundariesToWritten`).
