@@ -1,9 +1,10 @@
 import Foundation
 import Synchronization
 
-/// The last block of the Sound chain (spec §4.8 block 7): a look-ahead limiter that keeps the output's true peak, as
-/// ITU-R BS.1770-4 Annex 2 measures it, under a ceiling in dBTP. EQ boosts and preamp trim can then never push the
-/// DAC's reconstruction past full scale, even between samples, where a sample-peak limiter would let it through.
+/// The last block of the Sound chain (spec §4.8 block 7): a look-ahead limiter that keeps the output's true peak (the
+/// peak of the band-limited signal between samples, as ITU-R BS.1770-4 Annex 2 defines dBTP) under a ceiling. EQ
+/// boosts and preamp trim can then not push the DAC's reconstruction past full scale between samples, where a
+/// sample-peak limiter would let it through.
 ///
 /// It is in the chain whenever any block is on (plan ruling R4-6), so it must cost nothing audible while it is not
 /// needed: the audio path is only a delay line and a gain, and the gain is exactly 1 until a true peak would cross the
@@ -11,13 +12,23 @@ import Synchronization
 /// detection only; the audio itself is never resampled or filtered.
 ///
 /// ## Detector
-/// Each frame, every channel is read at the sample and at a quarter, a half and three quarters of the way to the next
-/// one, by a 4× polyphase interpolator after BS.1770-4 Annex 2: 48 taps, 12 per phase, a Kaiser-windowed sinc with
-/// β 8, each phase normalised to unity at DC. The phases sit on the sample grid, so phase 0 is the sample itself (the
-/// windowed sinc is an impulse there) and a sample peak is read exactly. The interpolating phases are flat to 0.01 dB
-/// up to 0.3 × the rate and fall away above it (−1.7 dB at 0.4 ×), as twelve taps must. With the quarter-sample grid,
-/// that is a 4× meter's blind spot: tones are held to within 0.07 dB at any frequency, but full-band noise can peak
-/// about 0.25 dB over the ceiling as a 16× reconstruction sees it. The frame's peak is the largest across channels.
+/// Each frame, every channel is read at the sample and at `oversampling − 1` evenly spaced points before the next one:
+/// 16× up to 48 kHz, 8× up to 96 kHz and 4× above, so the grid is at least 705.6 kHz (ruling R4-T4b). A BS.1770-style
+/// 4× grid let steady tones through 0.17 dB over at fs/4 and 0.44 dB at 0.4 fs: a crest between two points is
+/// under-read by up to cos(π f / grid). The points sit on the sample grid, so a sample peak is read exactly and no
+/// output sample can pass the ceiling. Each interpolating phase is a 32-tap Kaiser-windowed sinc (16 frames either
+/// side, β 5, normalised to unity at DC). The low β trades a passband ripple of about ±0.02 dB (reading high only
+/// makes it limit a little early) for a passband reaching 0.47 × the rate. The frame's peak is the largest across
+/// channels.
+///
+/// Measured, as the applied gain times a steady tone's amplitude, over 128 crest positions:
+/// - 44.1 and 48 kHz (16×): within +0.014 dB of the ceiling for any tone up to 0.45 × the rate.
+/// - 88.2 kHz and up (8× and 4×): 20 kHz tones stay under the ceiling. Any tone up to 20 kHz is bounded by the
+///   grid's cos(π f / grid), at most 0.035 dB. Ultrasonic tones read the coarser grids' bound: at 8×, +0.044 dB at
+///   fs/4 and +0.087 dB at 0.4 fs; at 4×, +0.17 dB at fs/4 and +0.42 dB at 0.4 fs.
+/// - Noise, on an FFT-exact reconstruction: within +0.003 dB when band-limited to 0.45 × the rate. Energy at the very
+///   top of the band (0.48–0.5 ×), which no finite filter reads in full, is under-read: twenty +24 dB peaks up to
+///   21.65 kHz at 44.1 kHz come out +0.30 dB over, and full-band white noise driven 12 dB into the limiter +1.0 dB.
 ///
 /// ## Gain envelope
 /// Channels share one gain, so a limited channel never shifts the stereo image. Per frame:
@@ -39,15 +50,17 @@ import Synchronization
 /// time (the render thread); `gainReductionDb` may be read from any thread.
 public final class TruePeakLimiter: @unchecked Sendable {
     public let channels: Int
-    /// Frames from input to output: the look-ahead, plus five more for the detector to read past the frame it judges.
+    /// Frames from input to output: the look-ahead, plus 15 more for the detector to read past the frame it judges.
     public let latencyFrames: Int
 
-    static let phases = 4
-    static let tapsPerPhase = 12
-    static let beta = 8.0
+    /// Taps per interpolating phase: 16 frames either side of the point. A multiple of 4, for `process`'s unrolling.
+    static let tapsPerPhase = 32
+    static let beta = 5.0
     /// Within this of its target, a releasing gain takes the target exactly.
     static let snap = 1e-9
 
+    /// Detection points per sample interval, the sample itself included: see `oversampling(atRate:)`.
+    let oversampling: Int
     /// The ceiling as a linear amplitude.
     private let ceiling: Double
     /// The look-ahead window, in frames: both the hold's and the ramp's length.
@@ -61,7 +74,8 @@ public final class TruePeakLimiter: @unchecked Sendable {
     /// `c * 2 * historyFrames`.
     private let history: UnsafeMutablePointer<Double>
     private let historyFrames: Int
-    /// The three interpolating phases' taps, `tapsPerPhase` each, for offsets ¼, ½ and ¾.
+    /// The interpolating phases' taps, `tapsPerPhase` each, for offsets 1/`oversampling` … (`oversampling` − 1)/
+    /// `oversampling`.
     private let taps: UnsafeMutablePointer<Double>
     /// The hold's deque of (needed gain, frame), a ring of `holdMask + 1` entries.
     private let holdGains: UnsafeMutablePointer<Double>
@@ -101,24 +115,26 @@ public final class TruePeakLimiter: @unchecked Sendable {
         let seconds = lookaheadSeconds.isFinite ? min(max(lookaheadSeconds, 0), 0.1) : 0.0015
         lookahead = max(1, Int((seconds * sampleRate).rounded()))
         inverseLookahead = 1 / Double(lookahead)
-        let release = releaseSeconds.isFinite && releaseSeconds > 0 ? releaseSeconds : 0.1
-        releaseCoefficient = 1 - exp(-1 / (release * sampleRate))
-        // The interval after frame m needs frame m + 6; the hold and the ramp then reach lookahead − 1 frames on.
+        let release = releaseSeconds.isFinite && releaseSeconds > 0 ? min(releaseSeconds, 10) : 0.1
+        // expm1 keeps the step exact for long releases at high rates, where 1 − exp(−x) loses its digits.
+        releaseCoefficient = -expm1(-1 / (release * sampleRate))
+        // The interval after frame m needs frame m + 16; the hold and the ramp then reach lookahead − 1 frames on.
         latencyFrames = lookahead + Self.tapsPerPhase / 2 - 1
+        oversampling = Self.oversampling(atRate: sampleRate)
 
         historyFrames = Self.powerOfTwo(atLeast: latencyFrames + Self.tapsPerPhase)
         history = .allocate(capacity: channels * 2 * historyFrames)
         history.initialize(repeating: 0, count: channels * 2 * historyFrames)
 
-        taps = .allocate(capacity: (Self.phases - 1) * Self.tapsPerPhase)
+        taps = .allocate(capacity: (oversampling - 1) * Self.tapsPerPhase)
         let i0Beta = ScrubKernel.besselI0(Self.beta)
         let half = Double(Self.tapsPerPhase / 2)
-        for phase in 1..<Self.phases {
-            let t = Double(phase) / Double(Self.phases)
+        for phase in 1..<oversampling {
+            let t = Double(phase) / Double(oversampling)
             let row = taps + (phase - 1) * Self.tapsPerPhase
             var sum = 0.0
             for i in 0..<Self.tapsPerPhase {
-                // Tap i reads frame m − 5 + i for the point m + t.
+                // Tap i reads frame m − 15 + i for the point m + t.
                 let u = Double(i - (Self.tapsPerPhase / 2 - 1)) - t
                 let sinc = sin(.pi * u) / (.pi * u)
                 let r = u / half
@@ -163,7 +179,8 @@ public final class TruePeakLimiter: @unchecked Sendable {
         let stride = 2 * historyFrames
         let taps = taps
         let tapsPerPhase = Self.tapsPerPhase
-        let interpolating = Self.phases - 1
+        let interpolating = oversampling - 1
+        let snap = Self.snap
         let reach = tapsPerPhase - 1
         let centre = tapsPerPhase / 2 - 1
         let ceiling = ceiling
@@ -188,7 +205,7 @@ public final class TruePeakLimiter: @unchecked Sendable {
         for offset in 0..<frames {
             let samples = io + offset * channels
             let write = frame & mask
-            // Frame m = frame − 6 and the interval after it: frames m − 5 ... m + 6.
+            // Frame m = frame − 16 and the interval after it: frames m − 15 ... m + 16.
             let window = (frame - reach) & mask
             var peak = 0.0
             for c in 0..<channels {
@@ -197,15 +214,29 @@ public final class TruePeakLimiter: @unchecked Sendable {
                 line[write] = x
                 line[write + historyFrames] = x
                 let points = line + window
-                let atSample = abs(points[centre])
+                let atSample = points[centre].magnitude
                 if atSample > peak { peak = atSample }
-                for phase in 0..<interpolating {
-                    let row = taps + phase * tapsPerPhase
-                    var sum = 0.0
-                    for i in 0..<tapsPerPhase { sum += row[i] * points[i] }
+                var row = taps
+                var phase = 0
+                while phase < interpolating {
+                    // Four running sums, so the adds don't wait on one another; tapsPerPhase is a multiple of 4.
+                    var sum0 = 0.0
+                    var sum1 = 0.0
+                    var sum2 = 0.0
+                    var sum3 = 0.0
+                    var i = 0
+                    while i < tapsPerPhase {
+                        sum0 += row[i] * points[i]
+                        sum1 += row[i + 1] * points[i + 1]
+                        sum2 += row[i + 2] * points[i + 2]
+                        sum3 += row[i + 3] * points[i + 3]
+                        i += 4
+                    }
                     // Written as a comparison so a NaN from overflowing extremes is ignored, never kept.
-                    let between = abs(sum)
+                    let between = ((sum0 + sum1) + (sum2 + sum3)).magnitude
                     if between > peak { peak = between }
+                    row += tapsPerPhase
+                    phase += 1
                 }
             }
 
@@ -227,7 +258,7 @@ public final class TruePeakLimiter: @unchecked Sendable {
                 envelope = hold
             } else if hold > envelope {
                 envelope += (hold - envelope) * releaseCoefficient
-                if hold - envelope < Self.snap { envelope = hold }
+                if hold - envelope < snap { envelope = hold }
             }
 
             // Ramp.
@@ -262,6 +293,13 @@ public final class TruePeakLimiter: @unchecked Sendable {
         self.deficitSlot = deficitSlot
         let db = smallestGain < 1 ? min(-20 * log10(max(smallestGain, 1e-6)), 120) : 0
         reduction.store(db.bitPattern, ordering: .relaxed)
+    }
+
+    /// Detection points per sample interval at `sampleRate`, chosen so the grid is at least 705.6 kHz (ruling R4-T4b):
+    /// 16 up to 48 kHz, 8 up to 96 kHz, 4 above. A crest between two points is then under-read by at most
+    /// cos(π f / grid), 0.035 dB at 20 kHz.
+    static func oversampling(atRate sampleRate: Double) -> Int {
+        sampleRate <= 48_000 ? 16 : sampleRate <= 96_000 ? 8 : 4
     }
 
     static func powerOfTwo(atLeast n: Int) -> Int {
