@@ -34,6 +34,20 @@ public enum SignalStrip {
     /// The pills' words, e.g. `["HI-RES 24/96", "PURE"]`.
     public static func badges(_ s: SignalState) -> [String] { signalBadges(s).map(\.text) }
 
+    /// The small note beside the song title for the altered or transient states (the pills in the cell cover the
+    /// rest): the rate change, the depth reduction, processing, a downmix, scrubbing. Nil for pure, for the route
+    /// warnings (Bluetooth, AirPlay, other, which stay in the cell), and for idle and pending.
+    public static func titleNote(_ s: SignalState) -> String? {
+        switch s.indicator {
+        case .resampled(let change): "Resampled \(shortRate(change.from))→\(shortRate(change.to))"
+        case .depthReduced(let from, let to): "\(from)→\(to)-bit"
+        case .processing: "Processing"
+        case .downmixed(let from, let to): "Downmixed \(from)→\(to)"
+        case .scrubbing: "Scrubbing"
+        case .idle, .pending, .pure, .bluetoothLossy, .airPlay, .otherRoute: nil
+        }
+    }
+
     /// The words for one indicator. `.idle` reads as the idle strip, never as "● Pure": with no track there is
     /// nothing to call pure.
     static func label(_ indicator: SignalIndicator) -> String {

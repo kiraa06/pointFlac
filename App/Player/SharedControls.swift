@@ -57,12 +57,25 @@ struct SharedControls: View {
                         .foregroundStyle(theme.inkSecondary)
                 }
             } else {
-                Text(title)
-                    .font(Typeface.display(30))
-                    .tracking(-0.6)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-                    .accessibilityIdentifier("nowPlayingTitle")
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(title)
+                        .font(Typeface.display(30))
+                        .tracking(-0.6)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .accessibilityIdentifier("nowPlayingTitle")
+                    if let note = SignalStrip.titleNote(player.signal) {
+                        // Fixed size and a higher priority: a long title truncates first, the note never.
+                        Text(note)
+                            .font(Typeface.monoSmall)
+                            .foregroundStyle(player.signal.scrubbing ? theme.inkSecondary : theme.altered)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .layoutPriority(1)
+                            .accessibilityLabel("Signal note: \(note)")
+                            .accessibilityIdentifier("titleNote")
+                    }
+                }
                 Text(subtitle)
                     .font(Typeface.artist)
                     .foregroundStyle(theme.inkSecondary)
@@ -274,46 +287,43 @@ struct WaveProgress: View {
 }
 
 /// The signal strip as the mockups draw it: FORMAT · DEPTH · DAC · SIGNAL cells, from `SignalStrip.text`, so the
-/// words are exactly the strip's and its honesty rules hold. The whole strip is one accessibility element whose
-/// label is the strip text, with the id the UI tests read.
+/// words are exactly the strip's and its honesty rules hold. When the delivered resolution is known, the SIGNAL cell
+/// shows its pills (HI-RES / LOSSLESS, PURE) where the indicator words would be; the altered states are noted beside
+/// the title instead. The whole strip is one accessibility element with the id the UI tests read.
 struct SignalCells: View {
     let signal: SignalState
     let theme: Theme
     @State private var details = false
 
     var body: some View {
-        let text = SignalStrip.text(signal)
-        VStack(alignment: .leading, spacing: 6) {
-            strip(text)
-            pills
-        }
+        strip(SignalStrip.text(signal))
     }
 
-    /// The Hi-Res / Lossless and Pure pills, under the strip: four cells and the signal words already fill the row at
-    /// iPhone width, so the pills take their own line rather than crowd it. The row keeps its height when there is
-    /// nothing to show (Bluetooth, AirPlay, idle), so the controls below never jump. Each pill is its own
-    /// accessibility element, apart from the strip's.
-    private var pills: some View {
+    /// The strip's spoken label: the plain text, with the pills' meaning in place of the indicator words.
+    private func spoken(_ text: String) -> String {
         let badges = SignalStrip.signalBadges(signal)
-        return HStack(spacing: 6) {
-            ForEach(badges, id: \.self) { badge in
+        let parts = text.components(separatedBy: " · ")
+        guard signal.resolution != nil, parts.count >= 4, parts[0] == "FLAC" else { return text }
+        var spoken = parts[0...2].joined(separator: ", ")
+        spoken += ". Signal: " + badges.map(\.accessibilityLabel).joined(separator: ", ")
+        if parts.count > 4 { spoken += ". " + parts[4...].joined(separator: " ") }
+        return spoken
+    }
+
+    /// The pills, in the SIGNAL cell. Tight padding, so two of them fit where "Resampled 96→48" did.
+    private var pills: some View {
+        HStack(spacing: 4) {
+            ForEach(SignalStrip.signalBadges(signal), id: \.self) { badge in
                 Text(badge.text)
                     .font(Typeface.monoSmall)
                     .foregroundStyle(color(badge))
-                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Capsule().strokeBorder(color(badge).opacity(0.7), lineWidth: 1))
                     .lineLimit(1).fixedSize()
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(badge.accessibilityLabel)
                     .accessibilityIdentifier(badge == .pure ? "pill.pure" : "pill.resolution")
             }
         }
-        .frame(minHeight: Self.pillRowHeight)
-        .animation(.easeOut(duration: 0.15), value: badges)
     }
-
-    /// A pill: 10 pt text, 3 pt padding above and below, 1 pt border.
-    private static let pillRowHeight: CGFloat = 20
 
     private func color(_ badge: SignalBadge) -> Color {
         switch badge {
@@ -331,7 +341,7 @@ struct SignalCells: View {
                 SignalDetailsSheet(signal: signal).presentationDetents([.medium, .large])
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(text)
+            .accessibilityLabel(spoken(text))
             .accessibilityAddTraits(.isStaticText)
             .accessibilityHint("Opens the signal details")
             .accessibilityAction { details = true }
@@ -347,7 +357,11 @@ struct SignalCells: View {
                     cell("FORMAT", parts[0])
                     cell("DEPTH", parts[1])
                     cell("DAC", parts[2])
-                    cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)
+                    if signal.resolution != nil {
+                        pillCell
+                    } else {
+                        cell("SIGNAL", parts[3], tint: tint(parts[3]), fixed: true)
+                    }
                 }
                 if parts.count > 4 {
                     Text(parts[4...].joined(separator: " · "))
@@ -360,6 +374,16 @@ struct SignalCells: View {
                 cell("SIGNAL", text)
             }
         }
+    }
+
+    /// The SIGNAL cell with pills in place of words, laid out like `cell` so the row keeps its rhythm.
+    private var pillCell: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Rectangle().fill(theme.hairline).frame(height: 1)
+            Text("SIGNAL").font(Typeface.cellLabel).tracking(1.2).foregroundStyle(theme.inkSecondary)
+            pills
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// One cell. The signal cell keeps its full width (`fixed`): its words are the claim, so they never truncate;

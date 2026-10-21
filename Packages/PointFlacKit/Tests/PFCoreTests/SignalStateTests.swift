@@ -253,3 +253,20 @@ private let allStates: [SignalState] = [
         SignalStrip.badges(state(96_000, 24, hardware: 96_000, port: .wired("Mono"), hardwareChannels: 1))
             == ["HI-RES 24/96"])
 }
+
+@Test func titleNoteTable() {
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 48_000, port: .builtIn)) == "Resampled 96→48")
+    #expect(SignalStrip.titleNote(state(96_000, 32, hardware: 96_000)) == "32→24-bit")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == "Processing")
+    #expect(
+        SignalStrip.titleNote(
+            state(48_000, 24, hardware: 48_000, port: .wired("Mono"), channels: 6, hardwareChannels: 2))
+            == "Downmixed 6→2")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, scrubbing: true)) == "Scrubbing")
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000)) == nil)
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, port: .bluetooth("AirPods"))) == nil)
+    #expect(SignalStrip.titleNote(state(44_100, 16, hardware: 44_100, port: .airPlay("TV"))) == nil)
+    #expect(SignalStrip.titleNote(state(44_100, 16, hardware: 44_100, port: .other("HDMI"))) == nil)
+    #expect(SignalStrip.titleNote(SignalState()) == nil)
+    #expect(SignalStrip.titleNote(SignalState(source: fmt(96_000, 24), port: .usb("DAC"))) == nil)
+}
