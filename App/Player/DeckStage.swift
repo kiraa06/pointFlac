@@ -473,9 +473,10 @@ struct DeckStage: View {
         }
         let now = Date.timeIntervalSinceReferenceDate
         spin.place(at: ended.baseAngle + ended.degrees, time: now, spinning: false)
-        spin.setSpinning(playback.isPlaying, at: now)
+        // A let-go record catches the platter turning under the slipmat: quick, and the sound's ramp matches.
+        spin.setSpinning(playback.isPlaying, at: now, rampSeconds: SpinModel.releaseSeconds)
         if ended.scrubbing {
-            playback.endScrub(spinUpSeconds: spin.spinUpSeconds)
+            playback.endScrub(spinUpSeconds: SpinModel.releaseSeconds)
         } else {
             jogBy(JogMath.seconds(forDegrees: ended.degrees))
         }

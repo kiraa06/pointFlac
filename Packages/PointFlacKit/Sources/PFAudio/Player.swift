@@ -426,11 +426,12 @@ public final class Player {
     /// The fastest a hand turns the record, in platter speeds: faster readings are touch noise.
     static let fastestHand = 8.0
 
-    /// The hand let go. A playing record spins back up over `spinUpSeconds` (the deck's motor, from rest), and the
-    /// pipeline takes over exactly where the needle is, with a short cross-fade. A paused record stays paused where
-    /// the hand left it. The returned task finishes once that has settled.
+    /// The hand let go. A playing record catches the platter turning under it, back to speed over `spinUpSeconds`
+    /// from rest (a slipmat's fraction of a second by default), and the pipeline takes over exactly where the needle
+    /// is, with a short cross-fade. A paused record stays paused where the hand left it. The returned task finishes
+    /// once that has settled.
     @discardableResult
-    public func endScrub(spinUpSeconds: Double = 0.9) -> Task<Void, Never> {
+    public func endScrub(spinUpSeconds: Double = 0.15) -> Task<Void, Never> {
         guard let run = scrubRun, run.settling == nil else { return Task {} }
         let task = Task { [weak self] in
             guard let self else { return }
