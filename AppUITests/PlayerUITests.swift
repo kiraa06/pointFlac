@@ -61,11 +61,14 @@ final class PlayerUITests: XCTestCase {
         let field = app.textFields["shelfSearch"]
         XCTAssertTrue(field.waitForExistence(timeout: 3))
         field.tap()
-        field.typeText("o")
-        app.buttons["chip-32bit"].tap()
-        // Hydrophone is the only 32-bit album; Paper Moons is 16/44.1.
+        // Shelf search matches word starts: "t" finds Hydrophone (by The Tidelines, the only 32-bit album) and Night
+        // Drive's "Tail Lights" (24/96).
+        field.typeText("t")
         XCTAssertTrue(app.buttons["result-album-Hydrophone"].waitForExistence(timeout: 2))
-        XCTAssertFalse(app.buttons["result-album-Paper Moons"].exists)
+        XCTAssertTrue(app.buttons["result-track-Tail Lights"].exists)
+        app.buttons["chip-32bit"].tap()
+        XCTAssertTrue(app.buttons["result-album-Hydrophone"].waitForExistence(timeout: 2))
+        XCTAssertFalse(app.buttons["result-track-Tail Lights"].exists)
     }
 
     @MainActor
