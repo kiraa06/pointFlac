@@ -7,9 +7,10 @@ import Foundation
 /// Filter 1: ON PK Fc 105 Hz Gain -2.3 dB Q 0.70
 /// ```
 ///
-/// Types: `PK`, `LSC`/`LS`, `HSC`/`HS`, `LP`, `HP` and `NO`. `OFF` filters are skipped. The parser is strict about
-/// anything it does not understand rather than guessing, and it never clamps: run `SoundSettings.clamped()` on the
-/// result before it reaches the audio thread.
+/// Types: `PK`, `LSC`/`LS`, `HSC`/`HS`, `LP`, `HP` and `NO`. `OFF` filters are skipped, and so are blank lines, comment
+/// lines (Equalizer APO's: the first character that is not a space is `#`) and a leading byte-order mark, which
+/// Windows editors write. The parser is strict about anything else it does not understand rather than guessing, and it
+/// never clamps: run `SoundSettings.clamped()` on the result before it reaches the audio thread.
 public enum AutoEqParser {
     public enum ParseError: Error, Equatable, Sendable {
         /// A line the parser does not recognise or cannot read; 1-based.
@@ -29,11 +30,13 @@ public enum AutoEqParser {
         var bands: [EQBand] = []
         // `split` on Character treats "\r\n" as one grapheme, so CRLF files need no special case; `newlines` also
         // covers a lone CR.
-        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        // A byte-order mark is not whitespace, so it would otherwise make the first line unreadable.
+        let body = text.first == "\u{FEFF}" ? text.dropFirst() : Substring(text)
+        let lines = body.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
         for (index, raw) in lines.enumerated() {
             let number = index + 1
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty { continue }
+            if line.isEmpty || line.hasPrefix("#") { continue }
             guard let colon = line.firstIndex(of: ":") else { throw ParseError.unsupportedLine(number) }
             let head = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
             let tokens = line[line.index(after: colon)...].split(whereSeparator: \.isWhitespace).map(String.init)
