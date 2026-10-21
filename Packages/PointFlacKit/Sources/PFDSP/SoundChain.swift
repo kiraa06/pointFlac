@@ -40,9 +40,9 @@ public struct SoundMeters: Equatable, Sendable {
 ///   response including the correction's preamp but does not apply that preamp itself;
 /// - the trim.
 ///
-/// That sum is then capped so the loudest frequency is driven at most +120 dB into the limiter (`maxDriveDb`). Only
-/// stacked boosts with automatic headroom off get there (twenty +24 dB bands make +480 dB), and well past it, about
-/// +280 dB, the limiter's gain, a Double, can no longer resolve the reduction it needs.
+/// That sum is then capped so the loudest frequency is driven at most `TruePeakLimiter.maxDriveDb` (+120 dB) into the
+/// limiter, the drive its guarantees hold for. Only stacked boosts with automatic headroom off get there (twenty
+/// +24 dB bands make +480 dB); far past it, about +280 dB, the limiter's gain can no longer resolve the reduction.
 ///
 /// Pure settings compile to a chain that only delays (its limiter is transparent below the ceiling). Install nil for
 /// Pure, which is bit-identical and has no delay.
@@ -50,9 +50,10 @@ public struct SoundMeters: Equatable, Sendable {
 /// ## State carried over
 /// A chain made for the same rate and channel count as the one it replaces takes over that chain's state when the
 /// runner installs it. Each filter keeps the state of the filter at the same place (block, index in that block's band
-/// list, shape) with its own coefficients; crossfeed keeps its state if the preset is unchanged; and the limiter
-/// carries on with its look-ahead, hold and release. Dragging one band then changes only that band's sound, and
-/// reinstalling the same settings is inaudible.
+/// list, shape) with its own coefficients, if their frequencies are within an octave: deleting a parametric band
+/// shifts the later bands' indices, and state is not carried between filters that far apart. Crossfeed keeps its
+/// state if the preset is unchanged, and the limiter carries on with its look-ahead, hold and release. Dragging one
+/// band then changes only that band's sound, and reinstalling the same settings is inaudible.
 public final class SoundChain: @unchecked Sendable {
     public let sampleRate: Double
     public let channels: Int
@@ -65,16 +66,14 @@ public final class SoundChain: @unchecked Sendable {
     /// The runner's crossfade into this chain, 10 ms at its rate.
     let fadeFrames: Int
 
-    /// Past this, in dB of drive at the loudest frequency, the preamp is pulled back (see "Compiling").
-    static var maxDriveDb: Double { 120 }
-
     private let gain: Double
     /// Filters per channel, in chain order.
     private let sections: Int
     /// `channels × sections` filters, channel-major.
     private let biquads: UnsafeMutablePointer<Biquad>
-    /// Each section's `FilterPlace.key`, for carrying state over.
+    /// Each section's `FilterPlace.key` and frequency, for carrying state over.
     private let keys: UnsafeMutablePointer<UInt64>
+    private let frequencies: UnsafeMutablePointer<Double>
     /// Stereo with crossfeed on only.
     private let crossfeed: UnsafeMutablePointer<Crossfeed>?
     /// The crossfeed preset's index, or −1: compared on the render thread, so a plain integer.
@@ -87,7 +86,8 @@ public final class SoundChain: @unchecked Sendable {
 
     #if DEBUG
         private static let live = Atomic<Int>(0)
-        /// Chains alive in the process. Debug builds only, for tests that check every retired chain is freed.
+        /// Chains alive in the whole process, debug builds only. Any test making chains in parallel moves it, so tests
+        /// that check chains are freed hold weak references to their own chains instead.
         static var liveInstances: Int { live.load(ordering: .acquiring) }
     #endif
 
@@ -100,16 +100,23 @@ public final class SoundChain: @unchecked Sendable {
         self.sampleRate = sampleRate
         self.channels = channels
 
-        // The filters SoundResponse designs (so the graph shows what plays), with their places, in the same order.
-        let filters = SoundResponse.filters(s, sampleRate: sampleRate)
-        let places = SoundResponse.placedBands(s).map(\.place.key)
-        let kept = zip(places, filters).filter { _, c in [c.b0, c.b1, c.b2, c.a1, c.a2].allSatisfy(\.isFinite) }
+        // The bands SoundResponse.filters designs, designed the same way, so the graph shows what plays. One list
+        // gives each filter and its place, so they can't fall out of step.
+        var kept: [(key: UInt64, hz: Double, c: BiquadCoefficients)] = []
+        for (place, band) in SoundResponse.placedBands(s) {
+            let c = BiquadCoefficients.design(
+                band.type, frequency: band.frequency, gainDb: band.gainDb, q: band.q, sampleRate: sampleRate)
+            guard [c.b0, c.b1, c.b2, c.a1, c.a2].allSatisfy(\.isFinite) else { continue }
+            kept.append((place.key, band.frequency, c))
+        }
         sections = kept.count
         biquads = .allocate(capacity: max(1, channels * kept.count))
         keys = .allocate(capacity: max(1, kept.count))
-        for (i, (key, c)) in kept.enumerated() {
-            keys[i] = key
-            for channel in 0..<channels { (biquads + channel * kept.count + i).initialize(to: Biquad(c)) }
+        frequencies = .allocate(capacity: max(1, kept.count))
+        for (i, section) in kept.enumerated() {
+            keys[i] = section.key
+            frequencies[i] = section.hz
+            for channel in 0..<channels { (biquads + channel * kept.count + i).initialize(to: Biquad(section.c)) }
         }
 
         let headroom = SoundResponse.autoHeadroomDb(s, sampleRate: sampleRate)
@@ -119,7 +126,7 @@ public final class SoundChain: @unchecked Sendable {
             preamp = correction + (s.preamp.autoHeadroom ? headroom : 0) + s.preamp.trimDb
             // −headroom is how far the curve, correction preamp included, peaks above 0 dB (0 if it doesn't).
             let loudest = -headroom + preamp - correction
-            if loudest > Self.maxDriveDb { preamp -= loudest - Self.maxDriveDb }
+            if loudest > TruePeakLimiter.maxDriveDb { preamp -= loudest - TruePeakLimiter.maxDriveDb }
         }
         preampDb = preamp.isFinite ? preamp : 0
         gain = pow(10, preampDb / 20)
@@ -151,6 +158,7 @@ public final class SoundChain: @unchecked Sendable {
         biquads.deinitialize(count: channels * sections)
         biquads.deallocate()
         keys.deallocate()
+        frequencies.deallocate()
         if let crossfeed {
             crossfeed.deinitialize(count: 1)
             crossfeed.deallocate()
@@ -229,17 +237,21 @@ public final class SoundChain: @unchecked Sendable {
         unretainedLimiter._withUnsafeGuaranteedRef { $0.process(io, frames: frames) }
     }
 
-    /// Takes over `old`'s state where it fits (see "State carried over"). Does nothing across rates or channel counts.
-    /// Real-time safe.
-    func adoptState(of old: SoundChain) {
-        guard old.biquads != biquads, old.channels == channels, old.sampleRate == sampleRate else { return }
+    /// Takes over the state of the chain at `old` where it fits (see "State carried over"). Does nothing across rates
+    /// or channel counts. Real-time safe: `old` is read as plain values, so no class reference is captured or retained
+    /// on the render thread, even in a debug build.
+    func adoptState(of old: UnsafeMutableRawPointer) {
+        let theirs = Unmanaged<SoundChain>.fromOpaque(old)._withUnsafeGuaranteedRef { $0.parts }
+        guard theirs.biquads != biquads, theirs.channels == channels, theirs.sampleRate == sampleRate else { return }
         let channels = channels
         for section in 0..<sections {
             let key = keys[section]
+            let hz = frequencies[section]
             var match = -1
             var i = 0
-            while i < old.sections {
-                if old.keys[i] == key {
+            while i < theirs.sections {
+                let ratio = theirs.frequencies[i] > hz ? theirs.frequencies[i] / hz : hz / theirs.frequencies[i]
+                if theirs.keys[i] == key, ratio <= 2 {
                     match = i
                     break
                 }
@@ -248,17 +260,35 @@ public final class SoundChain: @unchecked Sendable {
             guard match >= 0 else { continue }
             for channel in 0..<channels {
                 let mine = biquads + channel * sections + section
-                var carried = old.biquads[channel * old.sections + match]
+                var carried = theirs.biquads[channel * theirs.sections + match]
                 carried.c = mine.pointee.c
                 mine.pointee = carried
             }
         }
-        if let crossfeed, let theirs = old.crossfeed, crossfeedCode == old.crossfeedCode {
-            crossfeed.pointee = theirs.pointee
+        if let crossfeed, let previous = theirs.crossfeed, crossfeedCode == theirs.crossfeedCode {
+            crossfeed.pointee = previous.pointee
         }
-        unretainedLimiter._withUnsafeGuaranteedRef { mine in
-            old.unretainedLimiter._withUnsafeGuaranteedRef { mine.adoptState(of: $0) }
-        }
+        let limiter = theirs.limiter
+        unretainedLimiter._withUnsafeGuaranteedRef { $0.adoptState(of: limiter) }
+    }
+
+    /// What `adoptState(of:)` reads from the chain it replaces.
+    private struct Parts {
+        var channels: Int
+        var sampleRate: Double
+        var sections: Int
+        var biquads: UnsafeMutablePointer<Biquad>
+        var keys: UnsafeMutablePointer<UInt64>
+        var frequencies: UnsafeMutablePointer<Double>
+        var crossfeed: UnsafeMutablePointer<Crossfeed>?
+        var crossfeedCode: Int
+        var limiter: Unmanaged<TruePeakLimiter>
+    }
+
+    private var parts: Parts {
+        Parts(
+            channels: channels, sampleRate: sampleRate, sections: sections, biquads: biquads, keys: keys,
+            frequencies: frequencies, crossfeed: crossfeed, crossfeedCode: crossfeedCode, limiter: unretainedLimiter)
     }
 }
 
@@ -279,10 +309,15 @@ public final class SoundChain: @unchecked Sendable {
 /// 4. When the fade ends, the render thread hands the old chain back through a lock-free ring; nothing is released on
 ///    the render thread. `install` drains the ring, and so does a 100 ms timer while chains are still out (it gives up
 ///    after a second with none coming back, when the output has stopped mid-fade, and the next `install` drains).
-/// 5. Draining follows `ScrubTap.retireWindow`: it waits, at most 200 ms, until no render call is inside
-///    (`rendering`, stored sequentially consistently before a call touches any chain and loaded so by the drain), so a
-///    chain is never freed under the call that handed it back. If a call is still inside after that (a stalled render
-///    thread), the chains are stranded: kept, not freed, until the runner itself goes.
+///    Either way the chains are freed on the runner's own utility queue, not on the caller's thread or the main actor:
+///    `install` only takes them out of the ring, so it never waits.
+/// 5. The drain follows `ScrubTap.retireWindow`: it waits, at most 200 ms, until no render call is inside
+///    (`rendering`, stored sequentially consistently before a call touches any chain and loaded so by the drain), or
+///    the call that was inside has returned (`calls`), so a chain is never freed under the call that handed it back.
+///    If one call is still inside after that (a stalled render thread), the chains are stranded: kept, not freed,
+///    until the runner itself goes. The wait holds no lock.
+/// 6. The drain queue reaches the runner unretained (`Unmanaged`), so the runner always goes on the thread that lets it
+///    go: its `deinit` closes the queue to new timer work and waits out anything already on it.
 ///
 /// ## Pure
 /// With no chain and no fade in flight, `process` returns without touching `io`: the output is bit-identical.
@@ -306,6 +341,8 @@ public final class ChainRunner: @unchecked Sendable {
     private let mailbox = Atomic<UnsafeMutableRawPointer?>(nil)
     /// Set while a render call may touch a chain (see "Install protocol" step 5).
     private let rendering = Atomic<Bool>(false)
+    /// Render calls that have touched chains, counted as each returns: a drain waits for the one inside to return.
+    private let calls = Atomic<UInt64>(0)
 
     /// Render thread → main side: retired chains, still retained, in a single-producer, single-consumer ring.
     private let retireSlots: UnsafeMutablePointer<UnsafeMutableRawPointer?>
@@ -343,6 +380,8 @@ public final class ChainRunner: @unchecked Sendable {
 
     /// Main side, under `control`.
     private struct Control {
+        /// Set by `deinit`: no timer is armed again.
+        var closed = false
         /// Chains whose reference the render side holds: in the mailbox, playing, fading or in the ring.
         var outstanding = 0
         /// The latest install was a chain, which the render thread keeps playing.
@@ -357,7 +396,18 @@ public final class ChainRunner: @unchecked Sendable {
     /// Stands for Pure in the mailbox. Computed, not stored, so the render thread never runs a lazy initialiser.
     private static var pure: UnsafeMutableRawPointer { UnsafeMutableRawPointer(bitPattern: 1)! }
 
-    private static let drainQueue = DispatchQueue(label: "pointFlac.sound.retire", qos: .utility)
+    /// Where retired chains are freed and the timer runs (see "Install protocol" steps 4–6).
+    private let drainQueue = DispatchQueue(label: "pointFlac.sound.retire", qos: .utility)
+
+    /// The runner, unretained, for the drain queue's work. Unretained (not `unowned(unsafe)`, which a debug build
+    /// still retains for each call) so no block there ever holds the runner: it always goes on the thread that lets
+    /// it go, never on the drain queue, whose `sync` in `deinit` would then wait on itself.
+    private var unretained: Unmanaged<ChainRunner> { .passUnretained(self) }
+
+    /// Retired chains on their way to the drain queue.
+    private struct Retired: @unchecked Sendable {
+        var chains: [UnsafeMutableRawPointer] = []
+    }
 
     /// - Parameters:
     ///   - maxFrames: the largest piece of a block processed at once; longer blocks are split.
@@ -379,9 +429,12 @@ public final class ChainRunner: @unchecked Sendable {
     /// Frees every chain the runner still holds. No render call may be running: the owner stops the output first.
     deinit {
         control.withLock { control in
+            control.closed = true
             control.timer?.cancel()
             control.timer = nil
         }
+        // A timer tick or a free already on the queue reaches this runner unretained: let it finish first.
+        drainQueue.sync {}
         var held: [UnsafeMutableRawPointer] = []
         if let waiting = mailbox.exchange(nil, ordering: .acquiringAndReleasing), waiting != Self.pure {
             held.append(waiting)
@@ -414,7 +467,7 @@ public final class ChainRunner: @unchecked Sendable {
             chain = copy
         }
         let pointer = chain.map { Unmanaged.passRetained($0).toOpaque() } ?? Self.pure
-        control.withLock { control in
+        let retired = control.withLock { control -> Retired in
             let displaced = mailbox.exchange(pointer, ordering: .acquiringAndReleasing)
             if chain != nil { control.outstanding += 1 }
             control.keepsOne = chain != nil
@@ -423,10 +476,14 @@ public final class ChainRunner: @unchecked Sendable {
                 Unmanaged<SoundChain>.fromOpaque(displaced).release()
                 control.outstanding -= 1
             }
-            drain(&control)
+            let retired = collect(&control)
             control.idleTicks = 0
             updateTimer(&control)
+            return retired
         }
+        guard !retired.chains.isEmpty else { return }
+        let runner = unretained
+        drainQueue.async { runner._withUnsafeGuaranteedRef { $0.freeWhenIdle(retired) } }
     }
 
     /// The meters (see ``SoundMeters``). Reading starts a new peak interval. Any thread.
@@ -438,50 +495,80 @@ public final class ChainRunner: @unchecked Sendable {
             gainReductionDb: Double(bitPattern: reductionBits.load(ordering: .relaxed)))
     }
 
-    /// Releases the chains the render thread has handed back, once no render call can still be inside the call that
-    /// handed them back (`ScrubTap.retireWindow`'s handshake). Returns whether any came back.
-    @discardableResult
-    private func drain(_ control: inout Control) -> Bool {
+    /// Frees every chain handed back so far (or strands it), and returns once that is done. For tests.
+    func waitForFrees() {
+        let retired = control.withLock { collect(&$0) }
+        drainQueue.sync { freeWhenIdle(retired) }
+    }
+
+    /// Chains stranded so far (see "Install protocol" step 5). For tests.
+    var strandedCount: Int { control.withLock { $0.stranded.count } }
+
+    /// Drain queue: one timer tick.
+    private func tick() {
+        let retired = control.withLock { control -> Retired in
+            guard !control.closed else { return Retired() }
+            let retired = collect(&control)
+            control.idleTicks = retired.chains.isEmpty ? control.idleTicks + 1 : 0
+            updateTimer(&control)
+            return retired
+        }
+        freeWhenIdle(retired)
+    }
+
+    /// Takes the chains the render thread has handed back out of the ring. Under `control`.
+    private func collect(_ control: inout Control) -> Retired {
         let written = retireWritten.load(ordering: .acquiring)
         var read = retireRead.load(ordering: .relaxed)
-        guard read != written else { return false }
-        var returned: [UnsafeMutableRawPointer] = []
+        var retired = Retired()
         while read != written {
-            if let chain = retireSlots[read & retireMask] { returned.append(chain) }
+            if let chain = retireSlots[read & retireMask] { retired.chains.append(chain) }
             read += 1
         }
         retireRead.store(read, ordering: .releasing)
-        control.outstanding -= returned.count
-        // A render call that handed one back set `rendering` first (sequentially consistent with these loads), so once
-        // it reads false no call can still be inside.
+        control.outstanding -= retired.chains.count
+        return retired
+    }
+
+    /// Drain queue: frees `retired` once no render call can still be inside the call that handed them back
+    /// (`ScrubTap.retireWindow`'s handshake), or strands them if one call is still inside after 200 ms. Holds no lock
+    /// while it waits.
+    ///
+    /// The wait also ends when the call that was inside has returned (`calls` moved on), so a busy render thread,
+    /// whose next call may already be inside, never holds a free up, and a drain thread that was itself held up
+    /// past the deadline never strands chains a call that long since returned had handed back.
+    private func freeWhenIdle(_ retired: Retired) {
+        guard !retired.chains.isEmpty else { return }
+        // A render call that handed one back set `rendering` first, sequentially consistent with these loads (which
+        // come after the pointers were taken out of the ring), so once it reads false, or `calls` has moved on from
+        // the call that was inside, no call can still be inside the one that handed them back.
+        let inside = calls.load(ordering: .sequentiallyConsistent)
+        func stillInside() -> Bool {
+            rendering.load(ordering: .sequentiallyConsistent) && calls.load(ordering: .sequentiallyConsistent) == inside
+        }
         let deadline = ContinuousClock.now + .milliseconds(200)
-        while rendering.load(ordering: .sequentiallyConsistent), ContinuousClock.now < deadline {
+        while stillInside(), ContinuousClock.now < deadline {
             Thread.sleep(forTimeInterval: 0.0005)
         }
-        if rendering.load(ordering: .sequentiallyConsistent) {
+        if stillInside() {
             // A render call still inside after 200 ms (a stalled render thread): never free them under it.
-            control.stranded += returned.map { Unmanaged<SoundChain>.fromOpaque($0).takeRetainedValue() }
-            return true
+            let chains = retired.chains.map { Unmanaged<SoundChain>.fromOpaque($0).takeRetainedValue() }
+            control.withLock { $0.stranded += chains }
+            return
         }
-        for chain in returned { Unmanaged<SoundChain>.fromOpaque(chain).release() }
-        return true
+        for chain in retired.chains { Unmanaged<SoundChain>.fromOpaque(chain).release() }
     }
 
     /// Runs the 100 ms drain timer while chains are expected back, and stops it once none are, or after a second with
-    /// none coming back (the output stopped mid-fade: the next `install` drains them instead).
+    /// none coming back (the output stopped mid-fade: the next `install` drains them instead). Under `control`.
     private func updateTimer(_ control: inout Control) {
-        let expected = control.outstanding > (control.keepsOne ? 1 : 0) && control.idleTicks < 10
+        let expected = !control.closed && control.outstanding > (control.keepsOne ? 1 : 0) && control.idleTicks < 10
         if expected, control.timer == nil {
-            let timer = DispatchSource.makeTimerSource(queue: Self.drainQueue)
+            let timer = DispatchSource.makeTimerSource(queue: drainQueue)
             timer.schedule(
                 deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(20))
-            timer.setEventHandler { [weak self] in
-                guard let self else { return }
-                self.control.withLock { control in
-                    control.idleTicks = self.drain(&control) ? 0 : control.idleTicks + 1
-                    self.updateTimer(&control)
-                }
-            }
+            let runner = unretained
+            timer.setEventHandler { runner._withUnsafeGuaranteedRef { $0.tick() } }
             timer.resume()
             control.timer = timer
         } else if !expected, let timer = control.timer {
@@ -502,9 +589,12 @@ public final class ChainRunner: @unchecked Sendable {
         {
             return
         }
-        // Announce the call before touching any chain (sequentially consistent with `drain`).
+        // Announce the call before touching any chain (sequentially consistent with the drain's loads).
         rendering.store(true, ordering: .sequentiallyConsistent)
-        defer { rendering.store(false, ordering: .releasing) }
+        defer {
+            calls.wrappingAdd(1, ordering: .releasing)
+            rendering.store(false, ordering: .releasing)
+        }
 
         var meter = Meter()
         var done = 0
@@ -552,7 +642,8 @@ public final class ChainRunner: @unchecked Sendable {
             return
         }
         if let old {
-            Self.withChain(next) { new in Self.withChain(old) { new.adoptState(of: $0) } }
+            // Only the raw `old` is captured: a closure capturing a chain would retain it in a debug build.
+            Self.withChain(next) { $0.adoptState(of: old) }
         }
         state.pointee.current = next
         // Two calls rather than one returning a tuple, whose metadata a debug build would instantiate here.
@@ -616,18 +707,30 @@ public final class ChainRunner: @unchecked Sendable {
                 meter.reduction = max(meter.reduction, chain.gainReductionDb)
             }
         }
-        // Equal gain: the weights sum to 1. Silent while the new chain fills its look-ahead, then a 10 ms ramp.
+        // Equal gain: the weights sum to 1. Silent while the new chain fills its look-ahead, then a 10 ms ramp. At
+        // the end weights one side is taken whole, so a dry side heard alone stays bit for bit (−0 and NaN payloads
+        // too), and a non-finite dry sample never leaks into a chain heard alone (0 × NaN is NaN).
         let prime = state.pointee.prime
         let inverseLength = state.pointee.inverseLength
+        let outgoingDry = leaving == nil
+        let incomingDry = current == nil
         var elapsed = state.pointee.elapsed
         var i = 0
         for _ in 0..<frames {
             let g = elapsed < prime ? 0 : min(1, Double(elapsed - prime + 1) * inverseLength)
-            for _ in 0..<channels {
-                let y = Float((1 - g) * outgoing[i] + g * incoming[i])
-                io[i] = y
-                meter.write(y)
-                i += 1
+            if (g == 0 && outgoingDry) || (g == 1 && incomingDry) {
+                for _ in 0..<channels {
+                    meter.write(io[i])
+                    i += 1
+                }
+            } else {
+                for _ in 0..<channels {
+                    let mixed = (1 - g) * outgoing[i] + g * incoming[i]
+                    let y = Float(g == 0 ? outgoing[i] : g == 1 ? incoming[i] : mixed)
+                    io[i] = y
+                    meter.write(y)
+                    i += 1
+                }
             }
             elapsed += 1
         }

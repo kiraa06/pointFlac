@@ -17,6 +17,10 @@ import Synchronization
 /// - **Higher rates (8×): +0.1 dB.** Up to 20 kHz the bound is the grid's 0.035 dB, and a 20 kHz tone measures under
 ///   the ceiling. The rest is ultrasonic content, read on the coarser grid.
 ///
+/// These hold for input at most `maxDriveDb` (+120 dB) over full scale. Far past that, about +280 dB, the gain
+/// (a Double) can no longer resolve the reduction it needs, and the output overshoots: +47.7 dB out for input at 1e18
+/// (+360 dB). `SoundChain` caps its drive to this bound.
+///
 /// **Energy above 0.45 × the rate is not guaranteed.** It is under-read, as with any finite true-peak detector,
 /// BS.1770 meters included: near fs/2 a finite interpolator cannot reconstruct the signal (the half-sample phase has a
 /// zero at fs/2). For example, twenty +24 dB peaks reaching 21.65 kHz at 44.1 kHz come out +0.30 dB over, and white
@@ -71,6 +75,10 @@ public final class TruePeakLimiter: @unchecked Sendable {
     /// Within this of its target, a releasing gain takes the target exactly. Computed, not stored: `process` reads it,
     /// and a stored static's lazy initialiser would first run on the render thread.
     static var snap: Double { 1e-9 }
+
+    /// The most drive, in dB over full scale, the guarantees hold for (see "What it guarantees"). Computed, not
+    /// stored, like `snap`.
+    static var maxDriveDb: Double { 120 }
 
     /// Detection points per sample interval, the sample itself included: see `oversampling(atRate:)`.
     let oversampling: Int
@@ -311,23 +319,54 @@ public final class TruePeakLimiter: @unchecked Sendable {
     /// Render thread: carries on from `other`'s state (its recent input, hold, release and ramp), as if this limiter had
     /// been running all along, so a recompiled chain picks up mid-stream without restarting its look-ahead. Does
     /// nothing unless both were made for the same channels and rate, whose buffers then have the same shapes; their
-    /// ceilings may differ. Real-time safe: it only copies, into buffers allocated in `init`.
-    func adoptState(of other: TruePeakLimiter) {
-        guard other.history != history, other.channels == channels, other.historyFrames == historyFrames,
-            other.lookahead == lookahead, other.holdMask == holdMask, other.oversampling == oversampling
+    /// ceilings may differ. Real-time safe: it only copies, into buffers allocated in `init`, and reads `other` as
+    /// plain values, so no class reference is captured or retained, even in a debug build.
+    func adoptState(of other: Unmanaged<TruePeakLimiter>) {
+        let theirs = other._withUnsafeGuaranteedRef { $0.state }
+        guard theirs.history != history, theirs.channels == channels, theirs.historyFrames == historyFrames,
+            theirs.lookahead == lookahead, theirs.holdMask == holdMask, theirs.oversampling == oversampling
         else { return }
-        history.update(from: other.history, count: channels * 2 * historyFrames)
-        holdGains.update(from: other.holdGains, count: holdMask + 1)
-        holdFrames.update(from: other.holdFrames, count: holdMask + 1)
-        deficits.update(from: other.deficits, count: lookahead)
-        frame = other.frame
-        holdHead = other.holdHead
-        holdTail = other.holdTail
-        previousPeak = other.previousPeak
-        envelope = other.envelope
-        deficitSum = other.deficitSum
-        deficitCount = other.deficitCount
-        deficitSlot = other.deficitSlot
+        history.update(from: theirs.history, count: channels * 2 * historyFrames)
+        holdGains.update(from: theirs.holdGains, count: holdMask + 1)
+        holdFrames.update(from: theirs.holdFrames, count: holdMask + 1)
+        deficits.update(from: theirs.deficits, count: lookahead)
+        frame = theirs.frame
+        holdHead = theirs.holdHead
+        holdTail = theirs.holdTail
+        previousPeak = theirs.previousPeak
+        envelope = theirs.envelope
+        deficitSum = theirs.deficitSum
+        deficitCount = theirs.deficitCount
+        deficitSlot = theirs.deficitSlot
+    }
+
+    /// What `adoptState(of:)` copies, and the shapes it checks, as plain values.
+    private struct State {
+        var history: UnsafeMutablePointer<Double>
+        var holdGains: UnsafeMutablePointer<Double>
+        var holdFrames: UnsafeMutablePointer<Int>
+        var deficits: UnsafeMutablePointer<Double>
+        var channels: Int
+        var historyFrames: Int
+        var lookahead: Int
+        var holdMask: Int
+        var oversampling: Int
+        var frame: Int
+        var holdHead: Int
+        var holdTail: Int
+        var previousPeak: Double
+        var envelope: Double
+        var deficitSum: Double
+        var deficitCount: Int
+        var deficitSlot: Int
+    }
+
+    private var state: State {
+        State(
+            history: history, holdGains: holdGains, holdFrames: holdFrames, deficits: deficits, channels: channels,
+            historyFrames: historyFrames, lookahead: lookahead, holdMask: holdMask, oversampling: oversampling,
+            frame: frame, holdHead: holdHead, holdTail: holdTail, previousPeak: previousPeak, envelope: envelope,
+            deficitSum: deficitSum, deficitCount: deficitCount, deficitSlot: deficitSlot)
     }
 
     /// Detection points per sample interval at `sampleRate`: 16 up to 48 kHz and 8 above, so the grid is at least
