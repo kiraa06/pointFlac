@@ -127,6 +127,9 @@ struct SoundView: View {
         .listRowBackground(glass)
     }
 
+    /// The insets of the rows drawn on the deck's screen (the graph and the meters), so their panels line up.
+    static let screenInsets = EdgeInsets(top: 8, leading: 10, bottom: 10, trailing: 10)
+
     @ViewBuilder
     private func eqRows(_ s: SoundSettings) -> some View {
         EQControlsRow(eq: s.eq, store: store, theme: theme)
@@ -141,10 +144,12 @@ struct SoundView: View {
             }
         )
         .frame(height: 200)
-        .listRowInsets(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+        .listRowInsets(Self.screenInsets)
         if s.eq.mode == .graphic {
+            // Narrow insets: every point of width goes to the faders' touch columns.
             GraphicEQBank(gains: s.eq.graphicGainsDb, theme: theme) { store.setGraphicGain($0, $1) }
                 .padding(.vertical, 6)
+                .listRowInsets(EdgeInsets(top: 6, leading: 6, bottom: 6, trailing: 8))
                 .pureDimmed()
         } else {
             if s.eq.bands.isEmpty {

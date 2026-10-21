@@ -154,8 +154,10 @@ struct SoundSlider: View {
     }
 }
 
-/// A graphic EQ slider: a console fader, moved by dragging anywhere on its strip (relative to where it was, so a
-/// touch alone changes nothing), with a detent at 0 dB and a double tap back to it. VoiceOver steps it by 0.5 dB.
+/// A graphic EQ slider: a console fader. Only the cap takes a drag (a band 44 pt tall round it, the column's full
+/// width), as on a hardware console, so a scroll that starts anywhere else on the bank scrolls the list. The drag is
+/// relative to where the cap was, so a touch alone changes nothing; there is a detent at 0 dB, and a double tap
+/// anywhere on the column returns to it. VoiceOver steps it by 0.5 dB.
 struct VerticalFader: View {
     let value: Double
     let range: ClosedRange<Double>
@@ -166,11 +168,13 @@ struct VerticalFader: View {
     @State private var dragStart: Double?
 
     private static let capHeight: CGFloat = 12
+    /// The height of the band round the cap that takes a drag.
+    static let grabHeight: CGFloat = 44
 
     var body: some View {
         VStack(spacing: 6) {
             Text(SoundFormat.signed(value))
-                .font(.system(size: 9.5, weight: .semibold, design: .monospaced).monospacedDigit())
+                .font(.caption2.monospaced().weight(.semibold).monospacedDigit())
                 .foregroundStyle(value == 0 ? theme.inkSecondary : theme.ink)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
@@ -178,12 +182,13 @@ struct VerticalFader: View {
                 track(geo.size)
             }
             Text(SoundFormat.frequencyShort(frequency))
-                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                .font(.caption2.monospaced().weight(.medium))
                 .foregroundStyle(theme.inkSecondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
         }
         .sensoryFeedback(.selection, trigger: value == 0) { _, atZero in atZero && dragStart != nil }
+        .sensoryFeedback(.selection, trigger: dragStart != nil) { _, grabbed in grabbed }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(SoundFormat.frequency(frequency)) band")
         .accessibilityValue(SoundFormat.gainSpoken(value))
@@ -203,6 +208,7 @@ struct VerticalFader: View {
         let span = range.upperBound - range.lowerBound
         let y = Self.capHeight / 2 + (range.upperBound - value) / span * travel
         let tint = theme.processingTint
+        let grabbed = dragStart != nil
         return ZStack {
             // The scale: a tick at every 6 dB, longer at 0.
             Canvas { context, canvas in
@@ -230,31 +236,54 @@ struct VerticalFader: View {
                     Rectangle().fill(theme.isDark ? Color.black.opacity(0.55) : theme.ink.opacity(0.7))
                         .frame(height: 1.2)
                 )
-                .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous).strokeBorder(theme.plinthEdge))
-                .frame(width: min(size.width - 4, 26), height: Self.capHeight)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .strokeBorder(grabbed ? tint : theme.plinthEdge, lineWidth: grabbed ? 1.5 : 1)
+                )
+                .frame(width: min(size.width - 4, 28), height: Self.capHeight)
                 .shadow(color: .black.opacity(theme.isDark ? 0.5 : 0.18), radius: 2, y: 1)
+                .scaleEffect(grabbed ? 1.08 : 1)
                 .position(x: size.width / 2, y: y)
         }
         .frame(width: size.width, height: size.height)
+        // The whole column takes a double tap: a tap never holds up a scroll.
         .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { drag in
-                    let start = dragStart ?? value
-                    dragStart = start
-                    var next = SoundFormat.tenth(start - drag.translation.height / travel * span)
-                    if abs(next) < 0.3 { next = 0 }
-                    set(clamp(next))
-                }
-                .onEnded { _ in dragStart = nil }
-        )
-        .simultaneousGesture(TapGesture(count: 2).onEnded { set(0) })
+        .onTapGesture(count: 2) { set(0) }
+        // Only the band round the cap takes a drag. The overlay does not move, so the drag's space stays put.
+        .overlay {
+            Color.clear
+                .contentShape(CapBand(centreY: y, height: Self.grabHeight))
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { drag in
+                            let start = dragStart ?? value
+                            dragStart = start
+                            var next = SoundFormat.tenth(start - drag.translation.height / travel * span)
+                            if abs(next) < 0.3 { next = 0 }
+                            set(clamp(next))
+                        }
+                        .onEnded { _ in dragStart = nil }
+                )
+                .simultaneousGesture(TapGesture(count: 2).onEnded { set(0) })
+        }
+        .animation(.easeOut(duration: 0.12), value: grabbed)
     }
 
     private func clamp(_ v: Double) -> Double { min(max(v, range.lowerBound), range.upperBound) }
 }
 
-/// The ten graphic sliders, with the dB scale on the left.
+/// The band round a fader's cap that takes a drag: the column's full width, `height` tall, centred on the cap.
+private struct CapBand: Shape {
+    var centreY: CGFloat
+    var height: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: rect.minX, y: centreY - height / 2, width: rect.width, height: height))
+    }
+}
+
+/// The ten graphic sliders, with the dB scale on the left. Each fader takes an equal share of the row, so its touch
+/// column is as wide as the row allows (about 34 pt on an iPhone 17 Pro).
 struct GraphicEQBank: View {
     let gains: [Double]
     let theme: Theme
