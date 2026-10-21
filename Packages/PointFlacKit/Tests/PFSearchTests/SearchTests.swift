@@ -15,7 +15,7 @@ func makeTrack(
         id: id ?? "\(artist)|\(album)|\(title)", url: URL(fileURLWithPath: "/music/\(title).flac"), title: title,
         artist: artist, albumArtist: albumArtist, album: album, albumID: albumID, discNumber: 1, trackNumber: number,
         year: 1990, format: AudioFormat(sampleRate: rate, bitsPerSample: bits, channels: 2), totalFrames: 44_100 * 200,
-        artworkID: nil)
+        artworkID: nil, isInLibraryFolder: true)
 }
 
 /// A small library with the cases the ranking rules care about.
