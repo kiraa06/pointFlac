@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "PFSoulseek", targets: ["PFSoulseek"]),
         .library(name: "PFDownloads", targets: ["PFDownloads"]),
         .library(name: "PFArchive", targets: ["PFArchive"]),
+        .library(name: "PFDesign", targets: ["PFDesign"]),
     ],
     targets: [
         .target(
@@ -58,6 +59,16 @@ let package = Package(
         .target(
             name: "PFLibrary",
             dependencies: ["PFCore", "PFFlac"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Stream D: the player UI's maths (sides, spin, tonearm, jog, the hand-off timeline). Foundation only.
+        .target(
+            name: "PFDesign",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFDesignTests",
+            dependencies: ["PFDesign"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(

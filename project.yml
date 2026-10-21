@@ -23,6 +23,7 @@ targets:
       - path: App
         excludes:
           - Debug/Fixtures
+          - Debug/make-demo-fixtures.sh
       # The debug fixtures, as a folder reference: they land in the app bundle under Fixtures/.
       - path: App/Debug/Fixtures
         type: folder
@@ -36,6 +37,8 @@ targets:
         product: PFAudio
       - package: PointFlacKit
         product: PFLibrary
+      - package: PointFlacKit
+        product: PFDesign
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac
