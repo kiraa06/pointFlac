@@ -9,16 +9,22 @@ import Synchronization
 /// cheaper than list bookkeeping at the few hundred entries it holds.
 public final class LRUCache<Key: Hashable & Sendable, Value: Sendable>: Sendable {
     private struct State {
-        var entries: [Key: (value: Value, tick: UInt64)] = [:]
+        var entries: [Key: (value: Value, tick: UInt64, cost: Int)] = [:]
         var tick: UInt64 = 0
+        var totalCost = 0
     }
 
     public let capacity: Int
+    /// The most total cost (for example bytes) the cache holds; the oldest entries go first beyond it.
+    public let maxCost: Int
+    private let cost: @Sendable (Value) -> Int
     private let state = Mutex(State())
 
-    public init(capacity: Int) {
+    public init(capacity: Int, maxCost: Int = .max, cost: @escaping @Sendable (Value) -> Int = { _ in 0 }) {
         precondition(capacity > 0, "an LRU cache holds at least one entry")
         self.capacity = capacity
+        self.maxCost = maxCost
+        self.cost = cost
     }
 
     /// The value for `key`, marking it most recently used.
@@ -26,26 +32,43 @@ public final class LRUCache<Key: Hashable & Sendable, Value: Sendable>: Sendable
         state.withLock { state in
             guard let entry = state.entries[key] else { return nil }
             state.tick &+= 1
-            state.entries[key] = (entry.value, state.tick)
+            state.entries[key] = (entry.value, state.tick, entry.cost)
             return entry.value
         }
     }
 
     /// Stores `value`, evicting the least recently used entry when full.
     public func insert(_ value: Value, for key: Key) {
+        let itemCost = cost(value)
         state.withLock { state in
             state.tick &+= 1
-            state.entries[key] = (value, state.tick)
-            if state.entries.count > capacity,
+            if let previous = state.entries[key] { state.totalCost -= previous.cost }
+            state.entries[key] = (value, state.tick, itemCost)
+            state.totalCost += itemCost
+            while state.entries.count > capacity || (state.totalCost > maxCost && state.entries.count > 1),
                 let oldest = state.entries.min(by: { $0.value.tick < $1.value.tick })?.key
             {
+                state.totalCost -= state.entries[oldest]?.cost ?? 0
                 state.entries[oldest] = nil
             }
         }
     }
 
+    public func remove(_ key: Key) {
+        state.withLock { state in
+            if let entry = state.entries.removeValue(forKey: key) { state.totalCost -= entry.cost }
+        }
+    }
+
     public func removeAll() {
-        state.withLock { $0.entries.removeAll() }
+        state.withLock { state in
+            state.entries.removeAll()
+            state.totalCost = 0
+        }
+    }
+
+    public var totalCost: Int {
+        state.withLock { $0.totalCost }
     }
 
     public var count: Int {
@@ -98,6 +121,16 @@ public struct DiskCache: Sendable {
         guard (try? data.write(to: url, options: .atomic)) != nil else { return }
         try? manager.setAttributes([.modificationDate: now], ofItemAtPath: url.path)
         prune()
+    }
+
+    /// Deletes the entry for `key`, if any.
+    public func remove(_ key: String) {
+        try? FileManager.default.removeItem(at: fileURL(for: key))
+    }
+
+    /// Deletes every entry: the cache folder and everything in it.
+    public func removeAll() {
+        try? FileManager.default.removeItem(at: directory)
     }
 
     private func fileURL(for key: String) -> URL {

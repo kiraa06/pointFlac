@@ -125,13 +125,17 @@ import Testing
         let calls = Counter()
         let stub = StubMusicBrainz { _ in
             if calls.increment() == 1 {
-                return (503, ["Retry-After": "0.05"], try fixture("mb-503-busy"))
+                return (503, ["Retry-After": "0.4"], try fixture("mb-503-busy"))
             }
             return (200, [:], try fixture("mb-artist-gorill-prefix"))
         }
+        // The bucket interval (20 ms) and the default back-off (30 ms) are far shorter than Retry-After (400 ms), so
+        // a retry 400 ms later can only come from honouring the header.
         let response = try await stub.client().search(.artist, query: "q")
         #expect(response.artists?.first?.name == "Gorillaz")
-        #expect(stub.requestCount == 2)
+        let stamps = stub.requests.withLock { $0.map(\.at) }
+        #expect(stamps.count == 2)
+        #expect(stamps[1] - stamps[0] >= .milliseconds(390))
     }
 
     @Test func staysBusyAfterRetriesWithoutACache() async throws {
@@ -168,11 +172,16 @@ import Testing
         let clock = ContinuousClock()
         let start = clock.now
         let task = Task { try await client.search(.artist, query: "slow") }
-        try await Task.sleep(for: .milliseconds(100))
+        // Wait (bounded) for the request to reach the stub, so the cancel hits a request in flight.
+        let deadline = clock.now + .seconds(10)
+        while stub.requestCount == 0, clock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(stub.requestCount == 1)
+        let cancelledAt = clock.now
         task.cancel()
         let result = await task.result
         #expect(throws: CancellationError.self) { try result.get() }
-        #expect(clock.now - start < .seconds(2))
+        #expect(clock.now - cancelledAt < .seconds(2))
+        _ = start
     }
 
     @Test func refusesOversizedResponses() async throws {

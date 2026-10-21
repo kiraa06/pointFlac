@@ -63,7 +63,7 @@ public actor MusicBrainzClient {
         configuration: Configuration = Configuration(),
         session: URLSession = MusicBrainzClient.makeSession(),
         bucket: TokenBucket = .musicBrainz,
-        memory: LRUCache<String, Data> = LRUCache(capacity: 256),
+        memory: LRUCache<String, Data> = LRUCache(capacity: 256, maxCost: 8_000_000, cost: { $0.count }),
         disk: DiskCache? = DiskCache(directory: DiskCache.defaultDirectory())
     ) {
         self.configuration = configuration
@@ -98,34 +98,45 @@ public actor MusicBrainzClient {
 
     /// Searches `entity` with a Lucene `query`.
     public func search(_ entity: MB.Entity, query: String, limit: Int = 8) async throws -> MB.SearchResponse {
-        let data = try await fetch(searchURL(entity, query: query, limit: limit))
-        do {
-            return try JSONDecoder().decode(MB.SearchResponse.self, from: data)
-        } catch {
-            throw MusicBrainzError.undecodable
-        }
+        try await fetch(searchURL(entity, query: query, limit: limit))
     }
 
     /// The search response for `entity`/`query` if it is cached (memory, or fresh on disk); never touches the network.
     public func cachedSearch(_ entity: MB.Entity, query: String, limit: Int = 8) -> MB.SearchResponse? {
-        let key = searchURL(entity, query: query, limit: limit).absoluteString
-        guard let data = cachedData(for: key) else { return nil }
-        return try? JSONDecoder().decode(MB.SearchResponse.self, from: data)
+        cachedResponse(for: searchURL(entity, query: query, limit: limit).absoluteString)
     }
 
-    private func cachedData(for key: String) -> Data? {
-        if let data = memory.value(for: key) { return data }
-        if let entry = disk?.read(key), entry.isFresh {
-            memory.insert(entry.data, for: key)
-            return entry.data
+    /// Forgets every cached response, in memory and on disk (the person turned online suggestions off).
+    public func clearCaches() {
+        memory.removeAll()
+        disk?.removeAll()
+    }
+
+    /// A cached response that still decodes. One that does not (a block page cached by an older build, a truncated
+    /// file) is deleted, so the caller fetches afresh instead of being stuck with it for a week.
+    private func cachedResponse(for key: String, allowStale: Bool = false) -> MB.SearchResponse? {
+        if let data = memory.value(for: key) {
+            if let decoded = decode(data) { return decoded }
+            memory.remove(key)
         }
-        return nil
+        guard let entry = disk?.read(key, allowStale: allowStale), entry.isFresh || allowStale else { return nil }
+        guard let decoded = decode(entry.data) else {
+            disk?.remove(key)
+            return nil
+        }
+        if entry.isFresh { memory.insert(entry.data, for: key) }
+        return decoded
     }
 
-    /// Cache, then bucket, then network, then stale cache.
-    func fetch(_ url: URL) async throws -> Data {
+    private func decode(_ data: Data) -> MB.SearchResponse? {
+        try? JSONDecoder().decode(MB.SearchResponse.self, from: data)
+    }
+
+    /// Cache, then bucket, then network, then stale cache. Only bodies that are JSON and decode are ever cached: a
+    /// network filter's HTML "blocked" page served with status 200 must not stand in for the answer for a week.
+    func fetch(_ url: URL) async throws -> MB.SearchResponse {
         let key = url.absoluteString
-        if let data = cachedData(for: key) { return data }
+        if let cached = cachedResponse(for: key) { return cached }
         var attempt = 0
         while true {
             try Task.checkCancellation()
@@ -156,15 +167,22 @@ public actor MusicBrainzClient {
                 if Task.isCancelled { throw CancellationError() }
                 // Private: an error description can quote the request URL, which holds what the person typed.
                 logger.info("MusicBrainz unreachable: \(error.localizedDescription, privacy: .private)")
-                if let stale = disk?.read(key, allowStale: true) { return stale.data }
+                if let stale = cachedResponse(for: key, allowStale: true) { return stale }
                 throw MusicBrainzError.offline
             }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
             switch status {
             case 200:
+                let contentType = http?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+                guard contentType.contains("json"), let decoded = decode(data) else {
+                    logger.info("MusicBrainz answered 200 with a body that is not its JSON; not cached")
+                    if let stale = cachedResponse(for: key, allowStale: true) { return stale }
+                    throw MusicBrainzError.undecodable
+                }
                 memory.insert(data, for: key)
                 disk?.write(data, for: key)
-                return data
+                return decoded
             case 429, 503:
                 let delay = retryAfter(response) ?? configuration.defaultBusyDelay
                 await bucket.penalize(for: delay)
@@ -173,11 +191,11 @@ public actor MusicBrainzClient {
                     attempt += 1
                     continue
                 }
-                if let stale = disk?.read(key, allowStale: true) { return stale.data }
+                if let stale = cachedResponse(for: key, allowStale: true) { return stale }
                 throw MusicBrainzError.busy
             default:
                 // 403 from a network filter, 5xx during an outage: an old answer still beats no answer.
-                if let stale = disk?.read(key, allowStale: true) { return stale.data }
+                if let stale = cachedResponse(for: key, allowStale: true) { return stale }
                 throw MusicBrainzError.http(status: status)
             }
         }

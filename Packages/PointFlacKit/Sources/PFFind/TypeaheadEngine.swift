@@ -43,6 +43,8 @@ public final class TypeaheadEngine: Sendable {
     private let library: LibrarySearch
     private let registry: (any SuggestionRegistry)?
     private let inFlight = Mutex<Task<Void, Never>?>(nil)
+    /// Live switch for registry lookups, starting from ``Configuration/registryEnabled``.
+    private let registryOn: Mutex<Bool>
 
     public init(
         library: @escaping LibrarySearch, registry: (any SuggestionRegistry)?,
@@ -51,10 +53,22 @@ public final class TypeaheadEngine: Sendable {
         self.library = library
         self.registry = registry
         self.configuration = configuration
+        self.registryOn = Mutex(configuration.registryEnabled)
+    }
+
+    /// Whether keystrokes reach the registry right now.
+    public var isRegistryEnabled: Bool { registryOn.withLock { $0 } }
+
+    /// Turns registry lookups on or off without rebuilding the engine. Turning them off cancels the registry work in
+    /// flight at once: its stream ends with the rows it already had, and no further request is sent.
+    public func setRegistryEnabled(_ enabled: Bool) {
+        registryOn.withLock { $0 = enabled }
+        if !enabled { replaceInFlight(with: nil) }
     }
 
     /// Ranked suggestions for `partial`, emitted as they become known. See the type's documentation.
-    public func suggestions(_ partial: String) -> AsyncStream<[Suggestion]> {
+    public func suggestions(_ text: String) -> AsyncStream<[Suggestion]> {
+        let partial = FindText.bounded(text)
         let (stream, continuation) = AsyncStream.makeStream(
             of: [Suggestion].self, bufferingPolicy: .bufferingNewest(8))
         let configuration = configuration
@@ -63,7 +77,7 @@ public final class TypeaheadEngine: Sendable {
         continuation.yield(ranker.merge(library: local, registry: []))
 
         let folded = FindText.fold(partial)
-        guard configuration.registryEnabled, let registry, folded.count >= configuration.minimumRegistryCharacters
+        guard isRegistryEnabled, let registry, folded.count >= configuration.minimumRegistryCharacters
         else {
             replaceInFlight(with: nil)
             continuation.finish()
@@ -79,6 +93,7 @@ public final class TypeaheadEngine: Sendable {
             do {
                 try await Task.sleep(for: configuration.debounce)
                 for try await batch in registry.suggestions(for: partial) {
+                    try Task.checkCancellation()
                     continuation.yield(ranker.merge(library: local, registry: batch + cached))
                 }
             } catch {
@@ -92,7 +107,9 @@ public final class TypeaheadEngine: Sendable {
 
     /// The entity behind a picked suggestion, completed by the registry when it needs to be (an album's track count).
     public func resolve(_ suggestion: Suggestion) async -> ResolvedEntity {
-        guard suggestion.source == Suggestion.Source.musicBrainz, let registry else { return suggestion.entity }
+        guard suggestion.source == Suggestion.Source.musicBrainz, isRegistryEnabled, let registry else {
+            return suggestion.entity
+        }
         return (try? await registry.resolve(suggestion)) ?? suggestion.entity
     }
 

@@ -90,7 +90,10 @@ final class StubMusicBrainz: Sendable {
                 $0.append((request.url!, request.value(forHTTPHeaderField: "User-Agent"), ContinuousClock.now))
             }
             let (status, headers, body) = try await route(request.url!)
-            return (status, headers, body)
+            // MusicBrainz labels its answers JSON; a route that wants something else says so.
+            var labelled = headers
+            if labelled["Content-Type"] == nil { labelled["Content-Type"] = "application/json" }
+            return (status, labelled, body)
         }
     }
 

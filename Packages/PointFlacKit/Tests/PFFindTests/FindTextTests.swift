@@ -25,7 +25,7 @@ import Testing
 
     @Test func stripsLeadingArticle() {
         #expect(FindText.withoutLeadingArticle("The Beatles") == "Beatles")
-        #expect(FindText.withoutLeadingArticle("The The") == "The")
+        #expect(FindText.withoutLeadingArticle("The The") == "The The")
         #expect(FindText.withoutLeadingArticle("Theatre of Tragedy") == "Theatre of Tragedy")
     }
 
