@@ -134,15 +134,26 @@ final class RealMusicFinder: MusicFinding {
         removeJobs { Self.rowID($0.track) == id }
     }
 
-    /// Finished means published; failed means failed or cancelled. The library keeps every published song.
+    /// Works on rows, as the list shows them: a row is cleared when its newest job is finished (published) or failed
+    /// (failed or cancelled), and with it go all its track's final jobs, as in `removeDownload`. Clearing by job would
+    /// let an older job of another state surface as the row ("Clear Finished" turning a row into "Failed").
+    /// The library keeps every published song.
     func clearDownloads(finished: Bool, failed: Bool) {
-        removeJobs { item in
-            switch item.state {
-            case .published: finished
-            case .failed, .cancelled: failed
-            case .queued, .downloading, .waiting, .validating, .saving: false
-            }
-        }
+        var newest: [String: DownloadState] = [:]
+        // Oldest first, so each track's newest job is the last one written.
+        for item in observer.items { newest[Self.rowID(item.track)] = item.state }
+        let rows = Set(
+            newest.compactMap { row, state -> String? in
+                let cleared =
+                    switch state {
+                    case .published: finished
+                    case .failed, .cancelled: failed
+                    case .queued, .downloading, .waiting, .validating, .saving: false
+                    }
+                return cleared ? row : nil
+            })
+        guard !rows.isEmpty else { return }
+        removeJobs { rows.contains(Self.rowID($0.track)) }
     }
 
     /// Takes the final jobs matching `include` off the manager's list.
