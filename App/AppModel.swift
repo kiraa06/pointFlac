@@ -50,6 +50,7 @@ final class AppModel {
     #if DEBUG
         private let preloadFixtures: Bool
         /// `-PFDemoPlay`: plays the demo album "Night Drive" once the library is listed, for screenshots and UI tests.
+        /// `-PFDemoAlbum <title>` picks another (the Sound tests play the 48 kHz "Copper Garden").
         private let demoPlay: Bool
     #endif
 
@@ -161,8 +162,8 @@ final class AppModel {
             } else {
                 await reload()
             }
-            if demoPlay, let album = library.albums.first(where: { $0.title == "Night Drive" }) ?? library.albums.first
-            {
+            let demoAlbum = UserDefaults.standard.string(forKey: "PFDemoAlbum") ?? "Night Drive"
+            if demoPlay, let album = library.albums.first(where: { $0.title == demoAlbum }) ?? library.albums.first {
                 await playback.load(album)
             }
         #else

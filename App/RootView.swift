@@ -3,11 +3,11 @@ import SwiftUI
 import UIKit
 
 enum AppTab: Hashable {
-    case player, getMusic, downloads, settings
+    case player, getMusic, downloads, sound, settings
 }
 
-/// The app's frame (spec §4.1): the player is home, with the Shelf inside it; Get Music, Downloads and Settings sit
-/// beside it in a Liquid Glass tab bar. The appearance override applies here, to everything.
+/// The app's frame (spec §4.1): the player is home, with the Shelf inside it; Get Music, Downloads, Sound and Settings
+/// sit beside it in a Liquid Glass tab bar. The appearance override applies here, to everything.
 struct RootView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
@@ -28,6 +28,9 @@ struct RootView: View {
                 DownloadsView(finder: model.finder)
             }
             .badge(activeDownloads)
+            Tab("Sound", systemImage: "slider.vertical.3", value: AppTab.sound) {
+                SoundView(store: model.sound, playback: model.playback)
+            }
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView(model: model)
             }
@@ -70,12 +73,13 @@ struct RootView: View {
         }
     }
 
-    /// `-PFTab getMusic|downloads|settings` (DEBUG only) opens on that tab, for screenshots.
+    /// `-PFTab getMusic|downloads|sound|settings` (DEBUG only) opens on that tab, for screenshots.
     private static var launchTab: AppTab {
         #if DEBUG
             switch UserDefaults.standard.string(forKey: "PFTab") {
             case "getMusic": return .getMusic
             case "downloads": return .downloads
+            case "sound": return .sound
             case "settings": return .settings
             default: return .player
             }
