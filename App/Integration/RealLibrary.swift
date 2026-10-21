@@ -40,12 +40,20 @@ final class CoverIndex: Sendable {
 ///
 /// It also starts the library's loudness scan (`Library.scanLoudness`, for ReplayGain), in the background, whenever a
 /// catalog brings tracks no earlier one had: once a launch, and after every import, download or rescan that adds any.
+/// The Sound tab's ReplayGain block shows what is known (`loudness`) and the scan's progress (`loudnessScan`).
 @MainActor
 @Observable
 final class RealLibrary: LibraryBrowsing {
     private(set) var albums: [AlbumCard] = []
     /// The latest snapshot, for the debug views and the music finder.
     private(set) var snapshot: LibrarySnapshot = .empty
+    /// The playable tracks' loudness data, recounted with each catalog.
+    private(set) var loudness = LoudnessSummary()
+    /// The background loudness scan, while one runs and has tracks to measure; nil otherwise.
+    private(set) var loudnessScan: LoudnessScanProgress?
+    /// Scan calls not yet returned. A call made while another runs is merged into it and returns at once, reporting
+    /// nothing; the first call's progress counts the merged work too, so progress shows until every call is back.
+    @ObservationIgnored private var scansRunning = 0
 
     @ObservationIgnored let library: Library
     @ObservationIgnored let box = SnapshotBox()
@@ -93,6 +101,8 @@ final class RealLibrary: LibraryBrowsing {
     private func apply(_ snapshot: LibrarySnapshot) {
         self.snapshot = snapshot
         box.replace(with: snapshot)
+        let summary = LoudnessSummary(snapshot.catalog.tracks.values.filter(\.isSupported))
+        if summary != loudness { loudness = summary }
         measureNewTracks(in: snapshot.catalog)
         var built: [AlbumCard] = []
         var byID: [String: AlbumCard] = [:]
@@ -195,9 +205,26 @@ final class RealLibrary: LibraryBrowsing {
         knownTrackIDs = ids
         guard grew else { return }
         let library = library
-        Task.detached(priority: .background) {
-            await library.scanLoudness { _, _ in }
+        scansRunning += 1
+        Task.detached(priority: .background) { [weak self] in
+            await library.scanLoudness { [weak self] done, total in
+                Task { @MainActor [weak self] in self?.scanProgressed(done: done, total: total) }
+            }
+            await self?.scanReturned()
         }
+    }
+
+    /// The scan's `progress(done, total)`, hopped to the main actor. A report that arrives after every call returned
+    /// is late, and dropped.
+    private func scanProgressed(done: Int, total: Int) {
+        guard scansRunning > 0 else { return }
+        let next = total > 0 ? LoudnessScanProgress(done: min(done, total), total: total) : nil
+        if next != loudnessScan { loudnessScan = next }
+    }
+
+    private func scanReturned() {
+        scansRunning = max(scansRunning - 1, 0)
+        if scansRunning == 0 { loudnessScan = nil }
     }
 
     /// A track still in iCloud is listed and playable (the player fetches it first, spec §4.7); its format says so.
@@ -209,4 +236,38 @@ final class RealLibrary: LibraryBrowsing {
             durationSeconds: track.durationSeconds,
             format: track.formatLabel + (track.isCloudPending ? " · iCloud" : ""), side: side)
     }
+}
+
+/// What the library knows of its playable tracks' loudness (spec §4.8, ReplayGain): tag values, the scan's own
+/// measurements, and neither yet.
+struct LoudnessSummary: Equatable, Sendable {
+    /// With a ReplayGain tag, track or album: played from the tag.
+    var tagged = 0
+    /// Without a tag, but measured by the scan (including a track measured as silent, which gets no gain).
+    var measured = 0
+    /// Neither: not reached by a scan yet, in iCloud, or unreadable. These play at 0 dB.
+    var pending = 0
+
+    init() {}
+
+    init(_ tracks: some Sequence<LibraryTrack>) {
+        for track in tracks {
+            let l = track.loudness
+            if l?.trackGainDb != nil || l?.albumGainDb != nil {
+                tagged += 1
+            } else if l?.measuredPeak != nil {
+                measured += 1
+            } else {
+                pending += 1
+            }
+        }
+    }
+
+    var total: Int { tagged + measured + pending }
+}
+
+/// A loudness scan's tracks measured so far and planned in all (`Library.scanLoudness`'s cumulative count).
+struct LoudnessScanProgress: Equatable, Sendable {
+    var done: Int
+    var total: Int
 }
