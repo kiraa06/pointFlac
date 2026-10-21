@@ -138,6 +138,28 @@ struct BandGestureSessionTests {
         #expect(s.dragChanged(index: 0, band: bands[0], grabX: 0, grabY: 0)?.index == 0)
     }
 
+    @Test("a drag cut short by a reset is ignored until its finger lifts; another touch starts clean")
+    func resetCutsTheDragShort() {
+        var s = BandGestureSession<Band>()
+        let down = BandGestureSession<Band>.Touch(x: 40, y: 60)
+        #expect(s.dragChanged(index: 1, band: bands[1], grabX: 3, grabY: -2, touch: down)?.index == 1)
+        // The bands changed under the finger: a band before it was deleted, so its handle is now index 0.
+        s.reset()
+        #expect(s.isIdle)
+        #expect(s.dragChanged(index: 0, band: Band(id: 1, hz: 1500), grabX: 50, grabY: 50, touch: down) == nil)
+        // Another finger drags normally, and once it does the old touch is forgotten.
+        let other = BandGestureSession<Band>.Touch(x: 200, y: 10)
+        #expect(s.dragChanged(index: 2, band: bands[2], grabX: 1, grabY: 1, touch: other)?.grabX == 1)
+        #expect(s.cutShort == nil)
+        s.dragStopped(index: 2)
+        // Or the cut-short finger lifts: then the next touch, wherever it lands, drags.
+        _ = s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0, touch: down)
+        s.reset()
+        s.dragStopped(index: 1)
+        #expect(s.cutShort == nil)
+        #expect(s.dragChanged(index: 1, band: bands[1], grabX: 0, grabY: 0, touch: down)?.index == 1)
+    }
+
     @Test("no band to pinch: nothing starts")
     func nothingToPinch() {
         var s = BandGestureSession<Band>()

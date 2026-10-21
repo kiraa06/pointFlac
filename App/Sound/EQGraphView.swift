@@ -455,7 +455,8 @@ struct EQGraphView: View {
         let c = centre(band, size)
         guard
             let drag = session.dragChanged(
-                index: index, band: band, grabX: value.startLocation.x - c.x, grabY: value.startLocation.y - c.y),
+                index: index, band: band, grabX: value.startLocation.x - c.x, grabY: value.startLocation.y - c.y,
+                touch: .init(x: value.startLocation.x, y: value.startLocation.y)),
             eq.bands.indices.contains(drag.index)
         else { return }
         if starting { selection = drag.index }
