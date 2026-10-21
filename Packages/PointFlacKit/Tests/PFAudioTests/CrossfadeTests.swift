@@ -1060,6 +1060,67 @@ private final class PlayerRig {
         #expect(rig.output.plans == [floatPlan(48_000)])
     }
 
+    /// Review N1, the drain: an item at another rate, taken back while the ring drains for its reconfigure, must not
+    /// play. The take-back reports success and is kept: no output is configured for the item, and the queue ends
+    /// after the first. With an item appended in its place, that one plays as index 1 (nothing of the one taken
+    /// back under its index), through its own reconfigure.
+    @Test(arguments: [false, true])
+    func anItemTakenBackDuringADrainNeverPlays(replaced: Bool) async {
+        let a = tone(440, seconds: 1, rate: 44_100)
+        let b = tone(660, seconds: 1, rate: 96_000)
+        let c = noise(22, seconds: 0.5, rate: 96_000)
+        let rig = PipelineRig(["a": a, "b": b, "c": c])
+        await rig.pipeline.start([rig.item("a")], at: 0, fromFrame: 0)
+        #expect(rig.pipeline.append([rig.item("b")]))
+        // The decode thread has written all of the first item, opened the second and waits for the ring to drain.
+        #expect(await rig.puller.pull(upTo: 44_100 - 2_000))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(rig.pipeline.removeItems(from: 1))
+        if replaced { #expect(rig.pipeline.append([rig.item("c")])) }
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        #expect(!rig.log.contains(rig.started(1, "b")), "events: \(rig.log.events)")
+        let first = floatPlan(44_100)
+        if replaced {
+            #expect(mismatch(rig.captured, plain(a, 0..<44_100) + plain(c, 0..<48_000)) == nil)
+            #expect(
+                rig.log.events == [
+                    .planChanged(first), rig.started(0, "a"), .trackEnded(0), .planChanged(floatPlan(96_000)),
+                    rig.started(1, "c"), .trackEnded(1), .queueEnded,
+                ])
+        } else {
+            #expect(mismatch(rig.captured, plain(a, 0..<44_100)) == nil)
+            #expect(rig.log.events == [.planChanged(first), rig.started(0, "a"), .trackEnded(0), .queueEnded])
+            #expect(rig.output.plans == [first], "no output was configured for the item taken back")
+        }
+    }
+
+    /// Review N1, the overlap: an item taken back after the decode thread prepared its overlap (clamped to a quarter
+    /// of the fade by the item's length, so prepared at the outgoing item's 96 000 and due at 168 000), with another
+    /// appended in its place before the overlap starts. Index 1 is the replacement, overlapped afresh for what is
+    /// left (its own half, 12 000 frames), and nothing of the item taken back plays.
+    @Test func aTakeBackAndAReplacementBeforeAShortenedOverlap() async {
+        let a = tone(440, seconds: 4)
+        let b = tone(660, seconds: 1)
+        let c = noise(21, seconds: 0.5)
+        let rig = PipelineRig(["a": a, "b": b, "c": c])
+        await rig.pipeline.start([rig.item("a")], at: 0, fromFrame: 0, crossfade: always(2))
+        #expect(rig.pipeline.append([rig.item("b")]))
+        #expect(await rig.puller.pull(upTo: 100_000))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(rig.pipeline.removeItems(from: 1))
+        #expect(rig.pipeline.append([rig.item("c")]))
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        #expect(!rig.log.contains(rig.started(1, "b")), "events: \(rig.log.events)")
+        let want =
+            plain(a, 0..<180_000) + mixed(a, from: 180_000, c, from: 0, frames: 12_000) + plain(c, 12_000..<24_000)
+        #expect(mismatch(rig.captured, want) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), rig.started(0, "a"), rig.started(1, "c"), .trackEnded(0),
+                .trackEnded(1), .queueEnded,
+            ])
+    }
+
     /// An append taken back before it reached the pipeline (it waits on the engine's queue) never does; a later
     /// append at the same place plays.
     @Test func anAppendTakenBackOnItsWayNeverReachesThePipeline() async {

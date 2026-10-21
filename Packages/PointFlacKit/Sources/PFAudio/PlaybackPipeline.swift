@@ -341,9 +341,14 @@ final class PipelineCore: @unchecked Sendable {
         var gainsDb: [String: Double] = [:]
         /// The crossfade the decode thread applies at the boundaries it reaches from now on.
         var crossfade = CrossfadeSettings()
-        /// Items `append` added that the decode thread has not taken yet, and where each batch begins in the queue.
+        /// Items `append` added that the decode thread has not taken yet, their serials, and where each batch begins
+        /// in the queue.
         var appended: [PlaybackItem] = []
+        var appendedSerials: [UInt64] = []
         var appendedStarts: Set<Int> = []
+        /// The serial the next item queued gets: unique for the pipeline's life, so the decode thread can tell an item
+        /// `removeItems` took back from one appended in its place.
+        var nextSerial: UInt64 = 0
         /// The live session's queue length, appended items included.
         var queueCount = 0
         /// The decode thread found the queue at its end with nothing appended: `append` is refused from then on.
@@ -407,9 +412,14 @@ final class PipelineCore: @unchecked Sendable {
         firstFrame: FirstFrameInterval
     ) {
         let first = max(index, 0)
+        let serials = shared.withLock { s -> [UInt64] in
+            let serials = (0..<UInt64(items.count)).map { s.nextSerial + $0 }
+            s.nextSerial += UInt64(items.count)
+            return serials
+        }
         let session = DecodeSession(
-            core: self, items: items, batchStarts: appendedAt, startIndex: first, startFrame: max(fromFrame, 0),
-            firstFrame: firstFrame)
+            core: self, items: items, serials: serials, batchStarts: appendedAt, startIndex: first,
+            startFrame: max(fromFrame, 0), firstFrame: firstFrame)
         let dropped = outputGate.withLock {
             let dropped = shared.withLock { s in
                 s.session?.requestStop()
@@ -420,6 +430,7 @@ final class PipelineCore: @unchecked Sendable {
                 s.seekFadesIn = false
                 s.crossfade = Self.clamped(crossfade)
                 s.appended = []
+                s.appendedSerials = []
                 s.appendedStarts = []
                 s.queueCount = items.count
                 s.queueClosed = false
@@ -441,17 +452,24 @@ final class PipelineCore: @unchecked Sendable {
             guard !items.isEmpty else { return true }
             s.appendedStarts.insert(s.queueCount)
             s.appended += items
+            s.appendedSerials += (0..<UInt64(items.count)).map { s.nextSerial + $0 }
+            s.nextSerial += UInt64(items.count)
             s.queueCount += items.count
             queueStamp.wrappingAdd(1, ordering: .releasing)
             return true
         }
     }
 
+    /// The take-back is atomic with everything that would reveal the items, which all take this lock: the decode
+    /// thread enters an item (`enter`, `crossfade`) only while it is still queued, and emits a `trackStarted` only
+    /// then; the items' Timeline segments go here, so `position`, `enteredGains` and the seek below never land in
+    /// them; and the re-cue's hold is placed here too. Past this call, then, none of their audio is heard but what a
+    /// render call already in flight, and the seek's 6 ms fade-out, play of the ring: the documented dip.
     func removeItems(from index: Int) -> Bool {
         let limit = max(index, 0)
         var heard = false
-        let recueAt = shared.withLock { s -> Int64? in
-            guard s.session != nil, limit < s.queueCount else { return nil }
+        let superseded = shared.withLock { s -> FirstFrameInterval?? in
+            guard let session = s.session, limit < s.queueCount else { return nil }
             let playing = s.timeline.position(rendered: s.source?.renderedFrames ?? 0)
             guard playing.index < limit else {
                 heard = true
@@ -461,18 +479,22 @@ final class PipelineCore: @unchecked Sendable {
             let pending = s.queueCount - s.appended.count
             if limit < pending {
                 s.appended.removeAll()
+                s.appendedSerials.removeAll()
                 s.queueLimit = min(s.queueLimit ?? limit, limit)
             } else {
                 s.appended.removeSubrange((limit - pending)...)
+                s.appendedSerials.removeSubrange((limit - pending)...)
             }
             s.appendedStarts = s.appendedStarts.filter { $0 < limit }
             s.queueCount = limit
             queueStamp.wrappingAdd(1, ordering: .releasing)
-            // Entered already, in the ring: a re-cue makes the ring forget it. A seek on its way does that anyway.
-            guard s.requestedSeek == nil, s.timeline.segments.contains(where: { $0.index >= limit }) else { return nil }
-            return playing.frame
+            // Entered already, in the ring: a re-cue at the playhead makes the ring forget it. A seek on its way does
+            // that anyway, and lands where the Timeline, without the items' segments, now says.
+            guard s.timeline.removeSegments(from: limit), s.requestedSeek == nil else { return nil }
+            return registerSeek(
+                in: &s, session: session, frame: playing.frame, firstFrame: FirstFrameInterval(.seek), fadeIn: true)
         }
-        if let recueAt { seek(toFrame: recueAt, firstFrame: FirstFrameInterval(.seek), fadeIn: true) }
+        if case let interval?? = superseded { interval.end(.abandoned) }
         return !heard
     }
 
@@ -499,16 +521,23 @@ final class PipelineCore: @unchecked Sendable {
         // The interval this request supersedes, or this one when there is nothing to seek. Ended outside the lock.
         let abandoned = shared.withLock { s -> FirstFrameInterval? in
             guard let session = s.session else { return firstFrame }
-            s.requestedSeek = frame
-            s.seekFadesIn = fadeIn
-            let superseded = s.seekInterval
-            s.seekInterval = firstFrame
-            s.source?.holdForSeek()
-            s.timeline.pendingFrame = frame
-            session.wake()
-            return superseded
+            return registerSeek(in: &s, session: session, frame: frame, firstFrame: firstFrame, fadeIn: fadeIn)
         }
         abandoned?.end(.abandoned)
+    }
+
+    /// Places a seek's request and its hold, inside `shared`'s lock; returns the interval it supersedes.
+    private func registerSeek(
+        in s: inout Shared, session: DecodeSession, frame: Int64, firstFrame: FirstFrameInterval, fadeIn: Bool
+    ) -> FirstFrameInterval? {
+        s.requestedSeek = frame
+        s.seekFadesIn = fadeIn
+        let superseded = s.seekInterval
+        s.seekInterval = firstFrame
+        s.source?.holdForSeek()
+        s.timeline.pendingFrame = frame
+        session.wake()
+        return superseded
     }
 
     func stop() {
@@ -599,9 +628,12 @@ final class PipelineCore: @unchecked Sendable {
     }
 
     func emit(_ events: [PipelineEvent], for session: DecodeSession) {
-        _ = withShared(for: session) { _ in
-            for event in events { continuation.yield(event) }
-        }
+        _ = withShared(for: session) { _ in yield(events) }
+    }
+
+    /// Hands `events` to the stream. Only inside a `withShared` for the live session, as `emit` does.
+    func yield(_ events: [PipelineEvent]) {
+        for event in events { continuation.yield(event) }
     }
 }
 
@@ -695,6 +727,16 @@ struct Timeline {
         }
         if let fadeEnd, !segments.isEmpty { segments[segments.count - 1].fadeOutEnd = fadeEnd }
         segments.append(segment)
+    }
+
+    /// Drops the segments of items `limit` and after (`removeItems` took them back), and the fade out of the one before
+    /// them under the first. Returns whether there were any.
+    mutating func removeSegments(from limit: Int) -> Bool {
+        let count = segments.count
+        segments.removeAll { $0.index >= limit }
+        guard segments.count != count else { return false }
+        if !segments.isEmpty { segments[segments.count - 1].fadeOutEnd = nil }
+        return true
     }
 
     /// Moves the latest fade's end to `end`, where the overlap really ended.

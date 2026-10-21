@@ -40,12 +40,18 @@ final class DecodeSession: @unchecked Sendable {
         /// has rendered, the listener has heard the item go, so a seek fires the event at once (the seek cuts the item
         /// off) rather than dropping it with the markers it makes stale.
         var overlapStart: Int64?
+        /// For a `trackStarted`: the item's serial. It is emitted only while the item is still queued at its index
+        /// (`emit(_:)`), so an item `removeItems` took back never starts.
+        var serial: UInt64?
     }
 
     /// The next item, opened while the current one still plays, to see whether the two overlap (`prepareNext`). The
     /// overlap takes its decoder, or the join does when they do not overlap.
     private struct Prepared {
         var index: Int
+        /// The item's serial in the queue when it was opened: it is entered only while that is still what is queued
+        /// at `index` (`stillQueued`).
+        var serial: UInt64
         var decoder: PCMDecoding
         /// Where the overlap begins, in the current item's source frames, and its length; nil for a plain join.
         var overlap: (start: Int64, frames: Int)?
@@ -55,6 +61,7 @@ final class DecodeSession: @unchecked Sendable {
     /// frames. A class, so the mixing loop can update it in place and leave it as it stands at any interruption.
     private final class Overlap {
         let index: Int
+        let serial: UInt64
         let decoder: PCMDecoding
         let format: AudioFormat
         let frames: Int
@@ -72,9 +79,11 @@ final class DecodeSession: @unchecked Sendable {
         var incomingEnd: PipelineEvent?
 
         init(
-            index: Int, decoder: PCMDecoding, frames: Int, gain: Double, dither: TPDFDither, renderedStart: Int64
+            index: Int, serial: UInt64, decoder: PCMDecoding, frames: Int, gain: Double, dither: TPDFDither,
+            renderedStart: Int64
         ) {
             self.index = index
+            self.serial = serial
             self.decoder = decoder
             format = decoder.format
             self.frames = frames
@@ -93,6 +102,9 @@ final class DecodeSession: @unchecked Sendable {
     // Decode-thread state.
     /// The queue: the items `start` gave, then the ones `append` added, taken from the shared state as they are needed.
     private var items: [PlaybackItem]
+    /// Each queued item's serial, beside `items`: unique for the pipeline's life, so an item taken back and another
+    /// appended in its place are told apart.
+    private var serials: [UInt64]
     /// Where each appended batch begins: the boundaries Between albums overlaps.
     private var batchStarts: Set<Int>
     private var decoder: PCMDecoding?
@@ -143,11 +155,13 @@ final class DecodeSession: @unchecked Sendable {
     private var firstFrames: [(interval: FirstFrameInterval, mark: Int64)]
 
     init(
-        core: PipelineCore, items: [PlaybackItem], batchStarts: Set<Int>, startIndex: Int, startFrame: Int64,
-        firstFrame: FirstFrameInterval
+        core: PipelineCore, items: [PlaybackItem], serials: [UInt64], batchStarts: Set<Int>, startIndex: Int,
+        startFrame: Int64, firstFrame: FirstFrameInterval
     ) {
+        precondition(serials.count == items.count, "a serial for every item")
         self.core = core
         self.items = items
+        self.serials = serials
         self.batchStarts = batchStarts
         self.startIndex = startIndex
         self.startFrame = startFrame
@@ -210,7 +224,7 @@ final class DecodeSession: @unchecked Sendable {
         let opened = open(from: first, frame: frame, entry: entry)
         // Whatever `open` did not take was opened for another boundary: stale now.
         prepared = nil
-        guard let (next, target, frame, entry) = opened else {
+        guard let (next, target, frame, entry, serial) = opened else {
             return .finishQueue
         }
         let nextFormat = next.format
@@ -228,6 +242,9 @@ final class DecodeSession: @unchecked Sendable {
             // The output stops once this is rendered: the silence until then is the gap, not an underrun.
             source?.markEndOfStream()
             if let step = drain() { return step }
+            // Taken back while the ring drained (`removeItems`): no output is configured for it.
+            guard let queued = isQueued(target, serial: serial) else { return .stop }
+            guard queued else { return .enter(index: target, frame: 0, entry: .next) }
             switch reconfigure(for: nextFormat, gainDb: planGainDb) {
             case .configured: break
             case .interrupted(let step): return step
@@ -248,8 +265,40 @@ final class DecodeSession: @unchecked Sendable {
             converterBase = written
             converterInput = 0
         }
+        // The item is entered here: its gain is taken and its segment published in one critical section, the lock
+        // `setGains` takes (ruling R4-T12b). A `setGains` before it gives this item the new gain; one after it finds
+        // the segment in `enteredGains`, so a switch can re-cue it. Nothing of the item is decoded before this, so no
+        // audio is ever heard at a gain `enteredGains` did not show. Across a drain and reconfigure (a plan change) the
+        // gain read for the plan may be stale by now; a Float32 plan takes any gain. An Int32 one (passthrough, with a
+        // gain of 0 when planned) takes none: the item then plays at 0 dB, as its segment says, and a gain set
+        // meanwhile reaches it at the next seek or re-cue.
+        //
+        // The same section checks the item is still queued at `target` (ruling R4-T16b): `removeItems` takes the same
+        // lock, so it either finds the segment and re-cues it away, or the item is never entered.
+        let item = items[target]
+        let client = plan.client
+        let rendered = source.renderedFrames
+        let start = Timeline.Segment(
+            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
+            totalFrames: next.totalFrames, gainDb: 0)
+        let published = core.withShared(for: self) { s -> Double? in
+            guard stillQueued(target, serial: serial, in: &s) else { return nil }
+            let gainDb = Self.enteredGainDb(s.gainsDb[item.id] ?? item.gainDb, client: client)
+            var segment = start
+            segment.gainDb = gainDb
+            s.timeline.append(segment, rendered: rendered)
+            if s.requestedSeek == nil { s.timeline.pendingFrame = nil }
+            return gainDb
+        }
+        guard let published else { return .stop }
+        guard let enteredGainDb = published else {
+            // Taken back while it was opened, drained for or configured for: its decoder goes, and whatever the queue
+            // holds at `target` now (an item appended in its place, or nothing) is opened afresh.
+            return .enter(index: target, frame: 0, entry: .next)
+        }
         if entry != .seek {
-            appendMarker(.trackStarted(target, nextFormat, totalFrames: next.totalFrames), at: boundary)
+            appendMarker(
+                .trackStarted(target, nextFormat, totalFrames: next.totalFrames), at: boundary, serial: serial)
         }
         decoder = next
         index = target
@@ -266,28 +315,6 @@ final class DecodeSession: @unchecked Sendable {
         enteringFadeIn = false
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
-        // The item is entered here: its gain is taken and its segment published in one critical section, the lock
-        // `setGains` takes (ruling R4-T12b). A `setGains` before it gives this item the new gain; one after it finds
-        // the segment in `enteredGains`, so a switch can re-cue it. Nothing of the item is decoded before this, so no
-        // audio is ever heard at a gain `enteredGains` did not show. Across a drain and reconfigure (a plan change) the
-        // gain read for the plan may be stale by now; a Float32 plan takes any gain. An Int32 one (passthrough, with a
-        // gain of 0 when planned) takes none: the item then plays at 0 dB, as its segment says, and a gain set
-        // meanwhile reaches it at the next seek or re-cue.
-        let item = items[target]
-        let client = plan.client
-        let rendered = source.renderedFrames
-        let start = Timeline.Segment(
-            index: target, renderedStart: boundary, sourceStart: frame, rate: plan.resample,
-            totalFrames: next.totalFrames, gainDb: 0)
-        let enteredGainDb = core.withShared(for: self) { s -> Double in
-            let gainDb = Self.enteredGainDb(s.gainsDb[item.id] ?? item.gainDb, client: client)
-            var segment = start
-            segment.gainDb = gainDb
-            s.timeline.append(segment, rendered: rendered)
-            if s.requestedSeek == nil { s.timeline.pendingFrame = nil }
-            return gainDb
-        }
-        guard let enteredGainDb else { return .stop }
         gain = enteredGainDb == 0 ? 1 : pow(10, enteredGainDb / 20)
         return .play
     }
@@ -301,7 +328,7 @@ final class DecodeSession: @unchecked Sendable {
     /// the output is never configured for it and nothing of it reaches the ring.
     private func open(
         from first: Int, frame: Int64, entry: Entry
-    ) -> (decoder: PCMDecoding, index: Int, frame: Int64, entry: Entry)? {
+    ) -> (decoder: PCMDecoding, index: Int, frame: Int64, entry: Entry, serial: UInt64)? {
         var target = first
         var frame = frame
         var entry = entry
@@ -314,7 +341,7 @@ final class DecodeSession: @unchecked Sendable {
                 let candidate: PCMDecoding
                 if entry == .seek, target == index, let decoder {
                     candidate = decoder
-                } else if let prepared, prepared.index == target {
+                } else if let prepared, prepared.index == target, prepared.serial == serials[target] {
                     candidate = prepared.decoder
                     self.prepared = nil
                 } else {
@@ -328,7 +355,7 @@ final class DecodeSession: @unchecked Sendable {
                     frame = max(0, total > 0 ? min(frame, total) : frame)
                     try candidate.seek(toFrame: frame)
                 }
-                return (candidate, target, frame, entry)
+                return (candidate, target, frame, entry, serials[target])
             } catch {
                 boundaryEvents.append(.itemFailed(target, String(describing: error)))
                 target += 1
@@ -348,15 +375,32 @@ final class DecodeSession: @unchecked Sendable {
     private func takeAppends(from s: inout PipelineCore.Shared) {
         if let limit = s.queueLimit {
             s.queueLimit = nil
-            if items.count > limit { items.removeSubrange(limit...) }
+            if items.count > limit {
+                items.removeSubrange(limit...)
+                serials.removeSubrange(limit...)
+            }
             batchStarts = batchStarts.filter { $0 < limit }
             if let ready = prepared, ready.index >= limit { prepared = nil }
         }
         guard !s.appended.isEmpty else { return }
         items += s.appended
+        serials += s.appendedSerials
         batchStarts.formUnion(s.appendedStarts)
         s.appended.removeAll()
+        s.appendedSerials.removeAll()
         s.appendedStarts.removeAll()
+    }
+
+    /// Whether item `index` of the queue is still the one with `serial`, after taking what `append` and `removeItems`
+    /// changed: false once it was taken back, whatever was appended in its place. Inside a critical section.
+    private func stillQueued(_ index: Int, serial: UInt64, in s: inout PipelineCore.Shared) -> Bool {
+        takeAppends(from: &s)
+        return index < items.count && serials[index] == serial
+    }
+
+    /// `stillQueued` in a critical section of its own; nil when the session is no longer the live one.
+    private func isQueued(_ index: Int, serial: UInt64) -> Bool? {
+        core.withShared(for: self) { stillQueued(index, serial: serial, in: &$0) }
     }
 
     /// The gain, in dB, an item is entered at when `setGains` or its own gives it `set`: none for an Int32 client
@@ -400,8 +444,11 @@ final class DecodeSession: @unchecked Sendable {
 
     /// Queues `event` for when `frame` has been rendered. Frames never decrease along the queue: `emitDueMarkers`
     /// only looks at its head, so a marker placed behind a later one would wait for that one.
-    private func appendMarker(_ event: PipelineEvent, at frame: Int64, overlapStart: Int64? = nil) {
-        markers.append(Marker(at: max(frame, markers.last?.at ?? frame), event: event, overlapStart: overlapStart))
+    private func appendMarker(
+        _ event: PipelineEvent, at frame: Int64, overlapStart: Int64? = nil, serial: UInt64? = nil
+    ) {
+        markers.append(
+            Marker(at: max(frame, markers.last?.at ?? frame), event: event, overlapStart: overlapStart, serial: serial))
     }
 
     /// Once the resampler's tail is written, its true output length is known. A gapless join predicted from the
@@ -626,7 +673,7 @@ final class DecodeSession: @unchecked Sendable {
     private func prepareNext(fade: Int, remaining: Int64, total: Int64) {
         let next = index + 1
         guard next < items.count, let candidate = try? core.makeDecoder(items[next]) else { return }
-        var ready = Prepared(index: next, decoder: candidate, overlap: nil)
+        var ready = Prepared(index: next, serial: serials[next], decoder: candidate, overlap: nil)
         defer { prepared = ready }
         guard ChannelPolicy.isPlayable(candidate.format), isCompatible(candidate.format, gainDb: gainDb(of: next))
         else { return }
@@ -658,10 +705,16 @@ final class DecodeSession: @unchecked Sendable {
         let segment = Timeline.Segment(
             index: next, renderedStart: boundary, sourceStart: 0, rate: plan.resample,
             totalFrames: ready.decoder.totalFrames, gainDb: 0)
+        let serial = ready.serial
+        var takenBack = false
         let entered = core.withShared(for: self) { s -> Double? in
-            // Still wanted: not taken back by `removeItems`, nor called off by a switch to Off or Pure.
-            takeAppends(from: &s)
-            guard next < items.count, overlaps(s.crossfade, into: next) else { return nil }
+            // Still wanted: still queued there (`removeItems` did not take it back, whatever was appended in its
+            // place), and not called off by a switch to Off or Pure.
+            guard stillQueued(next, serial: serial, in: &s) else {
+                takenBack = true
+                return nil
+            }
+            guard overlaps(s.crossfade, into: next) else { return nil }
             var segment = segment
             segment.gainDb = Self.enteredGainDb(s.gainsDb[item.id] ?? item.gainDb, client: client)
             s.timeline.append(segment, rendered: rendered, fadingOutUntil: end)
@@ -669,15 +722,23 @@ final class DecodeSession: @unchecked Sendable {
         }
         guard let entered else { return .stop }
         guard let gainDb = entered else {
-            // Called off: the join takes the decoder, if the item is still in the queue.
-            if next < items.count { prepared = Prepared(index: next, decoder: ready.decoder, overlap: nil) }
+            if takenBack {
+                // Its decoder goes. The end is looked at again, for whatever the queue holds after this item now.
+                endConsidered = false
+            } else {
+                // Called off: the join takes the decoder.
+                prepared = Prepared(index: next, serial: serial, decoder: ready.decoder, overlap: nil)
+            }
             return .play
         }
         placeBoundaryEvents(at: boundary)
-        appendMarker(.trackStarted(next, ready.decoder.format, totalFrames: ready.decoder.totalFrames), at: boundary)
+        appendMarker(
+            .trackStarted(next, ready.decoder.format, totalFrames: ready.decoder.totalFrames), at: boundary,
+            serial: serial)
         overlap = Overlap(
-            index: next, decoder: ready.decoder, frames: frames, gain: gainDb == 0 ? 1 : pow(10, gainDb / 20),
-            dither: TPDFDither(seed: core.ditherSeed), renderedStart: boundary)
+            index: next, serial: serial, decoder: ready.decoder, frames: frames,
+            gain: gainDb == 0 ? 1 : pow(10, gainDb / 20), dither: TPDFDither(seed: core.ditherSeed),
+            renderedStart: boundary)
         return mix()
     }
 
@@ -990,23 +1051,27 @@ final class DecodeSession: @unchecked Sendable {
         if let interval = request.interval { firstFrames.append((interval, written)) }
         source?.releaseSeekHolds(through: ticket)
         emitDueMarkers()
-        // A seek ends any overlap. One already heard (its start rendered) has cut the outgoing item off: its end
-        // fires now, after the incoming item's `trackStarted`, whether its overlap is still being mixed or only its
-        // end marker waits. The seek lands in the incoming item then, which is the one rendering; before that it lands
-        // in the outgoing one, which overlaps afresh when its end comes round again.
-        var cut = markers.filter { ($0.overlapStart ?? .max) <= written }.map(\.event)
-        if let overlap, overlap.renderedStart <= written { cut.append(overlap.outgoingEnd ?? .trackEnded(index)) }
+        // The item the seek lands in: the one rendering, by the Timeline, which no longer holds an item
+        // `removeItems` took back.
+        let truncatedAt = written
+        guard let rendering = core.withShared(for: self, { $0.timeline.truncate(after: truncatedAt) }) else {
+            return .stop
+        }
+        // A seek ends any overlap. One already heard (the seek lands in its incoming item) has cut the outgoing item
+        // off: its end fires now, after the incoming item's `trackStarted`, whether its overlap is still being mixed
+        // or only its end marker waits. Before that the seek lands in the outgoing item, which overlaps afresh when
+        // its end comes round again.
+        var cut = markers.filter { $0.overlapStart != nil && Self.item(of: $0.event) != rendering }.map(\.event)
+        if let overlap, rendering == overlap.index { cut.append(overlap.outgoingEnd ?? .trackEnded(index)) }
         if !cut.isEmpty { core.emit(cut, for: self) }
-        let incoming = overlap.map { Prepared(index: $0.index, decoder: $0.decoder, overlap: nil) }
+        let incoming = overlap.map {
+            Prepared(index: $0.index, serial: $0.serial, decoder: $0.decoder, overlap: nil)
+        }
         overlap = nil
         prepared = nil
         markers.removeAll()
         boundaryEvents.removeAll()
         converter = nil
-        let truncatedAt = written
-        guard let rendering = core.withShared(for: self, { $0.timeline.truncate(after: truncatedAt) }) else {
-            return .stop
-        }
         // No segment means nothing ever played: every item failed and the queue has ended.
         guard let playing = rendering else { return .ended }
         // Seeking within the incoming item of an overlap still being mixed: `open` reuses its decoder.
@@ -1014,13 +1079,39 @@ final class DecodeSession: @unchecked Sendable {
         return .enter(index: playing, frame: target, entry: .seek)
     }
 
+    /// The queue item an item event is about.
+    private static func item(of event: PipelineEvent) -> Int? {
+        switch event {
+        case .trackStarted(let index, _, _), .trackEnded(let index), .itemFailed(let index, _): index
+        case .planChanged, .queueEnded: nil
+        }
+    }
+
     private func emitDueMarkers() {
         let rendered = source?.renderedFrames ?? 0
         endFirstFrameIntervals(rendered: rendered)
         guard let first = markers.first, first.at <= rendered else { return }
-        let due = markers.prefix { $0.at <= rendered }.map(\.event)
+        let due = Array(markers.prefix { $0.at <= rendered })
         markers.removeFirst(due.count)
-        core.emit(due, for: self)
+        emit(due)
+    }
+
+    /// Emits `due` in order, in one critical section with a look at the queue: the `trackStarted` of an item taken
+    /// back since its marker was placed is dropped, so an item `removeItems` took back never starts, not even when a
+    /// render call already in flight at the take-back played its first frames (ruling R4-T16b).
+    private func emit(_ due: [Marker]) {
+        guard due.contains(where: { $0.serial != nil }) else {
+            core.emit(due.map(\.event), for: self)
+            return
+        }
+        _ = core.withShared(for: self) { s in
+            takeAppends(from: &s)
+            let events = due.filter { marker in
+                guard let serial = marker.serial, let index = Self.item(of: marker.event) else { return true }
+                return index < items.count && serials[index] == serial
+            }
+            core.yield(events.map(\.event))
+        }
     }
 
     /// Ends every first-frame interval whose mark `rendered` has passed. Here on the decode thread, never in the render
