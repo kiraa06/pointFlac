@@ -1,0 +1,4 @@
+module CFLAC {
+    header "CFLAC.h"
+    export *
+}

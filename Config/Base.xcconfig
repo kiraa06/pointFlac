@@ -1,0 +1,12 @@
+// Base build settings for the PointFlac app target, in Debug and Release (project.yml `configFiles`).
+//
+// Signing is per machine and never committed. To sign for a device, copy Signing.local.xcconfig.example to
+// Signing.local.xcconfig, which git ignores, and set your team ID in it. The include is optional: without the file the
+// app still builds for the simulator, and for a device with DEVELOPMENT_TEAM=<id> or CODE_SIGNING_ALLOWED=NO on the
+// xcodebuild command line. The file is the only reliable home for the team, because xcodegen regenerates the project
+// and drops a team picked in Xcode's Signing & Capabilities pane.
+
+// Automatic signing, so `-allowProvisioningUpdates` can create the profile for a Personal Team.
+CODE_SIGN_STYLE = Automatic
+
+#include? "Signing.local.xcconfig"
