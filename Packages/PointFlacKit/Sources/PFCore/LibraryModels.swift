@@ -32,13 +32,14 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
     public var isCloudPending: Bool
     /// The file is the app's own copy, in its library folder (an import or a download): removing the track deletes it.
     /// False for a file in a folder added in place, which is the user's and is never deleted; removing that track only
-    /// takes it out of the library. Carried here so the UI can say which will happen before it asks.
+    /// takes it out of the library. Carried here so the UI can say which will happen before it asks. It has no default,
+    /// so no construction can leave it to chance: the delete dialog's promise rests on it.
     public var isInLibraryFolder: Bool
 
     public init(
         id: String, url: URL, title: String, artist: String, albumArtist: String, album: String, albumID: String,
         discNumber: Int?, trackNumber: Int?, year: Int?, format: AudioFormat, totalFrames: Int64,
-        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool = false
+        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool
     ) {
         self.id = id
         self.url = url
