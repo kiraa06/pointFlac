@@ -13,6 +13,7 @@ import Foundation
 public final class SmartSearch: Sendable {
     public let engine: TypeaheadEngine
     public let runner: SearchPlanRunner
+    private let registry: (any SuggestionRegistry)?
     private let coverArt: CoverArtArchive?
 
     /// - Parameters:
@@ -26,10 +27,22 @@ public final class SmartSearch: Sendable {
     ) {
         var configuration = TypeaheadEngine.Configuration()
         configuration.registryEnabled = registryEnabled
-        let registry = registryEnabled ? (registry ?? MusicBrainzRegistry()) : nil
+        // Built even when off, so it can be switched on at runtime; building it sends nothing.
+        let registry = registry ?? MusicBrainzRegistry()
+        self.registry = registry
         engine = TypeaheadEngine(library: library, registry: registry, configuration: configuration)
         runner = SearchPlanRunner(preference: preference)
         self.coverArt = artworkEnabled ? (coverArt ?? CoverArtArchive()) : nil
+    }
+
+    /// Whether typed text is sent to MusicBrainz right now.
+    public var isRegistryEnabled: Bool { engine.isRegistryEnabled }
+
+    /// The runtime switch for online suggestions (the app's Settings toggle). Turning it off cancels registry work in
+    /// flight at once and deletes every cached MusicBrainz response, in memory and on disk.
+    public func setRegistryEnabled(_ enabled: Bool) async {
+        engine.setRegistryEnabled(enabled)
+        if !enabled { await registry?.clearCaches() }
     }
 
     /// Ranked suggestions as they become known: library rows at once, then cached and live registry rows.
@@ -54,6 +67,16 @@ public final class SmartSearch: Sendable {
         for entity: ResolvedEntity, excludedPhrases: [String], search: @escaping SearchPlanRunner.Search
     ) -> AsyncStream<[AlbumCandidate]> {
         runner.albums(
+            soulseekPlan(for: entity, excludedPhrases: excludedPhrases), for: entity,
+            excludedPhrases: excludedPhrases, search: search)
+    }
+
+    /// Ranked single-file candidates from Soulseek for a track `entity`, for a track with no known album or when one
+    /// file is wanted rather than its album.
+    public func soulseekTracks(
+        for entity: ResolvedEntity, excludedPhrases: [String], search: @escaping SearchPlanRunner.Search
+    ) -> AsyncStream<[TrackCandidate]> {
+        runner.tracks(
             soulseekPlan(for: entity, excludedPhrases: excludedPhrases), for: entity,
             excludedPhrases: excludedPhrases, search: search)
     }

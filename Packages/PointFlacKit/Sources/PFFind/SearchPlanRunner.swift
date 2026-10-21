@@ -25,43 +25,83 @@ public struct SearchPlanRunner: Sendable {
         self.preference = preference
     }
 
-    /// Ranked album candidates, re-emitted after every batch. Finishes when the plan is exhausted, enough candidates
-    /// are found, or the consumer stops listening (which cancels the provider search in flight).
+    /// Ranked album candidates, re-emitted as batches arrive (at most every ``rankInterval``, and always at the end
+    /// of a variant). Finishes when the plan is exhausted, enough candidates are found, or the consumer stops
+    /// listening (which cancels the provider search in flight).
     public func albums(
         _ plan: SearchPlan, for entity: ResolvedEntity, excludedPhrases: [String] = [], search: @escaping Search
     ) -> AsyncStream<[AlbumCandidate]> {
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: [AlbumCandidate].self, bufferingPolicy: .bufferingNewest(4))
-        let runner = self
+        let preference = preference
+        let enoughComplete = enoughComplete
+        let enoughCandidates = enoughCandidates
+        return run(
+            plan, search: search,
+            rank: { files in
+                ResultRanker.rankAlbums(files, for: entity, preference: preference, excludedPhrases: excludedPhrases)
+            },
+            isEnough: { ranked in
+                // Oversized folders are not complete (``AlbumCandidate/isComplete``), so a discography never stops it.
+                ranked.filter(\.isComplete).count >= enoughComplete || ranked.count >= enoughCandidates
+            })
+    }
+
+    /// Ranked track candidates for a track entity, for tracks with no known album or when one file is wanted.
+    public func tracks(
+        _ plan: SearchPlan, for entity: ResolvedEntity, excludedPhrases: [String] = [], search: @escaping Search
+    ) -> AsyncStream<[TrackCandidate]> {
+        let preference = preference
+        let enoughCandidates = enoughCandidates
+        return run(
+            plan, search: search,
+            rank: { files in
+                ResultRanker.rankTracks(files, for: entity, preference: preference, excludedPhrases: excludedPhrases)
+            },
+            isEnough: { $0.count >= enoughCandidates })
+    }
+
+    /// How often a growing result list is re-ranked. Re-ranking every batch of a broad query (thousands of files)
+    /// was the cost; four times a second still feels live.
+    public static let rankInterval: Duration = .milliseconds(250)
+
+    private func run<Ranked: Sendable>(
+        _ plan: SearchPlan, search: @escaping Search, rank: @escaping @Sendable ([CandidateFile]) -> [Ranked],
+        isEnough: @escaping @Sendable ([Ranked]) -> Bool
+    ) -> AsyncStream<[Ranked]> {
+        let (stream, continuation) = AsyncStream.makeStream(of: [Ranked].self, bufferingPolicy: .bufferingNewest(4))
+        let bucket = bucket
         let task = Task {
             defer { continuation.finish() }
+            let clock = ContinuousClock()
             var files: [CandidateFile] = []
             var seen = Set<String>()
+            var lastRank = clock.now - Self.rankInterval
             for variant in plan.variants {
+                var unranked = false
                 do {
-                    try await runner.bucket.acquire()
+                    try await bucket.acquire()
                     for try await batch in search(variant.query) {
                         for file in batch where seen.insert((file.peer ?? "") + "|" + file.path).inserted {
                             files.append(file)
+                            unranked = true
                         }
-                        continuation.yield(
-                            ResultRanker.rankAlbums(
-                                files, for: entity, preference: runner.preference, excludedPhrases: excludedPhrases))
+                        if unranked, clock.now - lastRank >= Self.rankInterval {
+                            continuation.yield(rank(files))
+                            lastRank = clock.now
+                            unranked = false
+                        }
                     }
                 } catch is CancellationError {
                     return
                 } catch {
                     // One failed variant (a provider timeout) does not end the plan; the next variant may work.
                     if Task.isCancelled { return }
-                    continue
                 }
-                let ranked = ResultRanker.rankAlbums(
-                    files, for: entity, preference: runner.preference, excludedPhrases: excludedPhrases)
-                if ranked.filter(\.isComplete).count >= runner.enoughComplete
-                    || ranked.count >= runner.enoughCandidates
-                {
-                    return
+                let ranked = rank(files)
+                if unranked {
+                    continuation.yield(ranked)
+                    lastRank = clock.now
                 }
+                if isEnough(ranked) { return }
             }
         }
         continuation.onTermination = { _ in task.cancel() }

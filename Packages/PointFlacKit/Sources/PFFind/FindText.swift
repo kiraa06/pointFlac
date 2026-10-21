@@ -73,13 +73,37 @@ public enum FindText {
         return kept.isEmpty ? tokens : kept
     }
 
-    /// `name` without a leading English article, so "The Beatles" and "Beatles" agree.
+    /// `name` without a leading English article, so "The Beatles" and "Beatles" agree. When only stopwords would
+    /// remain ("The The"), the full name is kept: "the" alone would match every folder with "the" in it.
     public static func withoutLeadingArticle(_ name: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         for article in ["The ", "the ", "THE "] where trimmed.hasPrefix(article) && trimmed.count > article.count {
-            return String(trimmed.dropFirst(article.count))
+            let rest = String(trimmed.dropFirst(article.count))
+            let restTokens = tokens(rest)
+            if restTokens.isEmpty || restTokens.allSatisfy(stopwords.contains) { return trimmed }
+            return rest
         }
         return trimmed
+    }
+
+    /// `text` cut to at most `maxCharacters` and `maxWords` words. Typeahead input is bounded before any work: a
+    /// pasted page of text would otherwise cost seconds in prefix-cache lookups and fuzzy scoring.
+    public static func bounded(_ text: String, maxCharacters: Int = 100, maxWords: Int = 12) -> String {
+        var result = String(text.prefix(maxCharacters))
+        var words = 0
+        var inWord = false
+        for index in result.indices {
+            let isSpace = result[index].isWhitespace
+            if !isSpace, !inWord {
+                words += 1
+                if words > maxWords {
+                    result = String(result[..<index])
+                    break
+                }
+            }
+            inWord = !isSpace
+        }
+        return result
     }
 
     /// `title` without a featured-artist credit: "Feel Good Inc. (feat. De La Soul)", "Song ft. X", "Song featuring

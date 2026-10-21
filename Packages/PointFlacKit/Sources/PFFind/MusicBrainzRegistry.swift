@@ -10,6 +10,12 @@ public protocol SuggestionRegistry: Sendable {
     func suggestions(for partial: String) -> AsyncThrowingStream<[Suggestion], Error>
     /// Fills in what a picked suggestion still needs for searching, such as an album's track count.
     func resolve(_ suggestion: Suggestion) async throws -> ResolvedEntity
+    /// Forgets everything cached from the registry, in memory and on disk.
+    func clearCaches() async
+}
+
+extension SuggestionRegistry {
+    public func clearCaches() async {}
 }
 
 /// MusicBrainz as a ``SuggestionRegistry``.
@@ -35,7 +41,7 @@ public final class MusicBrainzRegistry: SuggestionRegistry {
     }
 
     public func cachedSuggestions(for partial: String) -> [Suggestion]? {
-        var key = FindText.fold(partial)
+        var key = FindText.fold(FindText.bounded(partial))
         // The exact phrase, else the longest cached prefix: "gorill" reuses "goril" while its own request is pending.
         while key.count >= 2 {
             if let hit = cache.value(for: key) { return hit }
@@ -45,7 +51,8 @@ public final class MusicBrainzRegistry: SuggestionRegistry {
         return nil
     }
 
-    public func suggestions(for partial: String) -> AsyncThrowingStream<[Suggestion], Error> {
+    public func suggestions(for text: String) -> AsyncThrowingStream<[Suggestion], Error> {
+        let partial = FindText.bounded(text)
         let key = FindText.fold(partial)
         let typing = !partial.hasSuffix(" ")
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: [Suggestion].self)
@@ -78,6 +85,12 @@ public final class MusicBrainzRegistry: SuggestionRegistry {
         }
         continuation.onTermination = { _ in task.cancel() }
         return stream
+    }
+
+    public func clearCaches() async {
+        cache.removeAll()
+        resolved.removeAll()
+        await client.clearCaches()
     }
 
     public func resolve(_ suggestion: Suggestion) async throws -> ResolvedEntity {

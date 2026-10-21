@@ -63,13 +63,12 @@ public enum ResultRanker {
         _ files: [CandidateFile], for entity: ResolvedEntity, preference: FormatPreference = .highest,
         excludedPhrases: [String] = [], minimumMatch: Double = 0.6
     ) -> [AlbumCandidate] {
-        let excluded = excludedPhrases.map(FindText.fold).filter { !$0.isEmpty }
-        let albumTitle = FindText.coreTitle(entity.album ?? entity.title)
-        let artistNames = entity.artistNames
+        let matcher = Matcher(entity: entity, needle: FindText.coreTitle(entity.album ?? entity.title))
+        let excluded = usableExcludedPhrases(excludedPhrases)
         var groups: [String: (peer: String?, folder: String, files: [CandidateFile])] = [:]
         var order: [String] = []
         for file in files where isFLAC(file.path) {
-            if !excluded.isEmpty, SoulseekQueryPlanner.firstExcluded(in: file.path, excluded) != nil { continue }
+            if !excluded.isEmpty, excluded.contains(where: matcher.folded(file.path).contains) { continue }
             let folder = albumFolder(of: file.path)
             let key = (file.peer ?? "") + "|" + folder.lowercased()
             if groups[key] == nil {
@@ -82,11 +81,17 @@ public enum ResultRanker {
         for key in order {
             guard let group = groups[key] else { continue }
             let folderParts = components(group.folder)
-            // For an artist, any of their album folders will do: only the artist has to match.
+            // The album gate runs first: it is cheap and rejects most folders of a broad query, so the artist
+            // matching (every alias against every component) only runs on the few that remain. For an artist entity,
+            // any of their album folders will do.
             let albumMatch =
-                entity.kind == .artist ? 1 : folderParts.suffix(3).map { phraseScore(albumTitle, in: $0) }.max() ?? 0
-            let artistMatch = bestArtistMatch(artistNames, in: folderParts + group.files.map { fileName($0.path) })
-            guard albumMatch >= minimumMatch, artistMatch >= minimumMatch else { continue }
+                entity.kind == .artist ? 1 : folderParts.suffix(3).map { matcher.needleScore(in: $0) }.max() ?? 0
+            guard albumMatch >= minimumMatch else { continue }
+            var artistMatch = matcher.artistScore(in: folderParts)
+            if artistMatch < minimumMatch {
+                artistMatch = max(artistMatch, matcher.artistScore(in: group.files.map { fileName($0.path) }))
+            }
+            guard artistMatch >= minimumMatch else { continue }
             let match = albumMatch * 0.55 + artistMatch * 0.45
             let sorted = group.files.sorted { $0.path < $1.path }
             let count = sorted.count
@@ -97,7 +102,8 @@ public enum ResultRanker {
             let score =
                 weights.match * match + weights.completeness * completeness + weights.format * format
                 + weights.availability * availability
-            let isComplete = entity.trackCount.map { count >= $0 } ?? false
+            // A folder with more than twice the expected tracks is a discography, not this album, however full.
+            let isComplete = entity.trackCount.map { count >= $0 && count <= $0 * 2 } ?? false
             candidates.append(
                 AlbumCandidate(
                     id: key, peer: group.peer, folder: group.folder, files: sorted,
@@ -115,16 +121,17 @@ public enum ResultRanker {
         _ files: [CandidateFile], for entity: ResolvedEntity, preference: FormatPreference = .highest,
         excludedPhrases: [String] = [], minimumMatch: Double = 0.6
     ) -> [TrackCandidate] {
-        let excluded = excludedPhrases.map(FindText.fold).filter { !$0.isEmpty }
-        let title = FindText.coreTitle(entity.track ?? entity.title)
+        let matcher = Matcher(entity: entity, needle: FindText.coreTitle(entity.track ?? entity.title))
+        let excluded = usableExcludedPhrases(excludedPhrases)
         var results: [TrackCandidate] = []
         for file in files where isFLAC(file.path) {
-            if !excluded.isEmpty, SoulseekQueryPlanner.firstExcluded(in: file.path, excluded) != nil { continue }
+            if !excluded.isEmpty, excluded.contains(where: matcher.folded(file.path).contains) { continue }
             let name = fileName(file.path)
             let stem = (name as NSString).deletingPathExtension
-            let titleMatch = phraseScore(title, in: stem)
-            let artistMatch = bestArtistMatch(entity.artistNames, in: components(file.path))
-            guard titleMatch >= minimumMatch, artistMatch >= minimumMatch else { continue }
+            let titleMatch = matcher.needleScore(in: stem)
+            guard titleMatch >= minimumMatch else { continue }
+            let artistMatch = matcher.artistScore(in: components(file.path))
+            guard artistMatch >= minimumMatch else { continue }
             let match = titleMatch * 0.6 + artistMatch * 0.4
             let format = formatScore(bits: file.bitsPerSample, rate: file.sampleRate, preference: preference)
             let availability = availabilityScore(file)
@@ -136,6 +143,11 @@ public enum ResultRanker {
                 TrackCandidate(file: file, matchScore: match, score: score, why: parts.joined(separator: " · ")))
         }
         return results.sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }
+    }
+
+    /// Excluded phrases worth checking: an empty or one-letter phrase would match nearly every path.
+    static func usableExcludedPhrases(_ phrases: [String]) -> [String] {
+        phrases.map(FindText.fold).filter { $0.count >= 2 }
     }
 
     // MARK: - Paths
@@ -154,7 +166,7 @@ public enum ResultRanker {
     }
 
     /// The folder that holds the album: the file's folder, or its parent when that folder is a disc ("CD1",
-    /// "Disc 2", "Side A"), so a double album is one candidate.
+    /// "Disc 2", "CD1 - Disc One", "Disc 1 of 2"), so a double album is one candidate.
     static func albumFolder(of path: String) -> String {
         var parts = components(path)
         parts.removeLast()
@@ -165,35 +177,85 @@ public enum ResultRanker {
         return parts.joined(separator: separator)
     }
 
+    /// Compiled once: building a `Regex` per file cost more than everything else in a rank.
+    nonisolated(unsafe) private static let discFolder = try? Regex(#"^(cd|disc|disk)\s*\d{1,2}\b"#)
+
     static func isDiscFolder(_ name: String) -> Bool {
-        let folded = FindText.fold(name)
-        guard let regex = try? Regex(#"^(cd|disc|disk|side)\s*([0-9]{1,2}|[a-d])$"#) else { return false }
-        return folded.wholeMatch(of: regex) != nil
+        guard let regex = discFolder else { return false }
+        return FindText.fold(name).prefixMatch(of: regex) != nil
     }
 
     // MARK: - Matching
 
-    /// How well a path component names `phrase`: 1 when the folded phrase appears whole, else the fuzzy score.
-    static func phraseScore(_ phrase: String, in component: String) -> Double {
-        let needle = FindText.fold(phrase)
-        guard !needle.isEmpty else { return 0 }
-        let haystack = " " + FindText.fold(component) + " "
-        if haystack.contains(" " + needle + " ") { return 1 }
-        // "Mountain, The" and "Beatles, The" style inversions.
-        let withoutArticle = FindText.fold(FindText.withoutLeadingArticle(phrase))
-        if withoutArticle != needle, haystack.contains(" " + withoutArticle + " ") { return 0.95 }
-        return FuzzyMatcher.score(query: phrase, candidate: component)
-    }
+    /// Everything about the entity that matching needs, folded once per rank rather than once per comparison, plus a
+    /// memo of folded path components (folders repeat across every file in them).
+    final class Matcher {
+        struct Needle {
+            let folded: String
+            let withoutArticle: String
+            let tokens: [String]
+            let significant: Set<String>
 
-    static func bestArtistMatch(_ names: [String], in components: [String]) -> Double {
-        var best = 0.0
-        for name in names {
-            for component in components {
-                best = max(best, phraseScore(FindText.withoutLeadingArticle(name), in: component))
-                if best >= 1 { return best }
+            init(_ text: String) {
+                folded = FindText.fold(text)
+                withoutArticle = FindText.fold(FindText.withoutLeadingArticle(text))
+                tokens = folded.split(separator: " ").map(String.init)
+                significant = Set(FindText.significantTokens(tokens))
             }
         }
-        return best
+
+        let needle: Needle
+        let artists: [Needle]
+        private var memo: [String: (folded: String, tokens: [String])] = [:]
+
+        init(entity: ResolvedEntity, needle: String) {
+            self.needle = Needle(needle)
+            var seen = Set<String>()
+            artists = entity.artistNames.map { Needle(FindText.withoutLeadingArticle($0)) }
+                .filter { !$0.folded.isEmpty && seen.insert($0.folded).inserted }
+        }
+
+        func folded(_ text: String) -> String { fold(text).folded }
+
+        private func fold(_ text: String) -> (folded: String, tokens: [String]) {
+            if let hit = memo[text] { return hit }
+            let folded = FindText.fold(text)
+            let value = (folded, folded.split(separator: " ").map(String.init))
+            memo[text] = value
+            return value
+        }
+
+        func needleScore(in component: String) -> Double {
+            score(needle, in: component)
+        }
+
+        func artistScore(in components: [String]) -> Double {
+            var best = 0.0
+            for component in components {
+                for artist in artists {
+                    best = max(best, score(artist, in: component))
+                    if best >= 1 { return best }
+                }
+            }
+            return best
+        }
+
+        /// 1 when the whole phrase appears, 0.95 for an inverted article ("Beatles, The"), else fuzzy, but only when
+        /// the component shares at least one word with the phrase: the fuzzy pass is the expensive part, and a
+        /// component with no word in common is not a match anyway (typo spellings arrive as MusicBrainz aliases).
+        private func score(_ phrase: Needle, in component: String) -> Double {
+            guard !phrase.folded.isEmpty else { return 0 }
+            let (folded, tokens) = fold(component)
+            let haystack = " " + folded + " "
+            if haystack.contains(" " + phrase.folded + " ") { return 1 }
+            if phrase.withoutArticle != phrase.folded, !phrase.withoutArticle.isEmpty,
+                haystack.contains(" " + phrase.withoutArticle + " ")
+            {
+                return 0.95
+            }
+            guard tokens.contains(where: phrase.significant.contains) else { return 0 }
+            return FuzzyMatcher.score(queryTokens: phrase.tokens, candidateTokens: tokens, lastIsPartial: false)
+        }
     }
 
     // MARK: - Scoring
@@ -216,7 +278,13 @@ public enum ResultRanker {
             let previous = counts[key]?.2 ?? 0
             counts[key] = (file.bitsPerSample, file.sampleRate, previous + 1)
         }
-        guard let best = counts.values.max(by: { $0.2 < $1.2 }) else { return (nil, nil) }
+        // Ties go to the higher resolution, so the result never depends on dictionary order.
+        let best = counts.values.max { lhs, rhs in
+            if lhs.2 != rhs.2 { return lhs.2 < rhs.2 }
+            if (lhs.0 ?? 0) != (rhs.0 ?? 0) { return (lhs.0 ?? 0) < (rhs.0 ?? 0) }
+            return (lhs.1 ?? 0) < (rhs.1 ?? 0)
+        }
+        guard let best else { return (nil, nil) }
         return (best.0, best.1)
     }
 
@@ -266,7 +334,9 @@ public enum ResultRanker {
 
     static func albumWhy(count: Int, expected: Int?, bits: Int?, rate: Int?, file: CandidateFile?) -> String {
         var parts: [String] = []
-        if let expected {
+        if let expected, count > expected * 2 {
+            parts.append("\(count) tracks (more than expected)")
+        } else if let expected {
             parts.append(count >= expected ? "Complete album" : "\(count) of \(expected) tracks")
         } else {
             parts.append(count == 1 ? "1 track" : "\(count) tracks")

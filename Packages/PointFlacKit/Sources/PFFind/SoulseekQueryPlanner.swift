@@ -22,16 +22,31 @@ public struct QueryVariant: Sendable, Hashable {
 
 /// The ordered queries for one entity.
 public struct SearchPlan: Sendable, Hashable {
+    /// Why a plan has no variants. An empty plan always says which.
+    public enum EmptyReason: Sendable, Hashable {
+        /// The entity's own name contains this server-excluded phrase.
+        case excludedPhrase(String)
+        /// The names have nothing Soulseek can match (no letters, digits or symbols).
+        case noSearchableWords
+        /// Every variant contained an excluded phrase.
+        case everyVariantExcluded
+    }
+
     /// Highest priority first. The caller runs them one at a time, within the provider's search rate limit, and
     /// stops as soon as it has enough results.
     public var variants: [QueryVariant]
     /// Set when the entity's own name contains a server-excluded phrase. The plan is then empty: see
     /// ``SoulseekQueryPlanner``.
-    public var blockedByExcludedPhrase: String?
+    public var blockedByExcludedPhrase: String? {
+        if case .excludedPhrase(let phrase) = emptyReason { return phrase }
+        return nil
+    }
+    /// Set exactly when ``variants`` is empty.
+    public var emptyReason: EmptyReason?
 
-    public init(variants: [QueryVariant], blockedByExcludedPhrase: String? = nil) {
+    public init(variants: [QueryVariant], emptyReason: EmptyReason? = nil) {
         self.variants = variants
-        self.blockedByExcludedPhrase = blockedByExcludedPhrase
+        self.emptyReason = variants.isEmpty ? (emptyReason ?? .noSearchableWords) : nil
     }
 }
 
@@ -73,11 +88,11 @@ public enum SoulseekQueryPlanner {
     public static func plan(
         for entity: ResolvedEntity, excludedPhrases: [String] = [], maxVariants: Int = 4
     ) -> SearchPlan {
-        let excluded = excludedPhrases.map(FindText.fold).filter { !$0.isEmpty }
+        let excluded = ResultRanker.usableExcludedPhrases(excludedPhrases)
         let names = [entity.artist, entity.album, entity.track].compactMap { $0 }
         for name in names {
             if let phrase = firstExcluded(in: name, excluded) {
-                return SearchPlan(variants: [], blockedByExcludedPhrase: phrase)
+                return SearchPlan(variants: [], emptyReason: .excludedPhrase(phrase))
             }
         }
         var variants: [QueryVariant] = []
@@ -90,11 +105,12 @@ public enum SoulseekQueryPlanner {
             variants = artistVariants(entity)
         }
         var seen = Set<String>()
-        let kept = variants.filter { variant in
-            !variant.query.isEmpty && firstExcluded(in: variant.query, excluded) == nil
-                && seen.insert(variant.query).inserted
+        let searchable = variants.filter { !$0.query.isEmpty }
+        let kept = searchable.filter { variant in
+            firstExcluded(in: variant.query, excluded) == nil && seen.insert(variant.query).inserted
         }
-        return SearchPlan(variants: Array(kept.prefix(maxVariants)))
+        let reason: SearchPlan.EmptyReason = searchable.isEmpty ? .noSearchableWords : .everyVariantExcluded
+        return SearchPlan(variants: Array(kept.prefix(maxVariants)), emptyReason: reason)
     }
 
     // MARK: - Variants
@@ -102,7 +118,7 @@ public enum SoulseekQueryPlanner {
     static func albumVariants(_ entity: ResolvedEntity) -> [QueryVariant] {
         let title = FindText.coreTitle(entity.album ?? "")
         let artist = artistWords(entity.artist)
-        let titleAll = words(title)
+        let titleAll = searchWords(title)
         let titleDistinct = distinctive(titleAll)
         guard !titleAll.isEmpty else { return artistVariants(entity) }
         // One distinctive word is too broad alone ("mountain"); keep the title as written ("the mountain").
@@ -129,7 +145,7 @@ public enum SoulseekQueryPlanner {
     static func trackVariants(_ entity: ResolvedEntity) -> [QueryVariant] {
         let title = FindText.coreTitle(entity.track ?? "")
         let artist = artistWords(entity.artist)
-        let titleAll = words(title)
+        let titleAll = searchWords(title)
         let titleDistinct = distinctive(titleAll)
         guard !titleAll.isEmpty else { return artistVariants(entity) }
         let titleQuery = titleDistinct.count >= 2 ? titleDistinct : titleAll
@@ -159,26 +175,44 @@ public enum SoulseekQueryPlanner {
     // MARK: - Words
 
     /// Soulseek words for `text`: lower-case, diacritics kept (folders usually keep them), punctuation removed.
-    /// Single letters are dropped unless they are digits: "Don't" becomes "don", which matches both spellings.
+    /// Single letters are words ("R.E.M." is "r e m", "Jay-Z" is "jay z", "嵐" stays), except the tail of a
+    /// contraction: "Don't" becomes "don", which matches both spellings ("B'z" keeps both letters).
     static func words(_ text: String) -> [String] {
-        let lowered = text.lowercased()
-        var current = ""
         var result: [String] = []
+        var current = ""
+        var currentIsTail = false
+        var nextIsTail = false
         func flush() {
-            if current.count >= 2 || (current.count == 1 && current.first!.isNumber) { result.append(current) }
+            if !current.isEmpty, !(currentIsTail && current.count == 1) { result.append(current) }
             current = ""
+            currentIsTail = false
         }
-        for character in lowered {
-            if character == "&" || character == "+" {
+        for character in text.lowercased() {
+            if character == "'" || character == "’" || character == "`" {
+                let wordLength = current.count
                 flush()
+                nextIsTail = wordLength >= 2
             } else if character.isLetter || character.isNumber {
+                if current.isEmpty {
+                    currentIsTail = nextIsTail
+                    nextIsTail = false
+                }
                 current.append(character)
             } else {
                 flush()
+                nextIsTail = false
             }
         }
         flush()
         return result
+    }
+
+    /// ``words(_:)``, or the whole name lower-cased when it has no letters or digits at all ("!!!").
+    static func searchWords(_ text: String) -> [String] {
+        let found = words(text)
+        if !found.isEmpty { return found }
+        let raw = text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return raw.isEmpty ? [] : [raw]
     }
 
     /// Words minus stopwords; never empty unless `words` is.
@@ -187,9 +221,13 @@ public enum SoulseekQueryPlanner {
         return kept.isEmpty ? words : kept
     }
 
-    /// The artist's distinctive words without a leading "The" ("The Beatles" → "beatles").
+    /// The artist's words without a leading "The" ("The Beatles" → "beatles"). Stopwords go only when two words
+    /// remain, and single letters are never stopwords: "a-ha" stays "a ha", "Florence and the Machine" becomes
+    /// "florence machine".
     static func artistWords(_ artist: String) -> [String] {
-        distinctive(words(FindText.withoutLeadingArticle(artist)))
+        let all = searchWords(FindText.withoutLeadingArticle(artist))
+        let kept = all.filter { $0.count < 2 || !FindText.stopwords.contains(FindText.fold($0)) }
+        return kept.count >= 2 ? kept : all
     }
 
     static func isGeneric(_ all: [String], distinct: [String]) -> Bool {
@@ -213,8 +251,11 @@ public enum SoulseekQueryPlanner {
         }
     }
 
+    /// Longer queries only lose results: every word must appear in the path.
+    static let maximumWordsPerQuery = 6
+
     static func join(_ words: [String]) -> String {
-        words.joined(separator: " ")
+        words.prefix(maximumWordsPerQuery).joined(separator: " ")
     }
 
     /// The first excluded phrase found in `text` (folded substring match, the strict reading).
