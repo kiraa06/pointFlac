@@ -138,6 +138,7 @@ final class RealMusicFinder: MusicFinding {
         switch state {
         case .queued: "Queued"
         case .downloading: "Downloading"
+        case .waiting: "Waiting for peer"
         case .validating: "Validating"
         case .saving: "Saving"
         case .published: "Done"
@@ -151,7 +152,7 @@ final class RealMusicFinder: MusicFinding {
         switch state {
         case .downloading(let progress): progress ?? 0
         case .validating, .saving: 1
-        case .queued, .published, .failed, .cancelled: nil
+        case .queued, .waiting, .published, .failed, .cancelled: nil
         }
     }
 
@@ -396,8 +397,9 @@ final class RealMusicFinder: MusicFinding {
         let configuration = DownloadManager.Configuration(
             stagingRoot: URL.cachesDirectory.appending(path: "Downloads", directoryHint: .isDirectory),
             stateFile: support.appending(path: "downloads.json"),
-            // Two at once, whichever the source: the Archive's politeness and the Soulseek cap of two transfers.
-            maxConcurrent: 2,
+            // Two Archive downloads at once (its bot guidance); Soulseek has its own limit (`SoulseekProvider`), and
+            // at most two per peer: one sending, one lined up behind it.
+            maxConcurrent: 2, maxPerSource: 2,
             // On a phone every connection dies whenever iOS suspends the app, so one long transfer can be cut short
             // several times; each retry resumes from the part file. Backoff 1, 2, 4, 8, 16 s.
             maxAttempts: 6)

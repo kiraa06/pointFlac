@@ -13,6 +13,9 @@
         static let providerID = "soulseek"
         let id = SoulseekProvider.providerID
         let displayName = "Soulseek"
+        /// Soulseek downloads in flight at once. Peers send one file at a time to each person and most of the wait is
+        /// in their queues, so songs from different peers run side by side; the manager allows two per peer.
+        let concurrencyLimit: Int? = 6
 
         let client: SoulseekClient
         /// Where transfers are written, outside the download manager's per-job folders. The client names each
@@ -90,6 +93,9 @@
         static func retryable(_ failure: SoulseekTransferFailure) -> DownloadFailure {
             DownloadFailure(failure.reason, retryable: true)
         }
+
+        /// The peer a track comes from: the manager's per-source limit keeps one peer's queue from holding every slot.
+        func source(of track: RemoteTrack) -> String? { track.detail["peer"] }
 
         /// Moves the finished file out of its `slsk-<hash>` folder into the job's staging folder, where admission
         /// expects it (directly inside the folder it was given), and deletes the now empty transfer folder.

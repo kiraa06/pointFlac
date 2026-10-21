@@ -37,6 +37,7 @@ public struct RemoteTrack: Sendable, Hashable, Identifiable, Codable {
 
 /// What a provider reports while it downloads one track.
 public enum DownloadEvent: Sendable, Equatable {
+    /// The source has the request but is not sending yet (it queued it). The job shows as waiting.
     case queued
     /// Fraction done, 0...1.
     case progress(Double)
@@ -54,6 +55,17 @@ public protocol DownloadProvider: Sendable {
     func search(_ query: String) -> AsyncThrowingStream<[RemoteTrack], Error>
     /// Downloads into `staging` (a directory); the last event is .finished(fileURL) or .failed.
     func download(_ track: RemoteTrack, into staging: URL) -> AsyncThrowingStream<DownloadEvent, Error>
+    /// Downloads this provider may run at once, counted apart from the manager's shared `maxConcurrent`; nil (the
+    /// default) shares that limit with the other providers.
+    var concurrencyLimit: Int? { get }
+    /// Where a track comes from (a Soulseek peer), so the manager can cap jobs per source; nil (the default) when
+    /// that does not matter.
+    func source(of track: RemoteTrack) -> String?
+}
+
+extension DownloadProvider {
+    public var concurrencyLimit: Int? { nil }
+    public func source(of track: RemoteTrack) -> String? { nil }
 }
 
 extension RemoteTrack {

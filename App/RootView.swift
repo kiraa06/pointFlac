@@ -68,6 +68,7 @@ struct RootView: View {
 
     /// Transfers still under way, for the Downloads badge (spec §4.1: a badge shows activity).
     private var activeDownloads: Int {
-        model.finder.downloads.filter { $0.progress != nil || $0.state == "Queued" }.count
+        model.finder.downloads.filter { $0.progress != nil || $0.state == "Queued" || $0.state.hasPrefix("Waiting") }
+            .count
     }
 }

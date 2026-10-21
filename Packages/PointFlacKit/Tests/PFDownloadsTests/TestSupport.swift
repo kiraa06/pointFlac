@@ -48,14 +48,24 @@ final class ScriptedProvider: DownloadProvider {
 
     let id: String
     let displayName = "Scripted"
+    let concurrencyLimit: Int?
     let calls = Mutex<[String: Int]>([:])
     let active = Mutex<(now: Int, peak: Int)>((0, 0))
     private let script: Script
+    private let sourceOf: @Sendable (RemoteTrack) -> String?
 
-    init(id: String = "fake", script: @escaping Script) {
+    init(
+        id: String = "fake", concurrencyLimit: Int? = nil,
+        source: @escaping @Sendable (RemoteTrack) -> String? = { _ in nil },
+        script: @escaping Script
+    ) {
         self.id = id
+        self.concurrencyLimit = concurrencyLimit
+        self.sourceOf = source
         self.script = script
     }
+
+    func source(of track: RemoteTrack) -> String? { sourceOf(track) }
 
     func search(_ query: String) -> AsyncThrowingStream<[RemoteTrack], Error> {
         AsyncThrowingStream { $0.finish() }

@@ -12,8 +12,12 @@ public actor DownloadManager {
         public var stagingRoot: URL
         /// Where the queue is saved between launches; `nil` keeps it in memory only.
         public var stateFile: URL?
-        /// Downloads running at once. Two keeps the Archive happy and leaves bandwidth for playback.
+        /// Downloads running at once, shared by every provider without a `concurrencyLimit` of its own. Two keeps the
+        /// Archive happy and leaves bandwidth for playback.
         public var maxConcurrent: Int
+        /// Downloads running at once from one source (`DownloadProvider.source(of:)`). A source that sends one file
+        /// at a time keeps the rest waiting; this stops them taking every slot from other sources.
+        public var maxPerSource: Int
         /// The largest file accepted. A 24/192 album side is well under 2 GiB.
         public var maxFileBytes: Int64
         /// Space left free on top of two copies of the file (staging plus library) before a download may start.
@@ -29,7 +33,8 @@ public actor DownloadManager {
         public var growthCheckInterval: Duration
 
         public init(
-            stagingRoot: URL, stateFile: URL? = nil, maxConcurrent: Int = 2, maxFileBytes: Int64 = 2 << 30,
+            stagingRoot: URL, stateFile: URL? = nil, maxConcurrent: Int = 2, maxPerSource: Int = 2,
+            maxFileBytes: Int64 = 2 << 30,
             diskMargin: Int64 = 256 << 20, maxAttempts: Int = 3,
             backoff: @escaping @Sendable (Int) -> Duration = { .seconds(1 << min($0 - 1, 6)) },
             freeSpace: @escaping @Sendable (URL) -> Int64? = DiskSpace.available(at:),
@@ -38,6 +43,7 @@ public actor DownloadManager {
             self.stagingRoot = stagingRoot
             self.stateFile = stateFile
             self.maxConcurrent = max(1, maxConcurrent)
+            self.maxPerSource = max(1, maxPerSource)
             self.maxFileBytes = maxFileBytes
             self.diskMargin = diskMargin
             self.maxAttempts = max(1, maxAttempts)
@@ -152,7 +158,7 @@ public actor DownloadManager {
         guard let index = index(of: id) else { return false }
         switch queue[index].state {
         case .saving, .published, .cancelled: return false
-        case .queued, .downloading, .validating, .failed: break
+        case .queued, .downloading, .waiting, .validating, .failed: break
         }
         queue[index].state = .cancelled
         queue[index].stagedFileName = nil
@@ -193,15 +199,31 @@ public actor DownloadManager {
 
     // MARK: Scheduling
 
+    /// Starts every queued job the limits allow, oldest first. A job its limits hold back is skipped, not waited for,
+    /// so a later job from another provider or source can start.
     private func pump() {
-        while running.count < configuration.maxConcurrent,
-            let next = queue.first(where: { $0.state == .queued && running[$0.id] == nil })
-        {
-            let id = next.id
+        for item in queue where item.state == .queued && running[item.id] == nil && admits(item.track) {
+            let id = item.id
             running[id] = Task { [weak self] in
                 await self?.execute(id)
             }
         }
+    }
+
+    /// Whether one more job for `track` fits: under its provider's own limit (or the shared one), and under the
+    /// per-source limit when the provider names a source.
+    private func admits(_ track: RemoteTrack) -> Bool {
+        let provider = providers[track.provider]
+        let busy = queue.filter { running[$0.id] != nil }.map(\.track)
+        if let limit = provider?.concurrencyLimit {
+            guard busy.count(where: { $0.provider == track.provider }) < limit else { return false }
+        } else {
+            let shared = busy.count(where: { providers[$0.provider]?.concurrencyLimit == nil })
+            guard shared < configuration.maxConcurrent else { return false }
+        }
+        guard let provider, let source = provider.source(of: track) else { return true }
+        let fromSource = busy.count(where: { $0.provider == track.provider && provider.source(of: $0) == source })
+        return fromSource < configuration.maxPerSource
     }
 
     private func execute(_ id: String) async {
@@ -309,7 +331,7 @@ public actor DownloadManager {
                     guard finished == nil else { continue }
                     switch event {
                     case .queued:
-                        break
+                        markWaiting(id)
                     case .progress(let fraction):
                         try checkGrowthOnProgress(id)
                         reportProgress(id, fraction)
@@ -422,10 +444,25 @@ public actor DownloadManager {
 
     /// Progress changes are frequent, so they are published only per whole percent and never written to disk.
     private func reportProgress(_ id: String, _ fraction: Double) {
-        guard let index = index(of: id), case .downloading(let old) = queue[index].state else { return }
+        guard let index = index(of: id) else { return }
         let clamped = min(max(fraction.isFinite ? fraction : 0, 0), 1)
-        if let old, (old * 100).rounded(.down) == (clamped * 100).rounded(.down) { return }
+        switch queue[index].state {
+        case .downloading(let old):
+            if let old, (old * 100).rounded(.down) == (clamped * 100).rounded(.down) { return }
+        case .waiting:
+            break  // bytes are flowing again
+        default:
+            return
+        }
         queue[index].state = .downloading(progress: clamped)
+        changed(persist: false)
+    }
+
+    /// The source queued the request: the job waits, without a progress bar, until it reports progress.
+    private func markWaiting(_ id: String) {
+        guard let index = index(of: id), case .downloading = queue[index].state else { return }
+        queue[index].state = .waiting
+        Self.log.info("download \(id.prefix(8), privacy: .public) → waiting")
         changed(persist: false)
     }
 

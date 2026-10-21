@@ -8,6 +8,9 @@ public enum DownloadState: Sendable, Hashable, Codable {
     case queued
     /// `progress` is 0...1, or `nil` while the provider has not reported a fraction yet.
     case downloading(progress: Double?)
+    /// The source has the request but is not sending yet: a Soulseek peer sends one file at a time to each person
+    /// and keeps the rest in its upload queue. Becomes `downloading` again when bytes flow.
+    case waiting
     /// The file is complete and is being checked against the FLAC admission rule.
     case validating
     /// The file passed validation and is being handed to the library.
@@ -21,7 +24,7 @@ public enum DownloadState: Sendable, Hashable, Codable {
     public var isFinal: Bool {
         switch self {
         case .published, .failed, .cancelled: true
-        case .queued, .downloading, .validating, .saving: false
+        case .queued, .downloading, .waiting, .validating, .saving: false
         }
     }
 
@@ -30,6 +33,7 @@ public enum DownloadState: Sendable, Hashable, Codable {
         switch self {
         case .queued: "Queued"
         case .downloading: "Downloading"
+        case .waiting: "Waiting"
         case .validating: "Checking"
         case .saving: "Saving"
         case .published: "Done"
@@ -43,7 +47,7 @@ public enum DownloadState: Sendable, Hashable, Codable {
         switch self {
         case .downloading(let progress): progress
         case .validating, .saving, .published: 1
-        case .queued, .failed, .cancelled: nil
+        case .queued, .waiting, .failed, .cancelled: nil
         }
     }
 }

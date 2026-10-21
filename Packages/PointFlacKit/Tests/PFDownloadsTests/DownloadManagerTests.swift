@@ -189,6 +189,83 @@ struct DownloadManagerTests {
         #expect(library.names.count == 6)
     }
 
+    @Test("a provider's own limit replaces the shared one")
+    func providerLimit() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let gate = Gate()
+        let provider = ScriptedProvider(concurrencyLimit: 4) { track, staging, _, events in
+            await gate.wait()
+            events.yield(.finished(try deliverFixture(track, staging)))
+        }
+        let manager = makeManager(folder, provider: provider, library: library)  // shared limit: 2
+        for index in 0..<6 {
+            await manager.enqueue(fixtureTrack("s16-44100", id: "t\(index)", fileName: "Song \(index).flac"))
+        }
+
+        try await waitFor(manager) { $0.filter { $0.state == .downloading(progress: nil) }.count == 4 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await manager.items.filter { $0.state == .queued }.count == 2)
+        await gate.open()
+        let items = try await waitFor(manager) { $0.count == 6 && allFinal($0) }
+        #expect(items.allSatisfy { $0.state == .published })
+        #expect(provider.active.withLock { $0.peak } == 4)
+    }
+
+    @Test("one source cannot take every slot: a later job from another source starts while the first one's extra wait")
+    func perSourceLimit() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let gate = Gate()
+        let byPeer: @Sendable (RemoteTrack) -> String? = { $0.detail["peer"] }
+        let provider = ScriptedProvider(concurrencyLimit: 6, source: byPeer) { track, staging, _, events in
+            await gate.wait()
+            events.yield(.finished(try deliverFixture(track, staging)))
+        }
+        let manager = makeManager(folder, provider: provider, library: library)
+        for (peer, number) in [("a", 0), ("a", 1), ("a", 2), ("b", 0)] {
+            var track = fixtureTrack("s16-44100", id: "\(peer)\(number)", fileName: "\(peer) \(number).flac")
+            track.detail["peer"] = peer
+            await manager.enqueue(track)
+        }
+
+        let running = try await waitFor(manager) { $0.filter { $0.state == .downloading(progress: nil) }.count == 3 }
+        #expect(Set(running.filter { $0.state == .downloading(progress: nil) }.map(\.track.id)) == ["a0", "a1", "b0"])
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await manager.items.first { $0.track.id == "a2" }?.state == .queued)
+        await gate.open()
+        let items = try await waitFor(manager) { $0.count == 4 && allFinal($0) }
+        #expect(items.allSatisfy { $0.state == .published })
+    }
+
+    @Test("a source holding the request without sending shows as waiting until bytes flow")
+    func waitingState() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let gate = Gate()
+        let provider = ScriptedProvider { track, staging, _, events in
+            events.yield(.queued)
+            await gate.wait()
+            events.yield(.progress(0.5))
+            events.yield(.finished(try deliverFixture(track, staging)))
+        }
+        let manager = makeManager(folder, provider: provider, library: library)
+        let updates = await manager.updates(buffering: 1000)
+        await manager.enqueue(fixtureTrack("s24-96000"))
+        try await waitFor(manager) { $0.first?.state == .waiting }
+        #expect(DownloadState.waiting.label == "Waiting")
+        #expect(!DownloadState.waiting.isFinal)
+        await gate.open()
+
+        var labels: [String] = []
+        for await snapshot in updates {
+            guard let state = snapshot.first?.state else { continue }
+            if labels.last != state.label { labels.append(state.label) }
+            if state.isFinal { break }
+        }
+        #expect(labels == ["Queued", "Downloading", "Waiting", "Downloading", "Checking", "Saving", "Done"])
+    }
+
     @Test("a thrown error is retried with the partial file kept, so the provider can resume")
     func retriesAndResumes() async throws {
         let folder = try TempFolder()

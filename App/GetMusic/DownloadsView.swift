@@ -56,7 +56,7 @@ struct DownloadsView: View {
     private func icon(_ state: String) -> String {
         if state.hasPrefix("Done") { return "checkmark.circle.fill" }
         if state.hasPrefix("Failed") { return "exclamationmark.triangle.fill" }
-        if state.hasPrefix("Queued") { return "clock" }
+        if state.hasPrefix("Queued") || state.hasPrefix("Waiting") { return "clock" }
         return "arrow.down.circle"
     }
 
