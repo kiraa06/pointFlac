@@ -95,7 +95,9 @@ enum Typeface {
     static let artist = Font.system(.subheadline, design: .default)
     static let mono = Font.system(.caption, design: .monospaced)
     static let monoSmall = Font.system(size: 10, weight: .medium, design: .monospaced)
-    static let cellValue = Font.system(.subheadline, design: .monospaced).weight(.semibold)
+    /// The signal strip's values: a step below the artist line, so FORMAT · DEPTH · DAC · SIGNAL reads as a readout,
+    /// not a second title.
+    static let cellValue = Font.system(.footnote, design: .monospaced).weight(.semibold)
     static let cellLabel = Font.system(size: 9, weight: .medium, design: .monospaced)
 }
 
