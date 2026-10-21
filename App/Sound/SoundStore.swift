@@ -400,15 +400,16 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     }
 
     /// The limiter and the preamp have no switch: the limiter joins the chain whenever another block is on, and the
-    /// preamp's automatic headroom runs with any chain; the chain lists the preamp only while it trims.
+    /// preamp stage runs with any chain; the chain lists the preamp only while it trims.
     var isSwitchable: Bool { self != .limiter && self != .preamp }
 
     /// The block's own state, whatever Pure says. The limiter's is whether any other block is on; the preamp's, whether
-    /// it can change the level: a trim, or automatic headroom. (Whether the chain lists it is `isActive`: a trim.)
+    /// it trims, as the chain lists it. What the preamp shows (its capsule, its header, VoiceOver) goes by what its
+    /// stage does to the level instead: `preampChangeDb`.
     func isOn(in s: SoundSettings) -> Bool {
         switch self {
         case .replayGain: return s.replayGain.mode != .off
-        case .preamp: return s.preamp.trimDb != 0 || s.preamp.autoHeadroom
+        case .preamp: return s.preamp.trimDb != 0
         case .correction: return s.correction.enabled
         case .eq: return s.eq.enabled
         case .tone: return s.tone.enabled
@@ -426,16 +427,24 @@ enum SoundBlock: String, CaseIterable, Identifiable {
         s.activeBlockNames.contains(name)
     }
 
-    /// A switchable block's state for VoiceOver, else what the block is doing: "Running" or "Standby" for the limiter,
-    /// the trim for the preamp.
+    /// A switchable block's state for VoiceOver, else what the block is doing: "Running" or "Standby" for the limiter.
+    /// (The preamp's capsule speaks what its stage does to the level, from `preampChangeDb`.)
     func spokenState(in s: SoundSettings) -> String {
         switch self {
         case .limiter: return isActive(in: s) ? "Running" : "Standby"
-        case .preamp:
-            if s.preamp.trimDb != 0 { return "Trim \(SoundFormat.gainSpoken(s.preamp.trimDb))" }
-            return s.preamp.autoHeadroom ? "Auto headroom" : "Off"
         default: return isOn(in: s) ? "On" : "Off"
         }
+    }
+
+    /// What the preamp stage does to the level now, in dB: the gain ahead of the filters as the chain applies it
+    /// (`SoundChain.preampStaging`: the trim, the automatic headroom the curve needs, `headroomDb`, and the correction's
+    /// own preamp), while a chain runs and that gain is not 0 dB to a twentieth of a dB; nil otherwise. Automatic
+    /// headroom being on changes nothing by itself: it is only ever non-zero alongside a block that boosts. The
+    /// preamp's capsule, its header and VoiceOver all go by this.
+    static func preampChangeDb(_ s: SoundSettings, headroomDb: Double) -> Double? {
+        guard !s.activeBlockNames.isEmpty else { return nil }
+        let total = SoundChain.preampStaging(s, headroomDb: headroomDb).totalDb
+        return abs(total) >= 0.05 ? total : nil
     }
 
     /// Switches the block, with a mode for the blocks that have one (`SoundStore.setBlock` brings back the last mode

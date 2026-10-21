@@ -320,7 +320,8 @@ struct PreampRows: View {
         )
         .accessibilityIdentifier("trimSlider")
         let stage = SoundChain.preampStaging(settings, headroomDb: headroom)
-        let running = !settings.activeBlockNames.isEmpty
+        // Tinted only while the stage changes the level, as the header and the capsule are.
+        let running = SoundBlock.preampChangeDb(settings, headroomDb: headroom) != nil
         Readout(
             cells: [
                 ReadoutCell(label: "Correction", value: stage.correctionDb.map { SoundFormat.gain($0) } ?? "Off"),

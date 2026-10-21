@@ -393,17 +393,19 @@ struct BlockHeaderRow: View {
         }
     }
 
-    /// Whether the non-switchable block works on the sound now: the limiter in the chain; the preamp with any chain,
-    /// while it can change the level (a trim, or automatic headroom: what lights its flow capsule).
+    /// Whether the non-switchable block works on the sound now: the limiter in the chain; the preamp while its stage
+    /// changes the level (`SoundBlock.preampChangeDb`, as its flow capsule shows it).
     private var running: Bool {
         guard block == .preamp else { return block.isActive(in: settings) }
-        return !settings.activeBlockNames.isEmpty && block.isOn(in: settings)
+        return SoundBlock.preampChangeDb(settings, headroomDb: headroomDb) != nil
     }
 
+    /// The limiter's Running or Standby; the preamp's change to the level, "0.0 dB" while a chain runs without one,
+    /// else Standby.
     private var status: String {
         guard block == .preamp else { return running ? "Running" : "Standby" }
-        return running
-            ? SoundFormat.gain(SoundChain.preampStaging(settings, headroomDb: headroomDb).totalDb) : "Standby"
+        if let change = SoundBlock.preampChangeDb(settings, headroomDb: headroomDb) { return SoundFormat.gain(change) }
+        return settings.activeBlockNames.isEmpty ? "Standby" : SoundFormat.gain(0)
     }
 
     private var label: some View {

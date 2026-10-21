@@ -88,7 +88,8 @@ struct SoundView: View {
             .listRowBackground(glass)
             Section {
                 SignalFlowRow(
-                    settings: s, theme: theme, toggle: { block in setBlock(block, on: !block.isOn(in: s)) },
+                    settings: s, theme: theme, curve: curve,
+                    toggle: { block in setBlock(block, on: !block.isOn(in: s)) },
                     show: { block in withAnimation(.snappy(duration: 0.35)) { proxy.scrollTo(block, anchor: .top) } })
                 OutputMeter(meters: meters, player: player, theme: screen, polling: polling)
                     .listRowInsets(Self.screenInsets)
@@ -98,7 +99,8 @@ struct SoundView: View {
                 footerText(
                     s.pure
                         ? "Pure sends the signal straight through."
-                        : "Tap a block to switch it; touch and hold it for its settings.")
+                        : "Tap a block to switch it, or the limiter or preamp to open its settings. Touch and hold any "
+                            + "block for its settings.")
             }
             .listRowBackground(glass)
             ForEach(SoundBlock.pageOrder) { block in
@@ -467,12 +469,14 @@ private struct BigSwitch: View {
 /// The chain as capsules, IN to OUT, joined by a wire. It wraps when the chain is wider than the row: rows as even as
 /// they can be, each spread across the width, and the wire turning down at a row's end and back to the next row's
 /// start, so the whole chain stays in view at every text size. Each switchable block's capsule toggles it; the
-/// limiter's and the preamp's report what they do. Every capsule's menu (touch and hold), and its VoiceOver action,
-/// "Show <block> settings", scrolls to the block's section. In Pure the wire is one green line from IN to OUT behind
-/// the capsules, which are ghosted, all alike, and inert.
+/// limiter's and the preamp's report what they do, and a tap on them opens their settings. Every capsule's menu (touch
+/// and hold), and its VoiceOver action, "Show <block> settings", scrolls to the block's section. In Pure the wire is
+/// one green line from IN to OUT behind the capsules, which are ghosted, all alike, and inert.
 struct SignalFlowRow: View {
     let settings: SoundSettings
     let theme: Theme
+    /// The curve model, for the headroom the preamp applies: only the preamp's capsule reads it.
+    let curve: EQCurveModel
     let toggle: (SoundBlock) -> Void
     /// Scrolls the page to the block's section.
     let show: (SoundBlock) -> Void
@@ -515,43 +519,58 @@ struct SignalFlowRow: View {
             .accessibilityHidden(true)
     }
 
-    /// A switchable block's capsule is a menu with a primary action: a tap switches the block, and a touch and hold
-    /// opens "Show <block> settings". A menu rather than a context menu: a List row merges its rows' context menus into
-    /// one, so every capsule would offer the first one's item. The limiter's and the preamp's capsules have no switch,
-    /// so they are plain buttons that go straight to their settings.
+    @ViewBuilder
     private func capsule(_ block: SoundBlock) -> some View {
+        switch block {
+        case .preamp:
+            PreampCapsule(model: curve, settings: settings, theme: theme) { show(.preamp) }
+        default:
+            FlowCapsule(
+                block: block, settings: settings, theme: theme, on: block.isOn(in: settings),
+                active: block.isActive(in: settings), state: block.spokenState(in: settings),
+                primary: { block.isSwitchable ? toggle(block) : show(block) }, show: { show(block) })
+        }
+    }
+}
+
+/// One flow capsule: a menu whose primary action (a tap) switches the block, or for the limiter and the preamp, which
+/// have no switch, opens their settings; and whose touch and hold offers "Show <block> settings". A menu rather than a
+/// context menu: a List row merges its rows' context menus into one, so every capsule would offer the first one's item.
+/// Outlined in the tint while `on`, filled while `active`, at work in the chain; ghosted under Pure, and inert.
+private struct FlowCapsule: View {
+    let block: SoundBlock
+    let settings: SoundSettings
+    let theme: Theme
+    let on: Bool
+    let active: Bool
+    /// What VoiceOver says of the block's state.
+    let state: String
+    let primary: () -> Void
+    let show: () -> Void
+
+    var body: some View {
         let title = "Show \(block.settingsName) settings"
-        return Group {
-            if block.isSwitchable {
-                Menu {
-                    Button(title, systemImage: "arrow.down.to.line") { show(block) }
-                } label: {
-                    capsuleFace(block)
-                } primaryAction: {
-                    toggle(block)
-                }
-                .accessibilityAddTraits(.isToggle)
-            } else {
-                Button {
-                    show(block)
-                } label: {
-                    capsuleFace(block)
-                }
-                .accessibilityHint(title)
-            }
+        Menu {
+            Button(title, systemImage: "arrow.down.to.line", action: show)
+        } label: {
+            face
+        } primaryAction: {
+            primary()
         }
         .menuStyle(.button)
         // A style of its own, so a disabled capsule is not dimmed a second time: Pure ghosts them all alike.
         .buttonStyle(CapsuleButtonStyle())
         .menuIndicator(.hidden)
         .disabled(settings.pure)
-        .modifier(CapsuleAccessibility(block: block, settings: settings))
-        .accessibilityAction(named: title) { show(block) }
+        .accessibilityAddTraits(block.isSwitchable ? .isToggle : [])
+        .accessibilityLabel(block.name)
+        .accessibilityValue(state + (settings.pure ? ", bypassed by Pure" : ""))
+        .accessibilityHint(block.isSwitchable ? "" : title)
+        .accessibilityAction(named: title, show)
+        .accessibilityIdentifier("block-\(block.name)")
     }
 
-    private func capsuleFace(_ block: SoundBlock) -> some View {
-        let on = block.isOn(in: settings)
-        let active = block.isActive(in: settings)
+    private var face: some View {
         let tint = theme.processingTint
         let pure = settings.pure
         return HStack(spacing: 4) {
@@ -579,6 +598,24 @@ struct SignalFlowRow: View {
                 pure ? theme.inkSecondary.opacity(0.5) : active ? Color.clear : on ? tint : theme.hairline,
                 style: StrokeStyle(lineWidth: 1, dash: pure ? [3, 2] : []))
         )
+    }
+}
+
+/// The preamp's capsule, reading the curve model itself, so that an EQ drag, which moves the headroom, redraws this
+/// capsule alone. Filled while its stage changes the level (`SoundBlock.preampChangeDb`), as the other blocks are when
+/// they act; unlit otherwise, automatic headroom on or not.
+private struct PreampCapsule: View {
+    let model: EQCurveModel
+    let settings: SoundSettings
+    let theme: Theme
+    let show: () -> Void
+
+    var body: some View {
+        let change = SoundBlock.preampChangeDb(settings, headroomDb: model.headroomDb)
+        FlowCapsule(
+            block: .preamp, settings: settings, theme: theme, on: change != nil, active: change != nil,
+            state: change.map { "Changes the level by \(SoundFormat.gainSpoken($0))" } ?? "Leaves the level as it is",
+            primary: show, show: show)
     }
 }
 
@@ -736,20 +773,6 @@ private struct FlowWire: Shape {
 private struct CapsuleButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label.opacity(configuration.isPressed ? 0.7 : 1)
-    }
-}
-
-/// A flow capsule's name, state and id, for VoiceOver and the UI tests.
-private struct CapsuleAccessibility: ViewModifier {
-    let block: SoundBlock
-    let settings: SoundSettings
-
-    func body(content: Content) -> some View {
-        let state = block.spokenState(in: settings)
-        content
-            .accessibilityLabel(block.name)
-            .accessibilityValue(state + (settings.pure ? ", bypassed by Pure" : ""))
-            .accessibilityIdentifier("block-\(block.name)")
     }
 }
 
