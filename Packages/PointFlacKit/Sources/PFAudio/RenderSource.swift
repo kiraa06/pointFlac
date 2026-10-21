@@ -131,6 +131,9 @@ public final class RenderSource: @unchecked Sendable {
         seeksServed = Atomic(previous?.seeksServed.load(ordering: .acquiring) ?? 0)
         // Built here, off the render thread, so the voice's first use never builds it there.
         if scrub != nil { _ = ScrubKernel() }
+        // Warms the Int32-to-Double conversion's witness table off the render thread: its first use calls into the
+        // runtime once, and the Int32 chain path converts every sample.
+        _ = int32Sample(0)
     }
 
     deinit {
@@ -519,7 +522,15 @@ private func soundIsIdle(_ runner: Unmanaged<ChainRunner>) -> Bool {
 /// `ScrubTap.rendering` announcement: `renderScrub` announces itself before it loads the window again.
 @inline(__always)
 private func scrubWindowIsOpen(_ tap: Unmanaged<ScrubTap>) -> Bool {
-    tap._withUnsafeGuaranteedRef { $0.window.load(ordering: .sequentiallyConsistent) != nil }
+    tap._withUnsafeGuaranteedRef {
+        guard $0.window.load(ordering: .sequentiallyConsistent) != nil else {
+            // A run retired without a handover leaves its voice behind; drop it here, as `renderScrub`'s guard did when
+            // it ran on every call, so the next run's first callback can never play it. Plain render-owned values.
+            $0.state.pointee.voice = nil
+            return false
+        }
+        return true
+    }
 }
 
 /// Runs the block in `buffer` through the chain, in place, after the ring or the scrub voice and before iOS (see "The
