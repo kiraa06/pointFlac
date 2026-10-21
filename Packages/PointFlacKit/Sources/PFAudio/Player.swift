@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PFCore
+import PFDSP
 
 /// The object the UI binds to. It plays a queue through a `PlaybackPipeline`, follows the audio session (routes,
 /// interruptions, volume, media-server resets), keeps an honest `SignalState`, and publishes Now Playing.
@@ -62,6 +63,8 @@ public final class Player {
     /// A failure, or `play([])`, clears the path altogether. Pause and the end of the queue keep the last track's path
     /// on show, refreshed only when the hardware really moves (`refreshIdleHardwareRate`).
     public private(set) var signal: SignalState
+    /// The Sound settings every pipeline plays with, clamped. Pure (the default) is bit-exact.
+    public private(set) var sound = SoundSettings()
 
     private let session: AudioSessionControlling
     private let gate: SessionGate
@@ -94,6 +97,8 @@ public final class Player {
     /// The finger on the record, from `beginScrub()` until its let-go has settled.
     @ObservationIgnored private var scrubRun: ScrubRun?
     @ObservationIgnored private var sessionEvents: Task<Void, Never>?
+    /// Clips counted by the pipelines retired so far, so `soundMeters.clipCount` runs on across them.
+    @ObservationIgnored private var retiredClips = 0
 
     /// - Parameters:
     ///   - makeOutput: builds the output every pipeline the player starts renders through, one at a time. Called on
@@ -224,6 +229,28 @@ public final class Player {
         }
     }
 
+    // MARK: Sound
+
+    /// Plays `settings`, clamped, from the next render call (cross-faded in over 10 ms, after the chain's few
+    /// milliseconds of look-ahead; a change made while the last one is still fading waits for it), and shows the
+    /// blocks at work on the strip (`signal.activeProcessing`). Compiled here, on the main actor, for the playing plan.
+    /// While nothing plays it is only kept, and the next start compiles it for its plan.
+    public func setSound(_ settings: SoundSettings) {
+        let settings = settings.clamped()
+        sound = settings
+        signal.activeProcessing = settings.activeBlockNames
+        engine?.pipeline.setSound(settings)
+    }
+
+    /// The Sound chain's meters: the peak since the last read, the clips since the player was made, and the latest
+    /// gain reduction. Reading starts a new peak interval, so keep to one reader. The floor, with nothing playing.
+    public var soundMeters: SoundMeters {
+        guard let engine else { return SoundMeters(peakDbFS: -120, clipCount: retiredClips, gainReductionDb: 0) }
+        var meters = engine.pipeline.soundMeters
+        meters.clipCount += retiredClips
+        return meters
+    }
+
     /// The pipeline playing now, if any. For tests.
     var pipeline: PlaybackPipeline? {
         engine?.pipeline
@@ -303,6 +330,8 @@ public final class Player {
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
             negotiateRate: { rate in await gate.requestSampleRate(rate, for: lease) }, makeDecoder: makeDecoder)
+        // Before it starts, so its first configure compiles the chain.
+        pipeline.setSound(sound)
         let engine = PlayerEngine(pipeline: pipeline, lease: lease, generation: generation)
         // Captures the generation, not the engine, so the task never keeps a pipeline alive.
         let events = pipeline.events
@@ -323,6 +352,7 @@ public final class Player {
         if let engine {
             self.engine = nil
             engine.retire()
+            retiredClips += engine.pipeline.soundMeters.clipCount
         }
         // After the output stopped: ending the scrub first would let a render call play the ring in between.
         abandonScrub()

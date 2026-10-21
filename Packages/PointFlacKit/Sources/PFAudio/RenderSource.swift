@@ -10,8 +10,9 @@ import Synchronization
 /// stays continuous.
 ///
 /// ## Real-time safety
-/// `render(into:frames:)` touches only the preallocated ring and atomics. It does not allocate, lock, log or cause
-/// ARC traffic: it reaches the ring through an unretained reference, kept alive by `ring`. Events are not emitted
+/// `render(into:frames:)` touches only the preallocated ring, scratch and atomics, and the chain runner's own
+/// preallocated state. It does not allocate, lock, log or cause ARC traffic: it reaches the ring, the scrub tap and the
+/// chain runner through unretained references, kept alive by the strong ones beside them. Events are not emitted
 /// from here; the decode thread compares `renderedFrames` with its boundary markers instead.
 ///
 /// ## Flushing while the render thread runs
@@ -36,6 +37,16 @@ import Synchronization
 /// `seeksRequested != seeksServed`, `render` outputs silence without touching the ring. The decode thread flushes
 /// and only then releases the holds up to the ticket it read together with the seek request, under the same lock.
 /// A hold placed after that ticket (a newer seek) stays in force until that seek is served too.
+///
+/// ## The Sound chain
+/// Whatever `render` produces, from the ring or the scrub voice, silence included, then runs through the pipeline's
+/// `ChainRunner` before iOS gets it, so the chain is a filter on the output stream itself: EQ is part of the sound
+/// while scrubbing too, and a seek's or a gap's silence lets the chain's look-ahead and filters ring out naturally. A
+/// Float32 client's words are its samples, processed in place. An Int32 client's are converted through the scratch
+/// buffer, and only where the runner is not idle; a word whose sample came back unchanged is kept as it was, so a
+/// 32-bit word's low bits never take a Float32 round trip. In Pure the runner leaves every word alone: the output is
+/// bit-identical to the path without it. The chain's latency (its look-ahead) delays the audio, so the last few
+/// milliseconds before a format change, or a stop, stay in it unheard; `renderedFrames` still counts ring frames.
 ///
 /// ## Scrubbing
 /// While a finger is on the record (`ScrubTap`), `render` plays the tap's `ScrubVoice` instead of the ring: the ring is
@@ -69,6 +80,9 @@ public final class RenderSource: @unchecked Sendable {
     /// The pipeline's scrub tap, unretained for `render`; `scrub` keeps it alive.
     private let scrub: ScrubTap?
     private let unretainedScrub: Unmanaged<ScrubTap>?
+    /// The pipeline's Sound chain runner, one for all its sources, unretained for `render`; `sound` keeps it alive.
+    private let sound: ChainRunner?
+    private let unretainedSound: Unmanaged<ChainRunner>?
     /// The client rate and sample format, which the scrub voice needs and the ring does not.
     private let clientRate: Int
     private let floatClient: Bool
@@ -88,7 +102,7 @@ public final class RenderSource: @unchecked Sendable {
     ///     change is still held. Pass it only while neither source is being rendered.
     init(
         channels: Int, capacityFrames: Int, renderedFrames: Int64, inheritingHoldsFrom previous: RenderSource?,
-        clientRate: Int = 0, floatClient: Bool = true, scrub: ScrubTap? = nil
+        clientRate: Int = 0, floatClient: Bool = true, scrub: ScrubTap? = nil, sound: ChainRunner? = nil
     ) {
         precondition(channels > 0 && capacityFrames > 0, "RenderSource needs channels and capacity")
         self.channels = channels
@@ -96,6 +110,8 @@ public final class RenderSource: @unchecked Sendable {
         self.floatClient = floatClient
         self.scrub = scrub
         unretainedScrub = scrub.map { .passUnretained($0) }
+        self.sound = sound
+        unretainedSound = sound.map { .passUnretained($0) }
         scratch = .allocate(capacity: Self.scratchFrames * channels)
         let ring = SampleRing<UInt32>(capacity: capacityFrames * channels)
         self.ring = ring
@@ -127,12 +143,22 @@ public final class RenderSource: @unchecked Sendable {
     /// Render thread only, one call at a time; real-time safe.
     ///
     /// Writes `frames` × `channels` interleaved 32-bit samples to `buffer`, which must have room for them. What the
-    /// ring cannot supply is zero-filled (silence in both client formats). Returns the frames of real audio, which
-    /// are always a prefix of the buffer.
+    /// ring cannot supply is zero-filled (silence in both client formats), then the whole block runs through the Sound
+    /// chain, whose look-ahead and filters may ring out into that silence. Returns the frames of real audio, which are
+    /// always a prefix of the buffer.
     public func render(into buffer: UnsafeMutableRawPointer, frames: Int) -> Int {
         guard frames > 0 else { return 0 }
+        let words = buffer.bindMemory(to: UInt32.self, capacity: frames * channels)
+        let real = produce(into: words, frames: frames)
+        if let unretainedSound {
+            unretainedSound._withUnsafeGuaranteedRef { applySound($0, to: words, frames: frames) }
+        }
+        return real
+    }
+
+    /// The block before the Sound chain: the ring's words, the scrub voice's, or silence. Returns the real frames.
+    private func produce(into words: UnsafeMutablePointer<UInt32>, frames: Int) -> Int {
         let count = frames * channels
-        let words = buffer.bindMemory(to: UInt32.self, capacity: count)
         if let unretainedScrub,
             let scrubbed = unretainedScrub._withUnsafeGuaranteedRef({ renderScrub($0, into: words, frames: frames) })
         {
@@ -164,6 +190,35 @@ public final class RenderSource: @unchecked Sendable {
             underruns.store(underruns.load(ordering: .relaxed) + Int64(frames - real), ordering: .releasing)
         }
         return real
+    }
+
+    // MARK: The Sound chain (render thread)
+
+    /// Runs the block through the chain, in place, after the ring or the scrub voice and before iOS (see "The Sound
+    /// chain"). In Pure the runner returns without touching a word.
+    @inline(__always)
+    private func applySound(_ runner: ChainRunner, to words: UnsafeMutablePointer<UInt32>, frames: Int) {
+        let count = frames * channels
+        if floatClient {
+            // The words are Float32 bit patterns: the samples themselves.
+            words.withMemoryRebound(to: Float.self, capacity: count) {
+                runner.process($0, frames: frames, channels: channels)
+            }
+            return
+        }
+        guard !runner.isIdle else { return }
+        var done = 0
+        while done < frames {
+            let n = min(Self.scratchFrames, frames - done)
+            let block = words + done * channels
+            for i in 0..<(n * channels) { scratch[i] = sample(block[i]) }
+            runner.process(scratch, frames: n, channels: channels)
+            // A sample the runner left alone keeps its word: a 32-bit word does not survive a Float32 round trip.
+            for i in 0..<(n * channels) where scratch[i].bitPattern != sample(block[i]).bitPattern {
+                block[i] = word(scratch[i])
+            }
+            done += n
+        }
     }
 
     // MARK: Scrubbing (render thread)

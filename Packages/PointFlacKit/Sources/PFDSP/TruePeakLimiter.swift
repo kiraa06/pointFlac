@@ -308,6 +308,28 @@ public final class TruePeakLimiter: @unchecked Sendable {
         reduction.store(db.bitPattern, ordering: .relaxed)
     }
 
+    /// Render thread: carries on from `other`'s state (its recent input, hold, release and ramp), as if this limiter had
+    /// been running all along, so a recompiled chain picks up mid-stream without restarting its look-ahead. Does
+    /// nothing unless both were made for the same channels and rate, whose buffers then have the same shapes; their
+    /// ceilings may differ. Real-time safe: it only copies, into buffers allocated in `init`.
+    func adoptState(of other: TruePeakLimiter) {
+        guard other.history != history, other.channels == channels, other.historyFrames == historyFrames,
+            other.lookahead == lookahead, other.holdMask == holdMask, other.oversampling == oversampling
+        else { return }
+        history.update(from: other.history, count: channels * 2 * historyFrames)
+        holdGains.update(from: other.holdGains, count: holdMask + 1)
+        holdFrames.update(from: other.holdFrames, count: holdMask + 1)
+        deficits.update(from: other.deficits, count: lookahead)
+        frame = other.frame
+        holdHead = other.holdHead
+        holdTail = other.holdTail
+        previousPeak = other.previousPeak
+        envelope = other.envelope
+        deficitSum = other.deficitSum
+        deficitCount = other.deficitCount
+        deficitSlot = other.deficitSlot
+    }
+
     /// Detection points per sample interval at `sampleRate`: 16 up to 48 kHz and 8 above, so the grid is at least
     /// 705.6 kHz (rulings R4-T4b, R4-T4e). A crest between two points is then under-read by at most
     /// cos(π f / grid), which is 0.035 dB at 20 kHz. Using 8× (not 4×) at the highest rates keeps ultrasonic content,
