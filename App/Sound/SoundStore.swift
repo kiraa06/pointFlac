@@ -37,12 +37,16 @@ final class SoundStore {
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var unsaved = false
 
-    static let saveDelay: Duration = .milliseconds(500)
+    /// How long a save waits for the edits to stop.
+    @ObservationIgnored private let saveDelay: Duration
 
     /// Loads the saved settings and gives them to the player at once, so the first pipeline plays with them.
-    init(player: Player, fileURL: URL = SoundStore.defaultFileURL) {
+    init(
+        player: Player, fileURL: URL = SoundStore.defaultFileURL, saveDelay: Duration = .milliseconds(500)
+    ) {
         self.player = player
         self.fileURL = fileURL
+        self.saveDelay = saveDelay
         let loaded = Self.load(from: fileURL)
         settings = loaded
         applied = loaded
@@ -208,8 +212,9 @@ final class SoundStore {
     private func scheduleSave() {
         unsaved = true
         saveTask?.cancel()
+        let delay = saveDelay
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.saveDelay)
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
             self?.save()
         }
@@ -233,7 +238,8 @@ final class SoundStore {
     #if DEBUG
         /// UI-test launch arguments, applied before the store loads: `-PFResetSound` deletes the saved settings, so
         /// the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a lenient reader would take
-        /// (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure.
+        /// (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure. (`-PFSoundSaveDelay <s>`, read
+        /// by `AppModel`, stretches the save's debounce, so a test can show that only the flush wrote.)
         static func prepareForLaunch(arguments: [String], fileURL: URL = defaultFileURL) {
             if arguments.contains("-PFResetSound") {
                 try? FileManager.default.removeItem(at: fileURL)

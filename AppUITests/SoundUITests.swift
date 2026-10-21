@@ -173,7 +173,8 @@ final class SoundUITests: XCTestCase {
         // The save follows half a second after the last change; a relaunch loads it.
         Thread.sleep(forTimeInterval: 1.2)
         app.terminate()
-        let again = relaunch()
+        // This launch's debounce is 30 s, so within the test only the flush on leaving the foreground can save.
+        let again = relaunch(["-PFSoundSaveDelay", "30"])
         let pureAgain = again.descendants(matching: .any)["pureSwitch"]
         XCTAssertTrue(pureAgain.waitForExistence(timeout: 5))
         XCTAssertEqual(pureAgain.value as? String, "0")
@@ -194,7 +195,7 @@ final class SoundUITests: XCTestCase {
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: handleAgain)
         waitForExpectations(timeout: 3)
 
-        // Home straight after the edit, well inside the debounce: leaving the foreground writes it at once.
+        // Home straight after the edit, long before the 30 s debounce: leaving the foreground must write it at once.
         XCUIDevice.shared.press(.home)
         Thread.sleep(forTimeInterval: 0.5)
         again.terminate()
@@ -245,9 +246,9 @@ final class SoundUITests: XCTestCase {
 
     /// The app again, keeping the saved Sound settings, on the Sound tab.
     @MainActor
-    private func relaunch() -> XCUIApplication {
+    private func relaunch(_ extra: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
+        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"] + extra
         app.launch()
         app.tabBars.buttons["Sound"].tap()
         return app

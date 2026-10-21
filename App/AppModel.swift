@@ -18,7 +18,8 @@ import PFLibrary
 ///   (ruling R22).
 /// - `-PFMockFinder`, and `-PFPreloadFixtures` too, keep the demo `MockMusicFinder`, so UI tests never touch the
 ///   network and stay deterministic.
-/// - `-PFResetSound` and `-PFCorruptSound` replace the saved Sound settings before they load (`SoundStore`).
+/// - `-PFResetSound` and `-PFCorruptSound` replace the saved Sound settings before they load (`SoundStore`), and
+///   `-PFSoundSaveDelay <seconds>` stretches their save's debounce.
 @MainActor
 @Observable
 final class AppModel {
@@ -87,7 +88,13 @@ final class AppModel {
             SoundStore.prepareForLaunch(arguments: arguments)
         #endif
         // Loads `sound.json` and hands it to the player now, so the first pipeline already plays with it.
-        sound = SoundStore(player: player)
+        #if DEBUG
+            // `-PFSoundSaveDelay <seconds>`: a longer debounce, so a UI test can tell the flush from the debounced save.
+            let delay = UserDefaults.standard.double(forKey: "PFSoundSaveDelay")
+            sound = SoundStore(player: player, saveDelay: delay > 0 ? .seconds(delay) : .milliseconds(500))
+        #else
+            sound = SoundStore(player: player)
+        #endif
         let names = UserDefaults.standard.bool(forKey: Self.lookupNamesKey)
         let artwork = UserDefaults.standard.bool(forKey: Self.lookupArtworkKey)
         #if SOULSEEK
