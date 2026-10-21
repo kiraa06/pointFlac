@@ -69,8 +69,12 @@ struct ShelfPanel: View {
         .onChange(of: query, initial: true) { runSearch() }
         .onChange(of: filter) { runSearch() }
         .onChange(of: library.albums) { runSearch() }
-        // Keyed by the phrase and by Search: a new phrase cancels the old search, and Search skips the pause.
-        .task(id: "\(immediate)|\(query)") { await searchOnline(after: immediate ? .zero : .milliseconds(600)) }
+        // Keyed by the phrase and by Search: a new phrase cancels the old search. Online search runs on Search only,
+        // never on a typing pause: one Internet Archive search costs about 21 requests, and Soulseek rate-limits
+        // accounts that search often (integration ruling).
+        .task(id: "\(immediate)|\(query)") {
+            if immediate { await searchOnline(after: .zero) } else { online = [] }
+        }
         .onSubmit { immediate = true }
         .onChange(of: query) { immediate = false }
         .fileImporter(isPresented: $importing, allowedContentTypes: [Self.flac], allowsMultipleSelection: true) {
@@ -313,8 +317,8 @@ struct ShelfPanel: View {
         }
     }
 
-    /// Online search starts by itself once typing pauses (about 0.6 s) with at least 3 characters, or at once on
-    /// Search. A new phrase cancels the old one: this runs in a task keyed by the query.
+    /// Online search runs on Search, with at least 3 characters. A new phrase cancels the old one: this runs in a
+    /// task keyed by the query.
     private func searchOnline(after pause: Duration) async {
         online = []
         let phrase = query.trimmingCharacters(in: .whitespaces)
