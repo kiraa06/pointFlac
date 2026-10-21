@@ -163,6 +163,39 @@ private final class TaskBox: Sendable {
     let task = Mutex<Task<Void, Never>?>(nil)
 }
 
+/// A one-shot signal: raised once by a hook or a test, awaited by the other, in either order.
+private final class Signal: Sendable {
+    private let state = Mutex<(raised: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
+
+    func raise() {
+        let waiters = state.withLock { state in
+            state.raised = true
+            defer { state.waiters = [] }
+            return state.waiters
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let raised = state.withLock { state in
+                if !state.raised { state.waiters.append(continuation) }
+                return state.raised
+            }
+            if raised { continuation.resume() }
+        }
+    }
+}
+
+/// Keeps the fresh scan a cancelled scan hands its merged requests to (`Library.loudnessHandoffHook`). The hand-off
+/// happens before the cancelled caller returns, so once that caller is awaited the test can await the fresh scan,
+/// however long the device takes to decode at background priority, instead of polling against a deadline.
+private func catchingHandoffs(_ library: Library) -> TaskBox {
+    let handoff = TaskBox()
+    library.loudnessHandoffHook.withLock { $0 = { task in handoff.task.withLock { $0 = task } } }
+    return handoff
+}
+
 @Test func cancelledScanKeepsItsProgressAndResumes() async throws {
     let box = try ScanSandbox()
     for (index, level) in [-20.0, -23.0, -26.0].enumerated() {
@@ -511,30 +544,21 @@ private func counting(_ library: Library) -> Counter {
     let y = try #require(track(library, "y1.flac")?.albumID)
     let x = try #require(track(library, "x1.flac")?.albumID)
 
-    let reached = Mutex(false)
-    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    // The first track measured raises `reached` and holds its scan until `gate` is raised.
+    let reached = Signal()
+    let gate = Signal()
     library.loudnessHook.withLock {
         $0 = { _ in
-            reached.withLock { $0 = true }
-            await withCheckedContinuation { continuation in
-                let proceed = gate.withLock { state in
-                    if state.open { return true }
-                    state.waiter = continuation
-                    return false
-                }
-                if proceed { continuation.resume() }
-            }
+            reached.raise()
+            await gate.wait()
         }
     }
     let seen = Mutex<[Int]>([])
     let first = Task { await library.scanLoudness(albums: [x]) { done, _ in seen.withLock { $0.append(done) } } }
-    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await reached.wait()
     await library.scanLoudness(albums: [y]) { _, _ in }  // returns at once
     #expect(track(library, "y1.flac")?.loudness == nil)
-    gate.withLock { state in
-        state.open = true
-        state.waiter?.resume()
-    }
+    gate.raise()
     await first.value
     #expect(track(library, "x1.flac")?.loudness?.measuredLufs != nil)
     #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by the running scan's follow-up")
@@ -621,34 +645,26 @@ private func counting(_ library: Library) -> Counter {
     let y = try #require(track(library, "y1.flac")?.albumID)
     let x = try #require(track(library, "x1.flac")?.albumID)
 
-    let reached = Mutex(false)
-    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    // The first track measured raises `reached` and holds its scan until `gate` is raised.
+    let reached = Signal()
+    let gate = Signal()
     library.loudnessHook.withLock {
         $0 = { _ in
-            reached.withLock { $0 = true }
-            await withCheckedContinuation { continuation in
-                let proceed = gate.withLock { state in
-                    if state.open { return true }
-                    state.waiter = continuation
-                    return false
-                }
-                if proceed { continuation.resume() }
-            }
+            reached.raise()
+            await gate.wait()
         }
     }
+    let handoff = catchingHandoffs(library)
     let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
-    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await reached.wait()
     await library.scanLoudness(albums: [y]) { _, _ in }
     first.cancel()
-    gate.withLock { state in
-        state.open = true
-        state.waiter?.resume()
-    }
+    gate.raise()
     await first.value
-    for _ in 0..<300 where track(library, "y1.flac")?.loudness == nil {
-        try await Task.sleep(for: .milliseconds(20))
-    }
+    let fresh = try #require(handoff.task.withLock { $0 }, "the merged request is handed to a fresh scan")
+    await fresh.value
     #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "served by a fresh scan")
+    #expect(library.loudnessScan.withLock { !$0.running && $0.pending == nil })
 }
 
 /// How many albums have a failed second-phase attempt recorded against them.
@@ -798,38 +814,29 @@ private func setMode(_ mode: Int, _ url: URL) throws {
     let y1 = try #require(track(library, "y1.flac")?.id)
 
     let holder = TaskBox()
-    let reached = Mutex(false)
-    let gate = Mutex<(open: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    let reached = Signal()
+    let gate = Signal()
     library.loudnessHook.withLock {
         $0 = { id in
             if id == y1 { holder.task.withLock { $0 }?.cancel() }  // the follow-up is serving Y
             guard id == x1 else { return }
-            reached.withLock { $0 = true }
-            await withCheckedContinuation { continuation in
-                let proceed = gate.withLock { state in
-                    if state.open { return true }
-                    state.waiter = continuation
-                    return false
-                }
-                if proceed { continuation.resume() }
-            }
+            reached.raise()
+            await gate.wait()
         }
     }
+    let handoff = catchingHandoffs(library)
     let first = Task { await library.scanLoudness(albums: [x]) { _, _ in } }
     holder.task.withLock { $0 = first }
-    while !reached.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+    await reached.wait()
     await library.scanLoudness(albums: [y]) { _, _ in }  // merged into the running scan
-    gate.withLock { state in
-        state.open = true
-        state.waiter?.resume()
-    }
+    gate.raise()
     await first.value
-    func served() -> Bool { track(library, "y2.flac")?.loudness?.albumMeasuredLufs != nil }
-    func idle() -> Bool { library.loudnessScan.withLock { !$0.running && $0.pending == nil } }
-    for _ in 0..<400 where !served() || !idle() { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(track(library, "y1.flac")?.loudness?.measuredLufs != nil, "the cancelled follow-up stored y1")
+    let fresh = try #require(handoff.task.withLock { $0 }, "the request it was serving is handed to a fresh scan")
+    await fresh.value
     #expect(track(library, "y2.flac")?.loudness?.measuredLufs != nil, "y2, not reached by the cancelled pass")
-    #expect(served(), "Y gets its album value")
-    #expect(idle())
+    #expect(track(library, "y2.flac")?.loudness?.albumMeasuredLufs != nil, "Y gets its album value")
+    #expect(library.loudnessScan.withLock { !$0.running && $0.pending == nil })
 }
 
 /// R3-4: the meters a cancelled scan held are released, in either phase.

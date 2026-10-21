@@ -232,9 +232,10 @@ extension Library {
                     }
                 }
                 if let orphaned {
-                    Task.detached(priority: .background) { [self] in
+                    let fresh = Task.detached(priority: .background) { [self] in
                         await scanLoudness(albums: orphaned.albums.map(Array.init)) { _, _ in }
                     }
+                    loudnessHandoffHook.withLock { $0 }?(fresh)
                 }
                 next = nil
             } else {
