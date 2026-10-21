@@ -232,6 +232,55 @@ final class SoundUITests: XCTestCase {
         XCTAssertEqual(eq.value as? String, "0")
     }
 
+    /// Headphone correction from OPRA: the picker finds the HD 600 by searching, picking it switches correction on
+    /// with the author's credit in the row ("EQ by oratory1990", OPRA's terms), and the strip says Processing.
+    @MainActor
+    func testCorrectionPickerAppliesAPreset() {
+        let app = launch()
+        addTeardownBlock { @MainActor in Self.resetSound() }
+        let strip = app.descendants(matching: .any)["signalStrip"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 8))
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(Self.saysProcessing(app), "Pure by default, the strip reads \"\(strip.label)\"")
+
+        app.tabBars.buttons["Sound"].tap()
+        let pure = app.descendants(matching: .any)["pureSwitch"]
+        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        pure.tap()
+        expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
+        waitForExpectations(timeout: 2)
+
+        // The correction block sits below ReplayGain and the preamp.
+        let choose = app.buttons["chooseCorrectionButton"]
+        Self.reveal(choose, in: app)
+        XCTAssertTrue(choose.isHittable)
+        choose.tap()
+
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["opraHeader"].exists, "the picker shows OPRA's logo and link")
+        search.tap()
+        search.typeText("HD 600")
+        let hd600 = app.buttons["opraPreset-sennheiser:hd_600::oratory1990_harman_target"]
+        XCTAssertTrue(hd600.waitForExistence(timeout: 5))
+        XCTAssertTrue(hd600.label.contains("EQ by oratory1990"), "the row reads \"\(hd600.label)\"")
+        hd600.tap()
+
+        // The sheet closes onto the correction row, switched on, crediting the author.
+        let preset = app.descendants(matching: .any)["correctionPreset"]
+        XCTAssertTrue(preset.waitForExistence(timeout: 5))
+        XCTAssertTrue(preset.label.contains("Sennheiser HD 600"), "the row reads \"\(preset.label)\"")
+        XCTAssertTrue(preset.label.contains("EQ by oratory1990"), "the row reads \"\(preset.label)\"")
+        let toggle = app.descendants(matching: .any)["correctionToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 2))
+        XCTAssertEqual(toggle.value as? String, "1")
+
+        app.tabBars.buttons["Player"].tap()
+        expectation(for: NSPredicate { _, _ in Self.saysProcessing(app) }, evaluatedWith: nil)
+        waitForExpectations(timeout: 5)
+    }
+
     // MARK: Helpers
 
     /// Scrolls the list by `distance` points (negative moves the content up), dragging in the margin beside the
