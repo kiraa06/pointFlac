@@ -273,7 +273,8 @@ private let allStates: [SignalState] = [
 }
 
 @Test func titleNoteTable() {
-    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 48_000, port: .builtIn)) == "Resampled 96→48")
+    // A rate change gets no note: the details sheet states it.
+    #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 48_000, port: .builtIn)) == nil)
     #expect(SignalStrip.titleNote(state(96_000, 32, hardware: 96_000)) == "32→24-bit")
     #expect(SignalStrip.titleNote(state(96_000, 24, hardware: 96_000, processing: ["EQ"])) == "Processing")
     #expect(
@@ -325,12 +326,7 @@ private let allStates: [SignalState] = [
 }
 
 @Test func titleNoteIsSpokenWithoutArrows() {
-    #expect(
-        SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 48_000, port: .builtIn))
-            == "Resampled 96 to 48 kilohertz")
-    #expect(
-        SignalStrip.titleNoteSpoken(state(44_100, 16, hardware: 48_000, port: .builtIn))
-            == "Resampled 44.1 to 48 kilohertz")
+    #expect(SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 48_000, port: .builtIn)) == nil)
     #expect(SignalStrip.titleNoteSpoken(state(96_000, 32, hardware: 96_000)) == "Reduced from 32-bit to 24-bit")
     #expect(SignalStrip.titleNoteSpoken(state(96_000, 24, hardware: 96_000)) == nil)
 }
