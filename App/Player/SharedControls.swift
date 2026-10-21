@@ -14,6 +14,8 @@ struct SharedControls: View {
     var libraryEmpty = false
     var addFromFiles: () -> Void = {}
     var getMusic: () -> Void = {}
+    /// Shows the Sound tab, from the signal details.
+    var openSound: () -> Void = {}
 
     private var player: Player { playback.player }
 
@@ -21,7 +23,7 @@ struct SharedControls: View {
         VStack(alignment: .leading, spacing: 12) {
             titleBlock
                 .opacity(hidden ? 0 : 1)
-            SignalCells(signal: player.signal, theme: theme)
+            SignalCells(signal: player.signal, theme: theme, openSound: openSound)
             ProgressRow(playback: playback, theme: theme)
             transport
         }
@@ -294,6 +296,7 @@ struct WaveProgress: View {
 struct SignalCells: View {
     let signal: SignalState
     let theme: Theme
+    var openSound: (() -> Void)?
     @State private var details = false
 
     var body: some View {
@@ -339,7 +342,8 @@ struct SignalCells: View {
             .contentShape(Rectangle())
             .onTapGesture { details = true }
             .sheet(isPresented: $details) {
-                SignalDetailsSheet(signal: signal).presentationDetents([.medium, .large])
+                SignalDetailsSheet(signal: signal, openSound: sheetOpenSound)
+                    .presentationDetents([.medium, .large])
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spoken(text))
@@ -402,6 +406,15 @@ struct SignalCells: View {
         }
         .frame(maxWidth: fixed ? nil : .infinity, alignment: .leading)
         .fixedSize(horizontal: fixed, vertical: false)
+    }
+
+    /// Open Sound in the details: the sheet closes as the tab changes.
+    private var sheetOpenSound: (() -> Void)? {
+        guard let openSound else { return nil }
+        return {
+            details = false
+            openSound()
+        }
     }
 
     private func tint(_ value: String) -> Color? {

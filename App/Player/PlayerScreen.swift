@@ -45,7 +45,7 @@ struct PlayerScreen: View {
                     SharedControls(
                         playback: playback, theme: theme, upNextOpen: $upNextOpen,
                         hidden: handoff.hidesTitle, libraryEmpty: model.library.albums.isEmpty,
-                        addFromFiles: { importing = true }, getMusic: { tab = .getMusic })
+                        addFromFiles: { importing = true }, getMusic: { tab = .getMusic }, openSound: { tab = .sound })
                     Spacer(minLength: 0)
                     shelfPeek
                 }
