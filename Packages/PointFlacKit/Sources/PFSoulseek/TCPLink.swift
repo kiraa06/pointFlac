@@ -71,7 +71,9 @@ final class TCPLink: Sendable {
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 60
         let parameters = NWParameters(tls: nil, tcp: tcp)
-        let link = TCPLink(connection: NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters))
+        // IPv4 literals go through the resolver so IPv6-only (NAT64) networks get a reachable address.
+        let endpointHost = await AddressSynthesis.host(for: host)
+        let link = TCPLink(connection: NWConnection(host: endpointHost, port: nwPort, using: parameters))
         try await link.start(timeout: timeout)
         return link
     }
@@ -96,9 +98,9 @@ final class TCPLink: Sendable {
                     switch state {
                     case .ready:
                         once.resume(with: .success(()))
-                    case .waiting:
+                    case .waiting(let error):
                         // Refused or unreachable: Network.framework would retry forever, we give up at once.
-                        if once.resume(with: .failure(LinkError.refused)) { connection.cancel() }
+                        if once.resume(with: .failure(LinkError.failed("waiting: \(error)"))) { connection.cancel() }
                     case .failed(let error):
                         once.resume(with: .failure(LinkError.failed("\(error)")))
                     case .cancelled:
