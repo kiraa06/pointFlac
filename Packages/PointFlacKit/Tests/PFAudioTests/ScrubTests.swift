@@ -273,6 +273,36 @@ struct ScrubTests {
         #expect(abs(moved - 4_410) <= 512)
     }
 
+    /// Render-polish brief: every seek fades in, but the let-go's hand-over seek must not. The render thread cross-fades
+    /// from the voice into the ring's first frames there; faded in as well, they would dip the level by up to 2.5 dB.
+    @Test("Let go of a record turning at normal speed: the hand-over keeps the level, one cross-fade and no fade-in")
+    func handOverIsOneCrossFade() async {
+        let rig = ScrubRig()
+        #expect(await rig.startPlaying())
+        await rig.pull(4_410)
+        rig.player.beginScrub()
+        #expect(await rig.voiceTookOver())
+        // The hand turns the record at normal speed, so the voice plays at full level right up to the let-go.
+        var offset = 0.0
+        for _ in 0..<20 {
+            offset += 512.0 / 44_100
+            rig.player.scrub(offsetSeconds: offset, speed: 1)
+            await rig.pull(512)
+        }
+        let letGo = rig.output.capturedFloat.count / 2
+        #expect(await rig.settle(rig.player.endScrub(spinUpSeconds: 0.01)))
+        #expect(!rig.player.isScrubbing && rig.player.status == .playing)
+        await rig.pull(4_410)
+        // The level in every two periods from the let-go on: the motor, the voice, the cross-fade, then the ring.
+        let since = rig.lastLeft(rig.output.capturedFloat.count / 2 - letGo)
+        let window = 200
+        let quietest =
+            stride(from: 0, to: since.count - window, by: 50).map { rms(Array(since[$0..<($0 + window)])) }
+            .min() ?? 0
+        #expect(quietest > fullLevel * 0.9, "the level fell to \(quietest / fullLevel) of the tone's")
+        #expect(largestStep(since) < toneSlope * 1.5)
+    }
+
     @Test("Scrub a paused record: it sounds while turned, then stays paused where the hand left it")
     func scrubWhilePaused() async {
         let rig = ScrubRig()

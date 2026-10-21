@@ -54,8 +54,9 @@ public enum PipelineEvent: Sendable, Equatable {
 ///   negotiates the next item's rate, configures and starts the output for the new plan, and emits `.planChanged`.
 /// - Boundaries are markers keyed by absolute rendered frame. The render callback only counts frames; the decode
 ///   thread emits each event once `RenderSource.renderedFrames` reaches its marker.
-/// - A seek holds the output silent at once, then the decode thread flushes the ring through `RenderSource`'s
-///   handshake (never `reset()` while the output runs), seeks the decoder and refills. The newest request wins.
+/// - A seek fades out what was playing over 6 ms and then holds the output silent, while the decode thread flushes the
+///   ring through `RenderSource`'s handshake (never `reset()` while the output runs), seeks the decoder and refills;
+///   the new position fades in over 6 ms. The newest request wins.
 /// - A decoder error emits `.itemFailed` and playback moves to the next item.
 /// - The Sound chain (`setSound`) runs on the render thread over everything the output is handed, after the ring or
 ///   the scrub voice. It is compiled for the plan's client rate and channel count, afresh at every configure, before
@@ -184,23 +185,35 @@ public final class PlaybackPipeline: @unchecked Sendable {
 
     /// Seeks within the item being rendered.
     ///
-    /// Returns as soon as the request is registered, without waiting for audio: from then on nothing buffered before
-    /// the request is rendered, and audio from `frame` follows once the decode thread has flushed the ring and
-    /// refilled it, which needs the output to keep pulling. A newer seek supersedes one not yet served. A "Seek to
-    /// first frame" signpost interval runs from here to the first real frame at the new position.
+    /// Returns as soon as the request is registered, without waiting for audio. The seek is a short dip, never a
+    /// click: what was playing fades out over the ring's next `RenderSource.crossfadeSeconds` (6 ms), then the output
+    /// holds silent, and audio from `frame` follows once the decode thread has flushed the ring and refilled it (which
+    /// needs the output to keep pulling), fading in over the same 6 ms. Nothing else buffered before the request is
+    /// rendered. The fade-out comes before the jump, so it adds its 6 ms (and up to one render callback) to the seek's
+    /// latency; its frames are the old position's, and the position reports `frame` throughout. A newer seek supersedes
+    /// one not yet served. A "Seek to first frame" signpost interval runs from here to the first real frame at the new
+    /// position.
     public func seek(toFrame frame: Int64) async {
-        core.seek(toFrame: frame, firstFrame: FirstFrameInterval(.seek), fadeIn: false)
+        core.seek(toFrame: frame, firstFrame: FirstFrameInterval(.seek), fadeIn: true)
     }
 
     /// `seek(toFrame:)` with the caller's own interval, begun when its request came in.
     func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
+        core.seek(toFrame: frame, firstFrame: firstFrame, fadeIn: true)
+    }
+
+    /// The seek behind a scrub's hand-over (`Player.endScrub`): the ring lined up ahead of the needle while the voice
+    /// plays. It does not fade in: the render thread cross-fades from the voice into the ring's first frames, and a
+    /// fade-in under that cross-fade would dip the level. Nothing fades out either, since the voice, not the ring, is
+    /// playing.
+    func handOver(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
         core.seek(toFrame: frame, firstFrame: firstFrame, fadeIn: false)
     }
 
     /// A seek to where playback is, so the item playing is decoded afresh, at the gains `setGains` holds now (ruling
-    /// R4-T12a: a switch of Pure, or of ReplayGain on or off, is heard at once). It is the seek path: the output holds
-    /// silent at once, the ring is flushed and refilled from `frame`. Unlike a seek, the new audio fades in, over
-    /// `RenderSource.crossfadeSeconds`, so it does not start with a step. A newer seek or re-cue supersedes it.
+    /// R4-T12a: a switch of Pure, or of ReplayGain on or off, is heard at once). It is the seek path, its dip included:
+    /// what was playing fades out, the output holds silent, the ring is flushed and refilled from `frame`, and the new
+    /// audio fades in over `RenderSource.crossfadeSeconds`. A newer seek or re-cue supersedes it.
     func recue(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
         core.seek(toFrame: frame, firstFrame: firstFrame, fadeIn: true)
     }
@@ -307,7 +320,7 @@ final class PipelineCore: @unchecked Sendable {
         var requestedSeek: Int64?
         /// `requestedSeek`'s signpost interval, taken by the decode thread with it.
         var seekInterval: FirstFrameInterval?
-        /// Whether `requestedSeek` is a re-cue (`recue(toFrame:firstFrame:)`), whose audio fades in.
+        /// Whether `requestedSeek`'s audio fades in: every seek's and re-cue's, not a scrub hand-over's.
         var seekFadesIn = false
         /// The Sound settings, clamped: compiled whenever they change, and at every configure for the new format.
         var soundSettings = SoundSettings()

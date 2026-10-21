@@ -125,6 +125,28 @@ private func mixed(
     return out
 }
 
+/// A seek's (or a re-cue's) fade-out and fade-in at 48 kHz: 6 ms, 288 frames. Not the crossfade's own length.
+private let seekFade = RenderSource.fadeFrames(atRate: 48_000)
+
+/// What a seek puts in a stereo capture at 48 kHz after the frames pulled before it: the first `seekFade` frames of
+/// `old` (what was playing) faded out on the raised cosine (`RenderSource.seekFadeGain`), then `new`, its first
+/// `seekFade` frames faded in linearly. Both are interleaved samples from those two points on.
+private func seekDip(old: some Collection<Float>, new: some Collection<Float>) -> [Float] {
+    var out: [Float] = []
+    for (i, x) in old.prefix(2 * seekFade).enumerated() {
+        out.append(x * RenderSource.seekFadeGain(i / 2, of: seekFade))
+    }
+    for (i, x) in new.enumerated() {
+        out.append(i / 2 < seekFade ? x * (Float(i / 2) / Float(seekFade)) : x)
+    }
+    return out
+}
+
+/// Waits without pulling while the decode thread runs ahead, so the ring holds the 6 ms a seek's fade-out plays.
+private func letTheRingFill() async {
+    try? await Task.sleep(for: .milliseconds(50))
+}
+
 /// Native-range samples as the Float32 client receives them: v / 2^(b−1).
 private func floats(_ samples: some Sequence<Int32>, bits: Int) -> [Float] {
     let scale = Float(1 << (bits - 1))
@@ -693,7 +715,8 @@ private final class PlayerRig {
     /// item's, the seek lands in it, and nothing of the outgoing item plays again: it is cut off, and its
     /// `trackEnded` fires at the seek. That holds whether the decode thread is still mixing (60 000) or past the
     /// overlap's end (90 000). A seek before the overlap is heard (40 000), with the decode thread mixing ahead in the
-    /// ring, lands in the outgoing item, which overlaps afresh when its end comes round again.
+    /// ring, lands in the outgoing item, which overlaps afresh when its end comes round again. Either way the seek is
+    /// the usual dip: the 6 ms of what was playing fade out, then the target fades in alone.
     @Test(arguments: [60_000, 90_000, 40_000])
     func aSeekDuringAnOverlapEndsIt(pulledTo: Int) async {
         let a = tone(440, seconds: 2)
@@ -701,19 +724,22 @@ private final class PlayerRig {
         let rig = PipelineRig(["a": a, "b": b])
         await rig.pipeline.start([rig.item("a"), rig.item("b")], at: 0, fromFrame: 0, crossfade: always(1))
         #expect(await rig.puller.pull(upTo: pulledTo))
-        // The decode thread runs ahead into, or past, the overlap.
-        try? await Task.sleep(for: .milliseconds(30))
+        // The decode thread runs ahead into, or past, the overlap, and fills the ring for the fade-out.
+        await letTheRingFill()
         let heard = pulledTo >= 48_000
         let target: Int64 = heard ? 30_000 : 20_000
         let mark = rig.captured.count
         await rig.pipeline.seek(toFrame: target)
         #expect(rig.pipeline.position == (heard ? 1 : 0, target))
         #expect(await rig.playToEnd(), "events: \(rig.log.events)")
-        let want =
+        let uninterrupted =
+            plain(a, 0..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 48_000) + plain(b, 48_000..<96_000)
+        let after =
             heard
             ? plain(b, target..<96_000)
             : plain(a, target..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 48_000)
                 + plain(b, 48_000..<96_000)
+        let want = seekDip(old: uninterrupted[(2 * pulledTo)...], new: after)
         #expect(mismatch(Array(rig.captured[mark...]), want) == nil)
         #expect(
             rig.log.events == [
@@ -721,6 +747,62 @@ private final class PlayerRig {
                 .trackEnded(1), .queueEnded,
             ])
         #expect(!rig.pipeline.crossfadePending)
+    }
+
+    /// The overlap's `aSeekJustBeforeAGaplessJoinStaysInItsItem`: a seek asked within the 6 ms before an overlap's
+    /// start plays its fade-out into the mixed audio, whose frames are not counted, so the overlap's `trackStarted`
+    /// is never reached and the seek stays in the outgoing item. That item replays from the target, overlapping
+    /// afresh at its end, and the incoming item's `trackStarted` fires once, there.
+    @Test func aSeekJustBeforeAnOverlapStaysInItsItem() async {
+        let a = tone(440, seconds: 2)
+        let b = tone(660, seconds: 2)
+        let rig = PipelineRig(["a": a, "b": b])
+        await rig.pipeline.start([rig.item("a"), rig.item("b")], at: 0, fromFrame: 0, crossfade: always(1))
+        let short = 100
+        #expect(short < seekFade)
+        #expect(await rig.puller.pull(upTo: 48_000 - short))
+        await letTheRingFill()
+        let mark = rig.captured.count
+        await rig.pipeline.seek(toFrame: 1000)
+        #expect(await rig.puller.pull(upTo: 48_000 - short + seekFade + 512))
+        #expect(rig.pipeline.position == (0, 1512), "the seek stayed in the outgoing item")
+        #expect(!rig.log.contains(rig.started(1, "b")))
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        // The fade-out: the outgoing item's last 100 plain frames, then the overlap's first 188, mixed.
+        let across = plain(a, Int64(48_000 - short)..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 48_000)
+        let after =
+            plain(a, 1000..<48_000) + mixed(a, from: 48_000, b, from: 0, frames: 48_000) + plain(b, 48_000..<96_000)
+        #expect(mismatch(Array(rig.captured[mark...]), seekDip(old: across, new: after)) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), rig.started(0, "a"), rig.started(1, "b"), .trackEnded(0),
+                .trackEnded(1), .queueEnded,
+            ])
+    }
+
+    /// A seek into the last fade's worth of an item overlaps at once, for what is left of it (16 000 frames here), and
+    /// its 6 ms fade-in is on what is heard: the mix, each side at its own gain, faded in as one.
+    @Test func aSeekIntoTheFadeOverlapsAtOnceAndFadesInTheMix() async {
+        let a = noise(10, seconds: 2)
+        let b = noise(11, seconds: 2)
+        let rig = PipelineRig(["a": a, "b": b])
+        await rig.pipeline.start(
+            [rig.item("a", gainDb: halfDb), rig.item("b", gainDb: -3)], at: 0, fromFrame: 0, crossfade: always(1))
+        #expect(await rig.puller.pull(upTo: 10_000))
+        await letTheRingFill()
+        let mark = rig.captured.count
+        await rig.pipeline.seek(toFrame: 80_000)
+        #expect(await rig.playToEnd(), "events: \(rig.log.events)")
+        let after =
+            mixed(a, from: 80_000, gainDb: halfDb, b, from: 0, gainDb: -3, frames: 16_000)
+            + plain(b, 16_000..<96_000, gainDb: -3)
+        let want = seekDip(old: plain(a, 10_000..<(10_000 + Int64(seekFade)), gainDb: halfDb), new: after)
+        #expect(mismatch(Array(rig.captured[mark...]), want) == nil)
+        #expect(
+            rig.log.events == [
+                .planChanged(floatPlan(48_000)), rig.started(0, "a"), rig.started(1, "b"), .trackEnded(0),
+                .trackEnded(1), .queueEnded,
+            ])
     }
 
     /// A stop during an overlap stops it like any other playback: the output stops, the decode thread unwinds, the
@@ -815,7 +897,7 @@ private final class PlayerRig {
 
     /// Pure set during an overlap is heard at once. Both items count as entered, so a gain on either re-cues, and so
     /// does the overlap itself when neither has one (Pure plays no crossfade). The re-cue ends the overlap: from one
-    /// buffer after it, the incoming item plays alone, ungained, to the bit, from where playback had reached.
+    /// buffer after its dip, the incoming item plays alone, ungained, to the bit, from where playback had reached.
     @Test(arguments: [(halfDb, halfDb), (halfDb, 0.0), (0.0, halfDb), (0.0, 0.0)] as [(Double, Double)])
     func aSwitchDuringAnOverlapReachesBoth(outgoingGainDb: Double, incomingGainDb: Double) async {
         let a = noise(7, seconds: 2)
@@ -833,16 +915,18 @@ private final class PlayerRig {
         #expect(pipeline.enteredGains.map(\.index) == [0, 1])
         #expect(pipeline.enteredGains.map(\.gainDb) == [outgoingGainDb, incomingGainDb])
         #expect(pipeline.crossfadePending)
+        await letTheRingFill()
         rig.player.setSound(SoundSettings())
         await rig.drained()
         #expect(rig.player.recueCount == 1)
-        #expect(await rig.puller.pull(upTo: 60_000 + 8192))
+        #expect(await rig.puller.pull(upTo: 60_000 + seekFade + 8192))
         let captured = rig.output.capturedFloat
         var got: [Float] = []
         var want: [Float] = []
+        // Past the re-cue's dip (the overlap's 6 ms fading out, then the fade-in) and the chain's fade to Pure.
         for k in 512..<8192 {
             for c in 0..<2 {
-                got.append(captured[2 * (60_000 + k) + c])
+                got.append(captured[2 * (60_000 + seekFade + k) + c])
                 want.append(b.float(Int64(12_000 + k), channel: c))
             }
         }

@@ -299,7 +299,8 @@ public final class Player {
     /// - Switching Pure on or off, or ReplayGain on or off (`.off` to a mode or back), is heard at once (rulings
     ///   R4-T12a and R4-T12b): when it changes the gain of any item the pipeline has entered and not yet played out
     ///   (the one rendering, or one already joined behind it in the ring), playback is re-cued where it is
-    ///   (`recueIfGainsDiffer`), a short gap with a fade-in, and the Sound chain changes behind the re-cue's hold.
+    ///   (`recueIfGainsDiffer`), a short dip like any seek's (6 ms out, a gap, 6 ms in), and the Sound chain changes
+    ///   behind the re-cue's hold.
     ///   When it does not (Pure toggled with ReplayGain off, or items that get 0 dB either way), nothing is re-cued.
     /// - Any other ReplayGain change (mode, preamp, clipping prevention, reference) applies from the next item the
     ///   pipeline enters, and on any seek: the item playing keeps its level, and the strip keeps listing ReplayGain
@@ -775,8 +776,9 @@ public final class Player {
             position = item.duration(ofFrames: target)
             nowPlaying.show(item, elapsed: position, playing: true)
             run.engine.seeksInFlight += 1
+            // The hand-over's seek, which does not fade in: the render thread cross-fades into the ring there.
             await run.engine.enqueue { pipeline in
-                await pipeline.seek(toFrame: target, firstFrame: FirstFrameInterval(.seek))
+                await pipeline.handOver(toFrame: target, firstFrame: FirstFrameInterval(.seek))
             }.value
             run.engine.seeksInFlight -= 1
             // Only now, with the seek's hold in place: before it, the ring still holds the audio from before the

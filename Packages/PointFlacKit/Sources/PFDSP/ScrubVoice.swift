@@ -10,6 +10,9 @@ import Foundation
 ///   read speed (and so the pitch) glides instead of stepping, and lands where the hand stopped.
 /// - ``ScrubVoice`` runs them per output frame, extrapolating the hand between touches, with a motor mode for the
 ///   spin-up after release, and the stylus's behaviour near rest: the level fades out, so a still record is silent.
+///
+/// What runs per frame is free of runtime calls in a debug build too: `while` loops, not for-in (whose iterator looks up
+/// generic metadata at -Onone), and `floor` and `ceil`, not `rounded(_:)` (which calls its rule's metadata accessor).
 
 /// Kaiser-windowed sinc interpolation over a ring of interleaved Float32 frames.
 public struct ScrubKernel: @unchecked Sendable {
@@ -55,7 +58,7 @@ public struct ScrubKernel: @unchecked Sendable {
 
     /// Frames either side of the read position that `read` touches at `cutoff`.
     public static func reach(cutoff: Double) -> Int {
-        Int((Double(halfWidth) / cutoff).rounded(.up))
+        Int(ceil(Double(halfWidth) / cutoff))
     }
 
     /// Writes `channels` samples interpolated at the fractional source frame `position` into `out`.
@@ -69,10 +72,14 @@ public struct ScrubKernel: @unchecked Sendable {
         into out: UnsafeMutablePointer<Float>
     ) {
         let reach = Self.reach(cutoff: cutoff)
-        let base = Int(position.rounded(.down))
+        let base = Int(floor(position))
         let frac = position - Double(base)
         let scale = cutoff * Double(Self.oversample)
-        for c in 0..<channels { out[c] = 0 }
+        var c = 0
+        while c < channels {
+            out[c] = 0
+            c += 1
+        }
         var sum = 0.0
         var n = 1 - reach
         while n <= reach {
@@ -82,14 +89,22 @@ public struct ScrubKernel: @unchecked Sendable {
                 let t = Float(d - Double(i))
                 let w = table[i] + (table[i + 1] - table[i]) * t
                 let source = ring + ((base + n) & mask) * channels
-                for c in 0..<channels { out[c] += w * source[c] }
+                c = 0
+                while c < channels {
+                    out[c] += w * source[c]
+                    c += 1
+                }
                 sum += Double(w)
             }
             n += 1
         }
         guard sum != 0 else { return }
         let gain = Float(1 / sum)
-        for c in 0..<channels { out[c] *= gain }
+        c = 0
+        while c < channels {
+            out[c] *= gain
+            c += 1
+        }
     }
 
     /// The zeroth-order modified Bessel function of the first kind, by its power series (for the Kaiser window).
@@ -190,7 +205,7 @@ public struct ScrubVoice: Sendable {
     ///   - position: the source frame under the needle.
     ///   - speed: the platter speed it is already turning at (1 when playing, 0 when stopped).
     public init(channels: Int, sourceRate: Double, outputRate: Double, at position: Double, speed: Double = 0) {
-        precondition((1...8).contains(channels), "ScrubVoice handles 1 to 8 channels")
+        precondition(channels >= 1 && channels <= 8, "ScrubVoice handles 1 to 8 channels")
         self.channels = channels
         nominal = sourceRate / outputRate
         self.outputRate = outputRate
@@ -230,23 +245,33 @@ public struct ScrubVoice: Sendable {
     public mutating func render(
         ring: UnsafePointer<Float>, mask: Int, valid: Range<Int64>, frames: Int, into out: UnsafeMutablePointer<Float>
     ) {
-        for i in 0..<frames {
+        var i = 0
+        while i < frames {
             let frame = out + i * channels
             let advance = follower.velocity
             let cutoff = ScrubKernel.cutoff(forAdvance: advance)
             let reach = Int64(ScrubKernel.reach(cutoff: cutoff))
-            let base = Int64(follower.position.rounded(.down))
+            let base = Int64(floor(follower.position))
+            var c = 0
             if base + 1 - reach >= valid.lowerBound, base + reach < valid.upperBound {
                 kernel.read(
                     ring: ring, mask: mask, channels: channels, position: follower.position, cutoff: cutoff,
                     into: frame)
             } else {
-                for c in 0..<channels { frame[c] = 0 }
+                while c < channels {
+                    frame[c] = 0
+                    c += 1
+                }
             }
             let target = Float(min(1, abs(advance / nominal) / Self.quietBelow))
             level += (target - level) * levelCoefficient
-            for c in 0..<channels { frame[c] *= level }
+            c = 0
+            while c < channels {
+                frame[c] *= level
+                c += 1
+            }
             step()
+            i += 1
         }
     }
 

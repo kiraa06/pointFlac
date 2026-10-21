@@ -161,6 +161,20 @@ private func runStress(total: Int, capacity: Int, chunks: ClosedRange<Int>, spin
         #expect(read(ring, count: 16) == [100, 101, 102])
     }
 
+    /// `skip` drops what `read` would read next, in order and across the physical end, never more than is buffered,
+    /// and frees the slots for the producer.
+    @Test func skipDropsWhatReadWouldReadNext() {
+        let ring = SampleRing<Int32>(capacity: 8)
+        #expect(write(ring, Array(0..<6)) == 6)
+        #expect(ring.skip(4) == 4)
+        #expect(write(ring, Array(6..<12)) == 6)
+        #expect(ring.skip(3) == 3)
+        #expect(read(ring, count: 2) == [7, 8])
+        #expect(ring.skip(100) == 3, "only what is buffered")
+        #expect(ring.availableToRead == 0 && ring.availableToWrite == 8)
+        #expect(ring.skip(1) == 0)
+    }
+
     @Test func staleTailNeverLetsWriteExceedCapacity() {
         let capacity = 16
         let ring = SampleRing<Int32>(capacity: capacity)
