@@ -42,6 +42,18 @@ public final class Library: Sendable {
         (catalog: LibraryCatalog, subscribers: [UUID: AsyncStream<LibraryCatalog>.Continuation])
     >((.empty, [:]))
     private let repairScheduled = Mutex(false)
+    /// For tests: how many files the loudness scan has opened to decode.
+    let loudnessDecodes = Mutex(0)
+    /// A loudness scan is running (`scanLoudness` runs one at a time), and what was asked for meanwhile.
+    let loudnessScan = Mutex<(running: Bool, pending: LoudnessRequest?)>((false, nil))
+    /// For tests: finished meters the scan holds to pool an album, now and at most.
+    let loudnessMeters = Mutex<(current: Int, peak: Int)>((0, 0))
+    /// For tests: called after each decoded chunk of a loudness scan.
+    let loudnessChunkHook = Mutex<(@Sendable () -> Void)?>(nil)
+    /// For tests: every album pool fails, as libebur128's would if it could not pool the meters.
+    let loudnessPoolFault = Mutex(false)
+    /// For tests: awaited after each track's measurement, before it is stored.
+    let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.
     private let publishedCount = Mutex(0)
     static let logger = Logger(subsystem: "io.github.kiraa06.pointflac", category: "library")
@@ -207,6 +219,18 @@ public final class Library: Sendable {
     /// For tests: how many catalogs have been published since the library opened.
     var publishCount: Int { publishedCount.withLock { $0 } }
 
+    /// For tests: every track's `r128_state` (0 not measured, 1 measured, 2 unmeasurable), by track ID.
+    func loudnessStates() async -> [String: Int] {
+        let rows = (try? await run(.never) { try $0.database.query("SELECT id, r128_state FROM tracks") }) ?? []
+        return Dictionary(
+            uniqueKeysWithValues: rows.compactMap { row in row[0].string.map { ($0, Int(row[1].int ?? -1)) } })
+    }
+
+    /// For tests: lowers the largest album the loudness scan pools.
+    func setMaxLoudnessAlbum(_ cap: Int) async {
+        _ = try? await run(.never) { $0.maxAlbumTracks = cap }
+    }
+
     /// For tests: lowers the per-folder file cap.
     func setMaxFilesPerFolder(_ cap: Int) async {
         _ = try? await run(.never) { $0.maxFilesPerFolder = cap }
@@ -235,7 +259,7 @@ public final class Library: Sendable {
     }
 
     /// When a call publishes a catalog: never (reads), always (a folder removed), or if its scan changed something.
-    private enum Publish {
+    enum Publish {
         case never
         case always
         case ifChanged
@@ -243,7 +267,7 @@ public final class Library: Sendable {
 
     /// Runs `body` on the library's queue; then, when `rule` says the result changed the library, publishes the
     /// catalog before the caller resumes, so `current` already shows what the call did.
-    private func run<T: Sendable>(
+    func run<T: Sendable>(
         _ rule: Publish, _ body: @escaping @Sendable (LibraryStore) throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -280,7 +304,7 @@ public final class Library: Sendable {
         for subscriber in subscribers { subscriber.yield(catalog) }
     }
 
-    private static func log(_ error: any Error, during operation: String) {
+    static func log(_ error: any Error, during operation: String) {
         let code = (error as? LibraryDatabaseError).map { String($0.code) } ?? "-"
         logger.error(
             "\(operation, privacy: .public) failed (code \(code, privacy: .public)): \(String(describing: error), privacy: .private)"

@@ -126,6 +126,34 @@ final class LibraryStore {
             mtime REAL NOT NULL,
             PRIMARY KEY(folder_id, rel_path));
         """,
+        // v4: loudness. The ReplayGain tags (gains in dB, peaks linear), the scan's per-track measurement (LUFS and
+        // true peak, linear), and the scan's per-album measurement. `r128_state` says where a track is: 0 not
+        // measured, 1 measured, 2 unmeasurable (a sample rate the meter does not take): state 1 with `r128_lufs`
+        // NULL is a track with no integrated loudness (silent, or shorter than one 400 ms gating block). A track's
+        // state returns to 0 when its file's size or modification date changes (and goes with the track).
+        // `album_loudness.members` is a hash of the album's sorted track IDs when it was measured; the catalog
+        // serves the value only while the album's tracks still hash to it. `album_attempts` remembers, per album, the
+        // tracks and files (sizes and dates) a second-phase pool failed on with every track read, so it is not tried
+        // again until a track or a file changes. A track's own failure is never recorded there: the track goes back
+        // to state 0 (or to 2). (A same-length audio edit past ContentIdentity's first 64 KiB, by an
+        // encoder that writes no MD5, also changes the date, so it too loses its measurement.)
+        """
+        ALTER TABLE tracks ADD COLUMN rg_track_gain REAL;
+        ALTER TABLE tracks ADD COLUMN rg_track_peak REAL;
+        ALTER TABLE tracks ADD COLUMN rg_album_gain REAL;
+        ALTER TABLE tracks ADD COLUMN rg_album_peak REAL;
+        ALTER TABLE tracks ADD COLUMN r128_lufs REAL;
+        ALTER TABLE tracks ADD COLUMN r128_peak REAL;
+        ALTER TABLE tracks ADD COLUMN r128_state INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE album_loudness(
+            album_id TEXT PRIMARY KEY,
+            lufs REAL,
+            peak REAL NOT NULL,
+            members TEXT NOT NULL);
+        CREATE TABLE album_attempts(
+            album_id TEXT PRIMARY KEY,
+            members TEXT NOT NULL);
+        """,
     ]
 
     /// Probed files per transaction: each batch is committed and published, so a scan killed part-way keeps what it
@@ -328,6 +356,7 @@ final class LibraryStore {
             }
             try database.query(
                 "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+            try dropOrphanAlbumLoudness()
         }
         let keep = Set(try database.query("SELECT id FROM artwork").compactMap { $0[0].string })
         artwork.removeAll(except: keep)
@@ -583,22 +612,33 @@ final class LibraryStore {
             .integer(Int64(probed.format.sampleRate)), .integer(Int64(probed.format.bitsPerSample)),
             .integer(Int64(probed.format.channels)), .integer(probed.totalFrames), .text(albumID),
             .optional(artworkID),
+            .optional(probed.trackGainDb), .optional(probed.trackPeak), .optional(probed.albumGainDb),
+            .optional(probed.albumPeak),
         ]
         if insert {
             try database.query(
                 """
                 INSERT INTO tracks(folder_id, rel_path, size, mtime, content_id, title, artist, album_artist, album,
-                    disc, track, year, sample_rate, bits, channels, total_frames, album_id, artwork_id, added_at, id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    disc, track, year, sample_rate, bits, channels, total_frames, album_id, artwork_id,
+                    rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, added_at, id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, values + [.real(Date().timeIntervalSince1970), .text(id)])
         } else {
             try database.query(
                 """
                 UPDATE tracks SET folder_id = ?, rel_path = ?, size = ?, mtime = ?, content_id = ?, title = ?,
                     artist = ?, album_artist = ?, album = ?, disc = ?, track = ?, year = ?, sample_rate = ?, bits = ?,
-                    channels = ?, total_frames = ?, album_id = ?, artwork_id = ?
+                    channels = ?, total_frames = ?, album_id = ?, artwork_id = ?, rg_track_gain = ?,
+                    rg_track_peak = ?, rg_album_gain = ?, rg_album_peak = ?,
+                    r128_lufs = CASE WHEN size = ? AND mtime = ? THEN r128_lufs END,
+                    r128_peak = CASE WHEN size = ? AND mtime = ? THEN r128_peak END,
+                    r128_state = CASE WHEN size = ? AND mtime = ? THEN r128_state ELSE 0 END
                 WHERE id = ?
-                """, values + [.text(id)])
+                """,
+                values + [
+                    .integer(file.size), .real(file.modified), .integer(file.size), .real(file.modified),
+                    .integer(file.size), .real(file.modified), .text(id),
+                ])
         }
     }
 
@@ -712,7 +752,7 @@ final class LibraryStore {
     }
 
     /// An iCloud file whose bytes are not on the device. Reading it would block on the download.
-    private static func isNotDownloaded(_ url: URL) -> Bool {
+    static func isNotDownloaded(_ url: URL) -> Bool {
         guard
             let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
             values.isUbiquitousItem == true, let status = values.ubiquitousItemDownloadingStatus
@@ -773,6 +813,7 @@ final class LibraryStore {
             // As `removeGone` does after a scan: the rows first, in the transaction, then the files.
             try database.query(
                 "DELETE FROM artwork WHERE id NOT IN (SELECT artwork_id FROM tracks WHERE artwork_id IS NOT NULL)")
+            try dropOrphanAlbumLoudness()
         }
         // Committed: nothing below throws, so the removal is always published. Should the covers that stay be
         // unreadable, their files are left for the next scan's sweep rather than every cover deleted.
@@ -835,15 +876,187 @@ final class LibraryStore {
         }
     }
 
+    // MARK: Loudness
+
+    /// An album's measurements are meaningless once no track is in it.
+    private func dropOrphanAlbumLoudness() throws {
+        try database.query("DELETE FROM album_loudness WHERE album_id NOT IN (SELECT album_id FROM tracks)")
+        try database.query("DELETE FROM album_attempts WHERE album_id NOT IN (SELECT album_id FROM tracks)")
+    }
+
+    /// The largest album the scan pools into an album value (`LoudnessScanner.maxAlbumTracks`; a test lowers it).
+    var maxAlbumTracks = LoudnessScanner.maxAlbumTracks
+
+    private struct AlbumState {
+        struct Member {
+            var id: String
+            /// Where to read it now: nil when the file is evicted to iCloud or its folder is not found this launch.
+            var url: URL?
+            var tagged: Bool
+            var state: Int
+            /// The file's size and date, as the library last saw them.
+            var file: String
+        }
+        var id: String
+        var members: [Member]
+        var hash: String
+        /// Covers the track set and each track's file, size and date (`attemptKey`), so a change in either lifts a
+        /// recorded attempt's block. Not the states: the second phase only runs, and so only records or checks a
+        /// key, when every track is measured, so they would always read the same.
+        var attemptKey: String
+        var attempted: Bool
+        var current: Bool
+    }
+
+    private func albumStates(only: [String]?) throws -> [AlbumState] {
+        let rows = try database.query(
+            """
+            SELECT id, folder_id, rel_path, album_id, rg_track_gain IS NOT NULL OR rg_album_gain IS NOT NULL,
+                r128_state, cloud_pending, size, mtime FROM tracks ORDER BY album_id, disc, track, id
+            """)
+        let filter = only.map(Set.init)
+        var order: [String] = []
+        var members: [String: [AlbumState.Member]] = [:]
+        for row in rows {
+            guard let id = row[0].string, let folder = row[1].int, let path = row[2].string,
+                let album = row[3].string, filter?.contains(album) ?? true
+            else { continue }
+            if members[album] == nil { order.append(album) }
+            let onDevice = row[6].int != 1
+            members[album, default: []].append(
+                AlbumState.Member(
+                    id: id, url: onDevice ? roots[folder]?.appending(path: path) : nil, tagged: row[4].int == 1,
+                    state: Int(row[5].int ?? 0), file: "\(row[7].int ?? -1):\(row[8].double ?? -1)"))
+        }
+        let values = try storedAlbumHashes("album_loudness")
+        let attempts = try storedAlbumHashes("album_attempts")
+        return order.compactMap { album in
+            guard let all = members[album] else { return nil }
+            let hash = Self.membersHash(all.map(\.id))
+            let key = Self.membersHash(all.map { "\($0.id):\($0.file)" })
+            return AlbumState(
+                id: album, members: all, hash: hash, attemptKey: key, attempted: attempts[album] == key,
+                current: values[album] == hash)
+        }
+    }
+
+    private func storedAlbumHashes(_ table: String) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for row in try database.query("SELECT album_id, members FROM \(table)") {
+            if let album = row[0].string, let hash = row[1].string { result[album] = hash }
+        }
+        return result
+    }
+
+    /// Phase 1 of the loudness scan: the tracks no scan has measured yet, in every album that is not fully tagged
+    /// (a tagged track in a mixed album is measured too, for the album value). Only unmeasured, readable tracks are
+    /// planned, so a track is never decoded twice for this phase, however large its album. Small albums go first,
+    /// so one huge album cannot starve the rest. `pool` is set when the pass measures the whole album, so the album
+    /// value can be pooled from the meters without decoding anything again.
+    func loudnessJobs(albums only: [String]?) throws -> [LoudnessJob] {
+        var jobs: [LoudnessJob] = []
+        for album in try albumStates(only: only) where !album.members.allSatisfy(\.tagged) {
+            let todo = album.members.filter { $0.state == 0 && $0.url != nil }
+            guard !todo.isEmpty else { continue }
+            let capped = album.members.count > maxAlbumTracks
+            if capped {
+                Library.logger.info(
+                    "Loudness: album of \(album.members.count, privacy: .public) tracks is measured per track, with no album value"
+                )
+            }
+            jobs.append(
+                LoudnessJob(
+                    albumID: album.id, tracks: todo.compactMap { m in m.url.map { .init(id: m.id, url: $0) } },
+                    membersHash: album.hash, attemptKey: album.attemptKey,
+                    pool: todo.count == album.members.count && !capped))
+        }
+        return jobs.sorted { ($0.tracks.count, $0.albumID) < ($1.tracks.count, $1.albumID) }
+    }
+
+    /// Phase 2: the albums to pool by decoding their tracks again, because some were measured by an earlier scan.
+    /// An album qualifies when every track is measured and readable now, it is within `maxAlbumTracks` (the cap
+    /// is checked here, each time, so an album over it needs no record), its value is missing or was taken over
+    /// another set of tracks, and no pool over these very files has failed. A fully tagged album never qualifies.
+    func poolJobs(albums only: [String]?) throws -> [LoudnessJob] {
+        let jobs: [LoudnessJob] = try albumStates(only: only).compactMap { album in
+            guard !album.members.allSatisfy(\.tagged), !album.current, !album.attempted,
+                album.members.count <= maxAlbumTracks, album.members.allSatisfy({ $0.state == 1 && $0.url != nil })
+            else { return nil }
+            return LoudnessJob(
+                albumID: album.id, tracks: album.members.compactMap { m in m.url.map { .init(id: m.id, url: $0) } },
+                membersHash: album.hash, attemptKey: album.attemptKey, pool: true)
+        }
+        // Small albums first, like phase 1: one large stale album cannot keep the rest waiting.
+        return jobs.sorted { ($0.tracks.count, $0.albumID) < ($1.tracks.count, $1.albumID) }
+    }
+
+    /// Identifies an album's set of tracks, whatever order they come in.
+    private static func membersHash(_ ids: [String]) -> String {
+        StableHash.hex(of: Array(ids.sorted().joined(separator: "\u{1F}").utf8))
+    }
+
+    /// Stores one track's result. State 1 is measured, with `lufs` nil when it has no integrated loudness; state 2 is
+    /// unmeasurable (no values). A track removed since the scan planned it has no row to update, so nothing is
+    /// written: false. Never inserts.
+    func recordLoudness(trackID: String, state: Int, lufs: Double?, peak: Double?) throws -> Bool {
+        try database.query(
+            "UPDATE tracks SET r128_state = ?, r128_lufs = ?, r128_peak = ? WHERE id = ?",
+            [.integer(Int64(state)), .optional(lufs), .optional(peak), .text(trackID)])
+        return try database.query("SELECT changes()").first?.first?.int == 1
+    }
+
+    /// Puts a measured track back to state 0, keeping its values: the second phase could not read it, so the next
+    /// scan's first phase measures it again, and its album is pooled once it has been.
+    func recordUnread(trackID: String) throws {
+        try database.query("UPDATE tracks SET r128_state = 0 WHERE id = ? AND r128_state = 1", [.text(trackID)])
+    }
+
+    /// Stores an album's measurement, only while the album still has tracks. An attempt recorded against the album
+    /// before goes: it was over other tracks or files.
+    func recordAlbumLoudness(albumID: String, lufs: Double?, peak: Double, members: String) throws {
+        try database.query(
+            """
+            INSERT OR REPLACE INTO album_loudness(album_id, lufs, peak, members)
+            SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE album_id = ?)
+            """, [.text(albumID), .optional(lufs), .real(peak), .text(members), .text(albumID)])
+        try database.query("DELETE FROM album_attempts WHERE album_id = ?", [.text(albumID)])
+    }
+
+    /// Remembers that the second phase read every track of `albumID` but could not pool them, over the tracks and
+    /// files `key` describes (`AlbumState.attemptKey`), so it is not tried again until a track or a file changes.
+    /// Nothing else is recorded: a track that fails goes back to the first phase on its own, and the cap is checked
+    /// when planning. Only while the album still has tracks.
+    func recordPoolAttempt(albumID: String, key: String) throws {
+        try database.query(
+            """
+            INSERT OR REPLACE INTO album_attempts(album_id, members)
+            SELECT ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE album_id = ?)
+            """, [.text(albumID), .text(key), .text(albumID)])
+    }
+
     // MARK: Reading
 
     /// Every track whose folder can be found this launch, as the catalog the UI and search see.
     func catalog() throws -> LibraryCatalog {
         let rows = try database.query(
             """
-            SELECT id, folder_id, rel_path, title, artist, album_artist, album, disc, track, year, sample_rate, bits,
-                channels, total_frames, album_id, artwork_id, cloud_pending FROM tracks
+            SELECT tracks.id, folder_id, rel_path, title, artist, album_artist, album, disc, track, year, sample_rate, bits,
+                channels, total_frames, tracks.album_id, artwork_id, cloud_pending, rg_track_gain, rg_track_peak,
+                rg_album_gain, rg_album_peak, r128_lufs, r128_peak
+            FROM tracks
             """)
+        // An album's value is served only while the album's tracks are the ones it was measured over.
+        var ids: [String: [String]] = [:]
+        for row in rows {
+            if let id = row[0].string, let album = row[14].string { ids[album, default: []].append(id) }
+        }
+        var albumValues: [String: (lufs: Double?, peak: Double)] = [:]
+        for row in try database.query("SELECT album_id, lufs, peak, members FROM album_loudness") {
+            guard let album = row[0].string, let peak = row[2].double, let members = row[3].string,
+                let current = ids[album], members == Self.membersHash(current)
+            else { continue }
+            albumValues[album] = (row[1].double, peak)
+        }
         var tracks: [LibraryTrack] = []
         tracks.reserveCapacity(rows.count)
         for row in rows {
@@ -859,9 +1072,19 @@ final class LibraryStore {
                         sampleRate: Int(row[10].int ?? 0), bitsPerSample: Int(row[11].int ?? 0),
                         channels: Int(row[12].int ?? 0)),
                     totalFrames: row[13].int ?? 0, artworkID: row[15].string, isCloudPending: row[16].int == 1,
-                    isInLibraryFolder: folder == Self.libraryFolderID))
+                    isInLibraryFolder: folder == Self.libraryFolderID,
+                    loudness: Self.loudness(row, album: albumValues[row[14].string ?? ""])))
         }
         return LibraryCatalog(tracks: tracks)
+    }
+
+    /// The loudness columns of a catalog row (indexes 17...22) and the album's, if current, or nil when all are empty.
+    private static func loudness(_ row: [SQLValue], album: (lufs: Double?, peak: Double)?) -> TrackLoudness? {
+        let value = TrackLoudness(
+            trackGainDb: row[17].double, trackPeak: row[18].double, albumGainDb: row[19].double,
+            albumPeak: row[20].double, measuredLufs: row[21].double, measuredPeak: row[22].double,
+            albumMeasuredLufs: album?.lufs, albumMeasuredPeak: album?.peak)
+        return value.isEmpty ? nil : value
     }
 
     private static func describe(_ rejection: FlacRejection) -> String {
@@ -876,4 +1099,22 @@ final class LibraryStore {
     private static func jsonArray(_ strings: Set<String>) -> String {
         (try? String(data: JSONEncoder().encode(Array(strings)), encoding: .utf8)) ?? "[]"
     }
+}
+
+/// Tracks of an album for the loudness scan to decode (`LibraryStore.loudnessJobs`, `poolJobs`).
+struct LoudnessJob: Sendable {
+    struct Track: Sendable {
+        var id: String
+        var url: URL
+    }
+    var albumID: String
+    /// The tracks to decode, on the device.
+    var tracks: [Track]
+    /// `LibraryStore.membersHash` of every track of the album, stored with its value.
+    var membersHash: String
+    /// What a second-phase pool that failed with every track read is recorded under (`AlbumState.attemptKey`).
+    var attemptKey: String
+    /// Whether the album value is pooled from this job's decodes: `tracks` are all the album's tracks, it is
+    /// not too big to pool, and (in the first phase) none was measured before.
+    var pool: Bool
 }

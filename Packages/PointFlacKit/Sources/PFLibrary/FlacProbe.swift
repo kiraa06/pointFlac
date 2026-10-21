@@ -17,6 +17,11 @@ struct ProbedTrack: Sendable, Equatable {
     var totalFrames: Int64
     /// The front cover's image bytes (type 3, else the first picture), at most `ArtworkStore.maxSourceBytes`.
     var cover: Data?
+    /// ReplayGain tags: gains in dB, peaks linear. Nil when absent or not plausible (`FlacMetadata`).
+    var trackGainDb: Double?
+    var trackPeak: Double?
+    var albumGainDb: Double?
+    var albumPeak: Double?
 }
 
 /// Reads a library file in two passes: `FlacMetadataReader` validates it against the admission rule (spec §5.3) and
@@ -45,7 +50,8 @@ enum FlacProbe {
                 trackNumber: metadata.trackNumber.flatMap(plausible),
                 year: metadata.year.flatMap(plausibleYear), format: metadata.streamInfo.format,
                 totalFrames: metadata.streamInfo.totalFrames,
-                cover: cover(fileAt: url)))
+                cover: cover(fileAt: url), trackGainDb: metadata.trackGainDb, trackPeak: metadata.trackPeak,
+                albumGainDb: metadata.albumGainDb, albumPeak: metadata.albumPeak))
     }
 
     /// A DATE of "0000" or "9999" is a placeholder, not a year.
