@@ -5,6 +5,8 @@ import SwiftUI
 struct SettingsView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
+    @AppStorage(AppModel.lookupNamesKey) private var lookupNames = true
+    @AppStorage(AppModel.lookupArtworkKey) private var lookupArtwork = false
 
     var body: some View {
         NavigationStack {
@@ -25,6 +27,24 @@ struct SettingsView: View {
                 } footer: {
                     Text("Needle and run-out sounds are off by default and never play in Pure mode.")
                 }
+                Section {
+                    Toggle("Look up names online (MusicBrainz)", isOn: $lookupNames)
+                        .accessibilityIdentifier("lookupNamesToggle")
+                    Toggle("Look up cover art online", isOn: $lookupArtwork)
+                        .accessibilityIdentifier("lookupArtworkToggle")
+                } header: {
+                    Text("Privacy")
+                } footer: {
+                    Text(
+                        "Names: what you type in Get Music is sent to musicbrainz.org for suggestions. "
+                            + "Cover art: the album's MusicBrainz ID is sent to coverartarchive.org. "
+                            + "Nothing else leaves the phone.")
+                }
+                .onChange(of: lookupNames) { model.lookupsChanged() }
+                .onChange(of: lookupArtwork) { model.lookupsChanged() }
+                #if SOULSEEK
+                    SoulseekSettingsSection(account: model.soulseek)
+                #endif
                 Section("Diagnostics") {
                     NavigationLink {
                         DebugLibraryView(model: model)
@@ -50,3 +70,54 @@ struct SettingsView: View {
         return "\(short) (\(build))"
     }
 }
+
+#if SOULSEEK
+    /// Settings → Soulseek (spec §4.7, §5.6): the account, its status, and the honest warnings.
+    private struct SoulseekSettingsSection: View {
+        let account: SoulseekAccount
+        @State private var username = ""
+        @State private var password = ""
+
+        var body: some View {
+            Section {
+                LabeledContent("Status", value: account.status)
+                    .accessibilityIdentifier("soulseekStatus")
+                if account.isSignedIn {
+                    Button("Sign Out", role: .destructive) {
+                        Task { await account.signOut() }
+                    }
+                    .accessibilityIdentifier("soulseekSignOut")
+                } else {
+                    TextField("Username", text: $username)
+                        .textContentType(.username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("soulseekUsername")
+                    SecureField("Password", text: $password)
+                        .textContentType(.password)
+                        .accessibilityIdentifier("soulseekPassword")
+                    Button(account.isBusy ? "Signing In…" : "Sign In") {
+                        Task {
+                            await account.signIn(username: username, password: password)
+                            if account.isSignedIn { password = "" }
+                        }
+                    }
+                    .disabled(account.isBusy || username.isEmpty || password.isEmpty)
+                    .accessibilityIdentifier("soulseekSignIn")
+                }
+            } header: {
+                Text("Soulseek")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("The Soulseek protocol sends your password unencrypted: use a password you use nowhere else.")
+                    Text("Signing in here signs out any other client using the same account.")
+                    Text("A new name creates a new account, and Soulseek has no password reset: check the spelling.")
+                    Text("pointFlac downloads FLAC only. It never shares or uploads anything.")
+                    Text("Some peers refuse users who share nothing.")
+                    Text("When both you and a peer are behind NAT, that peer may be unreachable.")
+                }
+            }
+            .onAppear { if username.isEmpty { username = account.savedUsername } }
+        }
+    }
+#endif

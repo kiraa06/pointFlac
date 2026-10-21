@@ -39,10 +39,25 @@ targets:
         product: PFLibrary
       - package: PointFlacKit
         product: PFDesign
+      - package: PointFlacKit
+        product: PFSearch
+      - package: PointFlacKit
+        product: PFFind
+      - package: PointFlacKit
+        product: PFDownloads
+      - package: PointFlacKit
+        product: PFArchive
+      # The App Store variant drops this product and the SOULSEEK flag below (spec §5.6 "Build flag"): builds without
+      # the flag compile no Soulseek code.
+      - package: PointFlacKit
+        product: PFSoulseek
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.kiraa06.pointflac
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The sideloaded soft-launch build includes Soulseek, in Debug and Release. The App Store variant removes
+        # SOULSEEK here and the PFSoulseek dependency above.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) SOULSEEK
       configs:
         # Ruling R4: the fixtures ship only in Debug builds. XcodeGen has no per-configuration sources, so Release
         # drops the folder by name, and the app reads it only under #if DEBUG.
@@ -55,6 +70,10 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UIBackgroundModes: [audio]
+        # Soulseek peers are reached directly; iOS asks before any local-network connection (spec §5.6).
+        NSLocalNetworkUsageDescription: >-
+          pointFlac connects to other Soulseek users' computers to download FLAC files you choose. It never shares
+          or uploads anything.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
