@@ -165,7 +165,13 @@ struct VerticalFader: View {
     let theme: Theme
     let set: (Double) -> Void
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.scenePhase) private var scenePhase
+    /// The value when the cap was grabbed. Cleared when the finger lifts, and, through `grabbing`, when the system
+    /// cancels the drag (which `onEnded` never reports), or when the app or the fader goes away, so a cancelled drag
+    /// never leaves the cap held or starts the next drag from a stale value.
     @State private var dragStart: Double?
+    /// True while a drag holds the cap. Gesture state resets on a cancel as well as on an end.
+    @GestureState private var grabbing = false
 
     private static let capHeight: CGFloat = 12
     /// The height of the band round the cap that takes a drag.
@@ -187,8 +193,15 @@ struct VerticalFader: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
         }
-        .sensoryFeedback(.selection, trigger: value == 0) { _, atZero in atZero && dragStart != nil }
-        .sensoryFeedback(.selection, trigger: dragStart != nil) { _, grabbed in grabbed }
+        .sensoryFeedback(.selection, trigger: value == 0) { _, atZero in atZero && grabbing }
+        .sensoryFeedback(.selection, trigger: grabbing) { _, grabbed in grabbed }
+        .onChange(of: grabbing) { _, active in
+            if !active { dragStart = nil }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { dragStart = nil }
+        }
+        .onDisappear { dragStart = nil }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(SoundFormat.frequency(frequency)) band")
         .accessibilityValue(SoundFormat.gainSpoken(value))
@@ -208,7 +221,7 @@ struct VerticalFader: View {
         let span = range.upperBound - range.lowerBound
         let y = Self.capHeight / 2 + (range.upperBound - value) / span * travel
         let tint = theme.processingTint
-        let grabbed = dragStart != nil
+        let grabbed = grabbing
         return ZStack {
             // The scale: a tick at every 6 dB, longer at 0.
             Canvas { context, canvas in
@@ -255,6 +268,7 @@ struct VerticalFader: View {
                 .contentShape(CapBand(centreY: y, height: Self.grabHeight))
                 .gesture(
                     DragGesture(minimumDistance: 0)
+                        .updating($grabbing) { _, active, _ in active = true }
                         .onChanged { drag in
                             let start = dragStart ?? value
                             dragStart = start

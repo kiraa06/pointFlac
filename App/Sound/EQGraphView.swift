@@ -1,5 +1,6 @@
 import Observation
 import PFDSP
+import PFDesign
 import SwiftUI
 
 /// What the EQ graph's curve and headroom are computed from: the bypassable stages with Pure off (so the graph can
@@ -97,23 +98,15 @@ struct EQGraphView: View {
     let addBand: (EQBand) -> Void
 
     @Environment(\.isEnabled) private var isEnabled
-    @State private var drag: DragState?
-    @State private var pinch: PinchState?
-    /// A pinch happened during the current drag: the drag stays inert until its finger lifts.
-    @State private var pinched = false
-
-    /// The band a finger is dragging: where it was, and where the finger took hold of it relative to its centre.
-    private struct DragState {
-        var index: Int
-        var origin: EQBand
-        var grab: CGSize
-    }
-
-    /// The band a pinch is shaping, and its Q when the pinch began.
-    private struct PinchState {
-        var index: Int
-        var q: Double
-    }
+    @Environment(\.scenePhase) private var scenePhase
+    /// What the running drag and pinch hold (`BandGestureSession`). It is put back to rest however a gesture stops:
+    /// `onEnded` when a finger lifts; the flags below when the system cancels a gesture (a lock, a system gesture, an
+    /// alert), which `onEnded` never reports but a `@GestureState` reset does; and leaving the foreground or the screen.
+    /// So a cancelled drag can never steer the next touch.
+    @State private var session = BandGestureSession<EQBand>()
+    @GestureState private var dragging = false
+    @GestureState private var graphPinching = false
+    @GestureState private var handlePinching = false
 
     /// The graph's coordinate space: the handles' drags are measured in it.
     static let space = "eqGraph"
@@ -144,7 +137,7 @@ struct EQGraphView: View {
             }
             .coordinateSpace(.named(Self.space))
             .contentShape(Rectangle())
-            .simultaneousGesture(pinchGesture(on: nil, size))
+            .simultaneousGesture(pinchGesture(on: nil, flag: $graphPinching, size))
             .onTapGesture(count: 2) { location in
                 guard eq.mode == .parametric, isEnabled, eq.bands.count < SoundRanges.maxBands else { return }
                 addBand(
@@ -154,6 +147,16 @@ struct EQGraphView: View {
             }
         }
         .dynamicTypeSize(...DynamicTypeSize.xLarge)
+        .onChange(of: dragging) { _, active in
+            if !active { session.dragStopped() }
+        }
+        .onChange(of: graphPinching || handlePinching) { _, active in
+            if !active { session.pinchStopped() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { session.reset() }
+        }
+        .onDisappear { session.reset() }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("eqGraph")
     }
@@ -337,7 +340,7 @@ struct EQGraphView: View {
         .contentShape(Circle())
         .gesture(dragGesture(index, band, size))
         // A pinch whose fingers both land on the handle reaches it here too; both pinches share one state.
-        .simultaneousGesture(pinchGesture(on: index, size))
+        .simultaneousGesture(pinchGesture(on: index, flag: $handlePinching, size))
         .opacity(look == .bypassed ? 0.45 : 1)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Band \(index + 1), \(band.type.title)\(band.enabled ? "" : ", off")")
@@ -390,60 +393,63 @@ struct EQGraphView: View {
     /// frequency and gain (less where it took hold), so the handle stays under the finger.
     private func dragGesture(_ index: Int, _ band: EQBand, _ size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
+            .updating($dragging) { _, active, _ in active = true }
             .onChanged { value in
-                guard !pinched else { return }
-                if drag == nil {
-                    let c = centre(band, size)
-                    drag = DragState(
-                        index: index, origin: band,
-                        grab: CGSize(width: value.startLocation.x - c.x, height: value.startLocation.y - c.y))
-                    selection = index
-                }
-                guard let drag, eq.bands.indices.contains(drag.index) else { return }
+                let starting = session.drag == nil
+                let c = centre(band, size)
+                guard
+                    let drag = session.dragChanged(
+                        index: index, band: band, grabX: value.startLocation.x - c.x,
+                        grabY: value.startLocation.y - c.y),
+                    eq.bands.indices.contains(drag.index)
+                else { return }
+                if starting { selection = drag.index }
                 // The band as it is now, so a Q set meanwhile is kept.
                 var b = eq.bands[drag.index]
-                b.frequency = clampHz(SoundFormat.rounded(hz(atX: value.location.x - drag.grab.width, size.width)))
+                b.frequency = clampHz(SoundFormat.rounded(hz(atX: value.location.x - drag.grabX, size.width)))
                 if b.type.usesGain {
-                    var gain = SoundFormat.tenth(db(atY: value.location.y - drag.grab.height, size.height))
+                    var gain = SoundFormat.tenth(db(atY: value.location.y - drag.grabY, size.height))
                     if abs(gain) < 0.3 { gain = 0 }
                     b.gainDb = clampGain(gain)
                 }
                 setBand(drag.index, b)
             }
-            .onEnded { _ in
-                drag = nil
-                pinched = false
-            }
+            .onEnded { _ in session.dragStopped() }
     }
 
     /// Two fingers: the Q of the band being dragged (put back where the drag found it), else the selected band, else
     /// the band nearest where the pinch began. Spreading the fingers widens the band (a lower Q). `handleIndex` is the
-    /// handle this copy is attached to, or nil for the graph's own.
-    private func pinchGesture(on handleIndex: Int?, _ size: CGSize) -> some Gesture {
+    /// handle this copy is attached to, or nil for the graph's own; `flag` is that copy's gesture flag.
+    private func pinchGesture(on handleIndex: Int?, flag: GestureState<Bool>, _ size: CGSize) -> some Gesture {
         MagnifyGesture()
+            .updating(flag) { _, active, _ in active = true }
             .onChanged { value in
                 guard eq.mode == .parametric, isEnabled else { return }
-                if pinch == nil {
-                    guard let index = pinchTarget(handleIndex, start: value.startLocation, size) else { return }
-                    selection = index
-                    pinch = PinchState(index: index, q: eq.bands[index].q)
-                    if drag != nil { pinched = true }
-                }
-                guard let pinch, eq.bands.indices.contains(pinch.index) else { return }
-                var b = eq.bands[pinch.index]
-                if let drag, drag.index == pinch.index {
+                let starting = session.pinch == nil
+                let bands = eq.bands
+                guard
+                    let result = session.pinchChanged(
+                        choose: { pinchTarget(handleIndex, start: value.startLocation, size) },
+                        q: { bands.indices.contains($0) ? bands[$0].q : nil }),
+                    bands.indices.contains(result.pinch.index)
+                else { return }
+                let pinch = result.pinch
+                if starting { selection = pinch.index }
+                var b = bands[pinch.index]
+                if let restore = result.restore {
                     // The first finger's stray drag is undone: a pinch shapes the band, it does not move it.
-                    b.frequency = drag.origin.frequency
-                    b.gainDb = drag.origin.gainDb
+                    b.frequency = restore.frequency
+                    b.gainDb = restore.gainDb
                 }
                 b.q = clampQ(SoundFormat.roundedQ(pinch.q / Double(value.magnification)))
                 setBand(pinch.index, b)
             }
-            .onEnded { _ in pinch = nil }
+            .onEnded { _ in session.pinchStopped() }
     }
 
+    /// The band a pinch that is not taking over a drag shapes: the handle it is on, else the selected band, else the
+    /// band nearest where it began.
     private func pinchTarget(_ handleIndex: Int?, start: CGPoint, _ size: CGSize) -> Int? {
-        if let drag, eq.bands.indices.contains(drag.index) { return drag.index }
         if let handleIndex, eq.bands.indices.contains(handleIndex) { return handleIndex }
         if let selection, eq.bands.indices.contains(selection) { return selection }
         let distances = eq.bands.indices.map { i -> (Int, CGFloat) in
