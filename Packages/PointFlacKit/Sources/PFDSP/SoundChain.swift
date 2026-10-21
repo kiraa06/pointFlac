@@ -316,8 +316,10 @@ public final class SoundChain: @unchecked Sendable {
 ///    the call that was inside has returned (`calls`), so a chain is never freed under the call that handed it back.
 ///    If one call is still inside after that (a stalled render thread), the chains are stranded: kept, not freed,
 ///    until the runner itself goes. The wait holds no lock.
-/// 6. The drain queue reaches the runner unretained (`Unmanaged`), so the runner always goes on the thread that lets it
-///    go: its `deinit` closes the queue to new timer work and waits out anything already on it.
+/// 6. A free queued on the drain queue holds the runner, so it never outlives it; the timer holds it weakly, so an
+///    armed timer never keeps it alive. The runner may therefore go on the drain queue, at the end of a free or a
+///    tick, and its `deinit` never waits on that queue: it closes the timer and frees what it still holds, wherever it
+///    runs (re-review N-1; codegen decides where a debug build's last release lands, so nothing may depend on it).
 ///
 /// ## Format changes
 /// `reset(to:)` replaces everything at once, with no fade and no state carried over, while the output is stopped: a
@@ -395,6 +397,10 @@ public final class ChainRunner: @unchecked Sendable {
         var idleTicks = 0
         /// Chains a stalled render call might still have been inside when they came back: kept until the runner goes.
         var stranded: [SoundChain] = []
+        #if DEBUG
+            /// Runs in every timer tick, on the drain queue, under the lock. For tests that hold a tick in flight.
+            var onTick: (@Sendable () -> Void)?
+        #endif
     }
 
     /// Stands for Pure in the mailbox. Computed, not stored, so the render thread never runs a lazy initialiser.
@@ -402,11 +408,6 @@ public final class ChainRunner: @unchecked Sendable {
 
     /// Where retired chains are freed and the timer runs (see "Install protocol" steps 4–6).
     private let drainQueue = DispatchQueue(label: "pointFlac.sound.retire", qos: .utility)
-
-    /// The runner, unretained, for the drain queue's work. Unretained (not `unowned(unsafe)`, which a debug build
-    /// still retains for each call) so no block there ever holds the runner: it always goes on the thread that lets
-    /// it go, never on the drain queue, whose `sync` in `deinit` would then wait on itself.
-    private var unretained: Unmanaged<ChainRunner> { .passUnretained(self) }
 
     /// Retired chains on their way to the drain queue.
     private struct Retired: @unchecked Sendable {
@@ -431,14 +432,14 @@ public final class ChainRunner: @unchecked Sendable {
     }
 
     /// Frees every chain the runner still holds. No render call may be running: the owner stops the output first.
+    /// It may run on the drain queue (see "Install protocol" step 6), so it never waits on it: no free is queued (each
+    /// holds the runner), and a tick in flight is the one letting it go.
     deinit {
         control.withLock { control in
             control.closed = true
             control.timer?.cancel()
             control.timer = nil
         }
-        // A timer tick or a free already on the queue reaches this runner unretained: let it finish first.
-        drainQueue.sync {}
         var held: [UnsafeMutableRawPointer] = []
         if let waiting = mailbox.exchange(nil, ordering: .acquiringAndReleasing), waiting != Self.pure {
             held.append(waiting)
@@ -481,8 +482,8 @@ public final class ChainRunner: @unchecked Sendable {
             return retired
         }
         guard !retired.chains.isEmpty else { return }
-        let runner = unretained
-        drainQueue.async { runner._withUnsafeGuaranteedRef { $0.freeWhenIdle(retired) } }
+        // The block holds the runner until the free is done (see "Install protocol" step 6).
+        drainQueue.async { [self] in freeWhenIdle(retired) }
     }
 
     /// Plays `chain` from the next render call at once, with no fade and nothing of what played before: every chain
@@ -517,8 +518,8 @@ public final class ChainRunner: @unchecked Sendable {
             return retired
         }
         guard !retired.chains.isEmpty else { return }
-        let runner = unretained
-        drainQueue.async { runner._withUnsafeGuaranteedRef { $0.freeWhenIdle(retired) } }
+        // The block holds the runner until the free is done (see "Install protocol" step 6).
+        drainQueue.async { [self] in freeWhenIdle(retired) }
     }
 
     /// `chain`, or a fresh compile of it if it was ever installed (here or in another runner), so no two runs share
@@ -548,9 +549,19 @@ public final class ChainRunner: @unchecked Sendable {
     /// Chains stranded so far (see "Install protocol" step 5). For tests.
     var strandedCount: Int { control.withLock { $0.stranded.count } }
 
+    #if DEBUG
+        /// Runs `hook` in every timer tick, on the drain queue, under the runner's lock. For tests.
+        func setTickHook(_ hook: @escaping @Sendable () -> Void) {
+            control.withLock { $0.onTick = hook }
+        }
+    #endif
+
     /// Drain queue: one timer tick.
     private func tick() {
         let retired = control.withLock { control -> Retired in
+            #if DEBUG
+                control.onTick?()
+            #endif
             guard !control.closed else { return Retired() }
             let retired = collect(&control)
             control.idleTicks = retired.chains.isEmpty ? control.idleTicks + 1 : 0
@@ -611,8 +622,8 @@ public final class ChainRunner: @unchecked Sendable {
             let timer = DispatchSource.makeTimerSource(queue: drainQueue)
             timer.schedule(
                 deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(20))
-            let runner = unretained
-            timer.setEventHandler { runner._withUnsafeGuaranteedRef { $0.tick() } }
+            // Weakly: an armed timer never keeps the runner alive. A tick in flight holds it until it returns.
+            timer.setEventHandler { [weak self] in self?.tick() }
             timer.resume()
             control.timer = timer
         } else if !expected, let timer = control.timer {

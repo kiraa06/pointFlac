@@ -76,6 +76,13 @@ struct SoundChainTests {
     /// Frames a Pure-to-chain install takes before the chain alone is heard: its latency, then the 10 ms fade.
     static func settled(_ chain: SoundChain) -> Int { chain.latencyFrames + chain.fadeFrames }
 
+    /// A flag one thread sets and another reads.
+    final class Latch: Sendable {
+        private let value = Atomic<Bool>(false)
+        var isSet: Bool { value.load(ordering: .acquiring) }
+        func set() { value.store(true, ordering: .releasing) }
+    }
+
     /// A weak reference to a chain, to see that it was freed.
     final class Freed {
         weak var chain: SoundChain?
@@ -396,6 +403,46 @@ struct SoundChainTests {
         }
         #expect(tracked.allSatisfy { $0.chain == nil })
     }
+
+    #if DEBUG
+        /// Re-review N-1: the owner lets go while a timer tick is in flight on the drain queue (held there by a hook,
+        /// the reviewer's widened window). Whatever thread the last release lands on, the runner goes without waiting
+        /// on its own queue, and frees its chains.
+        @Test("The last reference dropped while a timer tick is in flight: the runner goes safely, wherever it goes")
+        func droppedWhileATickIsInFlight() {
+            let entered = DispatchSemaphore(value: 0)
+            let dropped = DispatchSemaphore(value: 0)
+            let heldOpen = Latch()
+            var tracked: [Freed] = []
+            weak var gone: ChainRunner?
+            var runner: ChainRunner? = ChainRunner()
+            gone = runner
+            runner?.setTickHook {
+                entered.signal()
+                // Held until the owner has let go. A timeout means letting go waited on this tick.
+                if dropped.wait(timeout: .now() + 5) == .success { heldOpen.set() }
+            }
+            let tone = Self.tone(1_000, amplitude: 0.5, frames: 2_048)
+            // One chain playing and a second installed arm the drain timer (a chain is expected back).
+            for trim in [0.0, -3] {
+                let chain = SoundChain(Self.settings { $0.preamp.trimDb = trim }, sampleRate: Self.rate, channels: 2)
+                tracked.append(Freed(chain))
+                runner?.install(chain)
+                if let runner { _ = Self.run(runner, tone) }
+            }
+            // The fade has run, so the first chain is in the ring. The render side has stopped: the owner may let go.
+            #expect(entered.wait(timeout: .now() + 5) == .success, "a timer tick started")
+            runner = nil
+            dropped.signal()
+            let deadline = ContinuousClock.now + .seconds(5)
+            while gone != nil || tracked.contains(where: { $0.chain != nil }), ContinuousClock.now < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            #expect(heldOpen.isSet, "letting go never waited on the tick in flight")
+            #expect(gone == nil, "the runner went")
+            #expect(tracked.allSatisfy { $0.chain == nil }, "with every chain")
+        }
+    #endif
 
     @Test("A reset frees every chain the runner held, and the fresh chain plays from rest at once")
     func resetFreesEverythingAndStartsFresh() {

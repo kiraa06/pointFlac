@@ -105,16 +105,18 @@ public final class TruePeakLimiter: @unchecked Sendable {
     /// The ramp's window: `1 − gain` for the last `lookahead` frames.
     private let deficits: UnsafeMutablePointer<Double>
 
-    // Render-thread state.
-    private var frame = 0
-    private var holdHead = 0
-    private var holdTail = 0
-    private var previousPeak = 0.0
-    private var envelope = 1.0
-    private var deficitSum = 0.0
+    // Render-thread state, touched by one thread at a time. Unchecked: a debug build's dynamic exclusivity checks
+    // (`swift_beginAccess`) would allocate the render thread's TLS context on its first call (re-review N-2). Release
+    // builds check nothing either way.
+    @exclusivity(unchecked) private var frame = 0
+    @exclusivity(unchecked) private var holdHead = 0
+    @exclusivity(unchecked) private var holdTail = 0
+    @exclusivity(unchecked) private var previousPeak = 0.0
+    @exclusivity(unchecked) private var envelope = 1.0
+    @exclusivity(unchecked) private var deficitSum = 0.0
     /// Nonzero entries in `deficits`: at zero the ramp is exactly 1, whatever rounding the running sum carries.
-    private var deficitCount = 0
-    private var deficitSlot = 0
+    @exclusivity(unchecked) private var deficitCount = 0
+    @exclusivity(unchecked) private var deficitSlot = 0
 
     /// `gainReductionDb`'s bit pattern, for a meter on another thread.
     private let reduction = Atomic<UInt64>(0)
