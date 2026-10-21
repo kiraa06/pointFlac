@@ -122,6 +122,19 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.position
     }
 
+    /// The finger on the record, shared with every render source this pipeline makes.
+    var scrubTap: ScrubTap { core.scrubTap }
+
+    /// Where the needle is now, with the rendered-frame count it was read at, so the render thread can start the scrub
+    /// voice exactly where the ring would have played next, whatever it played meanwhile.
+    var scrubAnchor: (index: Int, frame: Int64, rendered: Int64) {
+        core.shared.withLock { s in
+            let rendered = s.source?.renderedFrames ?? 0
+            let position = s.timeline.position(rendered: rendered)
+            return (position.index, position.frame, rendered)
+        }
+    }
+
     /// Frames of silence rendered because the ring ran dry mid-stream, over the whole queue
     /// (`RenderSource.underrunFrames`). For diagnostics and tests.
     var underrunFrames: Int64 {
@@ -159,6 +172,7 @@ final class PipelineCore: @unchecked Sendable {
     let makeDecoder: @Sendable (PlaybackItem) throws -> PCMDecoding
     let ditherSeed: UInt64
     let shared = Mutex(Shared())
+    let scrubTap = ScrubTap()
     /// Decode threads that have not returned yet, including stopped sessions still unwinding. For tests.
     let liveDecodeThreads = Atomic<Int>(0)
     private let continuation: AsyncStream<PipelineEvent>.Continuation

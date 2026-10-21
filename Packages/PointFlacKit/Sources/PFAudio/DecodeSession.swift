@@ -322,7 +322,9 @@ final class DecodeSession: @unchecked Sendable {
                 let fresh = core.shared.withLock { s in
                     let fresh = RenderSource(
                         channels: channels, capacityFrames: max(newPlan.clientSampleRate / 2, 1),
-                        renderedFrames: rendered, inheritingHoldsFrom: s.source)
+                        renderedFrames: rendered, inheritingHoldsFrom: s.source,
+                        clientRate: newPlan.clientSampleRate, floatClient: newPlan.client == .float32,
+                        scrub: core.scrubTap)
                     s.source = fresh
                     return fresh
                 }
