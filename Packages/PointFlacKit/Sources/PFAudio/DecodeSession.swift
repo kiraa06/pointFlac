@@ -61,6 +61,12 @@ final class DecodeSession: @unchecked Sendable {
     private var dither: TPDFDither
     /// The current item's ReplayGain, linear: exactly 1 for a gain of 0 dB, which then multiplies nothing.
     private var gain = 1.0
+    /// The re-cue's fade-in (`PlaybackPipeline.recue`): its length in source frames, and the frames of it still to
+    /// write. 0 left is no fade.
+    private var fadeInFrames = 0
+    private var fadeInLeft = 0
+    /// The seek being entered is a re-cue's: its audio fades in.
+    private var enteringRecue = false
     private var converter: SampleRateConverter?
     /// `written` when `converter` was created, and the source frames fed to it since.
     private var converterBase: Int64 = 0
@@ -174,6 +180,14 @@ final class DecodeSession: @unchecked Sendable {
         index = target
         format = nextFormat
         gain = nextGainDb == 0 ? 1 : pow(10, nextGainDb / 20)
+        // Only into a Float32 client: an Int32 one carries the source's words untouched.
+        if entry == .seek, enteringRecue, plan.client == .float32 {
+            fadeInFrames = max(1, Int((RenderSource.crossfadeSeconds * Double(nextFormat.sampleRate)).rounded()))
+            fadeInLeft = fadeInFrames
+        } else {
+            fadeInLeft = 0
+        }
+        enteringRecue = false
         dither = TPDFDither(seed: core.ditherSeed)
         reserveBuffers(channels: nextFormat.channels)
         let segment = Timeline.Segment(
@@ -402,6 +416,7 @@ final class DecodeSession: @unchecked Sendable {
             let count = frames * channels
             Self.convert(
                 samples, count: count, bits: format.bitsPerSample, plan: plan, gain: gain, dither: &dither, into: words)
+            if fadeInLeft > 0 { fadeIn(frames: frames, channels: channels) }
             let interrupted: Step?
             if let converter {
                 resampled.removeAll(keepingCapacity: true)
@@ -456,6 +471,21 @@ final class DecodeSession: @unchecked Sendable {
                 words[i] = (Float(samples[i]) * scale).bitPattern
             }
         }
+    }
+
+    /// Ramps the start of a re-cue's audio up from silence, linearly over `fadeInFrames`, in the converted Float32
+    /// words: frame k of the ramp is scaled by k / `fadeInFrames`. Past the ramp, nothing is touched.
+    private func fadeIn(frames: Int, channels: Int) {
+        let n = min(frames, fadeInLeft)
+        let done = fadeInFrames - fadeInLeft
+        for f in 0..<n {
+            let weight = Float(done + f) / Float(fadeInFrames)
+            for c in 0..<channels {
+                let i = f * channels + c
+                words[i] = (Float(bitPattern: words[i]) * weight).bitPattern
+            }
+        }
+        fadeInLeft -= n
     }
 
     private func reserveBuffers(channels: Int) {
@@ -531,7 +561,10 @@ final class DecodeSession: @unchecked Sendable {
         let taken = core.withShared(for: self) { s -> SeekRequest? in
             guard let target = s.requestedSeek else { return nil }
             s.requestedSeek = nil
-            return SeekRequest(target: target, ticket: s.source?.seekHoldTicket ?? 0, interval: s.seekInterval.take())
+            let fadeIn = s.seekFadesIn
+            s.seekFadesIn = false
+            return SeekRequest(
+                target: target, ticket: s.source?.seekHoldTicket ?? 0, interval: s.seekInterval.take(), fadeIn: fadeIn)
         }
         guard let taken else { return .stop }
         guard let request = taken else {
@@ -539,6 +572,7 @@ final class DecodeSession: @unchecked Sendable {
             return .play
         }
         let (target, ticket) = (request.target, request.ticket)
+        enteringRecue = request.fadeIn
         // Nothing renders from the ring now until the new position's audio, so the next real frame past `written` is
         // the first one at the target. An earlier seek still waiting for its frame is superseded.
         firstFrames.removeAll { watch in
@@ -599,6 +633,8 @@ private struct SeekRequest: Sendable {
     var target: Int64
     var ticket: UInt64
     var interval: FirstFrameInterval?
+    /// A re-cue's: the audio from `target` fades in.
+    var fadeIn: Bool
 }
 
 /// An item the pipeline refuses to play. Its description is the `.itemFailed` message, word for word.

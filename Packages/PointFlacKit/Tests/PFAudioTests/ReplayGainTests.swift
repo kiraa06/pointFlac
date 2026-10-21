@@ -414,6 +414,7 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: 4096))
         rig.player.setSound(sound(.album))
+        #expect(rig.player.currentEngine?.seeksInFlight == 0, "a change of mode is no switch: no re-cue")
         #expect(await rig.puller.pull(upTo: 16_384))
         // The limiter that joins ReplayGain only delays here, by its look-ahead: the level stays far below its
         // ceiling. Swapping it for the album mode's chain (the same blocks) cross-fades two equal outputs.
@@ -438,11 +439,128 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         rig.player.pause()
     }
 
+    // MARK: Switches heard at once (ruling R4-T12a)
+
+    /// Pure set while an item plays at a gain re-cues it where it is: within one buffer of the re-cue, the capture is
+    /// the ungained source, to the bit, from the frame playback had reached. (That buffer holds the re-cue's fade-in
+    /// and the chain's fade out to Pure.)
+    @Test func pureTakesEffectAtOnce() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.track))
+        await rig.player.play([hashItem("hash-p", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 4096))
+        rig.player.setSound(SoundSettings())
+        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
+        // The re-cue reaches the pipeline through the engine's queue; nothing renders meanwhile.
+        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        #expect(await rig.puller.pull(upTo: 4096 + 8192))
+        let captured = rig.output.capturedFloat
+        var got: [Float] = []
+        var want: [Float] = []
+        for n in Int64(512)..<8192 {
+            for c in 0..<2 {
+                got.append(captured[2 * (4096 + Int(n)) + c])
+                want.append(HashDecoder.float(4096 + n, channel: c))
+            }
+        }
+        #expect(mismatch(got, want) == nil)
+        #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        #expect(await rig.puller.eventually { rig.player.signal.indicator == .pure })
+        #expect(rig.player.status == .playing)
+        rig.player.pause()
+    }
+
+    /// ReplayGain switched on (from off) while an item plays re-cues it too: within a buffer and the limiter's
+    /// look-ahead, the item plays halved. Switched off again, it re-cues back to the source's level.
+    @Test func replayGainOnTakesEffectAtOnce() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.off))
+        await rig.player.play([hashItem("hash-o", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 4096))
+        let settings = sound(.track)
+        rig.player.setSound(settings)
+        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
+        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        #expect(await rig.puller.pull(upTo: 4096 + 8192))
+        let latency = SoundChain(settings, sampleRate: 48_000, channels: 2).latencyFrames
+        let captured = rig.output.capturedFloat
+        // Past the fade-in, the chain's priming and its fade in: the halved source, delayed by the look-ahead.
+        let worst =
+            (1024..<8192).map { k in
+                abs(captured[2 * (4096 + k)] - HashDecoder.float(Int64(4096 + k - latency), channel: 0, gain: 0.5))
+            }.max() ?? 1
+        #expect(worst < 1e-6, "not halved after the re-cue: \(worst)")
+        #expect(rig.player.pipeline?.renderingGain?.gainDb == halfDb)
+        #expect(await rig.puller.eventually { rig.player.signal.activeProcessing == ["ReplayGain", "Limiter"] })
+
+        rig.player.setSound(sound(.off))
+        #expect(rig.player.currentEngine?.seeksInFlight == 1, "no re-cue")
+        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
+        #expect(await rig.puller.pull(upTo: rig.puller.pulled + 2048))
+        #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
+        rig.player.pause()
+    }
+
+    /// A switch that leaves the playing item's gain as it was re-cues nothing, so there is no gap: Pure toggled with
+    /// ReplayGain off (the capture stays the source, bit for bit, throughout), and ReplayGain switched on and off for
+    /// an item that gets 0 dB either way.
+    @Test func aSwitchThatChangesNoGainDoesNotRecue() async {
+        let rig = PlayerRig()
+        rig.player.setSound(sound(.off))
+        await rig.player.play([hashItem("hash-s", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        #expect(await rig.puller.pull(upTo: 4096))
+        rig.player.setSound(SoundSettings())
+        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        #expect(await rig.puller.pull(upTo: 8192))
+        rig.player.setSound(sound(.off))
+        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        #expect(await rig.puller.pull(upTo: 16_384))
+        var want: [Float] = []
+        for n in Int64(0)..<16_384 { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c)) } }
+        #expect(mismatch(rig.output.capturedFloat, want) == nil)
+
+        await rig.player.play([hashItem("hash-z", loudness: nil)], startingAt: 0)
+        #expect(await rig.puller.eventually { rig.player.status == .playing })
+        rig.player.setSound(sound(.track))
+        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        rig.player.setSound(sound(.off))
+        #expect(rig.player.currentEngine?.seeksInFlight == 0)
+        rig.player.pause()
+    }
+
+    /// A re-cue's audio fades in from silence over `RenderSource.crossfadeSeconds` (288 frames at 48 kHz), linearly,
+    /// so it never starts with a step; past the ramp every sample is the source's at its new gain, exactly. A seek
+    /// (`aSeekAppliesTheChange`) has no ramp.
+    @Test func recueFadesIn() async {
+        let rig = PipelineRig()
+        await rig.pipeline.start([playback("hash-r", gainDb: halfDb)], at: 0, fromFrame: 0)
+        #expect(await rig.puller.pull(upTo: 4096))
+        rig.pipeline.setGains(["hash-r": 0])
+        await rig.pipeline.recue(toFrame: 4096, firstFrame: FirstFrameInterval(.seek))
+        #expect(await rig.puller.pull(upTo: 8192))
+        let ramp = Int((RenderSource.crossfadeSeconds * 48_000).rounded())
+        #expect(ramp == 288)
+        var want: [Float] = []
+        for n in Int64(0)..<4096 { for c in 0..<2 { want.append(HashDecoder.float(n, channel: c, gain: 0.5)) } }
+        for k in 0..<4096 {
+            let weight: Float = k < ramp ? Float(k) / Float(ramp) : 1
+            for c in 0..<2 {
+                let sample = HashDecoder.float(Int64(4096 + k), channel: c)
+                want.append(k < ramp ? sample * weight : sample)
+            }
+        }
+        #expect(mismatch(rig.output.capturedFloat, want) == nil)
+    }
+
     // MARK: The strip
 
     /// The strip lists ReplayGain exactly while a non-zero gain applies to the item playing, and says Processing
     /// then. An item that gets no gain shows only the limiter that ReplayGain brings into the chain. A switch to Pure
-    /// while an item plays leaves its gain on until a seek (or the next item), and the strip never says Pure meanwhile.
+    /// while an item plays re-cues it at once (ruling R4-T12a); until the decode thread has taken the re-cue, the gain
+    /// is still on and the strip says so, and it says Pure once the item plays ungained.
     @Test func stripListsReplayGainOnlyWhileItApplies() async {
         let rig = PlayerRig()
         rig.player.setSound(sound(.track))
@@ -462,15 +580,15 @@ private func playback(_ id: String, gainDb: Double) -> PlaybackItem {
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(rig.player.signal.activeProcessing == ["ReplayGain", "Limiter"])
 
-        // Pure mid-play: the playing item keeps its gain, and the strip says so.
+        // Pure mid-play: re-cued at once, and the strip never says Pure while the gain is still on.
         await rig.player.play([hashItem("hash-g", loudness: TrackLoudness(trackGainDb: halfDb))], startingAt: 0)
         #expect(await rig.puller.eventually { rig.player.status == .playing })
         #expect(await rig.puller.pull(upTo: rig.puller.pulled + 2048))
         rig.player.setSound(SoundSettings())
         #expect(rig.player.signal.activeProcessing == ["ReplayGain"])
         #expect(rig.player.signal.indicator == .processing(1))
-        await rig.player.seek(to: .milliseconds(100))
-        // Some audio from the new position, then the position updates (10 Hz) show what the decode thread took.
+        // Some audio after the re-cue, then the position updates (10 Hz) show what the decode thread took.
+        #expect(await rig.puller.eventually { rig.player.currentEngine?.seeksInFlight == 0 })
         #expect(await rig.puller.pull(upTo: rig.puller.pulled + 2048))
         #expect(rig.player.pipeline?.renderingGain?.gainDb == 0)
         #expect(await rig.puller.eventually { rig.player.signal.indicator == .pure })

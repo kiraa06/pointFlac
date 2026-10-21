@@ -116,12 +116,20 @@ public final class PlaybackPipeline: @unchecked Sendable {
     /// refilled it, which needs the output to keep pulling. A newer seek supersedes one not yet served. A "Seek to
     /// first frame" signpost interval runs from here to the first real frame at the new position.
     public func seek(toFrame frame: Int64) async {
-        core.seek(toFrame: frame, firstFrame: FirstFrameInterval(.seek))
+        core.seek(toFrame: frame, firstFrame: FirstFrameInterval(.seek), fadeIn: false)
     }
 
     /// `seek(toFrame:)` with the caller's own interval, begun when its request came in.
     func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
-        core.seek(toFrame: frame, firstFrame: firstFrame)
+        core.seek(toFrame: frame, firstFrame: firstFrame, fadeIn: false)
+    }
+
+    /// A seek to where playback is, so the item playing is decoded afresh, at the gains `setGains` holds now (ruling
+    /// R4-T12a: a switch of Pure, or of ReplayGain on or off, is heard at once). It is the seek path: the output holds
+    /// silent at once, the ring is flushed and refilled from `frame`. Unlike a seek, the new audio fades in, over
+    /// `RenderSource.crossfadeSeconds`, so it does not start with a step. A newer seek or re-cue supersedes it.
+    func recue(toFrame frame: Int64, firstFrame: FirstFrameInterval) async {
+        core.seek(toFrame: frame, firstFrame: firstFrame, fadeIn: true)
     }
 
     /// Stops the output and ends the queue. Does not wait for the decode thread, which may be blocked in file I/O or
@@ -215,6 +223,8 @@ final class PipelineCore: @unchecked Sendable {
         var requestedSeek: Int64?
         /// `requestedSeek`'s signpost interval, taken by the decode thread with it.
         var seekInterval: FirstFrameInterval?
+        /// Whether `requestedSeek` is a re-cue (`recue(toFrame:firstFrame:)`), whose audio fades in.
+        var seekFadesIn = false
         /// The Sound settings, clamped: compiled whenever they change, and at every configure for the new format.
         var soundSettings = SoundSettings()
         /// ReplayGain by item ID, from `setGains`: read by the decode thread as it enters an item.
@@ -270,6 +280,7 @@ final class PipelineCore: @unchecked Sendable {
                 s.source = nil
                 s.timeline = Timeline(startIndex: first, startFrame: max(fromFrame, 0))
                 s.requestedSeek = nil
+                s.seekFadesIn = false
                 return s.seekInterval.take()
             }
             output.stop()
@@ -280,11 +291,12 @@ final class PipelineCore: @unchecked Sendable {
         session.launch()
     }
 
-    func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval) {
+    func seek(toFrame frame: Int64, firstFrame: FirstFrameInterval, fadeIn: Bool) {
         // The interval this request supersedes, or this one when there is nothing to seek. Ended outside the lock.
         let abandoned = shared.withLock { s -> FirstFrameInterval? in
             guard let session = s.session else { return firstFrame }
             s.requestedSeek = frame
+            s.seekFadesIn = fadeIn
             let superseded = s.seekInterval
             s.seekInterval = firstFrame
             s.source?.holdForSeek()

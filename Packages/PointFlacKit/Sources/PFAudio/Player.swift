@@ -37,8 +37,9 @@ import PFDSP
 /// Each queue item's gain is worked out from its `loudness` and `sound.replayGain` (`replayGainDb(for:sound:)`, 0 in
 /// Pure) and handed to the pipeline with the item, which applies it on the decode thread. A settings change
 /// recomputes the queue's gains (`PlaybackPipeline.setGains`); they apply from the next item the pipeline enters,
-/// and on any seek, never to the item playing mid-stream. The strip lists ReplayGain exactly while a non-zero gain
-/// applies to the item playing, whatever the settings say meanwhile.
+/// and on any seek, never to the item playing mid-stream. The exception (ruling R4-T12a): switching Pure on or off,
+/// or ReplayGain on or off, is heard at once, through a re-cue of the item playing at where it is, whenever that
+/// changes its gain. The strip lists ReplayGain exactly while a non-zero gain applies to the item playing.
 @MainActor
 @Observable
 public final class Player {
@@ -245,18 +246,48 @@ public final class Player {
     /// blocks at work on the strip (`signal.activeProcessing`). Compiled here, on the main actor, for the playing plan.
     /// While nothing plays it is only kept, and the next start compiles it for its plan.
     ///
-    /// A ReplayGain change (or a switch to or from Pure) recomputes every queue item's gain. The new gains apply from
-    /// the next item the pipeline enters, and on any seek: the item playing keeps its level to the end, and the strip
-    /// keeps listing ReplayGain while its gain is still on.
+    /// A ReplayGain change, or a switch to or from Pure, recomputes every queue item's gain.
+    /// - Switching Pure on or off, or ReplayGain on or off (`.off` to a mode or back), is heard at once (ruling
+    ///   R4-T12a): when it changes the gain of the item playing, that item is re-cued where it is
+    ///   (`recueForNewGain`), a short gap with a fade-in. When it does not (Pure toggled with ReplayGain off, or an item
+    ///   that gets 0 dB either way), nothing is re-cued.
+    /// - Any other ReplayGain change (mode, preamp, clipping prevention, reference) applies from the next item the
+    ///   pipeline enters, and on any seek: the item playing keeps its level, and the strip keeps listing ReplayGain
+    ///   while its gain is still on.
     public func setSound(_ settings: SoundSettings) {
         let settings = settings.clamped()
         let gainsChanged = settings.pure != sound.pure || settings.replayGain != sound.replayGain
+        let switched =
+            settings.pure != sound.pure || (settings.replayGain.mode == .off) != (sound.replayGain.mode == .off)
         sound = settings
         if let engine {
             engine.pipeline.setSound(settings)
             if gainsChanged { engine.pipeline.setGains(queueGains) }
+            if switched { recueForNewGain(engine) }
         }
         refreshProcessing()
+    }
+
+    /// Re-cues the item rendering where it is, through the pipeline's seek path (`PlaybackPipeline.recue`), when its
+    /// gain under the current settings differs from the gain it is playing at, so the new gain is heard at once.
+    ///
+    /// Nothing to do, and so no gap, when the gains agree; while a seek is still on its way (it is entered at the new
+    /// gains anyway); before the pipeline has entered an item (it enters it at the new gains); and while a finger is on
+    /// the record, whose let-go seeks the pipeline, at the new gains, itself.
+    private func recueForNewGain(_ engine: PlayerEngine) {
+        guard status == .playing || status == .preparing, scrubRun == nil, engine.seeksInFlight == 0,
+            let rendering = engine.pipeline.renderingGain, queue.indices.contains(rendering.index),
+            Self.replayGainDb(for: queue[rendering.index], sound: sound) != rendering.gainDb
+        else { return }
+        let point = currentPoint()
+        cue = point
+        let frame = point.frame
+        engine.seeksInFlight += 1
+        let interval = FirstFrameInterval(.seek)
+        _ = engine.enqueue { [weak engine] pipeline in
+            await pipeline.recue(toFrame: frame, firstFrame: interval)
+            engine?.seeksInFlight -= 1
+        }
     }
 
     // MARK: ReplayGain
