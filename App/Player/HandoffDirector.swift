@@ -24,8 +24,14 @@ final class HandoffDirector {
     private(set) var source: CGRect = .zero
     /// The record's frame on the platter, in the player's coordinate space; the deck keeps it current.
     var platterRect: CGRect = .zero
-    @ObservationIgnored private(set) var startDate = Date()
+    @ObservationIgnored private var startInstant = ContinuousClock.now
     @ObservationIgnored private var beats: Task<Void, Never>?
+    /// The needle drop in flight, held so a later run can cancel it.
+    @ObservationIgnored private var needle: Task<Void, Never>?
+    /// Which hand-off is current: late work from an older run checks it and stands down.
+    @ObservationIgnored private var generation = 0
+    /// The needle drop has been started for this run.
+    @ObservationIgnored private var finishing = false
     @ObservationIgnored private var track: TrackRow.ID?
     @ObservationIgnored private weak var playback: PlaybackController?
     @ObservationIgnored private var closeShelf: (() -> Void)?
@@ -33,15 +39,21 @@ final class HandoffDirector {
     /// The rotation the record lands at; the deck starts its spin from it, so the hand-over is seamless.
     static let landingAngle = -40.0
 
-    func elapsed(at date: Date) -> Double {
-        isRunning ? date.timeIntervalSince(startDate) : timeline.duration
+    /// Seconds into the hand-off, on the one monotonic clock everything here uses. (The `date` a `TimelineView`
+    /// passes is wall-clock time, so it is ignored: the clock is read when the frame is built.)
+    func elapsed(at date: Date = Date()) -> Double {
+        isRunning ? (ContinuousClock.now - startInstant).seconds : timeline.duration
     }
 
+    /// Starts a hand-off. A no-op while one runs: a tap during the flight belongs to the overlay, which finishes it.
     func start(
         album: AlbumCard, track: TrackRow.ID?, from rect: CGRect, playback: PlaybackController,
         closeShelf: @escaping () -> Void
     ) {
+        guard !isRunning else { return }
         beats?.cancel()
+        generation += 1
+        let run = generation
         self.album = album
         self.track = track
         self.playback = playback
@@ -51,18 +63,19 @@ final class HandoffDirector {
         landed = false
         spinning = false
         sinking = false
+        finishing = false
         hidesTitle = true
-        startDate = Date()
+        let begin = ContinuousClock.now
+        startInstant = begin
         isRunning = true
         // The old record comes off the platter: lift the needle before the new one travels.
         if playback.isPlaying { playback.player.pause() }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         let t = timeline
-        let begin = ContinuousClock.now
         beats = Task { [weak self] in
-            func wait(_ seconds: Double) async -> Bool {
+            @MainActor func wait(_ seconds: Double) async -> Bool {
                 try? await Task.sleep(until: begin + .seconds(seconds), clock: .continuous)
-                return !Task.isCancelled
+                return !Task.isCancelled && self?.generation == run
             }
             guard await wait(t.start(.sink)) else { return }
             withAnimation(.timingCurve(0.25, 0.8, 0.25, 1, duration: t.end(.sink) - t.start(.sink))) {
@@ -75,18 +88,22 @@ final class HandoffDirector {
             guard await wait(t.spinTime) else { return }
             self?.spinning = true
             guard await wait(t.duration) else { return }
-            await self?.dropNeedle()
+            self?.finish(run)
         }
     }
 
-    /// The second tap: everything lands at once and the needle drops.
+    /// The second tap: the clock jumps to the end, everything lands at once and the needle drops.
     func finishNow() {
         guard isRunning else { return }
         beats?.cancel()
-        hidesTitle = false
+        startInstant = ContinuousClock.now - .seconds(timeline.duration)
+        withAnimation(.easeOut(duration: 0.2)) {
+            sinking = true
+            hidesTitle = false
+        }
         if !landed { land() }
         spinning = true
-        Task { await dropNeedle() }
+        finish(generation)
     }
 
     /// Where the shelf sits during the hand-off: sunk away once the sink step starts.
@@ -101,7 +118,15 @@ final class HandoffDirector {
         UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.9)
     }
 
-    private func dropNeedle() async {
+    /// Drops the needle exactly once per run, from the timeline's end or the second tap, whichever comes first.
+    private func finish(_ run: Int) {
+        guard run == generation, !finishing else { return }
+        finishing = true
+        needle?.cancel()
+        needle = Task { [weak self] in await self?.dropNeedle(run) }
+    }
+
+    private func dropNeedle(_ run: Int) async {
         guard let playback, let album else { return }
         closeShelf?()
         let start = track.flatMap { id in playback.tracks.firstIndex { $0.id == id } } ?? 0
@@ -109,9 +134,12 @@ final class HandoffDirector {
         // The platter keeps spinning, and the arm holds the lead-in, until the player has the record: no stutter
         // between the hand-off's spin and the player's.
         await playback.play(fromTrack: start)
+        // A newer hand-off owns the state now; a late finish from this one must leave it alone.
+        guard run == generation else { return }
         isRunning = false
         spinning = false
         sinking = false
+        finishing = false
     }
 }
 
