@@ -95,4 +95,26 @@ struct CrossfeedTests {
         }
         #expect(l == 0 && r == 0)
     }
+
+    @Test(arguments: [Double.nan, .infinity, -.infinity])
+    func nonFiniteInputRecovers(bad: Double) {
+        var crossfeed = Crossfeed(preset: .defaultBS2B, sampleRate: 48_000)
+        var l = bad
+        var r = 0.25
+        crossfeed.process(left: &l, right: &r)
+        #expect(l.isFinite && r.isFinite)
+        // A tone afterwards comes through as if the bad sample had never been there.
+        var reference = Crossfeed(preset: .defaultBS2B, sampleRate: 48_000)
+        for n in 0..<4_800 {
+            let x = 0.5 * sin(2 * .pi * 1_000 * Double(n) / 48_000)
+            var (al, ar) = (x, x)
+            var (bl, br) = (x, x)
+            crossfeed.process(left: &al, right: &ar)
+            reference.process(left: &bl, right: &br)
+            #expect(al.isFinite && ar.isFinite)
+            if n >= 2_400 {
+                #expect(abs(al - bl) < 1e-9 && abs(ar - br) < 1e-9, "frame \(n)")
+            }
+        }
+    }
 }

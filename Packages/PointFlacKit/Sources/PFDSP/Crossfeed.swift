@@ -26,8 +26,8 @@ public struct Crossfeed: Sendable {
     private var prevL = 0.0
     private var prevR = 0.0
 
-    /// Magnitudes below this are flushed to zero. Far below any audible or dither-relevant level (about −600 dBFS) and
-    /// well above the subnormal range, so a silent tail never lets the recursive state decay into slow denormals.
+    /// Recursive state below this is flushed to zero. Far below any audible or dither-relevant level (about −600 dBFS)
+    /// and well above the subnormal range, so a silent tail never lets the state decay into slow denormals.
     private static let flushThreshold = 1e-30
 
     /// libbs2b clamps the sample rate to 2 kHz … 384 kHz.
@@ -61,14 +61,16 @@ public struct Crossfeed: Sendable {
         loR = Self.flush(a0Lo * inR + b1Lo * loR)
         hiL = Self.flush(a0Hi * inL + a1Hi * prevL + b1Hi * hiL)
         hiR = Self.flush(a0Hi * inR + a1Hi * prevR + b1Hi * hiR)
-        prevL = inL
-        prevR = inR
+        prevL = inL.isFinite ? inL : 0
+        prevR = inR.isFinite ? inR : 0
         left = (hiL + loR) * gain
         right = (hiR + loL) * gain
     }
 
+    /// Also zeroes non-finite state: one NaN or infinity in would otherwise stay in the recursion forever (libbs2b has
+    /// the same flaw), and every later frame would come out NaN.
     @inline(__always)
     private static func flush(_ value: Double) -> Double {
-        abs(value) < flushThreshold ? 0 : value
+        value.isFinite && abs(value) >= flushThreshold ? value : 0
     }
 }
