@@ -77,16 +77,15 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
-        # Xcode's template defaults. iPad multitasking needs every orientation; without them device builds warn.
+        # Portrait only for the soft launch: the Deck's layout is phone-portrait (UI review: landscape overflows and the
+        # tonearm geometry degenerates on wide plinths). UIRequiresFullScreen opts out of iPad multitasking, which
+        # would otherwise require every orientation. Revisit with the iPad layouts.
+        UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
   PointFlacUITests:
     type: bundle.ui-testing
     platform: iOS
