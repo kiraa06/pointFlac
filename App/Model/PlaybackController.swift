@@ -9,6 +9,13 @@ import PFDesign
 /// side A into side B (Kiran's decision); the deck only animates the flip. Records after this one wait in Up Next,
 /// and the controller starts the next when the player reports the queue played out. Repeat lives here too, because
 /// the player has none: album repeat replays the queue, and one-track repeat steps back when the player moves on.
+///
+/// With crossfade on (Between albums or Always, and not Pure: ruling R4-4), the next Up Next record instead joins the
+/// player's queue once the last queued track starts (`Player.append`), so the pipeline can overlap the two records.
+/// The queue then holds several records, and `albumSegments` maps each player index to its record and track: the
+/// platter, `trackIndex` and `currentSide` follow the record playing, and the platter takes the appended record (with
+/// `autoLoads`) when its first track starts. An appended record has left Up Next. With crossfade Off, or in Pure,
+/// nothing is appended: the queue plays out and the next record starts afresh, as before.
 @MainActor
 @Observable
 final class PlaybackController {
@@ -31,6 +38,20 @@ final class PlaybackController {
         let startTrack: TrackRow.ID?
     }
 
+    /// A record in the player's queue: its tracks from `firstTrack` on, the first of them at player index `start`.
+    struct AlbumSegment {
+        let album: AlbumCard
+        let tracks: [TrackRow]
+        let start: Int
+        let firstTrack: Int
+
+        /// The album track at player index `index`, which must be at or after `start`.
+        func track(at index: Int) -> Int { index - start + firstTrack }
+
+        /// The player index just past this record's tracks.
+        var end: Int { start + tracks.count - firstTrack }
+    }
+
     let player: Player
     @ObservationIgnored private let library: any LibraryBrowsing
     /// The transport command in flight, and the number of the latest one asked for.
@@ -45,8 +66,14 @@ final class PlaybackController {
     var repeatMode: RepeatMode = .off
     /// The side the needle will drop on when it is up: the deck's "turn the record over" moves it.
     private(set) var cuedSide = 0
-    /// Bumped when the controller itself pulls the next record from Up Next, so the deck can play the short hand-off.
+    /// Bumped when the controller itself pulls the next record from Up Next, so the deck can play the short hand-off:
+    /// when it starts the record afresh, or when the first track of a record it appended starts.
     private(set) var autoLoads = 0
+    /// The records in the player's queue, in queue order: one for a record the controller played, then one for each
+    /// it appended. Empty until the controller plays a queue.
+    private(set) var albumSegments: [AlbumSegment] = []
+    /// The segment whose record the platter shows while the queue plays it, so it can follow the queue on.
+    @ObservationIgnored private var platterSegment: Int?
 
     init(player: Player, library: any LibraryBrowsing) {
         self.player = player
@@ -57,10 +84,21 @@ final class PlaybackController {
 
     /// The playing track's index in the album, when the player is playing this album.
     var trackIndex: Int? {
-        guard let index = player.currentIndex, player.queue.indices.contains(index), tracks.indices.contains(index),
-            player.queue[index].id == tracks[index].id
+        guard let index = player.currentIndex, player.queue.indices.contains(index),
+            let segment = segment(at: index), segment.album.id == album?.id
         else { return nil }
-        return index
+        let track = segment.track(at: index)
+        guard tracks.indices.contains(track), player.queue[index].id == tracks[track].id else { return nil }
+        return track
+    }
+
+    /// The record player index `index` belongs to. Without a table (a queue the controller did not start), the queue
+    /// is taken to be the record on the platter, from its first track.
+    private func segment(at index: Int) -> AlbumSegment? {
+        if albumSegments.isEmpty {
+            return album.map { AlbumSegment(album: $0, tracks: tracks, start: 0, firstTrack: 0) }
+        }
+        return albumSegments.last { $0.start <= index }
     }
 
     var currentTrack: TrackRow? { trackIndex.map { tracks[$0] } }
@@ -128,11 +166,15 @@ final class PlaybackController {
         guard tracks.indices.contains(track) else { return }
         let items = library.queueItems(for: tracks.map(\.id))
         guard items.count == tracks.count else { return }
-        if player.currentIndex != track { intendedIndex = track }
-        if trackIndex != nil, player.queue.map(\.id) == items.map(\.id), player.currentIndex == track {
+        if trackIndex == track, queueHoldsPlatter(items) {
             await player.seek(to: .seconds(seconds))
             if !isPlaying { player.resume() }
             return
+        }
+        if player.currentIndex != track { intendedIndex = track }
+        if let album {
+            albumSegments = [AlbumSegment(album: album, tracks: tracks, start: 0, firstTrack: 0)]
+            platterSegment = 0
         }
         await player.play(items, startingAt: track)
         if seconds > 0.01 {
@@ -200,10 +242,22 @@ final class PlaybackController {
         }
     }
 
+    /// Whether the player's queue holds the platter's record as `items` (its whole album) gives it: the queue itself,
+    /// or the record's stretch of a queue that holds several.
+    private func queueHoldsPlatter(_ items: [QueueItem]) -> Bool {
+        guard let index = player.currentIndex, let segment = segment(at: index), segment.album.id == album?.id,
+            segment.end <= player.queue.count, segment.firstTrack <= items.count
+        else { return false }
+        let queued = player.queue[segment.start..<segment.end].map(\.id)
+        return queued == items[segment.firstTrack...].map(\.id)
+    }
+
     func next() async {
         await perform { [weak self] in
             guard let self else { return }
-            let atEnd = self.trackIndex.map { $0 + 1 >= self.tracks.count } ?? true
+            // At the end of the queue, which may hold an appended record behind this one.
+            let atEnd =
+                self.trackIndex == nil || (self.player.currentIndex.map { $0 + 1 >= self.player.queue.count } ?? true)
             if atEnd, !self.upNext.isEmpty {
                 await self.pullNextNow()
                 return
@@ -235,10 +289,13 @@ final class PlaybackController {
 
     func playNext(_ album: AlbumCard, startingAt track: TrackRow.ID? = nil) {
         upNext.insert(UpNextEntry(album: album, startTrack: track), at: 0)
+        // Added while the last track plays: with crossfade on, it joins the queue now.
+        appendNextRecordIfDue()
     }
 
     func addToUpNext(_ album: AlbumCard, startingAt track: TrackRow.ID? = nil) {
         upNext.append(UpNextEntry(album: album, startTrack: track))
+        appendNextRecordIfDue()
     }
 
     func removeUpNext(_ entry: UpNextEntry) {
@@ -267,6 +324,8 @@ final class PlaybackController {
         album = nil
         tracks = []
         layout = SideLayout(durations: [])
+        albumSegments = []
+        platterSegment = nil
         cuedSide = 0
         intendedIndex = nil
         // Unlike `perform`, never overtaken: the stop waits for the command in flight, and drops any still waiting,
@@ -292,7 +351,7 @@ final class PlaybackController {
             Task { await play(fromTrack: 0) }
         case .one:
             let last = max(0, tracks.count - 1)
-            let index = player.currentIndex ?? last
+            let index = trackIndex ?? last
             Task { await play(fromTrack: index) }
         case .off:
             guard !upNext.isEmpty else { return }
@@ -307,16 +366,62 @@ final class PlaybackController {
         }
     }
 
-    /// Called when the player moves to another track. Under one-track repeat, only a natural advance (the track played
-    /// out) goes back; a move the controller asked for (Next, Previous, a seek) is left alone.
+    /// Called when the player moves to another track. The platter follows the queue into another record of it (an
+    /// appended one, or back), and the last queued track starting appends the next Up Next record when crossfade is on
+    /// (`appendNextRecordIfDue`). Under one-track repeat, only a natural advance (the track played out) goes back; a
+    /// move the controller asked for (Next, Previous, a seek) is left alone.
     func playerTrackChanged(from old: Int?, to new: Int?) {
-        if let new, let side = layout.side(ofTrack: new) { cuedSide = side }
+        if let new { followQueue(to: new) }
+        if let track = trackIndex, let side = layout.side(ofTrack: track) { cuedSide = side }
+        appendNextRecordIfDue()
         if let intended = intendedIndex, new == intended {
             intendedIndex = nil
             return
         }
-        guard repeatMode == .one, let old, let new, new == old + 1, isPlaying else { return }
-        Task { await play(fromTrack: old) }
+        guard repeatMode == .one, let old, let new, new == old + 1, isPlaying, let segment = segment(at: old) else {
+            return
+        }
+        // Back to the track that played out, on its own record (the advance may have crossed into the next one).
+        if segment.album.id != album?.id { cue(segment.album) }
+        let track = segment.track(at: old)
+        Task { await play(fromTrack: track) }
+    }
+
+    /// Puts the record of player index `index` on the platter when the queue has moved into another of its records,
+    /// unless the platter shows a record the queue does not hold here (one cued by the hand-off). Moving on into an
+    /// appended record is the controller's own pull from Up Next: `autoLoads`.
+    private func followQueue(to index: Int) {
+        guard player.queue.indices.contains(index), let from = platterSegment, albumSegments.indices.contains(from),
+            albumSegments[from].album.id == album?.id,
+            let to = albumSegments.lastIndex(where: { $0.start <= index }), to != from
+        else { return }
+        let segment = albumSegments[to]
+        album = segment.album
+        tracks = segment.tracks
+        layout = SideLayout(durations: segment.tracks.map(\.durationSeconds))
+        platterSegment = to
+        if to > from { autoLoads += 1 }
+    }
+
+    /// Crossfade on (Between albums or Always, and not Pure), no repeat, a record waiting in Up Next, and the last
+    /// track of the player's queue just started: the waiting record joins the queue behind it, from its chosen song,
+    /// so the pipeline can overlap the boundary. It leaves Up Next.
+    private func appendNextRecordIfDue() {
+        let sound = player.sound
+        guard !sound.pure, sound.crossfade.mode != .off, repeatMode == .off, isPlaying, let entry = upNext.first,
+            let index = player.currentIndex, index == player.queue.count - 1, let last = albumSegments.last,
+            index >= last.start, index < last.end, trackIndex != nil
+        else { return }
+        let tracks = library.tracks(of: entry.album.id)
+        let first = entry.startTrack.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
+        guard tracks.indices.contains(first) else { return }
+        let ids = tracks[first...].map(\.id)
+        let items = library.queueItems(for: Array(ids))
+        guard items.count == ids.count else { return }
+        upNext.removeFirst()
+        albumSegments.append(
+            AlbumSegment(album: entry.album, tracks: tracks, start: player.queue.count, firstTrack: first))
+        player.append(items)
     }
 
     private func pullNextNow() async {
