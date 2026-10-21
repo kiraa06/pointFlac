@@ -30,11 +30,6 @@ struct SettingsView: View {
                     Text("Everything in greys except album artwork.")
                 }
                 Section {
-                    LabeledContent("Turntable sounds", value: "Off")
-                } footer: {
-                    Text("Needle and run-out sounds are off by default and never play in Pure mode.")
-                }
-                Section {
                     Toggle("Look up names online (MusicBrainz)", isOn: $lookupNames)
                         .accessibilityIdentifier("lookupNamesToggle")
                     Toggle("Look up cover art online", isOn: $lookupArtwork)

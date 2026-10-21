@@ -3,9 +3,12 @@ import SwiftUI
 
 /// The strip's details (spec §5.7): every field of the signal path, each with a plain-language line, and the volume
 /// advice for USB. The strongest claim it makes is "Untouched by pointFlac", never more: nothing here has been
-/// verified on hardware yet.
+/// verified on hardware yet. While blocks are processing, Open Sound goes to the chain (spec §5.7: tapping
+/// Processing opens it).
 struct SignalDetailsSheet: View {
     let signal: SignalState
+    /// Closes the sheet and shows the Sound tab.
+    var openSound: (() -> Void)?
 
     var body: some View {
         NavigationStack {
@@ -19,6 +22,11 @@ struct SignalDetailsSheet: View {
                     Section("Processing, in order") {
                         ForEach(Array(signal.activeProcessing.enumerated()), id: \.offset) { index, name in
                             Text("\(index + 1). \(name)").font(.body.monospacedDigit())
+                        }
+                        if let openSound {
+                            Button("Open Sound", systemImage: "slider.vertical.3", action: openSound)
+                                .accessibilityHint("Shows the Sound tab, where the blocks are switched")
+                                .accessibilityIdentifier("openSoundButton")
                         }
                     }
                 }

@@ -6,7 +6,8 @@ import PFFlac
 import PFLibrary
 
 /// The app's state: the player, wired to the real iOS audio stack; the library (stream A's `Library`, through
-/// `RealLibrary`); the music finder (the real providers, through `RealMusicFinder`); and the playback controller.
+/// `RealLibrary`); the music finder (the real providers, through `RealMusicFinder`); the playback controller; and the
+/// Sound settings, which reach the player before anything plays.
 ///
 /// There is one library over `Documents/Library`, and so one import inbox: `Library` owns it. Diagnostics (Plan 1's
 /// debug views) reads the same library rather than a second inbox, since two inboxes over one folder would race.
@@ -17,6 +18,8 @@ import PFLibrary
 ///   (ruling R22).
 /// - `-PFMockFinder`, and `-PFPreloadFixtures` too, keep the demo `MockMusicFinder`, so UI tests never touch the
 ///   network and stay deterministic.
+/// - `-PFResetSound` and `-PFCorruptSound` replace the saved Sound settings before they load (`SoundStore`), and
+///   `-PFSoundSaveDelay <seconds>` stretches their save's debounce.
 @MainActor
 @Observable
 final class AppModel {
@@ -34,6 +37,8 @@ final class AppModel {
     @ObservationIgnored let finder: any MusicFinding
     /// The record on the deck, its sides, Up Next and repeat. Set once, before the UI mounts.
     @ObservationIgnored let playback: PlaybackController
+    /// The Sound tab's settings, saved in Application Support. Set once, before the UI mounts.
+    @ObservationIgnored let sound: SoundStore
     /// The real library behind `library`.
     let realLibrary: RealLibrary
     /// The real finder, unless a DEBUG launch asked for the mock.
@@ -46,6 +51,7 @@ final class AppModel {
     #if DEBUG
         private let preloadFixtures: Bool
         /// `-PFDemoPlay`: plays the demo album "Night Drive" once the library is listed, for screenshots and UI tests.
+        /// `-PFDemoAlbum <title>` picks another (the Sound tests play the 48 kHz "Copper Garden").
         private let demoPlay: Bool
     #endif
 
@@ -78,6 +84,17 @@ final class AppModel {
                 return output
             },
             capabilities: .current, nowPlaying: SystemNowPlaying(), makeDecoder: { try FlacDecoder(url: $0.url) })
+        #if DEBUG
+            SoundStore.prepareForLaunch(arguments: arguments)
+        #endif
+        // Loads `sound.json` and hands it to the player now, so the first pipeline already plays with it.
+        #if DEBUG
+            // `-PFSoundSaveDelay <seconds>`: a longer debounce, so a UI test can tell the flush from the debounced save.
+            let delay = UserDefaults.standard.double(forKey: "PFSoundSaveDelay")
+            sound = SoundStore(player: player, saveDelay: delay > 0 ? .seconds(delay) : .milliseconds(500))
+        #else
+            sound = SoundStore(player: player)
+        #endif
         let names = UserDefaults.standard.bool(forKey: Self.lookupNamesKey)
         let artwork = UserDefaults.standard.bool(forKey: Self.lookupArtworkKey)
         #if SOULSEEK
@@ -152,8 +169,8 @@ final class AppModel {
             } else {
                 await reload()
             }
-            if demoPlay, let album = library.albums.first(where: { $0.title == "Night Drive" }) ?? library.albums.first
-            {
+            let demoAlbum = UserDefaults.standard.string(forKey: "PFDemoAlbum") ?? "Night Drive"
+            if demoPlay, let album = library.albums.first(where: { $0.title == demoAlbum }) ?? library.albums.first {
                 await playback.load(album)
             }
         #else
