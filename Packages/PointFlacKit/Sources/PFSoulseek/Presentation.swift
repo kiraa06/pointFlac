@@ -2,7 +2,8 @@ import Foundation
 
 /// One peer's folder from a search: the unit §4.7 asks the UI to show ("grouped by peer and complete folder").
 public struct SearchResultFolder: Sendable, Hashable, Identifiable {
-    public var id: String { "\(peer)\u{0}\(folder)" }
+    /// A NUL-free hash of peer and folder, like `SearchResultFile.id`.
+    public var id: String { PathSanitizer.resultID(peer: peer, path: folder + "\\") }
     public var peer: String
     /// The remote folder path, as `browseFolder(_:of:)` expects it.
     public var folder: String

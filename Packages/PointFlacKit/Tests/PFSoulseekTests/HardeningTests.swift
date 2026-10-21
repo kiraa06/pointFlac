@@ -336,6 +336,8 @@ struct HardeningTests {
         let b = SearchResultFile(peer: "bob", path: "a\\c.flac", sizeBytes: 1)
         #expect(!a.id.contains("\u{0}") && a.id.hasPrefix("slsk-") && a.id.count == 37)
         #expect(a.id != b.id && a.id == SearchResultFile(peer: "bob", path: "a\\b.flac", sizeBytes: 9).id)
+        let folderID = SearchResultFolder.group([a, b])[0].id
+        #expect(!folderID.contains("\u{0}") && folderID != a.id)
     }
 }
 

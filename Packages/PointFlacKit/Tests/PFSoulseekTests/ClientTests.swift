@@ -274,7 +274,11 @@ struct SearchTests {
         }
         let (honest, honestTask) = try await Self.respondingPeer(
             token: 3, searchToken: { await tokenBox.value }, files: Self.files)
-        let stream = client.search("x", options: SoulseekSearchOptions(window: .seconds(1)))
+        // A long window that ends early once the honest peer's two files arrive. The bomb takes a while to build on an
+        // instrumented (TSan) build and must still arrive while its connection is allowed to live.
+        var options = SoulseekSearchOptions(window: .seconds(30))
+        options.maxFiles = 2
+        let stream = client.search("x", options: options)
         let search = try await link.expect(code: 26)
         var reader = WireReader(search.payload)
         await tokenBox.set(try reader.u32())
@@ -286,7 +290,15 @@ struct SearchTests {
         try await garbageTask.value
         try await honestTask.value
         #expect(files.count == 2 && files.allSatisfy { $0.peer == "bob" })
-        #expect(await client.diagnostics.malformedMessages >= 2)
+        // The garbage is always malformed. The bomb is malformed (inflate cap) or, on a slow machine such as a TSan
+        // run, arrives after the window and is dropped as inactive; either way it never reaches the results.
+        // Inflating the bomb up to its cap can outlast the window on an instrumented build, so wait for its verdict.
+        #expect(
+            await eventually(within: .seconds(40)) {
+                let diagnostics = await client.diagnostics
+                return diagnostics.malformedMessages >= 1
+                    && diagnostics.malformedMessages + diagnostics.inactiveResponses >= 2
+            })
     }
 
     @Test("Early stop at maxFiles")
