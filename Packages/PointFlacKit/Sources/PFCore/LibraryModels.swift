@@ -30,11 +30,19 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
     public var artworkID: String?
     /// The file was evicted to iCloud: still in the library, but its bytes must download before it plays (§4.7).
     public var isCloudPending: Bool
+    /// The file is the app's own copy, in its library folder (an import or a download): removing the track deletes it.
+    /// False for a file in a folder added in place, which is the user's and is never deleted; removing that track only
+    /// takes it out of the library. Carried here so the UI can say which will happen before it asks. It has no default,
+    /// so no construction can leave it to chance: the delete dialog's promise rests on it.
+    public var isInLibraryFolder: Bool
+    /// What the library knows about the track's loudness (ReplayGain tags and the background R128 scan), or nil when it
+    /// knows nothing. It has no default, like `isInLibraryFolder`: a construction cannot forget it.
+    public var loudness: TrackLoudness?
 
     public init(
         id: String, url: URL, title: String, artist: String, albumArtist: String, album: String, albumID: String,
         discNumber: Int?, trackNumber: Int?, year: Int?, format: AudioFormat, totalFrames: Int64,
-        artworkID: String?, isCloudPending: Bool = false
+        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool, loudness: TrackLoudness?
     ) {
         self.id = id
         self.url = url
@@ -50,6 +58,8 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
         self.totalFrames = totalFrames
         self.artworkID = artworkID
         self.isCloudPending = isCloudPending
+        self.isInLibraryFolder = isInLibraryFolder
+        self.loudness = loudness
     }
 
     /// The track's length in seconds; zero when its frame count is unknown.
@@ -66,6 +76,43 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
 
     /// For track rows: "FLAC 24/96", like the album's label.
     public var formatLabel: String { LibraryAlbum.formatLabel(format) }
+}
+
+/// A track's loudness, from two sources. Playback (Plan 4, Task 12) prefers the tags, then the measurement.
+public struct TrackLoudness: Sendable, Hashable {
+    /// `REPLAYGAIN_TRACK_GAIN` in dB.
+    public var trackGainDb: Double?
+    /// `REPLAYGAIN_TRACK_PEAK`, linear.
+    public var trackPeak: Double?
+    public var albumGainDb: Double?
+    public var albumPeak: Double?
+    /// The scan's integrated loudness of the track, in LUFS. Nil with `measuredPeak` set means measured, but there is
+    /// no usable loudness (silent, or shorter than one 400 ms gating block): apply no gain from it.
+    public var measuredLufs: Double?
+    /// The scan's true peak of the track, linear (1.0 = full scale; 0 for silence). Set once the track is measured.
+    public var measuredPeak: Double?
+    /// The scan's loudness of the whole album, in LUFS (nil when it has no usable loudness), and its peak (the largest
+    /// track peak), linear. Both nil when the album was not measured as a whole.
+    public var albumMeasuredLufs: Double?
+    public var albumMeasuredPeak: Double?
+
+    public init(
+        trackGainDb: Double? = nil, trackPeak: Double? = nil, albumGainDb: Double? = nil, albumPeak: Double? = nil,
+        measuredLufs: Double? = nil, measuredPeak: Double? = nil, albumMeasuredLufs: Double? = nil,
+        albumMeasuredPeak: Double? = nil
+    ) {
+        self.trackGainDb = trackGainDb
+        self.trackPeak = trackPeak
+        self.albumGainDb = albumGainDb
+        self.albumPeak = albumPeak
+        self.measuredLufs = measuredLufs
+        self.measuredPeak = measuredPeak
+        self.albumMeasuredLufs = albumMeasuredLufs
+        self.albumMeasuredPeak = albumMeasuredPeak
+    }
+
+    /// True when nothing is known.
+    public var isEmpty: Bool { self == TrackLoudness() }
 }
 
 /// An album derived from its tracks' tags. Albums are not stored: they are regrouped from the tracks whenever the

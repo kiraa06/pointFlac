@@ -42,6 +42,18 @@ public final class Library: Sendable {
         (catalog: LibraryCatalog, subscribers: [UUID: AsyncStream<LibraryCatalog>.Continuation])
     >((.empty, [:]))
     private let repairScheduled = Mutex(false)
+    /// For tests: how many files the loudness scan has opened to decode.
+    let loudnessDecodes = Mutex(0)
+    /// A loudness scan is running (`scanLoudness` runs one at a time), and what was asked for meanwhile.
+    let loudnessScan = Mutex<(running: Bool, pending: LoudnessRequest?)>((false, nil))
+    /// For tests: finished meters the scan holds to pool an album, now and at most.
+    let loudnessMeters = Mutex<(current: Int, peak: Int)>((0, 0))
+    /// For tests: called after each decoded chunk of a loudness scan.
+    let loudnessChunkHook = Mutex<(@Sendable () -> Void)?>(nil)
+    /// For tests: every album pool fails, as libebur128's would if it could not pool the meters.
+    let loudnessPoolFault = Mutex(false)
+    /// For tests: awaited after each track's measurement, before it is stored.
+    let loudnessHook = Mutex<(@Sendable (String) async -> Void)?>(nil)
     /// For tests: how many catalogs have been published.
     private let publishedCount = Mutex(0)
     static let logger = Logger(subsystem: "io.github.kiraa06.pointflac", category: "library")
@@ -165,6 +177,24 @@ public final class Library: Sendable {
         try await run(.always) { try $0.removeFolder(id) }
     }
 
+    /// Takes tracks out of the library at the user's request (Delete Album, Delete Song), and publishes the new
+    /// catalog before returning. A track in the app's own library folder is deleted from the device, with any folder
+    /// that leaves empty below the library folder. A track in a folder added in place only leaves the library: its
+    /// file is the user's and is never touched, and rescans leave it out until it changes. Covers no track uses any
+    /// more are deleted. Unknown IDs are ignored.
+    ///
+    /// Should it fail, the database rolls back but a file already deleted stays deleted, so the library rescans
+    /// before throwing: its catalog, and the shelf, never list a file that is gone.
+    public func remove(trackIDs: [String]) async throws -> LibraryRemoval {
+        do {
+            return try await run(.ifChanged) { try $0.remove(trackIDs: trackIDs) }
+        } catch {
+            Self.log(error, during: "remove")
+            await rescan()
+            throw error
+        }
+    }
+
     /// The stored cover for `artworkID` (a JPEG at most 600 px on its long side), or nil. Safe from any thread; held
     /// in a byte-bounded memory cache. A cover whose file has gone is regenerated from its track in the background,
     /// so a later call finds it again.
@@ -189,9 +219,26 @@ public final class Library: Sendable {
     /// For tests: how many catalogs have been published since the library opened.
     var publishCount: Int { publishedCount.withLock { $0 } }
 
+    /// For tests: every track's `r128_state` (0 not measured, 1 measured, 2 unmeasurable), by track ID.
+    func loudnessStates() async -> [String: Int] {
+        let rows = (try? await run(.never) { try $0.database.query("SELECT id, r128_state FROM tracks") }) ?? []
+        return Dictionary(
+            uniqueKeysWithValues: rows.compactMap { row in row[0].string.map { ($0, Int(row[1].int ?? -1)) } })
+    }
+
+    /// For tests: lowers the largest album the loudness scan pools.
+    func setMaxLoudnessAlbum(_ cap: Int) async {
+        _ = try? await run(.never) { $0.maxAlbumTracks = cap }
+    }
+
     /// For tests: lowers the per-folder file cap.
     func setMaxFilesPerFolder(_ cap: Int) async {
         _ = try? await run(.never) { $0.maxFilesPerFolder = cap }
+    }
+
+    /// For tests: the next removal fails inside its transaction, after deleting its files.
+    func failNextRemoval() async {
+        _ = try? await run(.never) { $0.removalFault = LibraryDatabaseError(code: 1, message: "injected failure") }
     }
 
     /// For tests: waits until everything queued before it has run.
@@ -212,7 +259,7 @@ public final class Library: Sendable {
     }
 
     /// When a call publishes a catalog: never (reads), always (a folder removed), or if its scan changed something.
-    private enum Publish {
+    enum Publish {
         case never
         case always
         case ifChanged
@@ -220,7 +267,7 @@ public final class Library: Sendable {
 
     /// Runs `body` on the library's queue; then, when `rule` says the result changed the library, publishes the
     /// catalog before the caller resumes, so `current` already shows what the call did.
-    private func run<T: Sendable>(
+    func run<T: Sendable>(
         _ rule: Publish, _ body: @escaping @Sendable (LibraryStore) throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -257,7 +304,7 @@ public final class Library: Sendable {
         for subscriber in subscribers { subscriber.yield(catalog) }
     }
 
-    private static func log(_ error: any Error, during operation: String) {
+    static func log(_ error: any Error, during operation: String) {
         let code = (error as? LibraryDatabaseError).map { String($0.code) } ?? "-"
         logger.error(
             "\(operation, privacy: .public) failed (code \(code, privacy: .public)): \(String(describing: error), privacy: .private)"
@@ -288,6 +335,18 @@ private struct ImportScan: Sendable, ChangeReporting {
     var added: [String]
     var changedLibrary: Bool { !report.changedNothing }
     var pair: (ScanReport, [String]) { (report, added) }
+}
+
+/// What removing tracks did (`Library.remove(trackIDs:)`).
+public struct LibraryRemoval: Sendable, Equatable {
+    /// Tracks whose file was deleted from the app's library folder, or was already gone from it.
+    public var deletedFiles: Int
+    /// Tracks that left the library while their file stays where it is: those in folders added in place.
+    public var removedFromLibrary: Int
+}
+
+extension LibraryRemoval: ChangeReporting {
+    var changedLibrary: Bool { deletedFiles + removedFromLibrary > 0 }
 }
 
 /// A folder the library reads: the app's own library folder (always first) or one added in place.

@@ -10,18 +10,18 @@ echo "Simulator destination: $DEST"
 export TEST_RUNNER_CI="${CI:-}"
 
 echo "== 1/7 licence guard =="
-# Only BSD, MIT, zlib, Apache-2.0 or public-domain code may be vendored, so no file in the libFLAC copy may carry a GPL
+# Only BSD, MIT, zlib, Apache-2.0 or public-domain code may be vendored, so no file in the libFLAC or libebur128 copy may carry a GPL
 # or LGPL notice. Headers wrap the licence's name mid-phrase ("GNU Lesser General Public\n * License"), so the guard
 # matches the fragments as well as the full names.
 LICENCE_PATTERN='General Public License|Lesser General Public|Library General Public|GNU (Lesser|Library) General'
 LICENCE_PATTERN+='|GNU General Public|\b[AL]?GPL(v[0-9])?\b'
-if grep -rIlE "$LICENCE_PATTERN" Packages/PointFlacKit/Sources/CFLAC; then
-    echo "licence guard: the files above carry a GPL or LGPL notice; remove them from CFLAC" >&2
+if grep -rIlE "$LICENCE_PATTERN" Packages/PointFlacKit/Sources/CFLAC Packages/PointFlacKit/Sources/CEBUR128; then
+    echo "licence guard: the files above carry a GPL or LGPL notice; remove them from CFLAC or CEBUR128" >&2
     exit 1
 fi
-# The app's bundled notice must carry all three licences word for word.
+# The app's bundled notice must carry every vendored licence word for word.
 NOTICES=App/ThirdPartyNotices.txt
-for licence in Packages/PointFlacKit/Sources/CFLAC/COPYING.Xiph Packages/PointFlacKit/Licenses/LICENSE.bs2b LICENSE; do
+for licence in Packages/PointFlacKit/Sources/CFLAC/COPYING.Xiph Packages/PointFlacKit/Sources/CEBUR128/COPYING.libebur128 Packages/PointFlacKit/Licenses/LICENSE.bs2b LICENSE; do
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         grep -qF -- "$line" "$NOTICES" || {

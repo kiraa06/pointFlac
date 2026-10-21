@@ -55,6 +55,28 @@ enum SearchFilter: CaseIterable {
     func queueItems(for tracks: [TrackRow.ID]) -> [QueueItem]
     /// Imports files picked in Files; `rejected` holds one line per refused file ("name: reason").
     func importFiles(_ urls: [URL]) async -> (added: Int, rejected: [String])
+    /// What removing `album` (every track it has, the songs pointFlac can't play included) plus `tracks` would do,
+    /// before the user confirms.
+    func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan
+    /// Removes `tracks` (a plan's) as `removalPlan` described, and returns once the shelf shows the library without
+    /// them.
+    func remove(tracks: [TrackRow.ID]) async
+}
+
+/// What deleting an album or a song would do, worked out before the user confirms. The plan names the tracks it
+/// counted, and the deletion is given exactly those, so the dialog can never promise one thing and do another.
+struct RemovalPlan: Equatable {
+    /// Every track the deletion takes. An album's include the songs pointFlac can't play (multichannel), which the
+    /// shelf never lists: left behind, they would stay on the iPhone where nothing in the app can reach them.
+    var tracks: [TrackRow.ID] = []
+    /// Songs deleted from this iPhone: the app's own copies.
+    var deletes = 0
+    /// Songs only removed from pointFlac: files in folders added in place, which stay where they are.
+    var removes = 0
+    /// How many of `deletes` pointFlac can't play.
+    var unplayableDeletes = 0
+    /// How many of `removes` pointFlac can't play.
+    var unplayableRemoves = 0
 }
 
 /// Finding and downloading music from the online providers.
@@ -68,6 +90,10 @@ enum SearchFilter: CaseIterable {
     func cancelDownload(_ id: DownloadRow.ID)
     /// Starts a failed or cancelled download again.
     func retryDownload(_ id: DownloadRow.ID)
+    /// Takes a finished, failed or cancelled row off the list. A finished download's song stays in the library.
+    func removeDownload(_ id: DownloadRow.ID)
+    /// Takes every finished download (`finished`), and every failed or cancelled one (`failed`), off the list.
+    func clearDownloads(finished: Bool, failed: Bool)
 
     // Contract 3: typeahead.
     /// Emits library hits at once, then the registry's (MusicBrainz) as they arrive. Each emission is the full list.
@@ -76,11 +102,13 @@ enum SearchFilter: CaseIterable {
     func search(_ suggestion: Suggestion, provider: String) -> AsyncStream<[RemoteResultRow]>
 }
 
-/// Cancel and retry for the Downloads list: the integration's addition to contract 2. Defaulted to no-ops, so the
-/// mock and any other finder written to the original shape still conform.
+/// Cancel, retry, remove and clear for the Downloads list: the integration's additions to contract 2. Defaulted to
+/// no-ops, so the mock and any other finder written to the original shape still conform.
 extension MusicFinding {
     func cancelDownload(_ id: DownloadRow.ID) {}
     func retryDownload(_ id: DownloadRow.ID) {}
+    func removeDownload(_ id: DownloadRow.ID) {}
+    func clearDownloads(finished: Bool, failed: Bool) {}
 }
 
 struct RemoteResultRow: Identifiable, Hashable, Sendable {

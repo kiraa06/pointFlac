@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "PFCore", targets: ["PFCore"]),
         .library(name: "PFFlac", targets: ["PFFlac"]),
         .library(name: "PFDSP", targets: ["PFDSP"]),
+        .library(name: "PFLoudness", targets: ["PFLoudness"]),
         .library(name: "PFAudio", targets: ["PFAudio"]),
         .library(name: "PFLibrary", targets: ["PFLibrary"]),
         .library(name: "PFSearch", targets: ["PFSearch"]),
@@ -37,6 +38,27 @@ let package = Package(
                 .unsafeFlags(["-w"]),
             ]
         ),
+        // libebur128 1.2.6, vendored unmodified (MIT). See Sources/CEBUR128/README.md.
+        .target(
+            name: "CEBUR128",
+            exclude: ["COPYING.libebur128", "README.md"],
+            cSettings: [
+                .headerSearchPath("include"),
+                // On arm64 libebur128 takes its portable flush-to-zero path (correct, and the only one there) but
+                // announces it with an unconditional #warning that no define can switch off. This silences only that.
+                .unsafeFlags(["-Wno-#warnings"]),
+            ]
+        ),
+        .target(
+            name: "PFLoudness",
+            dependencies: ["CEBUR128"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "PFLoudnessTests",
+            dependencies: ["PFLoudness"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .target(
             name: "PFCore",
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -58,7 +80,7 @@ let package = Package(
         ),
         .target(
             name: "PFLibrary",
-            dependencies: ["PFCore", "PFFlac"],
+            dependencies: ["PFCore", "PFFlac", "PFLoudness"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // Stream D: the player UI's maths (sides, spin, tonearm, jog, the hand-off timeline). Foundation only.
@@ -134,7 +156,7 @@ let package = Package(
         .testTarget(
             name: "PFLibraryTests",
             // PFSearch and PFAudio only for the end-to-end test of the path the app adapter takes.
-            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFTestSupport"],
+            dependencies: ["PFLibrary", "PFSearch", "PFAudio", "PFLoudness", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
