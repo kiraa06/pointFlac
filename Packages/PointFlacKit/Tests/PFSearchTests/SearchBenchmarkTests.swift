@@ -101,6 +101,11 @@ enum SyntheticLibrary {
     for query in queries {
         let start = ContinuousClock.now
         let results = index.search(query, filter: .all, limit: 50)
+        // What one screen shows: ten rows highlighted.
+        for hit in (results.albums + results.artists + results.tracks).prefix(10) {
+            _ = hit.titleHighlights
+            _ = hit.subtitleHighlights
+        }
         times.append(ContinuousClock.now - start)
         if !results.isEmpty { nonEmpty += 1 }
     }
@@ -136,7 +141,11 @@ enum SyntheticLibrary {
     var times: [Duration] = []
     for query in queries {
         let start = ContinuousClock.now
-        _ = index.search(query, filter: .all, limit: 50)
+        let results = index.search(query, filter: .all, limit: 50)
+        for hit in (results.albums + results.artists + results.tracks).prefix(10) {
+            _ = hit.titleHighlights
+            _ = hit.subtitleHighlights
+        }
         times.append(ContinuousClock.now - start)
     }
     times.sort()
