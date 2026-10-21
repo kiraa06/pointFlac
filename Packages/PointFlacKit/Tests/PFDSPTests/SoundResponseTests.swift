@@ -75,4 +75,18 @@ struct SoundResponseTests {
         #expect(curve.first?.hz == 20)
         #expect(abs((curve.last?.hz ?? 0) - 3_920) < 1e-6)
     }
+
+    @Test("a narrow off-grid peak is found by the refinement, not just the grid scan")
+    func narrowOffGridPeakIsRefined() {
+        let fs = 48_000.0
+        let s = settings(eq: [EQBand(type: .peak, frequency: 1234.5, gainDb: 24, q: 20)])
+        let filter = SoundResponse.filters(s, sampleRate: fs)[0]
+        // Brute force reference: a dense log scan, far finer than the 1024-point grid the implementation starts from.
+        let n = 100_000
+        let reference = (0..<n).map { i in
+            filter.magnitudeDb(atHz: 20 * pow(1000.0, Double(i) / Double(n - 1)), sampleRate: fs)
+        }.max()!
+        #expect(reference > 20)
+        #expect(abs(SoundResponse.autoHeadroomDb(s, sampleRate: fs) + reference) < 0.01)
+    }
 }
