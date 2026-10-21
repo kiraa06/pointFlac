@@ -89,10 +89,6 @@ Each preset is credited to its author in the app ("EQ by <author> · OPRA"). The
 JSON form and presets the equaliser cannot represent were left out; the data is otherwise unmodified. The
 conversion script is scripts/build-opra.swift. Only the data is under CC BY-SA 4.0; pointFlac's own code is not.
 
-Presets credited to AutoEQ or Rtings/AutoEQ were derived by OPRA from the AutoEq project,
-https://github.com/jaakkopasanen/AutoEq, which is under the MIT licence:
-Copyright (c) 2018-2022 Jaakko Pasanen
-
 
 pointFlac
 ---------

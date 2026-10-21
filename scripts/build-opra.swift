@@ -5,7 +5,9 @@
 //     git -C /some/scratch/dir/opra checkout 0b88ecd4e2bef7cf69fd5d50f1d06fb586c10865
 //     swift scripts/build-opra.swift /some/scratch/dir/opra [--exclude-author <name>]...
 //
-// --exclude-author drops every preset by that author (exact match, repeatable), e.g. to ship a smaller file.
+// AutoEq results are never bundled (spec 4.8; only the user's own import of a ParametricEQ.txt is allowed), so every
+// preset whose author contains "AutoEQ" (case-insensitive, e.g. "AutoEQ", "Rtings/AutoEQ") is dropped BY DEFAULT.
+// --exclude-author additionally drops every preset by that exact author (repeatable).
 //
 // OPRA's data is CC BY-SA 4.0 (see App/ThirdPartyNotices.txt). The output is deterministic: presets sorted by id,
 // keys sorted, one preset per line, so re-running on the same commit gives a byte-identical file.
@@ -110,7 +112,7 @@ for (id, d) in eqs {
         skippedOrphan += 1
         continue
     }
-    if excludedAuthors.contains(author) {
+    if excludedAuthors.contains(author) || author.range(of: "autoeq", options: .caseInsensitive) != nil {
         skippedAuthor += 1
         continue
     }
@@ -171,6 +173,6 @@ print("presets written: \(presets.count) (\(out.count) bytes)")
 print("skipped, more than \(maxBands) bands: \(skippedTooMany)")
 print("skipped, unrepresentable band type: \(skippedType)")
 print("skipped, no vendor/product: \(skippedOrphan)")
-print("skipped, excluded author: \(skippedAuthor)")
+print("skipped, AutoEq-derived or excluded author: \(skippedAuthor)")
 print("presets with values outside clamped() ranges: \(outOfRange) (\(outOfRangeBands) bands), kept as is")
 for (a, n) in authors.sorted(by: { $0.key < $1.key }) { print("author \(a): \(n)") }
