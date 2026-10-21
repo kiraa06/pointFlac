@@ -28,11 +28,13 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
     public var totalFrames: Int64
     /// The content hash of the track's front cover in the artwork store, when it has one.
     public var artworkID: String?
+    /// The file was evicted to iCloud: still in the library, but its bytes must download before it plays (§4.7).
+    public var isCloudPending: Bool
 
     public init(
         id: String, url: URL, title: String, artist: String, albumArtist: String, album: String, albumID: String,
         discNumber: Int?, trackNumber: Int?, year: Int?, format: AudioFormat, totalFrames: Int64,
-        artworkID: String?
+        artworkID: String?, isCloudPending: Bool = false
     ) {
         self.id = id
         self.url = url
@@ -47,6 +49,7 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
         self.format = format
         self.totalFrames = totalFrames
         self.artworkID = artworkID
+        self.isCloudPending = isCloudPending
     }
 
     /// The track's length in seconds; zero when its frame count is unknown.

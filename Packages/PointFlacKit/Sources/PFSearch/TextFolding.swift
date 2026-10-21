@@ -107,6 +107,7 @@ public enum TextFolding {
                 query.contains { token in
                     hasPrefix(candidate.joined, token) || SearchMatching.prefixWithinOneEdit(token, candidate.joined)
                         || candidate.pieces.contains { hasPrefix($0, token) }
+                        || substringOffset(of: token, in: candidate.joined) != nil
                 }
             })
         else { return }
@@ -151,6 +152,10 @@ public enum TextFolding {
                 if let r = range(base: 0, count: count) { ranges.append(r) }
                 continue
             }
+            if let offset = substringOffset(of: token, in: joined) {
+                if let r = range(base: offset, count: token.count) { ranges.append(r) }
+                continue
+            }
             // A piece: "dc" in "AC/DC".
             for start in pieceStarts where start > 0 {
                 let base = ends[start - 1].foldedCount
@@ -160,6 +165,15 @@ public enum TextFolding {
                 }
             }
         }
+    }
+
+    /// Where `token` (3+ letters) occurs inside `word` after its first letter, as search's substring tier matches it.
+    static func substringOffset(of token: Token, in word: Token) -> Int? {
+        guard token.count >= SearchMatching.minimumSubstringLength, word.count > token.count else { return nil }
+        for offset in 1...(word.count - token.count) where word[offset] == token[0] {
+            if word[offset..<offset + token.count].elementsEqual(token) { return offset }
+        }
+        return nil
     }
 
     static func hasPrefix(_ word: Token, _ prefix: Token) -> Bool {

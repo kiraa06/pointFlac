@@ -9,9 +9,11 @@ public struct LibraryHit: Sendable, Hashable, Identifiable {
         case track
     }
 
-    /// How the hit matched, worst token first: one typo makes the whole hit fuzzy.
+    /// How the hit matched, worst token first: one typo makes the whole hit fuzzy, one word found only inside another
+    /// makes it a substring hit.
     public enum Match: Int, Sendable, Hashable, Comparable {
         case fuzzy
+        case substring
         case prefix
         case exact
 
@@ -25,10 +27,21 @@ public struct LibraryHit: Sendable, Hashable, Identifiable {
     public var title: String
     /// Album: its artist. Track: "artist · album". Artist: the number of albums.
     public var subtitle: String
-    /// Ranges of `title` and `subtitle` that matched, for bold or tinted letters (spec §4.6).
-    public var titleHighlights: [Range<String.Index>]
-    public var subtitleHighlights: [Range<String.Index>]
     public var match: Match
+    /// The folded query words the hit was found for, which the highlights are computed from.
+    let queryTokens: [TextFolding.Token]
+
+    /// Ranges of `title` that matched, for bold or tinted letters (spec §4.6). Computed when read, not when the
+    /// search runs: a search returns up to 150 hits and a screen shows about ten, so only the rows on screen pay for
+    /// highlighting, and the keystroke itself stays inside its frame.
+    public var titleHighlights: [Range<String.Index>] {
+        TextFolding.highlights(in: title, query: queryTokens)
+    }
+
+    /// Ranges of `subtitle` that matched (none for an artist, whose subtitle is a count).
+    public var subtitleHighlights: [Range<String.Index>] {
+        kind == .artist ? [] : TextFolding.highlights(in: subtitle, query: queryTokens)
+    }
 }
 
 /// What a search found, grouped as spec §4.6 lists them, best first in each group.
@@ -52,12 +65,12 @@ public struct LibrarySearchResults: Sendable {
 /// - Documents are albums (title, artist), artists (name) and tracks (title, artist, album).
 /// - The vocabulary is every distinct folded token (`TextFolding`), sorted, flat. Each token has postings: document,
 ///   field, word position, and whether it is a piece of a punctuated word.
-/// - Each query token matches vocabulary words exactly, as a prefix, or with one typo (tokens of 4+ letters).
-///   Documents must match every query token (AND).
+/// - Each query token matches vocabulary words exactly, as a prefix, inside the word (3+ letters: "ove" in "Love",
+///   "ヒカル" in "宇多田ヒカル"), or with one typo (5+ letters). Documents must match every query token (AND).
 /// - Ranking, highest first: no typo at all; the query is the whole title; the title starts with the query; the sum
-///   of match quality (exact 100, prefix 60, typo 25) × field weight (title 4, artist 2, album 2); albums, then
-///   artists, then tracks; shorter titles; library order. That is the spec's order: exact title, title word, title
-///   start, artist or album word, typo.
+///   of match quality (exact 100, prefix 60, substring 40, typo 25) × field weight (title 4, artist 2, album 2);
+///   albums, then artists, then tracks; shorter titles; library order. That is the spec's order: exact title, title
+///   word, title start, title substring, artist or album word, typo.
 public final class SearchIndex: Sendable {
     public typealias Token = TextFolding.Token
 
@@ -70,6 +83,9 @@ public final class SearchIndex: Sendable {
     private static let fieldWeights: [Int32] = [4, 2, 2]
     private static let exactQuality: Int32 = 100
     private static let prefixQuality: Int32 = 60
+    private static let substringQuality: Int32 = 40
+    /// At most this many postings come from substring matches of one query word (`appendSubstrings`).
+    static let maxSubstringPostings = 8_192
     private static let typoQuality: Int32 = 25
 
     // Documents, in library order: albums, then artists, then tracks album by album.
@@ -88,6 +104,9 @@ public final class SearchIndex: Sendable {
     // `document << 10 | field << 8 | piece << 7 | position`.
     private let postingStarts: [Int32]
     private let postings: [UInt32]
+    /// Every three-letter run at offset 1 or later in a vocabulary word → the words holding it, shortest first. A
+    /// substring query looks up its rarest run and checks only those words, instead of scanning the vocabulary.
+    private let innerTrigrams: [UInt64: [Int32]]
 
     public var documentCount: Int { kinds.count }
     public var vocabularySize: Int { vocabularyStarts.count - 1 }
@@ -191,6 +210,28 @@ public final class SearchIndex: Sendable {
         self.vocabularyStarts = vocabularyStarts
         self.postingStarts = postingStarts
         self.postings = postings
+        var trigrams: [UInt64: [Int32]] = [:]
+        vocabulary.withUnsafeBufferPointer { words in
+            for k in 0..<(vocabularyStarts.count - 1) {
+                let start = Int(vocabularyStarts[k])
+                let n = Int(vocabularyStarts[k + 1]) - start
+                guard n >= SearchMatching.minimumSubstringLength + 1 else { continue }
+                for offset in 1...(n - 3) {
+                    let key = Self.trigram(words[start + offset], words[start + offset + 1], words[start + offset + 2])
+                    if trigrams[key]?.last != Int32(k) { trigrams[key, default: []].append(Int32(k)) }
+                }
+            }
+        }
+        // Shortest words first (the closest substring matches), so a query stops reading a long list once its
+        // postings budget is spent.
+        for key in Array(trigrams.keys) {
+            trigrams[key]?.sort { a, b in
+                let lengthA = vocabularyStarts[Int(a) + 1] - vocabularyStarts[Int(a)]
+                let lengthB = vocabularyStarts[Int(b) + 1] - vocabularyStarts[Int(b)]
+                return lengthA != lengthB ? lengthA < lengthB : a < b
+            }
+        }
+        self.innerTrigrams = trigrams
     }
 
     // MARK: Queries
@@ -268,10 +309,7 @@ public final class SearchIndex: Sendable {
         let title = titles[document]
         let subtitle = subtitles[document]
         return LibraryHit(
-            kind: kind, id: ids[document], title: title, subtitle: subtitle,
-            titleHighlights: TextFolding.highlights(in: title, query: tokens),
-            subtitleHighlights: kind == .artist ? [] : TextFolding.highlights(in: subtitle, query: tokens),
-            match: entry.match)
+            kind: kind, id: ids[document], title: title, subtitle: subtitle, match: entry.match, queryTokens: tokens)
     }
 
     /// A vocabulary word that matched a query token, and how.
@@ -280,6 +318,8 @@ public final class SearchIndex: Sendable {
         var quality: Int32
         var exact: Bool
         var typo: Bool
+        /// Found inside the word, not at its start (spec §5.5 tier 3).
+        var substring: Bool
     }
 
     /// Every document that matches all `tokens`, with its ranking key.
@@ -294,6 +334,7 @@ public final class SearchIndex: Sendable {
         var titleRun = [UInt8](repeating: 0, count: count)
         var exactTitleRun = [UInt8](repeating: 0, count: count)
         var exactWords = [UInt8](repeating: 0, count: count)
+        var substringsOnly = [UInt8](repeating: 0, count: count)
         var typos = [UInt8](repeating: 0, count: count)
         var touched: [Int32] = []
 
@@ -327,7 +368,9 @@ public final class SearchIndex: Sendable {
                             var flag = flags[document]
                             if !match.typo { flag |= 4 }
                             if match.exact { flag |= 8 }
-                            if field == 0, Int(posting & 0x7F) == index {
+                            if !match.typo, !match.substring { flag |= 16 }
+                            // A match inside a word never makes the title "start with" the query.
+                            if field == 0, Int(posting & 0x7F) == index, !match.substring {
                                 flag |= 1
                                 if match.exact, posting & 0x80 == 0 { flag |= 2 }
                             }
@@ -340,7 +383,11 @@ public final class SearchIndex: Sendable {
                         let flag = flags[d]
                         if flag & 1 != 0 { titleRun[d] += 1 }
                         if flag & 2 != 0 { exactTitleRun[d] += 1 }
-                        if flag & 4 == 0 { typos[d] += 1 }
+                        if flag & 4 == 0 {
+                            typos[d] += 1
+                        } else if flag & 16 == 0 {
+                            substringsOnly[d] += 1
+                        }
                         if flag & 8 != 0 { exactWords[d] += 1 }
                     }
                     touched = next
@@ -368,7 +415,8 @@ public final class SearchIndex: Sendable {
                 typoFree << 50 | exactTitle << 49 | titleStart << 48 | Int64(min(score[d], 1 << 30)) << 8
                 | kindRank << 4 | shortness
             let match: LibraryHit.Match =
-                typos[d] > 0 ? .fuzzy : exactWords[d] == tokenCount ? .exact : .prefix
+                typos[d] > 0
+                ? .fuzzy : substringsOnly[d] > 0 ? .substring : exactWords[d] == tokenCount ? .exact : .prefix
             entries.append((key, document, match))
         }
         return entries
@@ -399,32 +447,93 @@ public final class SearchIndex: Sendable {
                         result.append(
                             WordMatch(
                                 word: k, quality: exact ? Self.exactQuality : Self.prefixQuality, exact: exact,
-                                typo: false))
+                                typo: false, substring: false))
                         k += 1
                     }
-                    guard query.count >= SearchMatching.minimumTypoLength, let base = words.baseAddress else { return }
-                    // One pass over the vocabulary. Within one edit, the first two letters line up somehow: the
-                    // four-comparison test below rejects nearly every word before any call is made.
+                    let m = query.count
+                    guard let base = words.baseAddress else { return }
+                    if m >= SearchMatching.minimumSubstringLength {
+                        appendSubstrings(query, base: base, starts: starts, into: &result)
+                    }
+                    guard m >= SearchMatching.minimumTypoLength else { return }
+                    // One pass over the vocabulary for typos. A typo lines its first two letters up somehow, so a
+                    // four-comparison test rejects nearly every word before any call.
                     let q0 = query[0]
                     let q1 = query[1]
-                    let minimumLength = query.count - 1
+                    let substringWords = Set(result.lazy.filter(\.substring).map(\.word))
                     var start = Int(starts[0])
                     for k in 0..<wordCount {
                         let end = Int(starts[k + 1])
                         defer { start = end }
-                        guard end - start >= minimumLength else { continue }
+                        let n = end - start
+                        guard n >= m - 1 else { continue }
                         let w0 = base[start]
                         let w1 = base[start + 1]
                         guard w0 == q0 || w1 == q1 || w1 == q0 || w0 == q1 else { continue }
-                        let candidate = UnsafeBufferPointer(start: base + start, count: end - start)
-                        if SearchMatching.prefixWithinOneEdit(query, candidate) {
-                            result.append(WordMatch(word: k, quality: Self.typoQuality, exact: false, typo: true))
+                        let candidate = UnsafeBufferPointer(start: base + start, count: n)
+                        // A word already matched as a substring keeps that (better) match. Checked only here, for
+                        // the rare word that passes, never once per vocabulary word.
+                        if SearchMatching.prefixWithinOneEdit(query, candidate), !substringWords.contains(k) {
+                            result.append(
+                                WordMatch(
+                                    word: k, quality: Self.typoQuality, exact: false, typo: true, substring: false))
                         }
                     }
                 }
             }
         }
         return result
+    }
+
+    /// Words holding `query` after their first letter (spec §5.5 tier 3), found through the rarest of its
+    /// three-letter runs in `innerTrigrams`.
+    private func appendSubstrings(
+        _ query: UnsafeBufferPointer<UInt32>, base: UnsafePointer<UInt32>, starts: UnsafeBufferPointer<Int32>,
+        into result: inout [WordMatch]
+    ) {
+        let m = query.count
+        var rarest: [Int32]?
+        for j in 0...(m - 3) {
+            guard let words = innerTrigrams[Self.trigram(query[j], query[j + 1], query[j + 2])] else { return }
+            if rarest == nil || words.count < rarest!.count { rarest = words }
+        }
+        guard let rarest else { return }
+        // A three-letter run like "ove" or "the" sits inside thousands of words in a large library, and the shortest
+        // of them are the commonest. Substring hits rank below every prefix hit and only the first screenful is
+        // shown, so the words kept are the closest (the list is shortest first, where the query is most of the word)
+        // up to a budget of postings: that, not the word count, is what the per-keystroke pass costs. The walk stops
+        // as soon as the budget is spent, so a common run never costs a pass over its whole list.
+        var budget = Self.maxSubstringPostings
+        for word in rarest {
+            let k = Int(word)
+            let start = Int(starts[k])
+            let n = Int(starts[k + 1]) - start
+            guard n > m else { continue }
+            var offset = 1
+            var found = false
+            while offset <= n - m {
+                if base[start + offset] == query[0] {
+                    var i = 1
+                    while i < m, base[start + offset + i] == query[i] { i += 1 }
+                    if i == m {
+                        found = true
+                        break
+                    }
+                }
+                offset += 1
+            }
+            guard found else { continue }
+            let cost = Int(postingStarts[k + 1] - postingStarts[k])
+            guard cost <= budget else { break }
+            budget -= cost
+            result.append(
+                WordMatch(word: k, quality: Self.substringQuality, exact: false, typo: false, substring: true))
+        }
+    }
+
+    @inline(__always)
+    private static func trigram(_ a: UInt32, _ b: UInt32, _ c: UInt32) -> UInt64 {
+        UInt64(a) << 42 | UInt64(b) << 21 | UInt64(c)
     }
 
     private static func precedes(_ a: UnsafeBufferPointer<UInt32>, _ b: UnsafeBufferPointer<UInt32>) -> Bool {

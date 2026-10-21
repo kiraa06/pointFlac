@@ -93,9 +93,10 @@ let sampleIndex = SearchIndex(sampleCatalog)
     #expect(sampleIndex.search("beatels").artists.first?.match == .fuzzy)
     // A typo while still typing: "compu" is a prefix; "cmoputer" is one swap from "computer".
     #expect(sampleIndex.search("cmoputer").albums.map(\.title).contains("OK Computer"))
-    // Short tokens get no typo tolerance: "hlep" is 4 letters and is allowed, "hep" is not.
+    // Tokens under five letters get no typo tolerance: "hlep" and "hep" find nothing.
     #expect(sampleIndex.search("hep").isEmpty)
-    #expect(!sampleIndex.search("hlep").tracks.isEmpty)
+    #expect(sampleIndex.search("hlep").isEmpty)
+    #expect(!sampleIndex.search("yesterdya").tracks.isEmpty)
     // Two edits are too many.
     #expect(sampleIndex.search("baetels").artists.isEmpty)
 }
@@ -208,4 +209,54 @@ private func highlighted(_ text: String, _ ranges: [Range<String.Index>]) -> [St
     #expect(sampleIndex.search(long).elapsed < .seconds(1))
     _ = sampleIndex.search("\u{0}\u{FEFF}🎵🎶 Ω≈ç√")
     _ = sampleIndex.search(String(repeating: "x", count: 10_000))
+}
+
+/// The review's false positives at four letters: none of them match any more.
+@Test func shortWordsHaveNoTypoNeighbours() {
+    let catalog = LibraryCatalog(tracks: [
+        makeTrack("Bertrand", artist: "Bear", album: "With You"),
+        makeTrack("Beat It", artist: "Michael Jackson", album: "Thriller"),
+    ])
+    let index = SearchIndex(catalog)
+    #expect(index.search("beat").tracks.map(\.title) == ["Beat It"])
+    #expect(index.search("beat").artists.isEmpty)
+    #expect(index.search("wish").isEmpty)
+    #expect(index.search("bert").tracks.map(\.title) == ["Bertrand"])
+}
+
+/// Spec §5.5 tier 3: three letters or more also match inside a word, below prefixes and above typos, with the inner
+/// letters highlighted. CJK titles have no spaces, so this is how a name inside one is found.
+@Test func substringsMatchInsideWords() {
+    let catalog = LibraryCatalog(tracks: [
+        makeTrack("Glove", artist: "Hands", album: "Wear"),
+        makeTrack("Love Song", artist: "Adele", album: "21"),
+        makeTrack("First Love", artist: "宇多田ヒカル", album: "First Love"),
+        makeTrack("Loveless", artist: "MBV", album: "Loveless"),
+        makeTrack("Lovely", artist: "Billie", album: "Single"),
+    ])
+    let index = SearchIndex(catalog)
+    let love = index.search("love").tracks
+    // Exact and prefix matches first; "Glove" (inside the word) after them.
+    #expect(love.last?.title == "Glove")
+    #expect(love.last?.match == .substring)
+    #expect(love.first?.match == .exact)
+    let ove = index.search("ove").tracks
+    #expect(Set(ove.map(\.title)) == ["Glove", "Love Song", "First Love", "Loveless", "Lovely"])
+    #expect(ove.allSatisfy { $0.match == .substring })
+    let glove = try! #require(ove.first { $0.title == "Glove" })
+    #expect(glove.titleHighlights.map { String(glove.title[$0]) } == ["ove"])
+    let hikaru = index.search("ヒカル")
+    #expect(hikaru.artists.map(\.title) == ["宇多田ヒカル"])
+    #expect(hikaru.tracks.map(\.title) == ["First Love"])
+    let artist = try! #require(hikaru.artists.first)
+    #expect(artist.titleHighlights.map { String(artist.title[$0]) } == ["ヒカル"])
+    // Two letters never match inside a word.
+    #expect(index.search("ov").isEmpty)
+    // A substring hit still ranks above a typo hit.
+    let mixed = SearchIndex(
+        LibraryCatalog(tracks: [
+            makeTrack("Overture", artist: "X", album: "Y"),
+            makeTrack("Ballroom", artist: "X", album: "Z"),
+        ]))
+    #expect(mixed.search("allro").tracks.first?.title == "Ballroom")
 }
