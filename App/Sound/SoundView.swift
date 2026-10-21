@@ -9,8 +9,10 @@ import SwiftUI
 /// Pure is the master. While it is on, every block row and capsule is greyed and inert, and the graph shows what Pure
 /// bypasses; the blocks keep their own switches, so turning Pure off brings them back as they were.
 ///
-/// The meters poll `Player.soundMeters` only while this tab is on screen and the app is active, once per display
-/// frame. The colours all come from the deck's `Theme`, and from its greyscale twin under Monochrome.
+/// The meters poll `Player.soundMeters` only while this tab is on screen and the app is active, at up to 60 Hz, and
+/// stop a few seconds after playback stops, once they have fallen back. Each time polling resumes, one read is thrown
+/// away, so an old peak or clip is never shown as new. The colours all come from the deck's `Theme`, and from its
+/// greyscale twin under Monochrome.
 struct SoundView: View {
     let store: SoundStore
     let playback: PlaybackController
@@ -21,13 +23,20 @@ struct SoundView: View {
     @State private var curve = EQCurveModel()
     @State private var meters = MeterBallistics()
     @State private var visible = false
+    /// Playback has been stopped long enough for the meters to fall back to rest (see `meterIdleDelay`).
+    @State private var metersIdle = false
+
+    /// Long enough for the meters to fall from full scale to the floor (60 dB at 24 dB/s, after a 1.5 s hold), and for
+    /// a clip LED to go out.
+    private static let meterIdleDelay: Duration = .seconds(4)
 
     private var player: Player { playback.player }
     private var theme: Theme { .look(stage: .deck, dark: scheme == .dark, monochrome: mono) }
     /// The deck screen's look, dark in both appearances, for the graph and the meters.
     private var screen: Theme { .look(stage: .deck, dark: true, monochrome: mono) }
     private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
-    private var polling: Bool { visible && scenePhase == .active }
+    private var polling: Bool { visible && scenePhase == .active && !metersIdle }
+    private var playing: Bool { player.status == .playing }
 
     /// The rate the chain runs at, which its filters are designed for: the output's, else the file's, else 48 kHz.
     private var sampleRate: Double {
@@ -47,6 +56,17 @@ struct SoundView: View {
         .onDisappear { visible = false }
         .onChange(of: CurveInput(s, sampleRate: sampleRate), initial: true) { _, input in
             curve.request(input)
+        }
+        .onChange(of: polling, initial: true) { _, on in
+            if on { meters.resync(player) }
+        }
+        .task(id: playing) {
+            guard !playing else {
+                metersIdle = false
+                return
+            }
+            try? await Task.sleep(for: Self.meterIdleDelay)
+            if !Task.isCancelled { metersIdle = true }
         }
     }
 

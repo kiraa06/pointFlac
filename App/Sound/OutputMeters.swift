@@ -61,6 +61,14 @@ final class MeterBallistics {
     private var lastClipCount: Int?
     private var lastRead: Date?
 
+    /// Starts afresh when polling resumes: one read of the player's meters, thrown away, so the peak held while
+    /// nothing was polling, and clips counted meanwhile, are never shown as new.
+    func resync(_ player: Player) {
+        let m = player.soundMeters
+        lastClipCount = m.clipCount
+        lastRead = nil
+    }
+
     /// Reads the player's meters, unless they were read for this frame already.
     func poll(_ player: Player, at now: Date) {
         if let lastRead, abs(now.timeIntervalSince(lastRead)) < 0.004 { return }
@@ -128,10 +136,11 @@ struct OutputMeter: View {
     let polling: Bool
 
     static let rangeDb = 60.0
-    private static let marks: [Double] = [-48, -36, -24, -12, -6, 0]
+    private static let marks: [Double] = [-60, -48, -36, -24, -12, -6, 0]
+    @ScaledMetric(relativeTo: .caption2) private var scaleHeight = 12.0
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: nil, paused: !polling)) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !polling)) { context in
             let _ = meters.poll(player, at: context.date)
             let clip = meters.clipLit(at: context.date)
             panel(level: meters.level, hold: meters.peakHold, clip: clip)
@@ -174,12 +183,13 @@ struct OutputMeter: View {
             for db in Self.marks {
                 let x = (db + Self.rangeDb) / Self.rangeDb * size.width
                 let label = Text(db == 0 ? "0" : SoundFormat.signed(db, decimals: 0))
-                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .font(.caption2.monospaced().weight(.medium)).textScale(.secondary)
                     .foregroundStyle(theme.lcdInk.opacity(0.5))
-                context.draw(label, at: CGPoint(x: x, y: 0), anchor: db == 0 ? .topTrailing : .top)
+                let anchor: UnitPoint = db == 0 ? .topTrailing : db == -Self.rangeDb ? .topLeading : .top
+                context.draw(label, at: CGPoint(x: x, y: 0), anchor: anchor)
             }
         }
-        .frame(height: 10)
+        .frame(height: scaleHeight)
     }
 
     private func fraction(_ db: Double) -> Double {
@@ -229,9 +239,10 @@ struct GainReductionMeter: View {
 
     static let rangeDb = 12.0
     private static let marks: [Double] = [12, 9, 6, 3, 0]
+    @ScaledMetric(relativeTo: .caption2) private var scaleHeight = 12.0
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: nil, paused: !polling)) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !polling)) { context in
             let _ = meters.poll(source, at: context.date)
             panel(reduction: meters.reduction, hold: meters.reductionHold)
                 .accessibilityElement(children: .ignore)
@@ -265,14 +276,14 @@ struct GainReductionMeter: View {
                 for db in Self.marks {
                     let x = size.width - db / Self.rangeDb * size.width
                     let label = Text(db == 0 ? "0" : SoundFormat.signed(-db, decimals: 0))
-                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .font(.caption2.monospaced().weight(.medium)).textScale(.secondary)
                         .foregroundStyle(theme.lcdInk.opacity(0.5))
                     context.draw(
                         label, at: CGPoint(x: x, y: 0),
                         anchor: db == 0 ? .topTrailing : db == Self.rangeDb ? .topLeading : .top)
                 }
             }
-            .frame(height: 10)
+            .frame(height: scaleHeight)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

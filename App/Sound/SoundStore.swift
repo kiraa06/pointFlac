@@ -246,9 +246,10 @@ final class SoundStore {
 }
 
 /// Runs an action on the next display frame, once, however many times it was asked for in between: the latest state
-/// wins and nothing queues. At most 60 times a second (see `SoundStore`).
+/// wins and nothing queues. At most 60 times a second (see `SoundStore`). The display link holds the gate only weakly,
+/// through a proxy, and the gate invalidates the link when it goes, so neither outlives its store.
 @MainActor
-final class FrameGate: NSObject {
+final class FrameGate {
     var action: () -> Void = {}
     private var link: CADisplayLink?
 
@@ -257,15 +258,33 @@ final class FrameGate: NSObject {
             link.isPaused = false
             return
         }
-        let link = CADisplayLink(target: self, selector: #selector(tick))
+        let link = CADisplayLink(target: FrameProxy(self), selector: #selector(FrameProxy.tick))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         self.link = link
     }
 
-    @objc private func tick() {
+    fileprivate func tick() {
         link?.isPaused = true
         action()
+    }
+
+    isolated deinit {
+        link?.invalidate()
+    }
+}
+
+/// The display link's target, which it retains: a weak hop back to the gate.
+@MainActor
+private final class FrameProxy: NSObject {
+    weak var gate: FrameGate?
+
+    init(_ gate: FrameGate) {
+        self.gate = gate
+    }
+
+    @objc func tick() {
+        gate?.tick()
     }
 }
 
