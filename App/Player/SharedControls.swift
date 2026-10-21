@@ -287,7 +287,7 @@ struct SignalCells: View {
     private func tint(_ value: String) -> Color? {
         if value.contains("Pure") { return theme.ok }
         if value.contains("Starting") { return nil }
-        return theme.warn
+        return theme.altered
     }
 }
 

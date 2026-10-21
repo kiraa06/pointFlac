@@ -35,6 +35,9 @@ struct Theme {
     let hairline: Color
     /// The "● Pure" green: the strip's only saturated colour, so the eye finds it.
     let ok: Color
+    /// Something changed the sound on its way out (resampled, reduced, processed, a lossy route): electric violet,
+    /// lively rather than alarming. `warn` stays for real warnings, such as a USB volume below full scale.
+    let altered: Color
     let warn: Color
     let playFill: Color
     let playGlyph: Color
@@ -52,7 +55,8 @@ struct Theme {
             ? Theme(
                 isDark: true, background: Color(red: 0.07, green: 0.07, blue: 0.09), ink: .white,
                 inkSecondary: .white.opacity(0.6), hairline: .white.opacity(0.22),
-                ok: Color(red: 0.49, green: 1, blue: 0.70), warn: Color(red: 1, green: 0.75, blue: 0.35),
+                ok: Color(red: 0.49, green: 1, blue: 0.70), altered: Color(red: 0.69, green: 0.55, blue: 1),
+                warn: Color(red: 1, green: 0.75, blue: 0.35),
                 playFill: .white, playGlyph: .black,
                 plinthTop: Color(red: 0.20, green: 0.21, blue: 0.24).opacity(0.85),
                 plinthBottom: Color(red: 0.10, green: 0.10, blue: 0.12).opacity(0.6),
@@ -62,7 +66,8 @@ struct Theme {
             : Theme(
                 isDark: false, background: Color(red: 0.953, green: 0.949, blue: 0.937), ink: Color(white: 0.08),
                 inkSecondary: Color(white: 0.45), hairline: .black.opacity(0.15),
-                ok: Color(red: 0.12, green: 0.62, blue: 0.39), warn: Color(red: 0.78, green: 0.45, blue: 0.05),
+                ok: Color(red: 0.12, green: 0.62, blue: 0.39), altered: Color(red: 0.48, green: 0.25, blue: 0.95),
+                warn: Color(red: 0.78, green: 0.45, blue: 0.05),
                 playFill: Color(white: 0.07), playGlyph: .white,
                 plinthTop: .white.opacity(0.8), plinthBottom: Color(red: 0.92, green: 0.93, blue: 0.96).opacity(0.5),
                 plinthEdge: .white.opacity(0.95), strobe: Color(red: 0.54, green: 0.55, blue: 0.58),
@@ -75,13 +80,15 @@ struct Theme {
             ? Theme(
                 isDark: true, background: Color(white: 0.04), ink: .white, inkSecondary: .white.opacity(0.72),
                 hairline: .white.opacity(0.25), ok: Color(red: 0.49, green: 1, blue: 0.70),
-                warn: Color(red: 1, green: 0.75, blue: 0.35), playFill: .white, playGlyph: .black,
+                altered: Color(red: 0.69, green: 0.55, blue: 1), warn: Color(red: 1, green: 0.75, blue: 0.35),
+                playFill: .white, playGlyph: .black,
                 plinthTop: .clear, plinthBottom: .clear, plinthEdge: .clear, strobe: .clear,
                 lcdBack: .clear, lcdInk: .clear, glow: 0.5)
             : Theme(
                 isDark: false, background: Color(red: 0.985, green: 0.98, blue: 0.97), ink: Color(white: 0.06),
                 inkSecondary: Color(white: 0.38), hairline: .black.opacity(0.14),
-                ok: Color(red: 0.12, green: 0.62, blue: 0.39), warn: Color(red: 0.78, green: 0.45, blue: 0.05),
+                ok: Color(red: 0.12, green: 0.62, blue: 0.39), altered: Color(red: 0.48, green: 0.25, blue: 0.95),
+                warn: Color(red: 0.78, green: 0.45, blue: 0.05),
                 playFill: Color(white: 0.07), playGlyph: .white, plinthTop: .clear, plinthBottom: .clear,
                 plinthEdge: .clear, strobe: .clear, lcdBack: .clear, lcdInk: .clear, glow: 0.32)
     }
