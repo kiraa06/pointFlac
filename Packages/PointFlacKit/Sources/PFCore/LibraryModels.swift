@@ -30,11 +30,15 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
     public var artworkID: String?
     /// The file was evicted to iCloud: still in the library, but its bytes must download before it plays (§4.7).
     public var isCloudPending: Bool
+    /// The file is the app's own copy, in its library folder (an import or a download): removing the track deletes it.
+    /// False for a file in a folder added in place, which is the user's and is never deleted; removing that track only
+    /// takes it out of the library. Carried here so the UI can say which will happen before it asks.
+    public var isInLibraryFolder: Bool
 
     public init(
         id: String, url: URL, title: String, artist: String, albumArtist: String, album: String, albumID: String,
         discNumber: Int?, trackNumber: Int?, year: Int?, format: AudioFormat, totalFrames: Int64,
-        artworkID: String?, isCloudPending: Bool = false
+        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool = false
     ) {
         self.id = id
         self.url = url
@@ -50,6 +54,7 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
         self.totalFrames = totalFrames
         self.artworkID = artworkID
         self.isCloudPending = isCloudPending
+        self.isInLibraryFolder = isInLibraryFolder
     }
 
     /// The track's length in seconds; zero when its frame count is unknown.
