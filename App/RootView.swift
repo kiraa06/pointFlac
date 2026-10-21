@@ -35,9 +35,10 @@ struct RootView: View {
         .preferredColorScheme(appearance.colorScheme)
         // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
         // colour of their own read the flag. The look switches live, over a short fade.
-        .tint(monochrome ? Self.monochromeInk : nil)
+        .tint(monochrome ? Theme.monochromeInk : nil)
         .environment(\.isMonochrome, monochrome)
         .animation(.easeInOut(duration: 0.3), value: monochrome)
+        .onChange(of: monochrome, initial: true) { _, on in Self.tintWindows(on) }
         .task { await model.load() }
         .onChange(of: scenePhase) { old, new in
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
@@ -59,9 +60,13 @@ struct RootView: View {
         }
     }
 
-    /// The ink of the Deck and Cover looks, whichever style is showing.
-    private static let monochromeInk = Color(
-        uiColor: UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.08, alpha: 1) })
+    /// UIKit-hosted pieces (alerts) take their tint from the window, not from SwiftUI's `.tint`.
+    private static func tintWindows(_ monochrome: Bool) {
+        let tint = monochrome ? UIColor(Theme.monochromeInk) : nil
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for window in scene.windows { window.tintColor = tint }
+        }
+    }
 
     /// `-PFTab getMusic|downloads|settings` (DEBUG only) opens on that tab, for screenshots.
     private static var launchTab: AppTab {

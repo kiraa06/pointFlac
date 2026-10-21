@@ -5,6 +5,7 @@ import SwiftUI
 struct DownloadsView: View {
     let finder: any MusicFinding
     @Environment(\.isMonochrome) private var mono
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         NavigationStack {
@@ -41,6 +42,7 @@ struct DownloadsView: View {
                             Button("Cancel", systemImage: "xmark", role: .destructive) {
                                 finder.cancelDownload(row.id)
                             }
+                            .monoDestructive()
                         }
                     }
                 }
@@ -62,9 +64,9 @@ struct DownloadsView: View {
     }
 
     private func color(_ state: String) -> Color {
-        if mono { return state.hasPrefix("Done") || state.hasPrefix("Failed") ? .primary : .secondary }
-        if state.hasPrefix("Done") { return .green }
-        if state.hasPrefix("Failed") { return .orange }
-        return .secondary
+        let tone: Color? =
+            state.hasPrefix("Done") ? .green : state.hasPrefix("Failed") ? .orange : nil
+        guard let tone else { return .secondary }
+        return mono ? tone.monochrome(dark: scheme == .dark) : tone
     }
 }

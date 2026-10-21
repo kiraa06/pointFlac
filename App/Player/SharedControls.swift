@@ -154,7 +154,8 @@ struct SharedControls: View {
                     .overlay(alignment: .topTrailing) {
                         if !playback.upNext.isEmpty {
                             Text("\(playback.upNext.count)").font(.caption2.bold()).padding(3)
-                                .background(Circle().fill(theme.ok)).foregroundStyle(.black)
+                                .background(Circle().fill(theme.ok)).foregroundStyle(
+                                    theme.isMonochrome ? theme.playGlyph : .black)
                         }
                     }
             }
@@ -439,6 +440,7 @@ struct UpNextSheet: View {
                         AlbumLine(album: entry.album)
                             .swipeActions {
                                 Button("Remove", role: .destructive) { playback.removeUpNext(entry) }
+                                    .monoDestructive()
                             }
                     }
                     .onMove { playback.moveUpNext(from: $0, to: $1) }

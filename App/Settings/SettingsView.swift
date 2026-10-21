@@ -104,6 +104,7 @@ struct SettingsView: View {
                     Button("Sign Out", role: .destructive) {
                         Task { await account.signOut() }
                     }
+                    .monoDestructive()
                     .accessibilityIdentifier("soulseekSignOut")
                 } else {
                     TextField("Username", text: $username)

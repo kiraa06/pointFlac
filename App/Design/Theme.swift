@@ -133,7 +133,7 @@ extension Theme {
         func grey(_ c: Color) -> Color { c.monochrome(dark: isDark) }
         func text(_ c: Color) -> Color {
             let m = c.greyscale(dark: isDark)
-            return Color(white: Luma.readable(m.grey, on: back), opacity: m.alpha)
+            return Color(white: Luma.readable(m.grey, alpha: m.alpha, on: back), opacity: m.alpha)
         }
         var twin = Theme(
             isDark: isDark, background: grey(background), ink: grey(ink), inkSecondary: text(inkSecondary),
@@ -147,9 +147,34 @@ extension Theme {
 
     /// The look for a stage, in greys when Monochrome is on.
     static func look(stage: PlayerStage, dark: Bool, monochrome: Bool) -> Theme {
-        let base = stage == .deck ? deck(dark: dark) : cover(dark: dark)
-        return monochrome ? base.monochrome() : base
+        if monochrome {
+            return monoLooks[LookKey(deck: stage == .deck, dark: dark)] ?? Theme.deck(dark: dark).monochrome()
+        }
+        return stage == .deck ? deck(dark: dark) : cover(dark: dark)
     }
+
+    private struct LookKey: Hashable {
+        let deck: Bool
+        let dark: Bool
+    }
+
+    /// The four greyscale twins, resolved once: the player reads its theme many times a pass.
+    private static let monoLooks: [LookKey: Theme] = {
+        var looks: [LookKey: Theme] = [:]
+        for deck in [true, false] {
+            for dark in [true, false] {
+                looks[LookKey(deck: deck, dark: dark)] = (deck ? Theme.deck(dark: dark) : Theme.cover(dark: dark))
+                    .monochrome()
+            }
+        }
+        return looks
+    }()
+
+    /// The ink of the Deck look in either style, as one dynamic colour: the root tint under Monochrome.
+    static let monochromeInk = Color(
+        uiColor: UIColor {
+            UIColor(Theme.deck(dark: $0.userInterfaceStyle == .dark).ink)
+        })
 }
 
 /// Whether Monochrome mode is on, for views that draw a colour of their own instead of taking it from a `Theme`.
@@ -165,9 +190,32 @@ extension View {
 private struct MonoForeground: ViewModifier {
     let colour: Color
     @Environment(\.isMonochrome) private var mono
+    @Environment(\.colorScheme) private var scheme
     func body(content: Content) -> some View {
-        if mono { content.foregroundStyle(.secondary) } else { content.foregroundStyle(colour) }
+        if mono {
+            content.foregroundStyle(colour.monochrome(dark: scheme == .dark))
+        } else {
+            content.foregroundStyle(colour)
+        }
     }
+}
+
+/// Destructive-role buttons are system red whatever the tint, so under Monochrome they get a grey of their own:
+/// a swipe action's background, and a plain button's label. `role: .destructive` stays for VoiceOver.
+private struct MonoDestructive: ViewModifier {
+    @Environment(\.isMonochrome) private var mono
+    func body(content: Content) -> some View {
+        if mono {
+            content.tint(Color(white: 0.35)).foregroundStyle(.primary)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Greys a destructive-role button under Monochrome; unchanged otherwise.
+    func monoDestructive() -> some View { modifier(MonoDestructive()) }
 }
 
 /// Type tokens (spec §4.9): a grotesk for UI and titles, monospaced for numbers and signal data, and a dot-matrix
@@ -224,7 +272,17 @@ struct ArtPalette: Hashable {
 extension ArtPalette {
     /// The palette in greys, for what tints the interface (the glow, the wash, the progress wave). The sleeve and the
     /// art are always drawn from the original.
-    func monochrome() -> ArtPalette {
+    @MainActor private static var monoCache: [ArtPalette: ArtPalette] = [:]
+
+    @MainActor func monochrome() -> ArtPalette {
+        if let cached = Self.monoCache[self] { return cached }
+        let twin = greyTwin()
+        if Self.monoCache.count > 256 { Self.monoCache.removeAll() }
+        Self.monoCache[self] = twin
+        return twin
+    }
+
+    private func greyTwin() -> ArtPalette {
         ArtPalette(
             base: base.monochrome(dark: false), deep: deep.monochrome(dark: false),
             night: night.monochrome(dark: false),
@@ -232,5 +290,5 @@ extension ArtPalette {
     }
 
     /// The palette for tinting `theme`'s glass: greys when the theme is monochrome.
-    func tint(for theme: Theme) -> ArtPalette { theme.isMonochrome ? monochrome() : self }
+    @MainActor func tint(for theme: Theme) -> ArtPalette { theme.isMonochrome ? monochrome() : self }
 }

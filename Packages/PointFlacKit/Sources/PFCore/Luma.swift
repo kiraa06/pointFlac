@@ -22,11 +22,16 @@ public enum Luma {
 
     /// `grey`, pushed away from `background` (darker on a light one, lighter on a dark one) until the contrast
     /// reaches `ratio`. Unchanged when it already does.
-    public static func readable(_ grey: Double, on background: Double, ratio: Double = 4.5) -> Double {
-        guard contrast(grey, background) < ratio else { return grey }
+    ///
+    /// A translucent `grey` (`alpha` below 1) is measured as it lands: composited over the background first.
+    public static func readable(
+        _ grey: Double, alpha: Double = 1, on background: Double, ratio: Double = 4.5
+    ) -> Double {
+        func seen(_ g: Double) -> Double { g * alpha + background * (1 - alpha) }
+        guard contrast(seen(grey), background) < ratio else { return grey }
         let step = background >= 0.5 ? -0.005 : 0.005
         var g = grey
-        while contrast(g, background) < ratio, g > 0, g < 1 { g = min(max(g + step, 0), 1) }
+        while contrast(seen(g), background) < ratio, g > 0, g < 1 { g = min(max(g + step, 0), 1) }
         return g
     }
 }

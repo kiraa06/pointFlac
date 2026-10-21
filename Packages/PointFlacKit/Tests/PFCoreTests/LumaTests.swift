@@ -30,4 +30,15 @@ import Testing
         #expect(onDark > 0.3 && Luma.contrast(onDark, 0.07) >= 4.5)
         #expect(Luma.readable(0.1, on: 0.95) == 0.1)
     }
+
+    @Test func readableMeasuresTranslucentGreyAsComposited() {
+        // Black at 40% over a light page is a mid grey: too faint at 4.5:1 until it is pushed darker (here, to 0).
+        let g = Luma.readable(0.0, alpha: 0.4, on: 0.95)
+        #expect(g == 0)
+        // White at 50% over a dark page needs to get lighter or stay; the composite must clear the ratio or max out.
+        let w = Luma.readable(0.6, alpha: 0.5, on: 0.07)
+        let composite = w * 0.5 + 0.07 * 0.5
+        #expect(Luma.contrast(composite, 0.07) >= 4.5 || w == 1)
+        #expect(w >= 0.6)
+    }
 }

@@ -232,7 +232,12 @@ final class PlayerUITests: XCTestCase {
     /// A Form row's switch is the right-hand end of the row; a tap in the middle only hits the label.
     @MainActor
     private func flip(_ toggle: XCUIElement) {
-        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        let control = toggle.switches.firstMatch
+        if control.exists {
+            control.tap()
+        } else {
+            toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        }
     }
 
     @MainActor
