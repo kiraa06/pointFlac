@@ -325,7 +325,8 @@ final class PlayerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["shelfButton"].waitForExistence(timeout: 3))
         app.terminate()
 
-        let relaunched = launch()
+        // Monochrome isn't Sound state, but a persistence relaunch keeps everything saved.
+        let relaunched = launch(freshSound: false)
         XCTAssertTrue(relaunched.buttons["shelfButton"].waitForExistence(timeout: 5))
         let persisted = openMonochromeToggle(relaunched)
         waitFor(persisted, value: "1")
@@ -363,10 +364,10 @@ final class PlayerUITests: XCTestCase {
     }
 
     @MainActor
-    private func launch(demoPlay: Bool = false) -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"]
-        if demoPlay { app.launchArguments.append("-PFDemoPlay") }
+    /// From Pure defaults unless `freshSound` is false (a relaunch that tests persistence).
+    private func launch(demoPlay: Bool = false, freshSound: Bool = true) -> XCUIApplication {
+        let app = XCUIApplication.pointFlac(
+            ["-PFPreloadFixtures", "-PFStage", "deck"] + (demoPlay ? ["-PFDemoPlay"] : []), freshSound: freshSound)
         app.launch()
         return app
     }

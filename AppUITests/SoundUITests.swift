@@ -221,8 +221,9 @@ final class SoundUITests: XCTestCase {
     /// off: `SoundSettings.decode` falls back to the defaults rather than half-reading it.
     @MainActor
     func testCorruptSoundFileLoadsAsPure() {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFCorruptSound", "-PFStage", "deck"]
+        // Not reset: this launch starts from the corrupt file `-PFCorruptSound` writes.
+        let app = XCUIApplication.pointFlac(
+            ["-PFPreloadFixtures", "-PFCorruptSound", "-PFStage", "deck"], freshSound: false)
         app.launch()
         addTeardownBlock { @MainActor in Self.resetSound() }
         app.tabBars.buttons["Sound"].tap()
@@ -337,8 +338,7 @@ final class SoundUITests: XCTestCase {
     /// The app again, keeping the saved Sound settings, on the Sound tab.
     @MainActor
     private func relaunch(_ extra: [String] = []) -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFPreloadFixtures", "-PFMuteOutput", "-PFStage", "deck"] + extra
+        let app = XCUIApplication.pointFlac(["-PFPreloadFixtures", "-PFStage", "deck"] + extra, freshSound: false)
         app.launch()
         app.tabBars.buttons["Sound"].tap()
         return app
@@ -367,8 +367,7 @@ final class SoundUITests: XCTestCase {
     /// Puts the Pure defaults back for the tests that follow.
     @MainActor
     private static func resetSound() {
-        let reset = XCUIApplication()
-        reset.launchArguments = ["-PFResetSound", "-PFMuteOutput"]
+        let reset = XCUIApplication.pointFlac()
         reset.launch()
         reset.terminate()
     }
@@ -395,11 +394,9 @@ final class SoundUITests: XCTestCase {
     /// Plays Copper Garden, the 48 kHz demo album, so a 48 kHz Mac output can show Pure.
     @MainActor
     private func launch() -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-PFPreloadFixtures", "-PFMuteOutput", "-PFDemoPlay", "-PFDemoAlbum", "Copper Garden", "-PFResetSound",
-            "-PFStage", "deck",
-        ]
+        let app = XCUIApplication.pointFlac([
+            "-PFPreloadFixtures", "-PFDemoPlay", "-PFDemoAlbum", "Copper Garden", "-PFStage", "deck",
+        ])
         app.launch()
         return app
     }

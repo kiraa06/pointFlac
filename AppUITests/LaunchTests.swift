@@ -3,9 +3,8 @@ import XCTest
 final class LaunchTests: XCTestCase {
     @MainActor
     func testAppShowsTitle() {
-        let app = XCUIApplication()
-        // Like every UI test, muted (ruling R22), though this one plays nothing.
-        app.launchArguments = ["-PFMuteOutput", "-PFMockFinder"]
+        // Like every UI test, muted (ruling R22), though this one plays nothing, and from Pure defaults.
+        let app = XCUIApplication.pointFlac(["-PFMockFinder"])
         app.launch()
         XCTAssertTrue(app.staticTexts["pointFlac"].waitForExistence(timeout: 5))
     }
@@ -13,8 +12,7 @@ final class LaunchTests: XCTestCase {
     /// The bundled licence notice is one tap away, and carries libFLAC's BSD notice and pointFlac's MIT licence.
     @MainActor
     func testLicencesShowTheBundledNotices() {
-        let app = XCUIApplication()
-        app.launchArguments = ["-PFMuteOutput", "-PFMockFinder"]
+        let app = XCUIApplication.pointFlac(["-PFMockFinder"])
         app.launch()
         // Settings → Licences, since Plan 3 (the player is home now).
         app.tabBars.buttons["Settings"].tap()
