@@ -200,6 +200,21 @@ public final class SoundChain: @unchecked Sendable {
             capped: capped)
     }
 
+    /// The stages a chain compiled from `s` puts to work, in chain order, as the signal readouts name them (ruling
+    /// R4-UI-c): `activeBlockNames`, with "Preamp" exactly where the preamp stage changes the level
+    /// (`PreampStaging.changesLevel`: a trim, the automatic headroom, the correction's own preamp), as the Sound
+    /// tab's preamp capsule lights. `headroomDb` is the automatic headroom the curve needs at the rate it plays
+    /// (`SoundResponse.autoHeadroomDb`). Empty in Pure.
+    public static func stageNames(_ s: SoundSettings, headroomDb: Double) -> [String] {
+        var names = s.activeBlockNames
+        guard !names.isEmpty else { return [] }
+        names.removeAll { $0 == "Preamp" }
+        if preampStaging(s, headroomDb: headroomDb).changesLevel {
+            names.insert("Preamp", at: names.first == "ReplayGain" ? 1 : 0)
+        }
+        return names
+    }
+
     /// `s` clamped, with what clamping lets through as NaN taken out (see "Compiling").
     static func compilable(_ settings: SoundSettings) -> SoundSettings {
         var s = settings.clamped()
@@ -1179,4 +1194,7 @@ public struct PreampStaging: Equatable, Sendable {
     public var totalDb: Double
     /// The cap lowered the sum: only stacked boosts with automatic headroom off reach it.
     public var capped: Bool
+
+    /// Whether the stage changes the level: the total is a twentieth of a dB or more from 0 dB.
+    public var changesLevel: Bool { abs(totalDb) >= 0.05 }
 }

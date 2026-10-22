@@ -620,8 +620,8 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     /// preamp's capsule, its header and VoiceOver all go by this.
     static func preampChangeDb(_ s: SoundSettings, headroomDb: Double) -> Double? {
         guard !s.activeBlockNames.isEmpty else { return nil }
-        let total = SoundChain.preampStaging(s, headroomDb: headroomDb).totalDb
-        return abs(total) >= 0.05 ? total : nil
+        let stage = SoundChain.preampStaging(s, headroomDb: headroomDb)
+        return stage.changesLevel ? stage.totalDb : nil
     }
 
     /// Switches the block, with a mode for the blocks that have one (`SoundStore.setBlock` brings back the last mode

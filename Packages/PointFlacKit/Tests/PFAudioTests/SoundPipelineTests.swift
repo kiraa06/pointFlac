@@ -415,18 +415,19 @@ private final class Flag: Sendable {
         #expect(abs(chain.preampDb + 6) < 0.1, "headroom \(chain.preampDb) dB")
     }
 
-    /// The strip names the blocks at work: EQ and the limiter that joins it.
+    /// The strip names the stages at work: the preamp, whose automatic headroom lowers the level by the boost, the EQ
+    /// and the limiter that joins it.
     @Test func stripSaysProcessing() async {
         let rig = SoundRig()
         rig.player.setSound(peak(1_000, 6))
-        #expect(rig.player.signal.activeProcessing == ["EQ", "Limiter"])
+        #expect(rig.player.signal.activeProcessing == ["Preamp", "EQ", "Limiter"])
         #expect(rig.player.signal.indicator == .idle)
         #expect(await rig.play([toneItem("steady")]))
-        #expect(rig.player.signal.indicator == .processing(2))
+        #expect(rig.player.signal.indicator == .processing(3))
         rig.player.setSound(SoundSettings())
         #expect(rig.player.signal.indicator == .pure)
         rig.player.setSound(peak(1_000, 6))
-        #expect(rig.player.signal.indicator == .processing(2))
+        #expect(rig.player.signal.indicator == .processing(3))
         // Clamped on the way in.
         var wild = trim(40)
         wild.eq.bands = [EQBand(type: .peak, frequency: 90_000, gainDb: 99, q: 0)]
@@ -434,6 +435,29 @@ private final class Flag: Sendable {
         #expect(rig.player.sound == wild.clamped())
         #expect(rig.player.sound.preamp.trimDb == 12)
         rig.player.pause()
+    }
+
+    /// Ruling R4-UI-c: the strip lists the preamp wherever its stage changes the level (a trim, the automatic
+    /// headroom, the correction's own preamp), as the Sound tab's capsule lights, and nowhere else: not for a trim the
+    /// headroom cancels, nor for automatic headroom on a curve that boosts nothing.
+    @Test func stripListsThePreampWhereItsStageActs() {
+        let rig = SoundRig()
+        func names(_ s: SoundSettings) -> [String] {
+            rig.player.setSound(s)
+            return rig.player.signal.activeProcessing
+        }
+        #expect(names(peak(1_000, 6)) == ["Preamp", "EQ", "Limiter"], "the headroom lowers the level")
+        #expect(names(peak(1_000, 6, autoHeadroom: false)) == ["EQ", "Limiter"])
+        #expect(names(peak(1_000, -6)) == ["EQ", "Limiter"], "a cut needs no headroom")
+        #expect(names(trim(-3)) == ["Preamp", "Limiter"])
+        let correction = sound {
+            $0.correction = CorrectionSettings(
+                enabled: true, preampDb: -3, bands: [EQBand(type: .peak, frequency: 3_000, gainDb: -2, q: 1)])
+        }
+        #expect(names(correction) == ["Preamp", "Headphone correction", "Limiter"], "the correction's preamp")
+        var cancelled = peak(1_000, 3)
+        cancelled.preamp.trimDb = 3
+        #expect(names(cancelled) == ["EQ", "Limiter"], "+3 dB of trim against the headroom's −3 dB")
     }
 
     /// A change is heard in the very next 512-frame render call, from a steady state: Pure to a chain, then one chain

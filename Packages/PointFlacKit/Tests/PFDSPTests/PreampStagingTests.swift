@@ -59,4 +59,23 @@ struct PreampStagingTests {
         #expect(abs(-headroom + staging.totalDb - TruePeakLimiter.maxDriveDb) < 1e-9)
         #expect(abs(staging.totalDb - SoundChain(s, sampleRate: 48_000, channels: 2).preampDb) < 1e-12)
     }
+    @Test("the stages named are the blocks on, with the preamp exactly where its stage changes the level (R4-UI-c)")
+    func stageNames() {
+        let boost = settings {
+            $0.eq.enabled = true
+            $0.eq.graphicGainsDb[5] = 6
+        }
+        let headroom = SoundResponse.autoHeadroomDb(boost, sampleRate: 48_000)
+        #expect(SoundChain.stageNames(boost, headroomDb: headroom) == ["Preamp", "EQ", "Limiter"])
+        #expect(SoundChain.stageNames(boost, headroomDb: 0) == ["EQ", "Limiter"])
+        var trimmed = boost
+        trimmed.preamp.trimDb = -headroom
+        #expect(SoundChain.stageNames(trimmed, headroomDb: headroom) == ["EQ", "Limiter"], "trim cancels headroom")
+        var replayGain = settings { $0.replayGain.mode = .track }
+        replayGain.preamp.trimDb = 1
+        #expect(SoundChain.stageNames(replayGain, headroomDb: 0) == ["ReplayGain", "Preamp", "Limiter"])
+        replayGain.pure = true
+        #expect(SoundChain.stageNames(replayGain, headroomDb: 0).isEmpty)
+        #expect(SoundChain.stageNames(settings { $0.preamp.trimDb = 0.04 }, headroomDb: 0) == ["Limiter"])
+    }
 }

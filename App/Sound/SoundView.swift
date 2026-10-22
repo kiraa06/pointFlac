@@ -85,7 +85,7 @@ struct SoundView: View {
     private func list(_ s: SoundSettings, _ proxy: ScrollViewProxy) -> some View {
         List {
             Section {
-                PureSwitch(settings: s, theme: theme) { store.setPure($0) }
+                PureSwitch(settings: s, curve: curve, theme: theme) { store.setPure($0) }
             }
             .listRowBackground(glass)
             Section {
@@ -412,14 +412,17 @@ private struct LiveEQGraph: View {
 // MARK: Pure
 
 /// The master switch: large, the whole card is the switch. Green as the strip's "● Pure" when on; when off, what
-/// plays instead.
+/// plays instead: the stages at work, as the strip's details list them (ruling R4-UI-c: the preamp wherever its stage
+/// changes the level, as its capsule lights).
 struct PureSwitch: View {
     let settings: SoundSettings
+    /// The curve model, for the automatic headroom the preamp applies.
+    let curve: EQCurveModel
     let theme: Theme
     let set: (Bool) -> Void
 
     private var isOn: Bool { settings.pure }
-    private var chain: [String] { settings.activeBlockNames }
+    private var chain: [String] { SoundChain.stageNames(settings, headroomDb: curve.headroomDb) }
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
