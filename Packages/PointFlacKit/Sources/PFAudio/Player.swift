@@ -689,7 +689,8 @@ public final class Player {
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
             negotiateRate: { rate in await gate.requestSampleRate(rate, for: lease) }, makeDecoder: makeDecoder)
-        // Before it starts, so its first configure compiles the chain, and a held comparison holds from its first block.
+        // Before it starts, so its first configure compiles the chain, and a held comparison holds from its first
+        // block.
         pipeline.setSound(sound)
         pipeline.setABBypass(abBypass)
         let engine = PlayerEngine(pipeline: pipeline, lease: lease, generation: generation)

@@ -767,7 +767,8 @@ private final class Flag: Sendable {
         #expect(original[0] > 0.05, "held, 1 kHz is at \(original[0])")
         #expect(abs(original[0] / original[1] - 2) < 0.01, "held, 1 kHz over 100 Hz is \(original[0] / original[1])")
 
-        // Live: the playing pipeline follows, a pause and resume (a new pipeline) keeps the hold, and a release ends it.
+        // Live: the playing pipeline follows, a pause and resume (a new pipeline) keeps the hold, and a release ends
+        // it.
         #expect(await rig.play([toneItem("steady")]))
         #expect(rig.player.pipeline?.abBypass == true)
         rig.player.setABBypass(false)

@@ -468,10 +468,10 @@ final class SoundStore {
 
     #if DEBUG
         /// UI-test launch arguments, applied before the store loads: `-PFResetSound` deletes the saved settings (and
-        /// the remembered modes), so the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a lenient reader would take
-        /// (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure. (`-PFSoundSaveDelay <s>`, read
-        /// by `AppModel`, stretches the save's debounce, so a test can show that only the flush wrote.)
-        /// `-PFResetSound` deletes the per-device settings too.
+        /// the remembered modes), so the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a
+        /// lenient reader would take (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure.
+        /// (`-PFSoundSaveDelay <s>`, read by `AppModel`, stretches the save's debounce, so a test can show that only
+        /// the flush wrote.) `-PFResetSound` deletes the per-device settings too.
         static func prepareForLaunch(
             arguments: [String], fileURL: URL = defaultFileURL, profilesURL: URL = defaultProfilesURL
         ) {
@@ -614,10 +614,11 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     }
 
     /// What the preamp stage does to the level now, in dB: the gain ahead of the filters as the chain applies it
-    /// (`SoundChain.preampStaging`: the trim, the automatic headroom the curve needs, `headroomDb`, and the correction's
-    /// own preamp), while a chain runs and that gain is not 0 dB to a twentieth of a dB; nil otherwise. Automatic
-    /// headroom being on changes nothing by itself: it is only ever non-zero alongside a block that boosts. The
-    /// preamp's capsule, its header and VoiceOver all go by this.
+    /// (`SoundChain.preampStaging`: the trim, the automatic headroom the curve needs, `headroomDb`, and the
+    /// correction's own preamp), while a chain runs and that gain is not 0 dB to a twentieth of a dB
+    /// (`PreampStaging.changesLevel`); nil otherwise. Automatic headroom being on changes nothing by itself: it is
+    /// only ever non-zero alongside a block that boosts. The preamp's capsule, its header and VoiceOver all go by this,
+    /// and so do the chain texts (`SoundChain.stageNames`, ruling R4-UI-c).
     static func preampChangeDb(_ s: SoundSettings, headroomDb: Double) -> Double? {
         guard !s.activeBlockNames.isEmpty else { return nil }
         let stage = SoundChain.preampStaging(s, headroomDb: headroomDb)

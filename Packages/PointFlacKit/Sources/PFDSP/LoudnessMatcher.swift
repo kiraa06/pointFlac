@@ -184,8 +184,8 @@ public final class LoudnessMatcher: @unchecked Sendable {
     }
 
     /// Measures `frames` interleaved frames of `channels` channels: `dry`, the original lined up with `wet`, the
-    /// processed signal. Each frame moves the window and the gain on; then, if `scale` is given, its frame (which may be
-    /// `dry` itself, or the original at another delay) is multiplied by the gain. Does nothing for more than
+    /// processed signal. Each frame moves the window and the gain on; then, if `scale` is given, its frame (which may
+    /// be `dry` itself, or the original at another delay) is multiplied by the gain. Does nothing for more than
     /// `maxFrames` frames or `maxChannels` channels.
     func process(
         dry: UnsafePointer<Double>, wet: UnsafePointer<Float>, scale: UnsafeMutablePointer<Double>?, frames: Int,

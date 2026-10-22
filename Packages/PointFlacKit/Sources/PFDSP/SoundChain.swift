@@ -782,9 +782,9 @@ public final class ChainRunner: @unchecked Sendable {
     // MARK: Render thread
 
     /// Whether `process` would return at once, leaving the block untouched: Pure, with no fade in flight, no A/B
-    /// comparison fading out, nothing waiting to be handed back and nothing in the mailbox (a relaxed load). Render thread only, as it reads the
-    /// render state (so `package`, not public). A caller that has to convert samples for `process` (an Int32 client)
-    /// skips the conversion then. One guard of loads in turn, not `&&`: `&&`'s right-hand side is an autoclosure,
+    /// comparison fading out, nothing waiting to be handed back and nothing in the mailbox (a relaxed load). Render
+    /// thread only, as it reads the render state (so `package`, not public). A caller that has to convert samples for
+    /// `process` (an Int32 client) skips the conversion then. One guard of loads in turn, not `&&`: `&&`'s right-hand side is an autoclosure,
     /// which a debug build makes capture, and so retain, the runner.
     @inline(__always)
     package var isIdle: Bool {
