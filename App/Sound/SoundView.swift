@@ -95,7 +95,7 @@ struct SoundView: View {
             } footer: {
                 footerText(
                     store.useProfiles
-                        ? "Plug in another output and its own settings come back. A new one starts from what is playing."
+                        ? "Plug in another output and its own settings come back. A new one starts from what plays."
                         : "On, a DAC, headphones and the speaker each keep their own settings.")
             }
             .listRowBackground(glass)
@@ -112,8 +112,7 @@ struct SoundView: View {
                 footerText(
                     s.pure
                         ? "Pure sends the signal straight through."
-                        : "Tap a block to switch it, or the limiter or preamp to open its settings. Touch and hold any "
-                            + "block for its settings.")
+                        : "Tap a block to switch it. Touch and hold one, or tap the limiter or preamp, for settings.")
             }
             .listRowBackground(glass)
             ForEach(SoundBlock.pageOrder) { block in
