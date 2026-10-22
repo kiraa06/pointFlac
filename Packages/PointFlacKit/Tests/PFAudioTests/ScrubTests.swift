@@ -42,6 +42,11 @@ private final class SineDecoder: PCMDecoding {
     }
 }
 
+/// How long a test waits for the filler or the player before calling it hung. Not a latency budget: every wait here
+/// ends on the awaited progress itself, however slow the machine, and this only stops a real hang from running for
+/// ever. A deadline of seconds made the tests fail whenever a loaded machine starved the filler's thread.
+private let hangGuard = Duration.seconds(60)
+
 @MainActor
 private final class ScrubRig {
     let output = FakeOutput()
@@ -64,7 +69,7 @@ private final class ScrubRig {
     /// to stay ahead of the needle, gets the same head start relative to it (harsher, not easier, than on a device).
     func pull(_ frames: Int) async {
         var left = frames
-        let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(10))
+        let deadline = ContinuousClock.now + hangGuard
         let pace = Duration.seconds(512.0 / 44_100 / 4)
         while left > 0, ContinuousClock.now < deadline {
             let n = output.pull(frames: min(512, left))
@@ -80,7 +85,7 @@ private final class ScrubRig {
 
     /// Pulls until `done()` holds.
     func pump(until done: () -> Bool) async -> Bool {
-        let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(10))
+        let deadline = ContinuousClock.now + hangGuard
         while !done() {
             guard ContinuousClock.now < deadline else { return false }
             if output.pull(frames: 512) == 0 {
@@ -96,7 +101,7 @@ private final class ScrubRig {
     /// thread sanitizer that can take a while, and measurements must start from it.
     func voiceTookOver() async -> Bool {
         guard let tap = player.pipeline?.scrubTap else { return false }
-        let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(10))
+        let deadline = ContinuousClock.now + hangGuard
         while tap.voiceStarted.load(ordering: .acquiring) != tap.generation.load(ordering: .acquiring) {
             guard ContinuousClock.now < deadline else { return false }
             // Paced, as a render thread would ask: unpaced, the ring would outrun the decoder for ever.
@@ -168,7 +173,7 @@ struct ScrubWindowTests {
         defer { filler.stop() }
         let reach = Int64(ScrubFiller.reachSeconds * 44_100)
         func covers(_ range: Range<Int64>) async -> Bool {
-            let deadline = ContinuousClock.now + LatencyBudget.scaled(.seconds(5))
+            let deadline = ContinuousClock.now + hangGuard
             while ContinuousClock.now < deadline {
                 let valid = window.valid
                 if valid.lowerBound <= range.lowerBound, valid.upperBound >= range.upperBound { return true }
