@@ -48,12 +48,18 @@ struct CompareBar: View {
                 .contentTransition(.symbolEffect(.replace))
                 .accessibilityHidden(true)
         }
+        // Only the contents dim while nothing plays: the glass stays whole, so the list never shows through.
+        .opacity(available || held ? 1 : 0.5)
         .padding(.leading, 12)
         .padding(.trailing, 18)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background {
-            Capsule().fill(theme.processingTint.opacity(held ? (theme.isDark ? 0.22 : 0.14) : 0))
+            // Backed, under the glass, so the list scrolling behind never reads through the words.
+            ZStack {
+                Capsule().fill(theme.background.opacity(0.72))
+                Capsule().fill(theme.processingTint.opacity(held ? (theme.isDark ? 0.22 : 0.14) : 0))
+            }
         }
         .overlay {
             Capsule().strokeBorder(held ? theme.processingTint.opacity(0.7) : theme.hairline, lineWidth: 1)
@@ -62,7 +68,6 @@ struct CompareBar: View {
         .scaleEffect(held ? 0.985 : 1)
         .animation(.snappy(duration: 0.18), value: held)
         .contentShape(Capsule())
-        .opacity(available || held ? 1 : 0.55)
         .gesture(
             DragGesture(minimumDistance: 0)
                 .updating($pressing) { _, active, _ in active = true }
