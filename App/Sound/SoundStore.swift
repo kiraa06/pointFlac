@@ -1,7 +1,9 @@
 import Foundation
 import Observation
 import PFAudio
+import PFCore
 import PFDSP
+import PFDesign
 import QuartzCore
 import SwiftUI
 
@@ -20,6 +22,19 @@ import SwiftUI
 ///
 /// Saving waits for half a second without a change, so a drag writes the file once, when the finger stops. `flush()`
 /// applies and saves at once, for when the app leaves the foreground.
+///
+/// ## Hold to compare
+/// The A/B button's press (Task 14) lives here (`CompareHold`), so every way it ends goes through one place and
+/// reaches the player: the finger lifting, the system cancelling the touch, the app leaving the foreground, the tab
+/// going away, an edit that leaves nothing to compare, a route change.
+///
+/// ## Per-device settings
+/// With "Per-device settings" on (Task 15, `SoundProfiles`), each output keeps its own settings, Pure included, under
+/// its `OutputPort.profileKey`. The store follows `player.signal.port`, in the foreground and the background alike
+/// (`apply(for:)`): a route change plays the new output's own settings at once, and the tab, if open, shows them. A
+/// new output starts from the settings playing as it appears. Edits are the output in use's. The profiles are saved
+/// next to `sound.json`, in `sound-profiles.json`, with the same debounce; `sound.json` keeps the settings in use, in
+/// its own format. A `sound.json` from before profiles becomes the profile of the output in use, profiles still off.
 @MainActor
 @Observable
 final class SoundStore {
@@ -28,9 +43,21 @@ final class SoundStore {
     /// One stable id per parametric band, parallel to `settings.eq.bands`, so the band rows and handles keep their
     /// identity: a deleted row animates away as itself, not as the last one.
     private(set) var bandIDs: [UUID] = []
+    /// The hold-to-compare button: while it is held, the original plays, level-matched (`Player.setABBypass`).
+    private(set) var compare = CompareHold()
+    /// The output in use: whose settings these are while per-device settings are on.
+    private(set) var device: OutputPort
+    /// Whether each output keeps its own settings.
+    private(set) var useProfiles: Bool
+    /// The outputs other than the one in use that have settings of their own, by name.
+    private(set) var otherDevices: [DeviceProfile] = []
 
     @ObservationIgnored private let player: Player
     @ObservationIgnored private let fileURL: URL
+    @ObservationIgnored private let profilesURL: URL
+    /// Every output's settings. Not observed: every edit records the output in use's, and nothing shows them but
+    /// `otherDevices`, which changes only when the outputs do.
+    @ObservationIgnored private var book: SoundProfiles
     @ObservationIgnored private let gate = FrameGate()
     /// The ReplayGain and crossfade modes their switches turn back on: the last one chosen, else Track and Between
     /// albums. Turning a block off sets its mode to Off, so the mode it had is kept here, and in `UserDefaults`
@@ -50,13 +77,16 @@ final class SoundStore {
     /// How long a save waits for the edits to stop.
     @ObservationIgnored private let saveDelay: Duration
 
-    /// Loads the saved settings and gives them to the player at once, so the first pipeline plays with them.
+    /// Loads the saved settings, the output in use's own if per-device settings are on, and gives them to the player
+    /// at once, so the first pipeline plays with them.
     init(
-        player: Player, fileURL: URL = SoundStore.defaultFileURL, saveDelay: Duration = .milliseconds(500),
+        player: Player, fileURL: URL = SoundStore.defaultFileURL,
+        profilesURL: URL = SoundStore.defaultProfilesURL, saveDelay: Duration = .milliseconds(500),
         defaults: UserDefaults = .standard
     ) {
         self.player = player
         self.fileURL = fileURL
+        self.profilesURL = profilesURL
         self.saveDelay = saveDelay
         self.defaults = defaults
         if let raw = defaults.string(forKey: Self.lastModesKey.replayGain), let mode = ReplayGainMode(rawValue: raw),
@@ -69,7 +99,24 @@ final class SoundStore {
         {
             lastCrossfadeMode = mode
         }
-        let loaded = Self.load(from: fileURL)
+        let port = player.signal.port ?? .builtIn
+        let saved = Self.load(from: fileURL)
+        var book: SoundProfiles
+        var migrated = false
+        if let data = try? Data(contentsOf: profilesURL) {
+            book = SoundProfiles.decode(data)
+        } else if FileManager.default.fileExists(atPath: fileURL.path) {
+            // A build from before profiles: its settings were the output in use's.
+            book = SoundProfiles.migrated(from: saved, for: port.profileKey)
+            migrated = true
+        } else {
+            book = SoundProfiles()
+        }
+        let before = book
+        let loaded = book.settings(for: port.profileKey, current: saved)
+        self.book = book
+        device = port
+        useProfiles = book.useProfiles
         settings = loaded
         applied = loaded
         bandIDs = loaded.eq.bands.map { _ in UUID() }
@@ -77,11 +124,19 @@ final class SoundStore {
         if loaded.crossfade.mode != .off { lastCrossfadeMode = loaded.crossfade.mode }
         player.setSound(loaded)
         gate.action = { [weak self] in self?.applyNow() }
+        refreshDevices()
+        if migrated || book != before || loaded != saved { scheduleSave() }
+        followPort()
     }
 
     /// `Application Support/sound.json`.
     nonisolated static var defaultFileURL: URL {
         URL.applicationSupportDirectory.appending(path: "sound.json")
+    }
+
+    /// `Application Support/sound-profiles.json`.
+    nonisolated static var defaultProfilesURL: URL {
+        URL.applicationSupportDirectory.appending(path: "sound-profiles.json")
     }
 
     /// The saved settings, through `SoundSettings.decode`: a missing, corrupt or newer-format file loads as Pure.
@@ -100,8 +155,11 @@ final class SoundStore {
         guard next != settings else { return }
         settings = next
         matchBandIDs()
+        book.record(next, for: device.profileKey)
         gate.request()
         scheduleSave()
+        // Pure, or every block off, leaves nothing to compare.
+        if !hasChain { interruptCompare() }
     }
 
     /// New ids for bands added at the end, and none for bands gone from it. Deletions in the middle and wholesale
@@ -251,6 +309,116 @@ final class SoundStore {
         return EQBand(type: .peak, frequency: SoundFormat.rounded(pow(2, best.middle)), gainDb: 0, q: 1)
     }
 
+    // MARK: Per-device settings
+
+    /// The output in use changed (`player.signal.port`): a held comparison ends, and with per-device settings on, the
+    /// new output's own settings play at once, or, for an output not seen before, the settings playing now become its
+    /// own. Called for every route change, in the foreground and the background.
+    func apply(for port: OutputPort) {
+        guard port.profileKey != device.profileKey else { return }
+        interruptCompare()
+        device = port
+        if book.useProfiles {
+            let before = book
+            replace(with: book.settings(for: port.profileKey, current: settings))
+            if book != before { scheduleSave() }
+        }
+        refreshDevices()
+    }
+
+    /// Switches per-device settings on (the output in use keeps the settings playing now) or off (every output plays
+    /// these; the others' are kept for next time).
+    func setUseProfiles(_ on: Bool) {
+        guard on != book.useProfiles else { return }
+        if on {
+            book.enable(for: device.profileKey, current: settings)
+        } else {
+            book.disable()
+        }
+        useProfiles = on
+        refreshDevices()
+        scheduleSave()
+    }
+
+    /// Forgets an output other than the one in use: next time it appears, it starts from the settings playing then.
+    func forgetDevice(_ key: String) {
+        guard key != device.profileKey else { return }
+        book.forget(key)
+        refreshDevices()
+        scheduleSave()
+    }
+
+    /// Plays `next` in place of the settings, at once: another output's, which owes nothing to a drag in progress.
+    private func replace(with next: SoundSettings) {
+        let next = next.clamped()
+        guard next != settings else { return }
+        settings = next
+        bandIDs = next.eq.bands.map { _ in UUID() }
+        applyNow()
+        scheduleSave()
+        if !hasChain { interruptCompare() }
+    }
+
+    private func refreshDevices() {
+        let others = book.profiles.compactMap { key, s -> DeviceProfile? in
+            guard key != device.profileKey, let port = OutputPort(profileKey: key) else { return nil }
+            return DeviceProfile(key: key, port: port, summary: DeviceProfile.summary(of: s))
+        }
+        .sorted { ($0.port.displayName, $0.key) < ($1.port.displayName, $1.key) }
+        if others != otherDevices { otherDevices = others }
+    }
+
+    /// Follows `player.signal.port` for as long as the store lives.
+    private func followPort() {
+        withObservationTracking {
+            _ = player.signal.port
+        } onChange: { [weak self] in
+            // Called before the change lands: read the port once it has.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.apply(for: self.player.signal.port ?? .builtIn)
+                self.followPort()
+            }
+        }
+    }
+
+    // MARK: Hold to compare
+
+    /// Whether the settings run a chain: Pure off and a block on. Only a chain has an original to compare it with.
+    var hasChain: Bool { !settings.activeBlockNames.isEmpty }
+
+    /// Whether the hold-to-compare button can take hold: a chain, and a track playing through it.
+    var canCompare: Bool { hasChain && player.status == .playing }
+
+    /// A finger is on the button: its touch-down, or a move.
+    func compareTouched() {
+        changeCompare { $0.touch(available: canCompare) }
+    }
+
+    /// The finger lifted, or the system cancelled the touch.
+    func compareLifted() {
+        changeCompare { $0.lift() }
+    }
+
+    /// The app left the foreground, the tab went away, the route changed, or there is nothing to compare any more.
+    func interruptCompare() {
+        changeCompare { $0.interrupt() }
+    }
+
+    /// VoiceOver's activate: a latch, since a VoiceOver user can't hold.
+    func toggleCompare() {
+        changeCompare { $0.toggle(available: canCompare) }
+    }
+
+    /// Applies `change` to the hold, stores it only if it changed (a finger's every move reports, and need not redraw
+    /// anything), and tells the player when the original starts or stops.
+    private func changeCompare(_ change: (inout CompareHold) -> Bool) {
+        var hold = compare
+        let switched = change(&hold)
+        if hold != compare { compare = hold }
+        if switched { player.setABBypass(hold.isHeld) }
+    }
+
     // MARK: Applying and saving
 
     /// Gives the player the latest settings now, and saves them if a save is pending.
@@ -278,14 +446,11 @@ final class SoundStore {
         }
     }
 
+    /// Writes the settings in use to `sound.json` and every output's to `sound-profiles.json`.
     private func save() {
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(settings)
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: fileURL, options: .atomic)
+            try Self.write(settings, to: fileURL)
+            try Self.write(book, to: profilesURL)
             unsaved = false
         } catch {
             // The settings still play; the next change, or the next flush, tries the write again.
@@ -293,14 +458,26 @@ final class SoundStore {
         }
     }
 
+    private static func write(_ value: some Encodable, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(value)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+
     #if DEBUG
         /// UI-test launch arguments, applied before the store loads: `-PFResetSound` deletes the saved settings (and
-        /// the remembered modes), so the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a lenient reader would take
-        /// (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure. (`-PFSoundSaveDelay <s>`, read
-        /// by `AppModel`, stretches the save's debounce, so a test can show that only the flush wrote.)
-        static func prepareForLaunch(arguments: [String], fileURL: URL = defaultFileURL) {
+        /// the remembered modes), so the launch starts from Pure defaults; `-PFCorruptSound` saves a file that only a
+        /// lenient reader would take (Pure off and the EQ on, under an unknown EQ mode), to show it loads as Pure.
+        /// (`-PFSoundSaveDelay <s>`, read by `AppModel`, stretches the save's debounce, so a test can show that only
+        /// the flush wrote.) `-PFResetSound` deletes the per-device settings too.
+        static func prepareForLaunch(
+            arguments: [String], fileURL: URL = defaultFileURL, profilesURL: URL = defaultProfilesURL
+        ) {
             if arguments.contains("-PFResetSound") {
                 try? FileManager.default.removeItem(at: fileURL)
+                try? FileManager.default.removeItem(at: profilesURL)
                 UserDefaults.standard.removeObject(forKey: lastModesKey.replayGain)
                 UserDefaults.standard.removeObject(forKey: lastModesKey.crossfade)
             }
@@ -437,14 +614,15 @@ enum SoundBlock: String, CaseIterable, Identifiable {
     }
 
     /// What the preamp stage does to the level now, in dB: the gain ahead of the filters as the chain applies it
-    /// (`SoundChain.preampStaging`: the trim, the automatic headroom the curve needs, `headroomDb`, and the correction's
-    /// own preamp), while a chain runs and that gain is not 0 dB to a twentieth of a dB; nil otherwise. Automatic
-    /// headroom being on changes nothing by itself: it is only ever non-zero alongside a block that boosts. The
-    /// preamp's capsule, its header and VoiceOver all go by this.
+    /// (`SoundChain.preampStaging`: the trim, the automatic headroom the curve needs, `headroomDb`, and the
+    /// correction's own preamp), while a chain runs and that gain is not 0 dB to a twentieth of a dB
+    /// (`PreampStaging.changesLevel`); nil otherwise. Automatic headroom being on changes nothing by itself: it is
+    /// only ever non-zero alongside a block that boosts. The preamp's capsule, its header and VoiceOver all go by this,
+    /// and so do the chain texts (`SoundChain.stageNames`, ruling R4-UI-c).
     static func preampChangeDb(_ s: SoundSettings, headroomDb: Double) -> Double? {
         guard !s.activeBlockNames.isEmpty else { return nil }
-        let total = SoundChain.preampStaging(s, headroomDb: headroomDb).totalDb
-        return abs(total) >= 0.05 ? total : nil
+        let stage = SoundChain.preampStaging(s, headroomDb: headroomDb)
+        return stage.changesLevel ? stage.totalDb : nil
     }
 
     /// Switches the block, with a mode for the blocks that have one (`SoundStore.setBlock` brings back the last mode

@@ -30,6 +30,9 @@ struct RootView: View {
             .badge(activeDownloads)
             Tab("Sound", systemImage: "slider.vertical.3", value: AppTab.sound) {
                 SoundView(store: model.sound, playback: model.playback, library: model.realLibrary)
+                    #if DEBUG
+                        .environment(model.fakeRoute)
+                    #endif
             }
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView(model: model)

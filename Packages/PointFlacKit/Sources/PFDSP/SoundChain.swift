@@ -14,11 +14,15 @@ public struct SoundMeters: Equatable, Sendable {
     public var clipCount: Int
     /// The deepest limiter reduction in the latest block, in dB: 0 while the limiter is transparent, and in Pure.
     public var gainReductionDb: Double
+    /// The gain the A/B comparison gives the original to match the processed loudness, in dB (``LoudnessMatcher``):
+    /// measured while any chain plays, held or not, and kept through Pure. 0 until something has been measured.
+    public var matchGainDb: Double
 
-    public init(peakDbFS: Double, clipCount: Int, gainReductionDb: Double) {
+    public init(peakDbFS: Double, clipCount: Int, gainReductionDb: Double, matchGainDb: Double = 0) {
         self.peakDbFS = peakDbFS
         self.clipCount = clipCount
         self.gainReductionDb = gainReductionDb
+        self.matchGainDb = matchGainDb
     }
 }
 
@@ -47,6 +51,13 @@ public struct SoundMeters: Equatable, Sendable {
 /// Pure settings compile to a chain that only delays (its limiter is transparent below the ceiling). Install nil for
 /// Pure, which is bit-identical and has no delay.
 ///
+/// ## The A/B comparison
+/// A chain also carries what a runner needs to play the original in its place, level-matched (Task 14): the
+/// `LoudnessMatcher` tuning for its rate, the 20 ms crossfade at that rate, and a second limiter at the same ceiling.
+/// The original, raised to the processed loudness, passes that limiter, so it never goes past the ceiling the
+/// processed signal keeps; and comes out `latencyFrames` later, lined up with the chain's output. Below the ceiling
+/// that limiter is a delay, bit for bit. It runs only while the comparison is held.
+///
 /// ## State carried over
 /// A chain made for the same rate and channel count as the one it replaces takes over that chain's state when the
 /// runner installs it. Each filter keeps the state of the filter at the same place (block, index in that block's band
@@ -65,6 +76,10 @@ public final class SoundChain: @unchecked Sendable {
     let settings: SoundSettings
     /// The runner's crossfade into this chain, 10 ms at its rate.
     let fadeFrames: Int
+    /// The A/B comparison's level match, tuned for this rate (see "The A/B comparison").
+    let matchTuning: LoudnessMatcher.Tuning
+    /// The A/B comparison's crossfade, 20 ms at this rate.
+    let compareFadeFrames: Int
 
     private let gain: Double
     /// Filters per channel, in chain order.
@@ -81,6 +96,9 @@ public final class SoundChain: @unchecked Sendable {
     private let limiter: TruePeakLimiter
     /// `limiter`, unretained, so the render thread reaches it without reference counting. `limiter` keeps it alive.
     private let unretainedLimiter: Unmanaged<TruePeakLimiter>
+    /// The A/B comparison's limiter, for the original (see "The A/B comparison"), and its unretained twin.
+    private let compareLimiter: TruePeakLimiter
+    private let unretainedCompare: Unmanaged<TruePeakLimiter>
     /// Set by the first `install`: a chain runs in one runner only, once.
     let claimed = Atomic<Bool>(false)
 
@@ -137,6 +155,11 @@ public final class SoundChain: @unchecked Sendable {
         unretainedLimiter = .passUnretained(limiter)
         latencyFrames = limiter.latencyFrames
         fadeFrames = max(1, Int((ChainRunner.fadeSeconds * sampleRate).rounded()))
+        compareLimiter = TruePeakLimiter(
+            channels: channels, sampleRate: sampleRate, ceilingDbTP: s.limiter.ceilingDbTP)
+        unretainedCompare = .passUnretained(compareLimiter)
+        matchTuning = LoudnessMatcher.Tuning(sampleRate: sampleRate)
+        compareFadeFrames = max(1, Int((ChainRunner.compareFadeSeconds * sampleRate).rounded()))
         #if DEBUG
             Self.live.add(1, ordering: .relaxed)
         #endif
@@ -175,6 +198,21 @@ public final class SoundChain: @unchecked Sendable {
             correctionDb: s.correction.enabled ? correction : nil,
             headroomDb: s.preamp.autoHeadroom ? headroomDb : nil, trimDb: s.preamp.trimDb, totalDb: total,
             capped: capped)
+    }
+
+    /// The stages a chain compiled from `s` puts to work, in chain order, as the signal readouts name them (ruling
+    /// R4-UI-c): `activeBlockNames`, with "Preamp" exactly where the preamp stage changes the level
+    /// (`PreampStaging.changesLevel`: a trim, the automatic headroom, the correction's own preamp), as the Sound
+    /// tab's preamp capsule lights. `headroomDb` is the automatic headroom the curve needs at the rate it plays
+    /// (`SoundResponse.autoHeadroomDb`). Empty in Pure.
+    public static func stageNames(_ s: SoundSettings, headroomDb: Double) -> [String] {
+        var names = s.activeBlockNames
+        guard !names.isEmpty else { return [] }
+        names.removeAll { $0 == "Preamp" }
+        if preampStaging(s, headroomDb: headroomDb).changesLevel {
+            names.insert("Preamp", at: names.first == "ReplayGain" ? 1 : 0)
+        }
+        return names
     }
 
     /// `s` clamped, with what clamping lets through as NaN taken out (see "Compiling").
@@ -246,12 +284,26 @@ public final class SoundChain: @unchecked Sendable {
         unretainedLimiter._withUnsafeGuaranteedRef { $0.process(io, frames: frames) }
     }
 
-    /// Takes over the state of the chain at `old` where it fits (see "State carried over"). Does nothing across rates
-    /// or channel counts. Real-time safe: `old` is read as plain values, so no class reference is captured or retained
-    /// on the render thread, even in a debug build.
-    func adoptState(of old: UnsafeMutableRawPointer) {
+    /// Render thread: the A/B comparison's limiter back to rest, before the runner primes it.
+    func resetCompare() {
+        unretainedCompare._withUnsafeGuaranteedRef { $0.reset() }
+    }
+
+    /// Render thread: limits `frames` interleaved frames of the original in place, for the A/B comparison. They come
+    /// out `latencyFrames` later, lined up with the chain's output.
+    func limitCompare(_ io: UnsafeMutablePointer<Double>, frames: Int) {
+        unretainedCompare._withUnsafeGuaranteedRef { $0.process(io, frames: frames) }
+    }
+
+    /// Takes over the state of the chain at `old` where it fits (see "State carried over"), the A/B comparison's
+    /// limiter included, and returns whether it did: not across rates or channel counts. Real-time safe: `old` is read
+    /// as plain values, so no class reference is captured or retained on the render thread, even in a debug build.
+    @discardableResult
+    func adoptState(of old: UnsafeMutableRawPointer) -> Bool {
         let theirs = Unmanaged<SoundChain>.fromOpaque(old)._withUnsafeGuaranteedRef { $0.parts }
-        guard theirs.biquads != biquads, theirs.channels == channels, theirs.sampleRate == sampleRate else { return }
+        guard theirs.biquads != biquads, theirs.channels == channels, theirs.sampleRate == sampleRate else {
+            return false
+        }
         let channels = channels
         for section in 0..<sections {
             let key = keys[section]
@@ -279,6 +331,9 @@ public final class SoundChain: @unchecked Sendable {
         }
         let limiter = theirs.limiter
         unretainedLimiter._withUnsafeGuaranteedRef { $0.adoptState(of: limiter) }
+        let compare = theirs.compareLimiter
+        unretainedCompare._withUnsafeGuaranteedRef { $0.adoptState(of: compare) }
+        return true
     }
 
     /// What `adoptState(of:)` reads from the chain it replaces.
@@ -292,12 +347,14 @@ public final class SoundChain: @unchecked Sendable {
         var crossfeed: UnsafeMutablePointer<Crossfeed>?
         var crossfeedCode: Int
         var limiter: Unmanaged<TruePeakLimiter>
+        var compareLimiter: Unmanaged<TruePeakLimiter>
     }
 
     private var parts: Parts {
         Parts(
             channels: channels, sampleRate: sampleRate, sections: sections, biquads: biquads, keys: keys,
-            frequencies: frequencies, crossfeed: crossfeed, crossfeedCode: crossfeedCode, limiter: unretainedLimiter)
+            frequencies: frequencies, crossfeed: crossfeed, crossfeedCode: crossfeedCode, limiter: unretainedLimiter,
+            compareLimiter: unretainedCompare)
     }
 }
 
@@ -334,8 +391,28 @@ public final class SoundChain: @unchecked Sendable {
 /// `reset(to:)` replaces everything at once, with no fade and no state carried over, while the output is stopped: a
 /// chain compiled for a new rate or channel count starts from rest (Task 7, Review Focus 1).
 ///
+/// ## The A/B comparison
+/// While `abBypass` is set (Task 14), the runner plays the original, the block as it came in, in place of the chain's
+/// output, brought to the processed signal's loudness by a ``LoudnessMatcher`` and lined up with it:
+/// - The original goes into a delay line, so the match measures it as it lines up with the chain's output: the same
+///   music in both 400 ms windows. The windows run whenever a chain plays, held or not, so the gain is ready when a
+///   finger lands, and keeps following the processed signal while it is held (an install, a drag).
+/// - Held, the original, raised by the gain, passes the current chain's comparison limiter (see ``SoundChain``): the
+///   same ceiling as the processed signal, and the same latency, so it comes out in line with the chain's output. The
+///   limiter is primed with the line's last `latencyFrames` when a hold begins, so the first frame is in line too.
+/// - Each switch is a 20 ms crossfade of the two lined-up, level-matched signals, equal-gain as for the chain fade.
+///   Released, once the crossfade is over the chain's output is bit for bit what it is without the comparison.
+/// - The chain runs throughout, so its filters, look-ahead and release carry on, and a release is as seamless as a
+///   press. A chain install while held keeps the original in line: chains at one rate share a latency, and a new
+///   chain takes over the comparison limiter's state as it does the rest. A format change (`reset(to:)`) starts the
+///   line, the match's windows and the limiter afresh, as the chain itself does, and keeps the gain and the hold.
+/// - Only a chain is compared: with none (Pure, or nothing for this channel count) the hold does nothing. A hold
+///   still fading out when the chain gives way to Pure finishes on the lined-up original, without the limiter, whose
+///   chain has been handed back.
+///
 /// ## Pure
-/// With no chain and no fade in flight, `process` returns without touching `io`: the output is bit-identical.
+/// With no chain, no fade and no comparison in flight, `process` returns without touching `io`: the output is
+/// bit-identical, whether or not `abBypass` is set.
 ///
 /// ## Blocks a chain can't take
 /// A block longer than `maxFrames` is processed in pieces of at most `maxFrames`. A chain made for another channel
@@ -351,6 +428,14 @@ public final class ChainRunner: @unchecked Sendable {
     public let maxFrames: Int
     public let maxChannels: Int
     static let fadeSeconds = 0.010
+    /// The A/B comparison's crossfade, each way.
+    static let compareFadeSeconds = 0.020
+    /// The original's delay line, in frames: it delays by up to one less, a chain's latency up to 2.7 MHz.
+    static let lineFrames = 4096
+
+    /// While set, the original plays in place of the chain's output, level-matched and lined up (see "The A/B
+    /// comparison"). Any thread; the render thread reads it at each block.
+    public let abBypass = Atomic<Bool>(false)
 
     /// Main side → render thread: a retained chain, the Pure sentinel, or nil when nothing is waiting.
     private let mailbox = Atomic<UnsafeMutableRawPointer?>(nil)
@@ -370,6 +455,16 @@ public final class ChainRunner: @unchecked Sendable {
     /// Float64 scratch, `maxFrames × maxChannels` each: the incoming chain's side and the outgoing side.
     private let incoming: UnsafeMutablePointer<Double>
     private let outgoing: UnsafeMutablePointer<Double>
+    /// The A/B comparison's level match, and its unretained twin for the render thread.
+    private let matcher: LoudnessMatcher
+    private let unretainedMatcher: Unmanaged<LoudnessMatcher>
+    /// The original's recent frames: a ring of `lineFrames` frames of `maxChannels` samples, plain values.
+    private let line: UnsafeMutablePointer<Double>
+    private let lineMask = ChainRunner.lineFrames - 1
+    /// Float64 scratch, `maxFrames × maxChannels` each: the original as it is now (raised and limited, it is what the
+    /// comparison plays), and as it lines up with the chain's output (what the match measures).
+    private let original: UnsafeMutablePointer<Double>
+    private let lined: UnsafeMutablePointer<Double>
 
     // Meters, render thread → any thread.
     private let peakBits = Atomic<UInt64>(0)
@@ -391,6 +486,16 @@ public final class ChainRunner: @unchecked Sendable {
         var inverseLength = 1.0
         /// A retired chain the ring had no room for. While set, no new chain is taken.
         var unreturned: UnsafeMutableRawPointer?
+        /// The A/B comparison: the original's share of the output (0 the processed signal, 1 the original), and its
+        /// step per frame, a 20 ms crossfade at the current chain's rate.
+        var abWeight = 0.0
+        var abStep = 1.0
+        /// The current chain's comparison limiter has been primed and is being fed.
+        var abPrimed = false
+        /// Frames the original is delayed by to line up with the chain's output: the current chain's latency.
+        var delay = 0
+        /// The next frame written into the original's line.
+        var lineWrite = 0
     }
 
     /// Main side, under `control`.
@@ -438,6 +543,14 @@ public final class ChainRunner: @unchecked Sendable {
         incoming.initialize(repeating: 0, count: maxFrames * maxChannels)
         outgoing = .allocate(capacity: maxFrames * maxChannels)
         outgoing.initialize(repeating: 0, count: maxFrames * maxChannels)
+        matcher = LoudnessMatcher(sampleRate: 48_000, maxFrames: maxFrames, maxChannels: maxChannels)
+        unretainedMatcher = .passUnretained(matcher)
+        line = .allocate(capacity: Self.lineFrames * maxChannels)
+        line.initialize(repeating: 0, count: Self.lineFrames * maxChannels)
+        original = .allocate(capacity: maxFrames * maxChannels)
+        original.initialize(repeating: 0, count: maxFrames * maxChannels)
+        lined = .allocate(capacity: maxFrames * maxChannels)
+        lined.initialize(repeating: 0, count: maxFrames * maxChannels)
     }
 
     /// Frees every chain the runner still holds. No render call may be running: the owner stops the output first.
@@ -466,6 +579,9 @@ public final class ChainRunner: @unchecked Sendable {
         state.deallocate()
         incoming.deallocate()
         outgoing.deallocate()
+        line.deallocate()
+        original.deallocate()
+        lined.deallocate()
     }
 
     // MARK: Main side
@@ -517,8 +633,10 @@ public final class ChainRunner: @unchecked Sendable {
                 held.append(waiting)
             }
             held += [state.pointee.current, state.pointee.leaving, state.pointee.unreturned].compactMap { $0 }
+            let weight = state.pointee.abWeight
             state.pointee = RenderState()
             state.pointee.current = chain.map { Unmanaged.passRetained($0).toOpaque() }
+            restartComparison(for: chain, weight: weight)
             reductionBits.store(0, ordering: .relaxed)
             retired.chains += held
             control.outstanding += (chain == nil ? 0 : 1) - held.count
@@ -530,6 +648,25 @@ public final class ChainRunner: @unchecked Sendable {
         guard !retired.chains.isEmpty else { return }
         // The block holds the runner until the free is done (see "Install protocol" step 6).
         drainQueue.async { [self] in freeWhenIdle(retired) }
+    }
+
+    /// `reset(to:)`'s part for the A/B comparison, with the render state just reset: the line silent, the match tuned
+    /// for `chain`'s rate with empty windows, its gain kept. A hold carries on (`weight`) with a chain, and ends with
+    /// none.
+    private func restartComparison(for chain: SoundChain?, weight: Double) {
+        var i = 0
+        while i < Self.lineFrames * maxChannels {
+            line[i] = 0
+            i += 1
+        }
+        guard let chain else {
+            matcher.restart()
+            return
+        }
+        state.pointee.abWeight = weight
+        state.pointee.abStep = 1 / Double(chain.compareFadeFrames)
+        state.pointee.delay = chain.latencyFrames
+        matcher.retune(chain.matchTuning)
     }
 
     /// `chain`, or a fresh compile of it if it was ever installed (here or in another runner), so no two runs share
@@ -547,7 +684,7 @@ public final class ChainRunner: @unchecked Sendable {
         return SoundMeters(
             peakDbFS: peak > 0 ? max(20 * log10(peak), -120) : -120,
             clipCount: clips.load(ordering: .relaxed),
-            gainReductionDb: Double(bitPattern: reductionBits.load(ordering: .relaxed)))
+            gainReductionDb: Double(bitPattern: reductionBits.load(ordering: .relaxed)), matchGainDb: matcher.gainDb)
     }
 
     /// Frees every chain handed back so far (or strands it), and returns once that is done. For tests.
@@ -644,15 +781,17 @@ public final class ChainRunner: @unchecked Sendable {
 
     // MARK: Render thread
 
-    /// Whether `process` would return at once, leaving the block untouched: Pure, with no fade in flight, nothing
-    /// waiting to be handed back and nothing in the mailbox (a relaxed load). Render thread only, as it reads the
-    /// render state (so `package`, not public). A caller that has to convert samples for `process` (an Int32 client)
-    /// skips the conversion then. One guard of loads in turn, not `&&`: `&&`'s right-hand side is an autoclosure,
+    /// Whether `process` would return at once, leaving the block untouched: Pure, with no fade in flight, no A/B
+    /// comparison fading out, nothing waiting to be handed back and nothing in the mailbox (a relaxed load). Render
+    /// thread only, as it reads the render state (so `package`, not public). A caller that has to convert samples for
+    /// `process` (an Int32 client) skips the conversion then. One guard of loads in turn, not `&&`: `&&`'s right-hand side is an autoclosure,
     /// which a debug build makes capture, and so retain, the runner.
     @inline(__always)
     package var isIdle: Bool {
         let state = state
-        guard state.pointee.current == nil, !state.pointee.fading, state.pointee.unreturned == nil else { return false }
+        guard state.pointee.current == nil, !state.pointee.fading, state.pointee.unreturned == nil,
+            state.pointee.abWeight == 0
+        else { return false }
         return mailbox.load(ordering: .relaxed) == nil
     }
 
@@ -662,7 +801,7 @@ public final class ChainRunner: @unchecked Sendable {
         guard frames > 0, channels > 0 else { return }
         let state = state
         if state.pointee.current == nil, !state.pointee.fading, state.pointee.unreturned == nil,
-            mailbox.load(ordering: .relaxed) == nil
+            state.pointee.abWeight == 0, mailbox.load(ordering: .relaxed) == nil
         {
             return
         }
@@ -715,18 +854,54 @@ public final class ChainRunner: @unchecked Sendable {
         if next == Self.pure {
             guard let old else { return }
             state.pointee.current = nil
+            // The comparison limiter goes with the chain: a hold still fading out finishes on the lined-up original.
+            state.pointee.abPrimed = false
             begin(leaving: old, prime: 0, length: Self.withChain(old) { $0.fadeFrames })
             return
         }
         if let old {
             // Only the raw `old` is captured: a closure capturing a chain would retain it in a debug build.
-            Self.withChain(next) { $0.adoptState(of: old) }
+            let adopted = Self.withChain(next) { $0.adoptState(of: old) }
+            // A comparison limiter that took nothing over starts again from the line.
+            if !adopted { state.pointee.abPrimed = false }
+        } else {
+            // From Pure: the line holds whatever played before, and the match's windows with it.
+            clearLine(Self.withChain(next) { $0.latencyFrames })
+            unretainedMatcher._withUnsafeGuaranteedRef { $0.restart() }
+            state.pointee.abPrimed = false
         }
+        let rate = Self.withChain(next) { $0.sampleRate }
+        if unretainedMatcher._withUnsafeGuaranteedRef({ $0.tuning.sampleRate }) != rate { retuneMatcher(next) }
         state.pointee.current = next
         // Two calls rather than one returning a tuple, whose metadata a debug build would instantiate here.
         let latency = Self.withChain(next) { $0.latencyFrames }
         let length = Self.withChain(next) { $0.fadeFrames }
+        state.pointee.delay = latency
+        state.pointee.abStep = 1 / Double(Self.withChain(next) { $0.compareFadeFrames })
         begin(leaving: old, prime: latency, length: length)
+    }
+
+    /// Silences the `frames` frames of the line before the next one written, the most the original is delayed by.
+    private func clearLine(_ frames: Int) {
+        let line = line
+        let mask = lineMask
+        let stride = maxChannels
+        var frame = state.pointee.lineWrite &- min(frames, mask)
+        while frame != state.pointee.lineWrite {
+            let slot = (frame & mask) * stride
+            var c = 0
+            while c < stride {
+                line[slot + c] = 0
+                c += 1
+            }
+            frame &+= 1
+        }
+    }
+
+    /// Tunes the match for `chain`'s rate, from its precomputed tuning, and starts its windows afresh.
+    private func retuneMatcher(_ chain: UnsafeMutableRawPointer) {
+        let tuning = Unmanaged<SoundChain>.fromOpaque(chain)._withUnsafeGuaranteedRef { $0.matchTuning }
+        unretainedMatcher._withUnsafeGuaranteedRef { $0.retune(tuning) }
     }
 
     private func begin(leaving: UnsafeMutableRawPointer?, prime: Int, length: Int) {
@@ -747,7 +922,8 @@ public final class ChainRunner: @unchecked Sendable {
         return true
     }
 
-    /// One piece of a block, at most `maxFrames` and never past the end of a fade.
+    /// One piece of a block, at most `maxFrames` and never past the end of a fade: the original into its line, the
+    /// chains (and any fade between them), then the A/B comparison, and the meter over what leaves.
     private func render(_ io: UnsafeMutablePointer<Float>, frames: Int, channels: Int, _ meter: inout Meter) {
         let state = state
         let fading = state.pointee.fading
@@ -755,29 +931,64 @@ public final class ChainRunner: @unchecked Sendable {
         let current = fits ? usable(state.pointee.current, channels: channels) : nil
         let leaving = fits && fading ? usable(state.pointee.leaving, channels: channels) : nil
         defer { if fading { advance(frames) } }
-        // Nothing to run: Pure, or no chain for this channel count. The block stays untouched.
-        guard current != nil || leaving != nil else { return }
+        // Conditions in turn, not `&&` or `||`, whose right-hand sides are autoclosures: one reading the runner would
+        // capture, and so retain, it in a debug build.
+        let chains = current != nil || leaving != nil
+        var fadingOut = false
+        if fits, state.pointee.abWeight > 0 { fadingOut = true }
+        // Nothing to run: Pure with no comparison fading out, or no chain for this channel count. The block stays
+        // untouched.
+        guard chains || fadingOut else { return }
 
+        // Held: the original, while a chain plays whose latency the line can delay by.
+        var comparing = false
+        if current != nil, abBypass.load(ordering: .relaxed), state.pointee.delay <= lineMask { comparing = true }
+        if comparing, !state.pointee.abPrimed, let current { primeComparison(current, channels: channels) }
+        takeOriginal(io, frames: frames, channels: channels)
+        if chains { runChains(io, frames: frames, channels: channels, current: current, leaving: leaving, &meter) }
+        compare(io, frames: frames, channels: channels, current: current, comparing: comparing)
+        let count = frames * channels
+        var i = 0
+        while i < count {
+            meter.write(io[i])
+            i += 1
+        }
+    }
+
+    /// The chains over one piece, in place: the current one, and while fading the one leaving, under the fade.
+    private func runChains(
+        _ io: UnsafeMutablePointer<Float>, frames: Int, channels: Int, current: UnsafeMutableRawPointer?,
+        leaving: UnsafeMutableRawPointer?, _ meter: inout Meter
+    ) {
+        let state = state
         let count = frames * channels
         let incoming = incoming
-        for i in 0..<count { incoming[i] = Double(io[i]) }
+        var i = 0
+        while i < count {
+            incoming[i] = Double(io[i])
+            i += 1
+        }
         if let current {
             Self.withChain(current) { chain in
                 chain.process(incoming, frames: frames)
                 meter.reduction = max(meter.reduction, chain.gainReductionDb)
             }
         }
-        guard fading else {
-            for i in 0..<count {
-                let y = Float(incoming[i])
-                io[i] = y
-                meter.write(y)
+        guard state.pointee.fading else {
+            i = 0
+            while i < count {
+                io[i] = Float(incoming[i])
+                i += 1
             }
             return
         }
 
         let outgoing = outgoing
-        for i in 0..<count { outgoing[i] = Double(io[i]) }
+        i = 0
+        while i < count {
+            outgoing[i] = Double(io[i])
+            i += 1
+        }
         if let leaving {
             Self.withChain(leaving) { chain in
                 chain.process(outgoing, frames: frames)
@@ -792,25 +1003,159 @@ public final class ChainRunner: @unchecked Sendable {
         let outgoingDry = leaving == nil
         let incomingDry = current == nil
         var elapsed = state.pointee.elapsed
-        var i = 0
-        for _ in 0..<frames {
+        i = 0
+        var frame = 0
+        while frame < frames {
             let g = elapsed < prime ? 0 : min(1, Double(elapsed - prime + 1) * inverseLength)
             if (g == 0 && outgoingDry) || (g == 1 && incomingDry) {
-                for _ in 0..<channels {
-                    meter.write(io[i])
-                    i += 1
-                }
+                i += channels
             } else {
-                for _ in 0..<channels {
+                var c = 0
+                while c < channels {
                     let mixed = (1 - g) * outgoing[i] + g * incoming[i]
-                    let y = Float(g == 0 ? outgoing[i] : g == 1 ? incoming[i] : mixed)
-                    io[i] = y
-                    meter.write(y)
+                    io[i] = Float(g == 0 ? outgoing[i] : g == 1 ? incoming[i] : mixed)
                     i += 1
+                    c += 1
                 }
             }
             elapsed += 1
+            frame += 1
         }
+    }
+
+    /// The original over one piece, before the chains touch it: into the line, into `original` as it is, and into
+    /// `lined` as it lines up with the chain's output, `delay` frames ago. Non-finite samples are silence.
+    private func takeOriginal(_ io: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+        let state = state
+        let line = line
+        let original = original
+        let lined = lined
+        let mask = lineMask
+        let stride = maxChannels
+        let delay = min(state.pointee.delay, mask)
+        var write = state.pointee.lineWrite
+        var i = 0
+        var frame = 0
+        while frame < frames {
+            let slot = (write & mask) * stride
+            let read = ((write &- delay) & mask) * stride
+            var c = 0
+            while c < channels {
+                let x = Double(io[i])
+                let clean = x.isFinite ? x : 0
+                line[slot + c] = clean
+                original[i] = clean
+                lined[i] = line[read + c]
+                i += 1
+                c += 1
+            }
+            write &+= 1
+            frame += 1
+        }
+        state.pointee.lineWrite = write
+    }
+
+    /// Starts `chain`'s comparison limiter from rest and feeds it the line's last `delay` frames, raised by the match's
+    /// gain, so its output lines up with the chain's from the hold's first frame. Uses `original` as scratch, before
+    /// this piece fills it.
+    private func primeComparison(_ chain: UnsafeMutableRawPointer, channels: Int) {
+        let state = state
+        Self.withChain(chain) { $0.resetCompare() }
+        let gain = unretainedMatcher._withUnsafeGuaranteedRef { $0.gain }
+        let line = line
+        let scratch = original
+        let mask = lineMask
+        let stride = maxChannels
+        let delay = min(state.pointee.delay, mask)
+        var frame = state.pointee.lineWrite &- delay
+        var left = delay
+        while left > 0 {
+            let n = min(left, maxFrames)
+            var i = 0
+            var f = 0
+            while f < n {
+                let slot = (frame & mask) * stride
+                var c = 0
+                while c < channels {
+                    scratch[i] = line[slot + c] * gain
+                    i += 1
+                    c += 1
+                }
+                frame &+= 1
+                f += 1
+            }
+            Self.withChain(chain) { $0.limitCompare(scratch, frames: n) }
+            left -= n
+        }
+        state.pointee.abPrimed = true
+    }
+
+    /// The A/B comparison over one piece whose processed output is in `io`: the match measures the lined-up original
+    /// against it; then, while held or still fading either way, the original is mixed in, a 20 ms crossfade each way.
+    /// Released and faded out, `io` stays as the chains left it.
+    private func compare(
+        _ io: UnsafeMutablePointer<Float>, frames: Int, channels: Int, current: UnsafeMutableRawPointer?,
+        comparing: Bool
+    ) {
+        let state = state
+        let original = original
+        let lined = lined
+        var weight = state.pointee.abWeight
+        guard comparing || weight > 0 else {
+            unretainedMatcher._withUnsafeGuaranteedRef {
+                $0.process(dry: lined, wet: io, scale: nil, frames: frames, channels: channels)
+            }
+            state.pointee.abPrimed = false
+            return
+        }
+        // What the comparison plays: the original raised to match, through the chain's comparison limiter, which
+        // delays it into line. With no primed limiter (the chain gave way to Pure while a release was still fading),
+        // the lined-up original raised to match.
+        let source: UnsafeMutablePointer<Double>
+        if let current, state.pointee.abPrimed {
+            unretainedMatcher._withUnsafeGuaranteedRef {
+                $0.process(dry: lined, wet: io, scale: original, frames: frames, channels: channels)
+            }
+            Self.withChain(current) { $0.limitCompare(original, frames: frames) }
+            source = original
+        } else {
+            unretainedMatcher._withUnsafeGuaranteedRef {
+                $0.process(dry: lined, wet: io, scale: lined, frames: frames, channels: channels)
+            }
+            state.pointee.abPrimed = false
+            source = lined
+        }
+        let goal = comparing ? 1.0 : 0.0
+        let step = state.pointee.abStep
+        var i = 0
+        var frame = 0
+        while frame < frames {
+            if weight < goal {
+                weight = min(goal, weight + step)
+            } else if weight > goal {
+                weight = max(goal, weight - step)
+            }
+            if weight == 0 {
+                i += channels
+            } else if weight == 1 {
+                var c = 0
+                while c < channels {
+                    io[i] = Float(source[i])
+                    i += 1
+                    c += 1
+                }
+            } else {
+                var c = 0
+                while c < channels {
+                    io[i] = Float((1 - weight) * Double(io[i]) + weight * source[i])
+                    i += 1
+                    c += 1
+                }
+            }
+            frame += 1
+        }
+        state.pointee.abWeight = weight
+        if weight == 0, !comparing { state.pointee.abPrimed = false }
     }
 
     /// Moves the fade on by `frames`, and hands the old chain back when it ends.
@@ -849,4 +1194,7 @@ public struct PreampStaging: Equatable, Sendable {
     public var totalDb: Double
     /// The cap lowered the sum: only stacked boosts with automatic headroom off reach it.
     public var capped: Bool
+
+    /// Whether the stage changes the level: the total is a twentieth of a dB or more from 0 dB.
+    public var changesLevel: Bool { abs(totalDb) >= 0.05 }
 }

@@ -43,8 +43,9 @@ echo "== 4/7 thread sanitizer: pipeline, player, ring, scrub, sound chain, sound
 swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'PlaybackPipelineTests|PlayerTests|SampleRingTests'
 # The scrub suites on their own: their decoder threads would otherwise share the CPU with the pipeline's latency checks.
 swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'ScrubTests|ScrubWindowTests'
-# The Sound chain on its own as well: its runner's install and retire protocol, and the limiter and crossfeed it runs.
-swift test --sanitize=thread --package-path Packages/PointFlacKit --filter SoundChainTests
+# The Sound chain on its own as well: its runner's install and retire protocol, the limiter and crossfeed it runs, and
+# the level-matched A/B comparison (held and released from another thread while the render thread runs).
+swift test --sanitize=thread --package-path Packages/PointFlacKit --filter 'SoundChainTests|LoudnessMatcherTests'
 # The chain in the render path on its own too: installs from the main actor, the format change's reset on the decode
 # thread and a render thread pulling flat out, all on the same runner.
 swift test --sanitize=thread --package-path Packages/PointFlacKit --filter SoundPipelineTests

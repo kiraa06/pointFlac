@@ -94,6 +94,12 @@ public final class Player {
     public private(set) var signal: SignalState
     /// The Sound settings every pipeline plays with, clamped. Pure (the default) is bit-exact.
     public private(set) var sound = SoundSettings()
+    /// The A/B comparison is held: the original plays in place of the Sound chain's output (`setABBypass`).
+    public private(set) var abBypass = false
+    /// The automatic headroom `sound`'s curve needs, for the strip's preamp (ruling R4-UI-c): worked out by each
+    /// `setSound` at the rate playing then (the plan's, else the file's, else 48 kHz), as the Sound tab works out its
+    /// own.
+    @ObservationIgnored private var soundHeadroomDb = 0.0
 
     private let session: AudioSessionControlling
     private let gate: SessionGate
@@ -352,6 +358,7 @@ public final class Player {
         let switched =
             settings.pure != sound.pure || (settings.replayGain.mode == .off) != (sound.replayGain.mode == .off)
         sound = settings
+        soundHeadroomDb = Self.headroomDb(settings, rate: signal.plan?.clientSampleRate ?? signal.source?.sampleRate)
         if let engine {
             // At once, whatever waits behind a re-cue's hold: it decides only boundaries the decode thread has yet to
             // reach, so a switch to Pure stops the next overlap before the re-cue check below looks for one begun.
@@ -555,7 +562,8 @@ public final class Player {
         return Self.replayGainDb(for: queue[index], sound: sound)
     }
 
-    /// Shows the blocks at work on what plays now (`signal.activeProcessing`): the Sound settings' blocks, with
+    /// Shows the blocks at work on what plays now (`signal.activeProcessing`): the Sound settings' stages
+    /// (`SoundChain.stageNames`: the blocks on, with the preamp where its stage changes the level), with
     /// ReplayGain listed exactly while a non-zero gain applies to the current item. An item that gets 0 dB is not
     /// processed by it, though the limiter ReplayGain brings into the chain still runs; an item still playing at the
     /// gain it started with, after a switch to Pure or to off, still is, and the strip says Processing until it ends
@@ -565,7 +573,9 @@ public final class Player {
     /// Crossfade is listed the same way: exactly while an overlap is heard (`PlaybackPipeline.crossfading`), last, as
     /// `SoundSettings.activeBlockNames` orders it. During one, ReplayGain is listed while either item's gain applies.
     private func refreshProcessing() {
-        var names = sound.activeBlockNames.filter { $0 != "ReplayGain" && $0 != "Crossfade" }
+        var names = SoundChain.stageNames(sound, headroomDb: soundHeadroomDb).filter {
+            $0 != "ReplayGain" && $0 != "Crossfade"
+        }
         let fading = engine.flatMap { $0.hasStarted ? $0.pipeline.crossfading : nil }
         if let index = currentIndex, queue.indices.contains(index),
             gainDb(at: index) != 0 || (fading.map { $0.gainDb != 0 } ?? false)
@@ -576,6 +586,13 @@ public final class Player {
         if signal.activeProcessing != names { signal.activeProcessing = names }
     }
 
+    /// The automatic headroom `s`'s curve needs at `rate` (48 kHz if unknown); 0 with automatic headroom off or no
+    /// chain, where it changes nothing.
+    private static func headroomDb(_ s: SoundSettings, rate: Int?) -> Double {
+        guard s.preamp.autoHeadroom, !s.activeBlockNames.isEmpty else { return 0 }
+        return SoundResponse.autoHeadroomDb(s, sampleRate: Double(rate ?? 48_000))
+    }
+
     /// The Sound chain's meters: the peak since the last read, the clips since the player was made, and the latest
     /// gain reduction. Reading starts a new peak interval, so keep to one reader. The floor, with nothing playing.
     public var soundMeters: SoundMeters {
@@ -583,6 +600,14 @@ public final class Player {
         var meters = engine.pipeline.soundMeters
         meters.clipCount += retiredClips
         return meters
+    }
+
+    /// Plays the original in place of the Sound chain's output, level-matched and lined up, while `on` (Task 14's
+    /// A/B comparison): the playing pipeline at once, and every pipeline made while it holds. Nothing to compare
+    /// without a chain, so in Pure it changes nothing.
+    public func setABBypass(_ on: Bool) {
+        abBypass = on
+        engine?.pipeline.setABBypass(on)
     }
 
     /// The pipeline playing now, if any. For tests.
@@ -664,8 +689,10 @@ public final class Player {
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
             negotiateRate: { rate in await gate.requestSampleRate(rate, for: lease) }, makeDecoder: makeDecoder)
-        // Before it starts, so its first configure compiles the chain.
+        // Before it starts, so its first configure compiles the chain, and a held comparison holds from its first
+        // block.
         pipeline.setSound(sound)
+        pipeline.setABBypass(abBypass)
         let engine = PlayerEngine(pipeline: pipeline, lease: lease, generation: generation)
         // Captures the generation, not the engine, so the task never keeps a pipeline alive.
         let events = pipeline.events

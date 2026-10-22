@@ -335,16 +335,19 @@ struct PreampRows: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Gain into the filters")
-        .accessibilityValue(spoken(stage, running: running))
+        .accessibilityValue(spoken(stage, chain: !settings.activeBlockNames.isEmpty))
         .accessibilityIdentifier("gainStaging")
     }
 
-    private func spoken(_ stage: PreampStaging, running: Bool) -> String {
-        var parts = [SoundFormat.gainSpoken(stage.totalDb) + (stage.capped ? ", capped" : "")]
+    /// The readout in words: the total, then each part. "Standby" only with no chain at all, as the header says it; a
+    /// chain whose preamp stage changes nothing reads "0 decibels", as the header's "0.0 dB" (review R2-2).
+    private func spoken(_ stage: PreampStaging, chain: Bool) -> String {
+        let total = stage.changesLevel || !chain ? stage.totalDb : 0
+        var parts = [SoundFormat.gainSpoken(total) + (stage.capped ? ", capped" : "")]
         parts.append("correction \(stage.correctionDb.map(SoundFormat.gainSpoken) ?? "off")")
         parts.append("headroom \(stage.headroomDb.map(SoundFormat.gainSpoken) ?? "off")")
         parts.append("trim \(SoundFormat.gainSpoken(stage.trimDb))")
-        return parts.joined(separator: ", ") + (running ? "" : ", standby")
+        return parts.joined(separator: ", ") + (chain ? "" : ", standby")
     }
 }
 

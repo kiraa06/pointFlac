@@ -290,6 +290,18 @@ public final class PlaybackPipeline: @unchecked Sendable {
         core.soundRunner.meters
     }
 
+    /// The level-matched A/B comparison (Task 14): while on, the original plays in place of the Sound chain's output,
+    /// brought to its loudness and lined up with it, from the render thread's next block (a 20 ms crossfade each way).
+    /// It does nothing without a chain (Pure). Any thread.
+    public func setABBypass(_ on: Bool) {
+        core.soundRunner.abBypass.store(on, ordering: .relaxed)
+    }
+
+    /// What `setABBypass` last set. For tests.
+    var abBypass: Bool {
+        core.soundRunner.abBypass.load(ordering: .relaxed)
+    }
+
     /// The finger on the record, shared with every render source this pipeline makes.
     var scrubTap: ScrubTap { core.scrubTap }
 

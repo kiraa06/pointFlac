@@ -221,9 +221,9 @@ final class SoundUITests: XCTestCase {
     /// off: `SoundSettings.decode` falls back to the defaults rather than half-reading it.
     @MainActor
     func testCorruptSoundFileLoadsAsPure() {
-        // Not reset: this launch starts from the corrupt file `-PFCorruptSound` writes.
-        let app = XCUIApplication.pointFlac(
-            ["-PFPreloadFixtures", "-PFCorruptSound", "-PFStage", "deck"], freshSound: false)
+        // `-PFResetSound` runs first, then `-PFCorruptSound` writes the corrupt file: so no per-device settings an
+        // earlier run left behind can stand in for it (review R2-6).
+        let app = XCUIApplication.pointFlac(["-PFPreloadFixtures", "-PFCorruptSound", "-PFStage", "deck"])
         app.launch()
         addTeardownBlock { @MainActor in Self.resetSound() }
         app.tabBars.buttons["Sound"].tap()
@@ -301,6 +301,98 @@ final class SoundUITests: XCTestCase {
         app.tabBars.buttons["Player"].tap()
         expectation(for: NSPredicate { _, _ in Self.saysProcessing(app) }, evaluatedWith: nil)
         waitForExpectations(timeout: 5)
+    }
+
+    /// Hold to compare (Task 14): no button in Pure or with every block off; with a block on and a track playing, a
+    /// button pinned above the tab bar that a press holds and a release lets go (it reads "Processed" again), and
+    /// that goes away again with Pure.
+    @MainActor
+    func testHoldToCompareFollowsTheChainAndReleases() {
+        let app = launch()
+        addTeardownBlock { @MainActor in Self.resetSound() }
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        app.tabBars.buttons["Sound"].tap()
+        let pure = app.descendants(matching: .any)["pureSwitch"]
+        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        let compare = app.descendants(matching: .any)["compareButton"]
+        XCTAssertFalse(compare.exists, "Pure, yet there is something to compare")
+        pure.tap()
+        expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
+        waitForExpectations(timeout: 2)
+        XCTAssertFalse(compare.exists, "no block is on, yet there is something to compare")
+
+        let tone = app.descendants(matching: .any)["block-Tone"]
+        XCTAssertTrue(tone.waitForExistence(timeout: 2))
+        tone.tap()
+        XCTAssertTrue(compare.waitForExistence(timeout: 3))
+        XCTAssertEqual(compare.value as? String, "Processed")
+        XCTAssertTrue(compare.isHittable, "the button is not clear of the tab bar")
+        // A press holds while it lasts; once it lifts, the processed sound is back.
+        compare.press(forDuration: 1.0)
+        expectation(for: NSPredicate(format: "value == 'Processed'"), evaluatedWith: compare)
+        waitForExpectations(timeout: 2)
+
+        pure.tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: compare)
+        waitForExpectations(timeout: 3)
+    }
+
+    /// Per-device settings (Task 15), on a DEBUG fake route (`-PFFakeRoute usb:Test DAC`) that the Sound tab switches
+    /// to the built-in speaker and back, as plugging the DAC out and in does. The speaker is visited once first, while
+    /// the EQ is off: a new output starts from the settings playing when it appears. Then the EQ goes on for the DAC,
+    /// the speaker plays its own settings (EQ off), and the DAC brings the EQ back.
+    @MainActor
+    func testProfilesSwitchWithTheDevice() {
+        let app = XCUIApplication.pointFlac(["-PFPreloadFixtures", "-PFStage", "deck", "-PFFakeRoute", "usb:Test DAC"])
+        app.launch()
+        addTeardownBlock { @MainActor in Self.resetSound() }
+        app.tabBars.buttons["Sound"].tap()
+        let pure = app.descendants(matching: .any)["pureSwitch"]
+        XCTAssertTrue(pure.waitForExistence(timeout: 5))
+        pure.tap()
+        expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
+        waitForExpectations(timeout: 2)
+
+        let profiles = app.descendants(matching: .any)["profilesToggle"]
+        Self.reveal(profiles, in: app)
+        XCTAssertTrue(profiles.exists)
+        XCTAssertEqual(profiles.value as? String, "0")
+        Self.flip(profiles)
+        expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: profiles)
+        waitForExpectations(timeout: 2)
+        let device = app.descendants(matching: .any)["profileDevice"]
+        XCTAssertTrue(device.waitForExistence(timeout: 2))
+        XCTAssertTrue(device.label.contains("Test DAC"), "the device row reads \"\(device.label)\"")
+
+        let route = app.buttons["fakeRouteButton"]
+        func switchRoute(to name: String) {
+            Self.reveal(route, in: app, up: true)
+            Self.reveal(route, in: app)
+            XCTAssertTrue(route.exists)
+            route.tap()
+            expectation(for: NSPredicate(format: "label CONTAINS %@", name), evaluatedWith: device)
+            waitForExpectations(timeout: 5)
+        }
+        // The speaker, while the EQ is off: it starts from the settings playing now.
+        switchRoute(to: "Built-in")
+        switchRoute(to: "Test DAC")
+
+        let eq = app.descendants(matching: .any)["eqToggle"]
+        Self.reveal(eq, in: app)
+        XCTAssertTrue(eq.exists)
+        XCTAssertEqual(eq.value as? String, "0")
+        Self.flip(eq)
+        expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: eq)
+        waitForExpectations(timeout: 2)
+
+        switchRoute(to: "Built-in")
+        Self.reveal(eq, in: app)
+        XCTAssertEqual(eq.value as? String, "0", "the speaker plays the DAC's EQ")
+
+        switchRoute(to: "Test DAC")
+        Self.reveal(eq, in: app)
+        XCTAssertEqual(eq.value as? String, "1", "the DAC lost its EQ")
     }
 
     // MARK: Helpers

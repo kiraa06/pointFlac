@@ -64,6 +64,8 @@ struct SoundView: View {
         }
         .onAppear { visible = true }
         .onDisappear { visible = false }
+        // Another output's settings: a selected band index may not exist in them.
+        .onChange(of: store.device) { selectedBand = nil }
         .onChange(of: CurveInput(s, sampleRate: sampleRate), initial: true) { _, input in
             curve.request(input)
         }
@@ -83,7 +85,18 @@ struct SoundView: View {
     private func list(_ s: SoundSettings, _ proxy: ScrollViewProxy) -> some View {
         List {
             Section {
-                PureSwitch(settings: s, theme: theme) { store.setPure($0) }
+                PureSwitch(settings: s, curve: curve, theme: theme) { store.setPure($0) }
+            }
+            .listRowBackground(glass)
+            Section {
+                DeviceProfileRows(store: store, theme: theme)
+            } header: {
+                header("Output device")
+            } footer: {
+                footerText(
+                    store.useProfiles
+                        ? "Plug in another output and its own settings come back. A new one starts from what plays."
+                        : "On, a DAC, headphones and the speaker each keep their own settings.")
             }
             .listRowBackground(glass)
             Section {
@@ -99,8 +112,7 @@ struct SoundView: View {
                 footerText(
                     s.pure
                         ? "Pure sends the signal straight through."
-                        : "Tap a block to switch it, or the limiter or preamp to open its settings. Touch and hold any "
-                            + "block for its settings.")
+                        : "Tap a block to switch it. Touch and hold one, or tap the limiter or preamp, for settings.")
             }
             .listRowBackground(glass)
             ForEach(SoundBlock.pageOrder) { block in
@@ -113,16 +125,33 @@ struct SoundView: View {
         .background(background)
         .foregroundStyle(theme.ink)
         .tint(theme.processingTint)
+        // Hold to compare (Task 14), pinned above the tab bar while a chain runs: nothing to compare in Pure.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.hasChain {
+                CompareBar(store: store, meters: meters, player: player, theme: theme, polling: polling)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.3), value: store.hasChain)
     }
 
     /// `-PFSoundScrollTo <block>` (DEBUG only; a `SoundBlock` raw value, such as replayGain or eq) opens scrolled to
-    /// that block, `-PFSoundSelectBand <n>` with parametric band n selected, and `-PFSoundOpenPicker YES` with the
-    /// headphone-correction picker open, for screenshots.
+    /// that block, `-PFSoundSelectBand <n>` with parametric band n selected, `-PFSoundOpenPicker YES` with the
+    /// headphone-correction picker open, and `-PFSoundHoldCompare YES` with the A/B comparison latched on once a track
+    /// plays (as VoiceOver's double-tap latches it), for screenshots.
     private func scrollForScreenshots(_ proxy: ScrollViewProxy) {
         #if DEBUG
             let band = UserDefaults.standard.integer(forKey: "PFSoundSelectBand")
             if band > 0 { selectedBand = band - 1 }
             if UserDefaults.standard.bool(forKey: "PFSoundOpenPicker") { choosingCorrection = true }
+            if UserDefaults.standard.bool(forKey: "PFSoundHoldCompare") {
+                Task {
+                    for _ in 0..<100 where !store.canCompare { try? await Task.sleep(for: .milliseconds(100)) }
+                    if !store.compare.isHeld { store.toggleCompare() }
+                }
+            }
             guard let name = UserDefaults.standard.string(forKey: "PFSoundScrollTo"),
                 let block = SoundBlock(rawValue: name)
             else { return }
@@ -382,14 +411,17 @@ private struct LiveEQGraph: View {
 // MARK: Pure
 
 /// The master switch: large, the whole card is the switch. Green as the strip's "● Pure" when on; when off, what
-/// plays instead.
+/// plays instead: the stages at work, as the strip's details list them (ruling R4-UI-c: the preamp wherever its stage
+/// changes the level, as its capsule lights).
 struct PureSwitch: View {
     let settings: SoundSettings
+    /// The curve model, for the automatic headroom the preamp applies.
+    let curve: EQCurveModel
     let theme: Theme
     let set: (Bool) -> Void
 
     private var isOn: Bool { settings.pure }
-    private var chain: [String] { settings.activeBlockNames }
+    private var chain: [String] { SoundChain.stageNames(settings, headroomDb: curve.headroomDb) }
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
