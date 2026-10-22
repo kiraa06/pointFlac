@@ -64,6 +64,8 @@ struct SoundView: View {
         }
         .onAppear { visible = true }
         .onDisappear { visible = false }
+        // Another output's settings: a selected band index may not exist in them.
+        .onChange(of: store.device) { selectedBand = nil }
         .onChange(of: CurveInput(s, sampleRate: sampleRate), initial: true) { _, input in
             curve.request(input)
         }
@@ -84,6 +86,17 @@ struct SoundView: View {
         List {
             Section {
                 PureSwitch(settings: s, theme: theme) { store.setPure($0) }
+            }
+            .listRowBackground(glass)
+            Section {
+                DeviceProfileRows(store: store, theme: theme)
+            } header: {
+                header("Output device")
+            } footer: {
+                footerText(
+                    store.useProfiles
+                        ? "Plug in another output and its own settings come back. A new one starts from what is playing."
+                        : "On, a DAC, headphones and the speaker each keep their own settings.")
             }
             .listRowBackground(glass)
             Section {

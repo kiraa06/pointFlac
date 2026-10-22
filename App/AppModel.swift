@@ -20,6 +20,8 @@ import PFLibrary
 ///   network and stay deterministic.
 /// - `-PFResetSound` and `-PFCorruptSound` replace the saved Sound settings before they load (`SoundStore`), and
 ///   `-PFSoundSaveDelay <seconds>` stretches their save's debounce.
+/// - `-PFFakeRoute <profile key>` reports a made-up output route that the Sound tab can switch to the built-in speaker
+///   and back (`FakeRouteSwitch`), for the per-device settings.
 @MainActor
 @Observable
 final class AppModel {
@@ -49,6 +51,8 @@ final class AppModel {
     #endif
 
     #if DEBUG
+        /// `-PFFakeRoute`'s switch, when the launch asked for one.
+        let fakeRoute: FakeRouteSwitch?
         private let preloadFixtures: Bool
         /// `-PFDemoPlay`: plays the demo album "Night Drive" once the library is listed, for screenshots and UI tests.
         /// `-PFDemoAlbum <title>` picks another (the Sound tests play the 48 kHz "Copper Garden").
@@ -70,8 +74,15 @@ final class AppModel {
             let mute = arguments.contains("-PFMuteOutput")
             let useMock = preloadFixtures || arguments.contains("-PFMockFinder")
         #endif
+        #if DEBUG
+            let fakeRoute = FakeRouteSwitch.fromLaunch()
+            self.fakeRoute = fakeRoute
+            let session: AudioSessionControlling = fakeRoute?.session ?? SystemAudioSession()
+        #else
+            let session = SystemAudioSession()
+        #endif
         player = Player(
-            session: SystemAudioSession(),
+            session: session,
             makeOutput: {
                 let output = try RemoteIOOutput()
                 #if DEBUG
