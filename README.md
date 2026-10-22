@@ -126,7 +126,7 @@ Everything runs in **64-bit floating point** on the audio thread, at the output'
 IN ─▶ ReplayGain ─▶ Preamp ─▶ Headphone correction ─▶ EQ ─▶ Tone ─▶ Crossfeed ─▶ True-peak limiter ─▶ Crossfade ─▶ OUT
 ```
 
-The **Signal flow** row draws that chain live: switch a block on or off from the diagram itself, and watch the output meters in dBFS with a clip indicator. Every change cross-fades in without a click.
+The **Signal flow** row draws that chain live: switch a block on or off from the diagram itself, and watch the output meters in dBFS with a clip indicator. Every change cross-fades in without a click. And when you want to know whether your changes really help, hold **A/B** for a level-matched comparison.
 
 | Block | What you get |
 |---|---|
@@ -140,6 +140,8 @@ The **Signal flow** row draws that chain live: switch a block on or off from the
 | **Auto headroom** | Boosts in your EQ or correction get matching headroom automatically, so they don't clip |
 | **True-peak limiter** | 16× oversampled at 44.1/48 kHz, 8× above, measuring **inter-sample** peaks. It holds its ceiling to within 0.03 dB at 44.1/48 kHz. It switches on whenever any block is, and stays transparent until it's needed |
 | **Crossfade** | Equal-power, 1 to 12 seconds. **Between albums** blends only where the next record in Up Next begins, so songs inside an album stay gapless. Or **Always**. Off by default |
+| **A/B compare** | Touch and hold to hear the original, brought to your processed sound's loudness (ITU-R BS.1770, K-weighted) and lined up with it in time. Let go for your settings. Each switch is a 20 ms crossfade, so neither a level jump nor a click gives the answer away |
+| **Per-device settings** | Switch it on and every output keeps its own Sound settings, Pure included: your USB DAC, your wired IEMs, the phone's speaker. Plug in and pointFlac switches to that device's sound. Off by default |
 
 When the output can't run at the file's rate, pointFlac resamples itself with the highest-quality converter iOS offers. Its tests hold the passband within 0.1 dB from 20 Hz to 20 kHz and keep everything above the new Nyquist more than 100 dB down. 32-bit files take TPDF dither on their way to the 24 bits the output carries, and the strip says **32→24-bit** when that happens.
 
