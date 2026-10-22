@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import PFAudio
 import PFDSP
+import PFDesign
 import QuartzCore
 import SwiftUI
 
@@ -20,6 +21,11 @@ import SwiftUI
 ///
 /// Saving waits for half a second without a change, so a drag writes the file once, when the finger stops. `flush()`
 /// applies and saves at once, for when the app leaves the foreground.
+///
+/// ## Hold to compare
+/// The A/B button's press (Task 14) lives here (`CompareHold`), so every way it ends goes through one place and
+/// reaches the player: the finger lifting, the system cancelling the touch, the app leaving the foreground, the tab
+/// going away, an edit that leaves nothing to compare.
 @MainActor
 @Observable
 final class SoundStore {
@@ -28,6 +34,8 @@ final class SoundStore {
     /// One stable id per parametric band, parallel to `settings.eq.bands`, so the band rows and handles keep their
     /// identity: a deleted row animates away as itself, not as the last one.
     private(set) var bandIDs: [UUID] = []
+    /// The hold-to-compare button: while it is held, the original plays, level-matched (`Player.setABBypass`).
+    private(set) var compare = CompareHold()
 
     @ObservationIgnored private let player: Player
     @ObservationIgnored private let fileURL: URL
@@ -102,6 +110,8 @@ final class SoundStore {
         matchBandIDs()
         gate.request()
         scheduleSave()
+        // Pure, or every block off, leaves nothing to compare.
+        if !hasChain { interruptCompare() }
     }
 
     /// New ids for bands added at the end, and none for bands gone from it. Deletions in the middle and wholesale
@@ -249,6 +259,43 @@ final class SoundStore {
             best = (b - a, (a + b) / 2)
         }
         return EQBand(type: .peak, frequency: SoundFormat.rounded(pow(2, best.middle)), gainDb: 0, q: 1)
+    }
+
+    // MARK: Hold to compare
+
+    /// Whether the settings run a chain: Pure off and a block on. Only a chain has an original to compare it with.
+    var hasChain: Bool { !settings.activeBlockNames.isEmpty }
+
+    /// Whether the hold-to-compare button can take hold: a chain, and a track playing through it.
+    var canCompare: Bool { hasChain && player.status == .playing }
+
+    /// A finger is on the button: its touch-down, or a move.
+    func compareTouched() {
+        changeCompare { $0.touch(available: canCompare) }
+    }
+
+    /// The finger lifted, or the system cancelled the touch.
+    func compareLifted() {
+        changeCompare { $0.lift() }
+    }
+
+    /// The app left the foreground, the tab went away, the route changed, or there is nothing to compare any more.
+    func interruptCompare() {
+        changeCompare { $0.interrupt() }
+    }
+
+    /// VoiceOver's activate: a latch, since a VoiceOver user can't hold.
+    func toggleCompare() {
+        changeCompare { $0.toggle(available: canCompare) }
+    }
+
+    /// Applies `change` to the hold, stores it only if it changed (a finger's every move reports, and need not redraw
+    /// anything), and tells the player when the original starts or stops.
+    private func changeCompare(_ change: (inout CompareHold) -> Bool) {
+        var hold = compare
+        let switched = change(&hold)
+        if hold != compare { compare = hold }
+        if switched { player.setABBypass(hold.isHeld) }
     }
 
     // MARK: Applying and saving

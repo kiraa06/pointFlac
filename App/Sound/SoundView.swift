@@ -113,16 +113,33 @@ struct SoundView: View {
         .background(background)
         .foregroundStyle(theme.ink)
         .tint(theme.processingTint)
+        // Hold to compare (Task 14), pinned above the tab bar while a chain runs: nothing to compare in Pure.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.hasChain {
+                CompareBar(store: store, meters: meters, player: player, theme: theme, polling: polling)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.3), value: store.hasChain)
     }
 
     /// `-PFSoundScrollTo <block>` (DEBUG only; a `SoundBlock` raw value, such as replayGain or eq) opens scrolled to
-    /// that block, `-PFSoundSelectBand <n>` with parametric band n selected, and `-PFSoundOpenPicker YES` with the
-    /// headphone-correction picker open, for screenshots.
+    /// that block, `-PFSoundSelectBand <n>` with parametric band n selected, `-PFSoundOpenPicker YES` with the
+    /// headphone-correction picker open, and `-PFSoundHoldCompare YES` with the A/B comparison latched on once a track
+    /// plays (as VoiceOver's double-tap latches it), for screenshots.
     private func scrollForScreenshots(_ proxy: ScrollViewProxy) {
         #if DEBUG
             let band = UserDefaults.standard.integer(forKey: "PFSoundSelectBand")
             if band > 0 { selectedBand = band - 1 }
             if UserDefaults.standard.bool(forKey: "PFSoundOpenPicker") { choosingCorrection = true }
+            if UserDefaults.standard.bool(forKey: "PFSoundHoldCompare") {
+                Task {
+                    for _ in 0..<100 where !store.canCompare { try? await Task.sleep(for: .milliseconds(100)) }
+                    if !store.compare.isHeld { store.toggleCompare() }
+                }
+            }
             guard let name = UserDefaults.standard.string(forKey: "PFSoundScrollTo"),
                 let block = SoundBlock(rawValue: name)
             else { return }

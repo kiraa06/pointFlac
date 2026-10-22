@@ -342,6 +342,37 @@ public final class TruePeakLimiter: @unchecked Sendable {
         deficitSlot = theirs.deficitSlot
     }
 
+    /// Render thread: back to rest, as `init` left it: silent history, no reduction, the ramp empty. For a limiter that
+    /// starts again after standing idle (the A/B comparison's, `SoundChain`). Real-time safe: plain loops over buffers
+    /// allocated in `init`.
+    func reset() {
+        var i = 0
+        while i < channels * 2 * historyFrames {
+            history[i] = 0
+            i += 1
+        }
+        i = 0
+        while i <= holdMask {
+            holdGains[i] = 1
+            holdFrames[i] = 0
+            i += 1
+        }
+        i = 0
+        while i < lookahead {
+            deficits[i] = 0
+            i += 1
+        }
+        frame = 0
+        holdHead = 0
+        holdTail = 0
+        previousPeak = 0
+        envelope = 1
+        deficitSum = 0
+        deficitCount = 0
+        deficitSlot = 0
+        reduction.store(0, ordering: .relaxed)
+    }
+
     /// What `adoptState(of:)` copies, and the shapes it checks, as plain values.
     private struct State {
         var history: UnsafeMutablePointer<Double>

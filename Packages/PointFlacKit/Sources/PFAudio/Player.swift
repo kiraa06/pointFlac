@@ -94,6 +94,8 @@ public final class Player {
     public private(set) var signal: SignalState
     /// The Sound settings every pipeline plays with, clamped. Pure (the default) is bit-exact.
     public private(set) var sound = SoundSettings()
+    /// The A/B comparison is held: the original plays in place of the Sound chain's output (`setABBypass`).
+    public private(set) var abBypass = false
 
     private let session: AudioSessionControlling
     private let gate: SessionGate
@@ -585,6 +587,14 @@ public final class Player {
         return meters
     }
 
+    /// Plays the original in place of the Sound chain's output, level-matched and lined up, while `on` (Task 14's
+    /// A/B comparison): the playing pipeline at once, and every pipeline made while it holds. Nothing to compare
+    /// without a chain, so in Pure it changes nothing.
+    public func setABBypass(_ on: Bool) {
+        abBypass = on
+        engine?.pipeline.setABBypass(on)
+    }
+
     /// The pipeline playing now, if any. For tests.
     var pipeline: PlaybackPipeline? {
         engine?.pipeline
@@ -664,8 +674,9 @@ public final class Player {
         let pipeline = PlaybackPipeline(
             output: lease, capabilities: capabilities,
             negotiateRate: { rate in await gate.requestSampleRate(rate, for: lease) }, makeDecoder: makeDecoder)
-        // Before it starts, so its first configure compiles the chain.
+        // Before it starts, so its first configure compiles the chain, and a held comparison holds from its first block.
         pipeline.setSound(sound)
+        pipeline.setABBypass(abBypass)
         let engine = PlayerEngine(pipeline: pipeline, lease: lease, generation: generation)
         // Captures the generation, not the engine, so the task never keeps a pipeline alive.
         let events = pipeline.events

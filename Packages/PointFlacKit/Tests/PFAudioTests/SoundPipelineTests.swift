@@ -719,4 +719,42 @@ private final class Flag: Sendable {
         #expect(whilePlaying >= 20, "\(whilePlaying) of \(changes) changes while playing")
         #expect(output.plans.map(\.clientSampleRate) == [44_100, 96_000])
     }
+
+    /// The level-matched A/B (Task 14) reaches the pipeline's runner. Held, the output is the original: a notch's
+    /// 1 kHz comes back, at the original's balance with 100 Hz (one gain for the whole signal, the K-weighted match).
+    /// A hold set before the start reaches the pipeline that start makes, and a pause and resume keeps it.
+    @Test func abBypassPlaysTheOriginal() async {
+        let notch = sound {
+            $0.eq = EQSettings(
+                enabled: true, mode: .parametric, bands: [EQBand(type: .notch, frequency: 1_000, gainDb: 0, q: 4)])
+        }
+        let span = 28_800..<48_000
+        let plain = SoundRig()
+        let processed = await plain.render([toneItem("eq")], with: notch)
+        let notched = amplitudes(left(processed[...], frames: span), hz: [1_000, 100], rate: 48_000)
+        #expect(notched[0] < 0.01, "processed, 1 kHz is at \(notched[0])")
+
+        let rig = SoundRig()
+        rig.player.setABBypass(true)
+        #expect(rig.player.abBypass)
+        let held = await rig.render([toneItem("eq")], with: notch)
+        #expect(held.count == processed.count)
+        let original = amplitudes(left(held[...], frames: span), hz: [1_000, 100], rate: 48_000)
+        #expect(original[0] > 0.05, "held, 1 kHz is at \(original[0])")
+        #expect(abs(original[0] / original[1] - 2) < 0.01, "held, 1 kHz over 100 Hz is \(original[0] / original[1])")
+
+        // Live: the playing pipeline follows, a pause and resume (a new pipeline) keeps the hold, and a release ends it.
+        #expect(await rig.play([toneItem("steady")]))
+        #expect(rig.player.pipeline?.abBypass == true)
+        rig.player.setABBypass(false)
+        #expect(rig.player.pipeline?.abBypass == false)
+        rig.player.setABBypass(true)
+        rig.player.pause()
+        rig.player.resume()
+        #expect(await rig.eventually { rig.player.status == .playing })
+        #expect(rig.player.pipeline?.abBypass == true)
+        rig.player.setABBypass(false)
+        #expect(rig.player.pipeline?.abBypass == false)
+        rig.player.pause()
+    }
 }

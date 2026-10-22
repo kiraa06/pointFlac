@@ -303,6 +303,41 @@ final class SoundUITests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// Hold to compare (Task 14): no button in Pure or with every block off; with a block on and a track playing, a
+    /// button pinned above the tab bar that a press holds and a release lets go (it reads "Processed" again), and
+    /// that goes away again with Pure.
+    @MainActor
+    func testHoldToCompareFollowsTheChainAndReleases() {
+        let app = launch()
+        addTeardownBlock { @MainActor in Self.resetSound() }
+        expectation(for: NSPredicate(format: "label == 'Pause'"), evaluatedWith: app.buttons["playButton"])
+        waitForExpectations(timeout: 8)
+        app.tabBars.buttons["Sound"].tap()
+        let pure = app.descendants(matching: .any)["pureSwitch"]
+        XCTAssertTrue(pure.waitForExistence(timeout: 3))
+        let compare = app.descendants(matching: .any)["compareButton"]
+        XCTAssertFalse(compare.exists, "Pure, yet there is something to compare")
+        pure.tap()
+        expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: pure)
+        waitForExpectations(timeout: 2)
+        XCTAssertFalse(compare.exists, "no block is on, yet there is something to compare")
+
+        let tone = app.descendants(matching: .any)["block-Tone"]
+        XCTAssertTrue(tone.waitForExistence(timeout: 2))
+        tone.tap()
+        XCTAssertTrue(compare.waitForExistence(timeout: 3))
+        XCTAssertEqual(compare.value as? String, "Processed")
+        XCTAssertTrue(compare.isHittable, "the button is not clear of the tab bar")
+        // A press holds while it lasts; once it lifts, the processed sound is back.
+        compare.press(forDuration: 1.0)
+        expectation(for: NSPredicate(format: "value == 'Processed'"), evaluatedWith: compare)
+        waitForExpectations(timeout: 2)
+
+        pure.tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: compare)
+        waitForExpectations(timeout: 3)
+    }
+
     // MARK: Helpers
 
     /// Scrolls the list by `distance` points (negative moves the content up), dragging in the margin beside the

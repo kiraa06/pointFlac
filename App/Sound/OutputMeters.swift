@@ -42,6 +42,7 @@ struct ScreenPanel: View {
 /// - Gain reduction: the limiter reports each render block's deepest reduction, too brief to see, so it gets the same
 ///   instant rise with a 12 dB/s fall, and a 1.5 s hold mark of its own.
 /// - Clip: lit for 2 s whenever the clip count goes up (from the first reading on, so old overs never light it).
+/// - The A/B comparison's matching gain, as last read, for the hold-to-compare button.
 @MainActor
 final class MeterBallistics {
     static let floorDb = -120.0
@@ -55,6 +56,8 @@ final class MeterBallistics {
     private(set) var peakHold = floorDb
     private(set) var reduction = 0.0
     private(set) var reductionHold = 0.0
+    /// The gain the A/B comparison gives the original, in dB, as last read (`SoundMeters.matchGainDb`).
+    private(set) var matchGainDb = 0.0
     private var peakHoldUntil = Date.distantPast
     private var reductionHoldUntil = Date.distantPast
     private var clipUntil = Date.distantPast
@@ -104,6 +107,7 @@ final class MeterBallistics {
         }
         if let lastClipCount, m.clipCount > lastClipCount { clipUntil = now + Self.clipSeconds }
         lastClipCount = m.clipCount
+        if m.matchGainDb.isFinite { matchGainDb = m.matchGainDb }
     }
 
     func clipLit(at now: Date) -> Bool { now < clipUntil }
