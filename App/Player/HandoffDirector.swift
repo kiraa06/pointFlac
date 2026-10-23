@@ -24,12 +24,9 @@ final class HandoffDirector {
     private(set) var source: CGRect = .zero
     /// The record's frame on the platter, in the player's coordinate space; the deck keeps it current.
     var platterRect: CGRect = .zero
-    /// The deck's geometry, kept current by the deck, for the incoming record's track gaps.
-    @ObservationIgnored var deckLayout: DeckLayout?
     /// The incoming record's track gaps, drawn while it flies so it lands looking exactly like the deck's record.
     private(set) var incomingBands: [CGFloat] = []
-    /// The side the incoming record lands on, for its label. Worked out from the side it will be cued on: side A when
-    /// that is the record's first side, else B (the deck's own label takes over on landing, from the player's side).
+    /// The side the incoming record will be cued on, for its label.
     private(set) var incomingSide = "A"
     /// How far the shelf travels as it sinks; the sleeve in flight sinks with it.
     private(set) var sinkDistance: CGFloat = 0
@@ -70,9 +67,9 @@ final class HandoffDirector {
         palette = ArtPalette(seed: album.id)
         source = rect
         self.sinkDistance = sinkDistance
-        let incoming = playback.sideTimeline(of: album, startingAt: track)
-        incomingBands = deckLayout?.bands(for: incoming) ?? RecordFace.bands(for: incoming)
-        incomingSide = incoming == playback.sideTimeline(of: album, startingAt: nil) ? "A" : "B"
+        let cue = playback.cueSide(of: album, startingAt: track)
+        incomingBands = RecordFace.bands(for: cue.timeline)
+        incomingSide = cue.letter
         landed = false
         spinning = false
         sinking = false
@@ -198,8 +195,9 @@ struct HandoffOverlay: View {
                             style: RecordStyle(rawValue: recordStyle) ?? .standard),
                         diameter: dst.width, angle: HandoffDirector.landingAngle * arc
                     )
-                    // Lifted off the shelf, it casts a soft shadow that tightens as it settles on the platter.
-                    .shadow(color: .black.opacity(0.35 * (1 - lin * 0.6)), radius: 8 - 5 * lin, y: 5 - 3 * lin)
+                    // Lifted off the shelf, it casts a soft shadow that fades as it settles, to nothing on landing:
+                    // there the deck's record, with only its own contact shadow, replaces it exactly.
+                    .shadow(color: .black.opacity(0.35 * (1 - lin)), radius: 8 * (1 - lin), y: 5 * (1 - lin))
                     .scaleEffect(scale)
                     .position(center)
                 }

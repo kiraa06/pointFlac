@@ -73,17 +73,6 @@ struct DeckLayout: Equatable {
         travel.needle(at: position)
     }
 
-    /// The groove radius, as a fraction of the record's, under the needle at `fraction` of the side.
-    func bandRadius(forFraction fraction: Double) -> CGFloat {
-        travel.radius(forFraction: fraction) / recordRadius
-    }
-
-    /// The track gaps of a side, as the record draws them. The hand-off's record in flight uses it too, so the record
-    /// that lands looks exactly like the one that flew.
-    func bands(for timeline: SideTimeline) -> [CGFloat] {
-        RecordFace.bands(for: timeline)
-    }
-
     /// The front band under the platter: its controls sit left of the display.
     var frontBand: CGRect {
         CGRect(x: 0, y: size.height - Self.screenBand, width: size.width, height: Self.screenBand)
