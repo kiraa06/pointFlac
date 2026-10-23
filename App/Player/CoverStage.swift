@@ -7,19 +7,25 @@ struct CoverStage: View {
     let playback: PlaybackController
     let theme: Theme
     let discSpace: Namespace.ID
+    @AppStorage(DeckPreferences.recordStyleKey) private var recordStyle = RecordStyle.standard.rawValue
 
     var body: some View {
         GeometryReader { proxy in
             let side = min(proxy.size.width * 0.74, proxy.size.height * 0.9)
             ZStack {
                 if let album = playback.album {
-                    // The record peeks out of the sleeve's right edge, further while it plays.
-                    RecordDisc(albumID: album.id, artwork: album.artwork, bands: [], grooveInk: .black)
-                        .overlay(Circle().fill(.black.opacity(0.55)).mask(Circle().strokeBorder(lineWidth: side * 0.3)))
-                        .frame(width: side * 0.94, height: side * 0.94)
-                        .offset(x: side * (playback.isPlaying ? 0.2 : 0.12))
-                        .shadow(color: .black.opacity(0.45), radius: 14, y: 8)
-                        .animation(.spring(duration: 0.7, bounce: 0.2), value: playback.isPlaying)
+                    // The record peeks out of the sleeve's right edge, further while it plays: the same record the
+                    // deck plays, in the style chosen in Customize deck.
+                    RecordView(
+                        face: RecordFace(
+                            album: album, side: sideLetter,
+                            bands: RecordFace.bands(for: playback.sideTimeline(playback.currentSide)),
+                            style: RecordStyle(rawValue: recordStyle) ?? .standard),
+                        diameter: side * 0.94
+                    )
+                    .offset(x: side * (playback.isPlaying ? 0.2 : 0.12))
+                    .shadow(color: .black.opacity(0.45), radius: 14, y: 8)
+                    .animation(.spring(duration: 0.7, bounce: 0.2), value: playback.isPlaying)
                     ArtworkView(albumID: album.id, artwork: album.artwork, pixels: 900)
                         .frame(width: side, height: side)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -44,5 +50,10 @@ struct CoverStage: View {
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
+    }
+
+    private var sideLetter: String {
+        let sides = playback.layout.sides
+        return sides.indices.contains(playback.currentSide) ? sides[playback.currentSide].letter : "A"
     }
 }

@@ -28,6 +28,9 @@ final class HandoffDirector {
     @ObservationIgnored var deckLayout: DeckLayout?
     /// The incoming record's track gaps, drawn while it flies so it lands looking exactly like the deck's record.
     private(set) var incomingBands: [CGFloat] = []
+    /// The side the incoming record lands on, for its label. Worked out from the side it will be cued on: side A when
+    /// that is the record's first side, else B (the deck's own label takes over on landing, from the player's side).
+    private(set) var incomingSide = "A"
     /// How far the shelf travels as it sinks; the sleeve in flight sinks with it.
     private(set) var sinkDistance: CGFloat = 0
     @ObservationIgnored private var startInstant = ContinuousClock.now
@@ -67,7 +70,9 @@ final class HandoffDirector {
         palette = ArtPalette(seed: album.id)
         source = rect
         self.sinkDistance = sinkDistance
-        incomingBands = deckLayout?.bands(for: playback.sideTimeline(of: album, startingAt: track)) ?? []
+        let incoming = playback.sideTimeline(of: album, startingAt: track)
+        incomingBands = deckLayout?.bands(for: incoming) ?? RecordFace.bands(for: incoming)
+        incomingSide = incoming == playback.sideTimeline(of: album, startingAt: nil) ? "A" : "B"
         landed = false
         spinning = false
         sinking = false
@@ -153,12 +158,13 @@ final class HandoffDirector {
 
 /// The travelling sleeve and record, drawn above everything (the shelf included) while the hand-off runs.
 ///
-/// The record is drawn exactly as the deck draws it (same size, track gaps, sheen and shadow) and scaled down to the
+/// The record is drawn exactly as the deck draws it (same size, style, track gaps and light) and scaled down to the
 /// sleeve at the start, so at the landing the deck's record replaces it pixel for pixel. The sleeve is the shelf's own
 /// `Sleeve`, standing in for the front sleeve (which the shelf hides meanwhile) and sinking with the shelf.
 struct HandoffOverlay: View {
     let director: HandoffDirector
     let palette: ArtPalette
+    @AppStorage(DeckPreferences.recordStyleKey) private var recordStyle = RecordStyle.standard.rawValue
 
     var body: some View {
         TimelineView(.animation) { context in
@@ -186,14 +192,14 @@ struct HandoffOverlay: View {
             ZStack {
                 Color.black.opacity(0.001)
                 if !director.landed, let album = director.album {
-                    RecordDisc(
-                        albumID: album.id, artwork: album.artwork, bands: director.incomingBands, grooveInk: .black
+                    RecordView(
+                        face: RecordFace(
+                            album: album, side: director.incomingSide, bands: director.incomingBands,
+                            style: RecordStyle(rawValue: recordStyle) ?? .standard),
+                        diameter: dst.width, angle: HandoffDirector.landingAngle * arc
                     )
-                    .equatable()
-                    .rotationEffect(.degrees(HandoffDirector.landingAngle * arc))
-                    .overlay(RecordSheen())
-                    .frame(width: dst.width, height: dst.width)
-                    .shadow(color: .black.opacity(0.35), radius: 8, y: 5)
+                    // Lifted off the shelf, it casts a soft shadow that tightens as it settles on the platter.
+                    .shadow(color: .black.opacity(0.35 * (1 - lin * 0.6)), radius: 8 - 5 * lin, y: 5 - 3 * lin)
                     .scaleEffect(scale)
                     .position(center)
                 }
