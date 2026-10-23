@@ -49,3 +49,45 @@ public struct ListenRule: Sendable {
         return true
     }
 }
+
+/// Follows the player across tracks and loops, handing each play to its own `ListenRule`.
+///
+/// A play starts when the player's track changes, and when a repeat-one loop restarts the same track: the position
+/// falls back by more than five seconds to within two of the start. Dragging the needle back to the start does the
+/// same to the position, but it is not a new play, so a fall during a scrub is left to the rule (which keeps what was
+/// played and carries on from there).
+public struct ListenSession: Sendable {
+    /// How far the position must fall back to count as a loop rather than a small seek.
+    static let loopFall = 5.0
+    /// How near the start it must land.
+    static let loopStart = 2.0
+
+    private var rule: ListenRule?
+    private var playing: (index: Int, id: String)?
+    private var lastPosition = 0.0
+
+    public init() {}
+
+    /// Takes one observation of the player (`index` and `trackID` are nil when nothing is queued). Returns the ID of
+    /// the track whose play just counted as a listen, once per play.
+    public mutating func observe(
+        index: Int?, trackID: String?, durationSeconds: Double, positionSeconds: Double, playing isPlaying: Bool,
+        scrubbing: Bool
+    ) -> String? {
+        guard let index, let trackID else {
+            rule = nil
+            playing = nil
+            return nil
+        }
+        let sameTrack = playing?.index == index && playing?.id == trackID
+        let looped =
+            !scrubbing && lastPosition - positionSeconds > Self.loopFall && positionSeconds < Self.loopStart
+        if !sameTrack || looped || rule == nil {
+            rule = ListenRule(durationSeconds: durationSeconds)
+            playing = (index, trackID)
+        }
+        lastPosition = positionSeconds
+        let counted = rule?.observe(positionSeconds: positionSeconds, playing: isPlaying, scrubbing: scrubbing) ?? false
+        return counted ? trackID : nil
+    }
+}

@@ -70,5 +70,8 @@ private func key(
 }
 
 @Test func titlesAreHumanReadable() {
-    #expect(AlbumSort.allCases.map(\.title) == ["Most played", "Recently played", "Newest release", "Last added", "Hi-res first"])
+    #expect(
+        AlbumSort.allCases.map(\.title) == [
+            "Most played", "Recently played", "Newest release", "Last added", "Hi-res first",
+        ])
 }

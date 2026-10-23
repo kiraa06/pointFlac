@@ -100,3 +100,72 @@ private func play(_ rule: inout ListenRule, from: Double, to: Double, step: Doub
     let obs5 = rule.observe(positionSeconds: 60, playing: true, scrubbing: false)
     #expect(obs5)
 }
+
+// MARK: ListenSession
+
+/// One observation of a player playing track "t" at index 0, 200 s long.
+private func observe(
+    _ session: inout ListenSession, at position: Double, index: Int? = 0, id: String? = "t", duration: Double = 200,
+    playing: Bool = true, scrubbing: Bool = false
+) -> String? {
+    session.observe(
+        index: index, trackID: id, durationSeconds: duration, positionSeconds: position, playing: playing,
+        scrubbing: scrubbing)
+}
+
+@Test func sessionReportsTheTrackOnceItCounts() {
+    var session = ListenSession()
+    var reported: [String] = []
+    var position = 0.0
+    while position <= 150 {
+        if let id = observe(&session, at: position) { reported.append(id) }
+        position += 0.5
+    }
+    #expect(reported == ["t"])
+}
+
+@Test func sessionStartsFreshWhenTheTrackChanges() {
+    var session = ListenSession()
+    var reported: [String] = []
+    // 60 s of track "a", then 60 s of "b": neither reaches its 100 s alone, though together they would.
+    for step in 0...120 {
+        if let id = observe(&session, at: Double(step) * 0.5, index: 0, id: "a") { reported.append(id) }
+    }
+    for step in 0...120 {
+        if let id = observe(&session, at: Double(step) * 0.5, index: 1, id: "b") { reported.append(id) }
+    }
+    #expect(reported.isEmpty)
+}
+
+@Test func sessionCountsEachLoopOfRepeatOne() {
+    var session = ListenSession()
+    var reported: [String] = []
+    // Three loops of a 200 s track, each played through to 101 s, then the position falls back to the start.
+    for _ in 0..<3 {
+        var position = 0.0
+        while position <= 101 {
+            if let id = observe(&session, at: position) { reported.append(id) }
+            position += 0.5
+        }
+    }
+    #expect(reported == ["t", "t", "t"])
+}
+
+@Test func sessionTreatsAScrubBackToTheStartAsTheSamePlay() {
+    var session = ListenSession()
+    var reported: [String] = []
+    for step in 0...160 {
+        if let id = observe(&session, at: Double(step) * 0.5) { reported.append(id) }
+    }
+    // 80 s played; the finger drags back to the start. That is not a new play: the 80 s are kept, and 20 more count.
+    _ = observe(&session, at: 1, scrubbing: true)
+    for step in 3...42 {
+        if let id = observe(&session, at: Double(step) * 0.5) { reported.append(id) }
+    }
+    #expect(reported == ["t"])
+}
+
+@Test func sessionIgnoresNothingPlaying() {
+    var session = ListenSession()
+    #expect(observe(&session, at: 0, index: nil, id: nil) == nil)
+}
