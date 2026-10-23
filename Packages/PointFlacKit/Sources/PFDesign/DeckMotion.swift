@@ -75,33 +75,6 @@ public struct SpinModel: Sendable, Equatable {
     }
 }
 
-/// The tonearm's sweep: the needle angle for a place on the side, and back.
-///
-/// Angles are degrees of rotation about the pivot from the arm's rest position. The lead-in groove sits at
-/// `leadInAngle` and the run-out at `runoutAngle`; the needle tracks linearly between them, as the mockups draw it.
-public struct TonearmGeometry: Sendable, Equatable {
-    public var restAngle: Double
-    public var leadInAngle: Double
-    public var runoutAngle: Double
-
-    public init(restAngle: Double = 0, leadInAngle: Double = 17, runoutAngle: Double = 38) {
-        self.restAngle = restAngle
-        self.leadInAngle = leadInAngle
-        self.runoutAngle = runoutAngle
-    }
-
-    /// The angle for `fraction` (0 = lead-in, 1 = run-out) of the side.
-    public func angle(forFraction fraction: Double) -> Double {
-        leadInAngle + (runoutAngle - leadInAngle) * min(max(fraction, 0), 1)
-    }
-
-    /// The fraction of the side under the needle at `angle`, clamped to the grooves.
-    public func fraction(forAngle angle: Double) -> Double {
-        guard runoutAngle != leadInAngle else { return 0 }
-        return min(max((angle - leadInAngle) / (runoutAngle - leadInAngle), 0), 1)
-    }
-}
-
 /// The platter as a jog wheel (spec §4.3): one turn of the record moves 1.8 s, as at 33⅓ rpm.
 public enum JogMath {
     /// The signed change from angle `a` to angle `b`, in degrees, the short way round: (−180, 180]. Summing these per

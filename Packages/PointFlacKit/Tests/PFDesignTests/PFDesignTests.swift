@@ -90,15 +90,6 @@ import Testing
 
 // MARK: Tonearm and jog
 
-@Test func tonearmMapsAnglesToTheSide() {
-    let arm = TonearmGeometry(restAngle: 0, leadInAngle: 20, runoutAngle: 40)
-    #expect(arm.angle(forFraction: 0) == 20)
-    #expect(arm.angle(forFraction: 0.5) == 30)
-    #expect(arm.fraction(forAngle: 35) == 0.75)
-    #expect(arm.fraction(forAngle: 5) == 0)
-    #expect(arm.fraction(forAngle: 90) == 1)
-}
-
 @Test func jogUnwrapsAndTurnsIntoSeconds() {
     #expect(JogMath.delta(from: 170, to: -170) == 20)
     #expect(JogMath.delta(from: -170, to: 170) == -20)
