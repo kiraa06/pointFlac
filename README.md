@@ -94,6 +94,7 @@ The **Deck** is a frosted-glass turntable with a strobe-dotted platter, an S-sha
 - **Tap the record** with the needle up to turn it over. Albums play in **sides**, like they were sequenced.
 - **Pick a record from the shelf** and watch the hand-off: the shelf sinks away, the record lands on the spindle, the platter spins up and the needle drops.
 - **Cover view** puts the artwork first, with the record peeking out of its sleeve.
+- **Jump to any song.** Tap the song line under the title for the tracklist, or tap the deck's display to unfold it. See below.
 
 Seeks are click-free: a 6 ms dip out and back in, never a hard cut. Albums play **gapless**, sample for sample, across every track boundary.
 
@@ -107,6 +108,34 @@ Seeks are click-free: a 6 ms dip out and back in, never a hard cut. Albums play 
 </td>
 </tr>
 </table>
+
+---
+
+## Your shelf as a galaxy, and every song a tap away
+
+<div align="center">
+
+<img src="docs/images/shelf-galaxy.png" width="260" alt="The Shelf in Galaxy mode: hundreds of album sleeves scattered around a large centre sleeve, sorted Hi-res first">&nbsp;&nbsp;
+<img src="docs/images/tracklist-sheet.png" width="260" alt="The tracklist sheet laid out like the back of a sleeve: Side A and Side B, track codes, times, and the playing song marked">&nbsp;&nbsp;
+<img src="docs/images/tracklist-deck.png" width="260" alt="The deck's dot-matrix display unfolded into a green tracklist over the platter">
+
+</div>
+
+**Galaxy.** Switch the Shelf from **Crate** to **Galaxy** and every album becomes a solid, floating sleeve.
+
+- **Your favourites at the core.** The album you play most is biggest, in the middle. The rest scatter outward, smaller as they go, drifting slowly over a glow in the centre album's colour.
+- **Five ways to see it.** Sort by Most played, Recently played, Newest release, Last added or Hi-res first, and the whole galaxy glides into its new shape.
+- **Hands on.** Grab any sleeve and push it through the others. Sleeves collide and never overlap, and they stay where you drop them. Open the galaxy again and it re-forms in order.
+- **Pick and play.** Tap a sleeve to play it, with the same hand-off as the crate. Hold it for Play Next, Add to Up Next or Delete. Pan and pinch-zoom for big libraries.
+- **Listens that mean something.** A play counts once a song has really played half its length or four minutes. Seeking and scrubbing don't count, and the history never leaves your phone.
+
+**Tracklist.** No more dragging the tonearm to reach the last song.
+
+- **Tap the song line** under the title for the tracklist, laid out like the back of the sleeve: grouped by side, with codes (A1, B2), exact times, and the playing song marked.
+- **On the Deck, tap the dot-matrix display** and it unfolds into a tracklist over the platter.
+- **Pick a song and the tonearm swings to its groove.** If the song is on the other side, the record turns over first.
+
+The galaxy, the deck and the hand-off draw at up to 120 Hz on ProMotion iPhones.
 
 ---
 
