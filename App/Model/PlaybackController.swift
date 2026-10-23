@@ -233,6 +233,37 @@ final class PlaybackController {
         await play(fromTrack: layout.sides[side].tracks.lowerBound + local, at: offset)
     }
 
+    // MARK: The tracklist
+
+    /// A song chosen in the tracklist, with where the needle was when it was chosen: the deck swings its tonearm from
+    /// there to the song's groove (turning the record over first when the song is on the other side) instead of
+    /// snapping. Captured here, before the player moves, so the swing's start never depends on when the deck sees it.
+    struct TrackJump: Equatable {
+        /// Counts the jumps, so choosing the same song twice is still a change.
+        let serial: Int
+        /// The album track it plays from.
+        let track: Int
+        /// The side the needle was on (or cued on, needle up).
+        let fromSide: Int
+        /// Seconds into that side, or nil with the needle up: nothing playing, or the record played out.
+        let fromPosition: Double?
+    }
+
+    /// The latest `jump(toTrack:)`.
+    private(set) var lastJump: TrackJump?
+
+    /// Plays the record from album track `index` (the tracklist), and on through the album. Through `play(fromTrack:)`,
+    /// so it is serialised with the tonearm, the jog and Next: whichever was asked for last wins. A song on the other
+    /// side moves the side with it, and the deck turns the record over.
+    func jump(toTrack index: Int) {
+        guard tracks.indices.contains(index) else { return }
+        let down = trackIndex != nil && player.status != .ended
+        lastJump = TrackJump(
+            serial: (lastJump?.serial ?? 0) + 1, track: index, fromSide: currentSide,
+            fromPosition: down ? sidePosition : nil)
+        Task { await play(fromTrack: index) }
+    }
+
     // MARK: A finger on the record
 
     /// The hand holds the record (spec §4.3): from now until `endScrub`, the music follows it. False when the player
