@@ -61,6 +61,12 @@ struct GalaxyLayoutTests {
         #expect(GalaxyLayout.place(count: 120) == GalaxyLayout.place(count: 120))
     }
 
+    @Test("the gap covers two sleeves drifting together, which Drift's fixed amplitude of 4 relies on")
+    func gapCoversDrift() {
+        #expect(metrics.driftAmplitude == 4)
+        #expect(metrics.gap >= 2 * 4 + 6)
+    }
+
     @Test("an empty library places nothing")
     func empty() {
         #expect(GalaxyLayout.place(count: 0).isEmpty)
@@ -70,7 +76,6 @@ struct GalaxyLayoutTests {
     func thousandAlbumsPlaceQuickly() {
         let clock = ContinuousClock()
         let took = clock.measure { _ = GalaxyLayout.place(count: 1000) }
-        print("galaxy place(1000):", took)
         #expect(took < .seconds(1))
     }
 }

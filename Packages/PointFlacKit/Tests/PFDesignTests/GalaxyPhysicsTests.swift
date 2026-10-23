@@ -24,18 +24,21 @@ struct GalaxyPhysicsTests {
         return false
     }
 
-    /// Drags the biggest sleeve across the galaxy in 60 steps, easing to a stop, and lets go.
+    /// Drags the biggest sleeve across the galaxy in 60 steps and lets go while still moving (the drag stops
+    /// easing only 20% in), so the throw's coast is exercised. Returns the point of the last drag step.
     private func dragAndRelease(_ p: inout GalaxyPhysics) -> CGPoint {
         let start = p.bodies[0].center
         let end = CGPoint(x: start.x + 260, y: start.y + 150)
         p.bodies[0].held = true
+        var last = start
         for k in 1...60 {
             let t = Double(k) / 60
-            let e = t * t * (3 - 2 * t)
-            p.step(holdTarget: CGPoint(x: start.x + (end.x - start.x) * e, y: start.y + (end.y - start.y) * e))
+            let e = t * t  // still accelerating at the end
+            last = CGPoint(x: start.x + (end.x - start.x) * e, y: start.y + (end.y - start.y) * e)
+            p.step(holdTarget: last)
         }
         p.bodies[0].held = false
-        return end
+        return last
     }
 
     @Test("a held sleeve shoves the others aside and the galaxy settles apart")
@@ -51,22 +54,26 @@ struct GalaxyPhysicsTests {
         #expect(!overlaps(p))
     }
 
-    @Test("a dropped sleeve stays where it was let go")
+    @Test("a dropped sleeve stays where it was let go, plus its coast")
     func droppedBodyStays() {
         var p = physics()
-        _ = dragAndRelease(&p)
+        let dropPoint = dragAndRelease(&p)
         let letGo = p.bodies[0].center
+        #expect(letGo == dropPoint)
         let v = p.bodies[0].velocity
-        // Damping 0.90 per step: a sleeve at speed s coasts at most s / (1 - 0.90) further.
-        let coast = Double(hypot(v.dx, v.dy)) / 0.10
+        let speed = Double(hypot(v.dx, v.dy))
+        #expect(speed > 1)  // a real throw
+        // Damping 0.90 per step: a sleeve at speed s coasts s * 0.9 / (1 - 0.9) = 9 s further, at most.
+        let coast = speed * 0.9 / 0.1
         var steps = 0
         while !p.isSettled && steps < 600 {
             p.step(holdTarget: nil)
             steps += 1
         }
         let moved = Double(hypot(p.bodies[0].center.x - letGo.x, p.bodies[0].center.y - letGo.y))
-        #expect(moved <= 2 + coast)
-        #expect(p.bodies[0].center.x > 100)  // it did not spring back to the middle
+        #expect(moved <= coast + 2)
+        #expect(moved > 1)  // it did coast
+        #expect(p.bodies[0].center.x > 100)  // and did not spring back to the middle
     }
 
     @Test("a laid-out galaxy with nothing held does not move")
@@ -109,5 +116,20 @@ struct GalaxyPhysicsTests {
         #expect(Drift.seed(for: "a") != Drift.seed(for: "b"))
         // FNV-1a 64 of the empty string is its offset basis.
         #expect(Drift.seed(for: "") == 0xcbf2_9ce4_8422_2325)
+    }
+
+    @Test("a thousand bodies with one held step fast enough for 120 Hz, even in a Debug host test")
+    func thousandBodiesStepQuickly() {
+        var p = GalaxyPhysics(slots: GalaxyLayout.place(count: 1000))
+        p.bodies[0].held = true
+        let start = p.bodies[0].center
+        let clock = ContinuousClock()
+        let took = clock.measure {
+            for k in 1...120 {
+                let t = Double(k) / 120
+                p.step(holdTarget: CGPoint(x: start.x + 400 * t, y: start.y + 250 * t))
+            }
+        }
+        #expect(took < .seconds(2))
     }
 }

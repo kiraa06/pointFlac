@@ -58,7 +58,9 @@ public struct GalaxyLayout: Sendable {
     /// on hashing order or randomness.
     public static func place(count: Int, metrics: GalaxyMetrics = .init()) -> [GalaxySlot] {
         guard count > 0 else { return [] }
-        var grid = Grid(cell: metrics.coreSide + metrics.gap)
+        // The 3x3 cell scan is only exhaustive while no two sleeves can reach further than a cell: the reach is at most
+        // the largest side plus the gap, and the core is the largest side unless a custom `maxSide` exceeds it.
+        var grid = Grid(cell: max(metrics.coreSide, metrics.maxSide) + metrics.gap)
         var slots: [GalaxySlot] = []
         slots.reserveCapacity(count)
         var lastRing = 0
@@ -70,28 +72,32 @@ public struct GalaxyLayout: Sendable {
             // nearest free spot. Beyond that, sleeves are all close to `minSide` and the inside is packed, so the
             // search resumes a few rings behind the previous sleeve instead of rescanning thousands of blocked
             // spots: that keeps 1,000 albums fast, where a full scan per rank grows with the square of the radius.
-            var ring = rank < Self.exactRanks ? 0 : max(0, lastRing - Self.lookbackRings)
-            var found: CGPoint?
-            while found == nil {
-                let radius = Double(ring) * metrics.radialStep
-                let steps = radius == 0 ? 1 : max(10, Int((2 * Double.pi * radius / metrics.arcStep).rounded()))
-                for k in 0..<steps {
-                    let angle = start + Double(k) / Double(steps) * 2 * Double.pi
-                    let x = cos(angle) * radius
-                    let y = sin(angle) * radius * metrics.aspect
-                    if grid.isFree(x: x, y: y, side: side, gap: metrics.gap) {
-                        found = CGPoint(x: x, y: y)
-                        break
-                    }
-                }
-                if found == nil { ring += 1 }
-            }
+            let first = rank < Self.exactRanks ? 0 : max(0, lastRing - Self.lookbackRings)
+            let (ring, center) = firstFreeSpot(from: first, start: start, side: side, grid: grid, metrics: metrics)
             lastRing = ring
-            let center = found ?? .zero
             grid.insert(x: Double(center.x), y: Double(center.y), side: side)
             slots.append(GalaxySlot(center: center, side: side))
         }
         return slots
+    }
+
+    /// Walks rings outward from `first` and returns the ring and centre of the first free spot. It always returns:
+    /// the world is unbounded, so some ring is clear of every placed slot.
+    private static func firstFreeSpot(
+        from first: Int, start: Double, side: Double, grid: Grid, metrics: GalaxyMetrics
+    ) -> (Int, CGPoint) {
+        var ring = first
+        while true {
+            let radius = Double(ring) * metrics.radialStep
+            let steps = radius == 0 ? 1 : max(10, Int((2 * Double.pi * radius / metrics.arcStep).rounded()))
+            for k in 0..<steps {
+                let angle = start + Double(k) / Double(steps) * 2 * Double.pi
+                let x = cos(angle) * radius
+                let y = sin(angle) * radius * metrics.aspect
+                if grid.isFree(x: x, y: y, side: side, gap: metrics.gap) { return (ring, CGPoint(x: x, y: y)) }
+            }
+            ring += 1
+        }
     }
 
     /// A uniform grid of the slots placed so far, so a free-spot check looks at a handful of neighbours instead of
@@ -146,7 +152,8 @@ public struct GalaxyLayout: Sendable {
 /// clock rather than integrated, and stays exact at any frame rate. Each sleeve gets its own speed and phase from its
 /// seed so they don't move in lockstep.
 public struct Drift: Sendable {
-    /// Offset from home at `time` seconds. Each axis stays within ±4 (2.5 + 1.5), the default `driftAmplitude`.
+    /// Offset from home at `time` seconds. Each axis stays within ±4 (2.5 + 1.5): fixed at the default
+    /// `GalaxyMetrics.driftAmplitude`, which the layout gap is sized against (`gap ≥ 2 × 4 + 6`).
     public static func offset(seed: UInt64, time: Double) -> CGVector {
         var state = seed
         let speed = 0.5 + 0.6 * unit(splitMix64(&state))
