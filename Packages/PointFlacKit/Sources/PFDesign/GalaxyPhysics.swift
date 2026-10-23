@@ -24,6 +24,16 @@ public struct GalaxyPhysics: Sendable {
 
     public var bodies: [Body]
 
+    /// Sleeve sizes the grid cell must cover at the least (twice the biggest non-core side).
+    private let maxSide: Double
+    /// Reused between steps so a frame allocates nothing: bodies sorted by grid cell (see `bin`).
+    private var entries: [Entry] = []
+
+    private struct Entry {
+        var key: Int64
+        var index: Int32
+    }
+
     /// Clear space the separation pass leaves, and the one `isSettled` demands. Smaller than the layout gap: a
     /// shoved sleeve only has to stop touching, not return to the airy resting spacing.
     private static let gap = 6.0
@@ -35,30 +45,42 @@ public struct GalaxyPhysics: Sendable {
     /// Overlap below this is float noise from the separation arithmetic, not a real overlap.
     private static let tolerance = 1e-3
 
-    public init(bodies: [Body]) {
+    public init(bodies: [Body], metrics: GalaxyMetrics = .init()) {
         self.bodies = bodies
+        self.maxSide = metrics.maxSide
+        entries.reserveCapacity(bodies.count)
     }
 
-    public init(slots: [GalaxySlot]) {
-        self.bodies = slots.map { Body(center: $0.center, side: $0.side) }
+    public init(slots: [GalaxySlot], metrics: GalaxyMetrics = .init()) {
+        self.init(bodies: slots.map { Body(center: $0.center, side: $0.side) }, metrics: metrics)
     }
 
     /// True when nothing is moving noticeably and no two sleeves overlap, so the view can stop stepping.
     public var isSettled: Bool {
         for b in bodies where hypot(b.velocity.dx, b.velocity.dy) >= Self.restSpeed { return false }
-        var settled = true
-        forEachPair { i, j in
+        var grid: [Entry] = []
+        let cell = cellSize()
+        Self.bin(bodies, cell: cell, into: &grid)
+        for p in grid.indices {
+            let i = Int(grid[p].index)
             let a = bodies[i]
-            let b = bodies[j]
-            let need = (a.side + b.side) / 2 + Self.gap - Self.tolerance
-            if abs(a.center.x - b.center.x) < need && abs(a.center.y - b.center.y) < need { settled = false }
+            var settled = true
+            Self.forEachNeighbour(of: i, in: grid, bodies: bodies, cell: cell) { j in
+                let b = bodies[j]
+                let need = (a.side + b.side) / 2 + Self.gap - Self.tolerance
+                if abs(a.center.x - b.center.x) < need && abs(a.center.y - b.center.y) < need { settled = false }
+            }
+            if !settled { return false }
         }
-        return settled
+        return true
     }
 
     /// Advances one frame. The held body moves to `holdTarget` (it stays put without one) and its velocity becomes
     /// that move, so letting go throws it naturally. The others coast with damping, then four separation passes
     /// resolve overlaps.
+    ///
+    /// The grid is rebuilt into reused storage before each pass, since the previous pass moved bodies. Within a pass
+    /// a body can still shift past its binned cell; a pair that therefore gets missed is caught by the next pass.
     public mutating func step(holdTarget: CGPoint?) {
         for i in bodies.indices {
             if bodies[i].held {
@@ -72,8 +94,24 @@ public struct GalaxyPhysics: Sendable {
                 bodies[i].center.y += bodies[i].velocity.dy
             }
         }
+        let cell = cellSize()
         for pass in 0..<Self.passes {
-            forEachPair { i, j in separate(i, j, kick: pass == 0) }
+            Self.bin(bodies, cell: cell, into: &entries)
+            for p in entries.indices {
+                let i = Int(entries[p].index)
+                let (cx, cy) = Self.cellOf(bodies[i].center, cell)
+                for ix in (cx - 1)...(cx + 1) {
+                    for iy in (cy - 1)...(cy + 1) {
+                        var q = Self.lowerBound(entries, Self.key(ix, iy))
+                        let key = Self.key(ix, iy)
+                        while q < entries.count && entries[q].key == key {
+                            let j = Int(entries[q].index)
+                            if j > i { separate(i, j, kick: pass == 0) }
+                            q += 1
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -112,25 +150,57 @@ public struct GalaxyPhysics: Sendable {
         }
     }
 
-    /// Calls `visit(i, j)` with `i < j` for every pair close enough to touch, found through a uniform grid so 1,000
-    /// sleeves don't cost a million comparisons. The cell is twice the largest sleeve, so a 3×3 block of cells holds
-    /// every possible partner. Visit order depends only on body order, so a run is reproducible.
-    private func forEachPair(_ visit: (Int, Int) -> Void) {
-        let largest = bodies.reduce(0) { max($0, $1.side) }
-        let cell = max(2 * 96, largest + Self.gap + 1)
-        func index(_ v: CGFloat) -> Int64 { Int64((Double(v) / cell).rounded(.down)) }
-        func key(_ cx: Int64, _ cy: Int64) -> Int64 { (cx << 32) ^ (cy & 0xFFFF_FFFF) }
-        var cells: [Int64: [Int]] = [:]
+    // MARK: Spatial grid
+
+    /// Grid cell: at least twice the biggest regular sleeve, and always more than the largest actual sleeve plus the
+    /// gap, so the 3x3 block of cells around a body holds every body it could touch.
+    private func cellSize() -> Double {
+        var largest = 0.0
+        for b in bodies where b.side > largest { largest = b.side }
+        return max(2 * maxSide, largest + Self.gap + 1)
+    }
+
+    private static func cellOf(_ c: CGPoint, _ cell: Double) -> (Int64, Int64) {
+        (Int64((Double(c.x) / cell).rounded(.down)), Int64((Double(c.y) / cell).rounded(.down)))
+    }
+
+    private static func key(_ cx: Int64, _ cy: Int64) -> Int64 { (cx << 32) ^ (cy & 0xFFFF_FFFF) }
+
+    /// Fills `grid` with every body tagged by its cell, sorted by (cell, index). Sorting by index within a cell keeps
+    /// the visit order a pure function of the body order, so a run is reproducible. Reuses `grid`'s storage.
+    private static func bin(_ bodies: [Body], cell: Double, into grid: inout [Entry]) {
+        grid.removeAll(keepingCapacity: true)
         for i in bodies.indices {
-            cells[key(index(bodies[i].center.x), index(bodies[i].center.y)), default: []].append(i)
+            let (cx, cy) = cellOf(bodies[i].center, cell)
+            grid.append(Entry(key: key(cx, cy), index: Int32(i)))
         }
-        for i in bodies.indices {
-            let cx = index(bodies[i].center.x)
-            let cy = index(bodies[i].center.y)
-            for ix in (cx - 1)...(cx + 1) {
-                for iy in (cy - 1)...(cy + 1) {
-                    guard let members = cells[key(ix, iy)] else { continue }
-                    for j in members where j > i { visit(i, j) }
+        grid.sort { $0.key != $1.key ? $0.key < $1.key : $0.index < $1.index }
+    }
+
+    /// First position in `grid` whose key is at least `key`.
+    private static func lowerBound(_ grid: [Entry], _ key: Int64) -> Int {
+        var lo = 0
+        var hi = grid.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if grid[mid].key < key { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
+    /// Calls `visit(j)` for every other body `j > i` in the 3x3 cells around body `i`.
+    private static func forEachNeighbour(
+        of i: Int, in grid: [Entry], bodies: [Body], cell: Double, _ visit: (Int) -> Void
+    ) {
+        let (cx, cy) = cellOf(bodies[i].center, cell)
+        for ix in (cx - 1)...(cx + 1) {
+            for iy in (cy - 1)...(cy + 1) {
+                let k = key(ix, iy)
+                var q = lowerBound(grid, k)
+                while q < grid.count && grid[q].key == k {
+                    let j = Int(grid[q].index)
+                    if j > i { visit(j) }
+                    q += 1
                 }
             }
         }
