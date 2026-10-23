@@ -191,7 +191,7 @@ struct DeckControls: View, Equatable {
     private func acrylic(_ context: inout GraphicsContext) {
         // The outboard motor pod, rear left, and its belt round the platter's rim.
         let w = layout.size.width
-        let pod = CGPoint(x: w * 0.105, y: w * 0.105)
+        let pod = CGPoint(x: w * 0.12, y: w * 0.12)
         let podRadius = r * 0.13
         let pulley = r * 0.045
         let hardware = paint.hardware
@@ -240,12 +240,13 @@ struct DeckControls: View, Equatable {
         context.fill(
             Path(ellipseIn: CGRect(x: pod.x - pulley, y: pod.y - pulley, width: pulley * 2, height: pulley * 2)),
             with: hardware.dome(center: pod, radius: pulley))
-        // Champagne bolts holding the slabs together, clear of the arm and the display.
+        // Champagne bolts through the slabs' four corners, square to one another, clear of the pod, the arm's
+        // counterweight and the display.
         let h = layout.size.height
-        let inset = w * 0.05
+        let inset: CGFloat = 9
         for (point, angle) in [
-            (CGPoint(x: w - inset, y: inset), 20.0), (CGPoint(x: inset, y: h - inset), 70.0),
-            (CGPoint(x: w - inset, y: DeckScreen.frame(in: layout.size).minY - inset * 0.6), 120.0),
+            (CGPoint(x: inset, y: inset), 20.0), (CGPoint(x: w - inset, y: inset), 70.0),
+            (CGPoint(x: inset, y: h - inset), 110.0), (CGPoint(x: w - inset, y: h - inset), 160.0),
         ] {
             context.fill(
                 Path(ellipseIn: CGRect(x: point.x - 5.5, y: point.y - 5.5, width: 11, height: 11)),
@@ -279,7 +280,9 @@ struct DeckControls: View, Equatable {
     private func portable(_ context: inout GraphicsContext) {
         // The speaker grille, front left: a perforated plate over dark cloth.
         let f = layout.frontControls
-        let grille = CGRect(x: f.minX + 2, y: f.minY + 2, width: f.width * 0.74, height: f.height - 6)
+        // Its bottom stops short of the stitched seam round the case (9 pt in from the edge).
+        let seam = layout.size.height - 9
+        let grille = CGRect(x: f.minX + 2, y: f.minY + 2, width: f.width * 0.74, height: seam - 6 - (f.minY + 2))
         context.fill(Path(roundedRect: grille, cornerRadius: 5), with: .color(paint(0x3A2E27)))
         var holes = Path()
         var y = grille.minY + 3
@@ -300,11 +303,10 @@ struct DeckControls: View, Equatable {
                 Gradient(colors: [.black.opacity(0.45), .white.opacity(0.2)]),
                 startPoint: CGPoint(x: 0, y: grille.minY),
                 endPoint: CGPoint(x: 0, y: grille.maxY)), lineWidth: 0.8)
-        // Brass latches on the front edge.
+        // Brass latches on the front edge, set squarely over the seam.
         let hardware = paint.hardware
-        let h = layout.size.height
         for x in [layout.size.width * 0.12, f.maxX - 24] {
-            let latch = CGRect(x: x, y: h - 9, width: 24, height: 6.5)
+            let latch = CGRect(x: x, y: seam - 3.25, width: 24, height: 6.5)
             context.fill(
                 Path(roundedRect: latch.offsetBy(dx: 0.6, dy: 1), cornerRadius: 1.5), with: .color(.black.opacity(0.4)))
             context.fill(
@@ -539,15 +541,32 @@ struct LidReflection: View, Equatable {
 
     var body: some View {
         let radius = paint.cornerRadius(width: layout.size.width)
-        LinearGradient(
-            stops: [
-                .init(color: .white.opacity(0), location: 0.16), .init(color: .white.opacity(0.16), location: 0.24),
-                .init(color: .white.opacity(0), location: 0.3), .init(color: .white.opacity(0), location: 0.62),
-                .init(color: .white.opacity(0.08), location: 0.67), .init(color: .white.opacity(0), location: 0.71),
-            ], startPoint: .topLeading, endPoint: .bottomTrailing
-        )
-        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous).inset(by: 4))
+        let lid = RoundedRectangle(cornerRadius: max(2, radius - 4), style: .continuous).inset(by: 4)
+        ZStack {
+            // The reflections lie across the record, where the dark vinyl shows them; on the white lacquer a clear
+            // lid shows mostly as its edge.
+            LinearGradient(
+                stops: [
+                    .init(color: .white.opacity(0.02), location: 0), .init(color: .white.opacity(0.02), location: 0.26),
+                    .init(color: .white.opacity(0.2), location: 0.33),
+                    .init(color: .white.opacity(0.08), location: 0.39),
+                    .init(color: .white.opacity(0.02), location: 0.43),
+                    .init(color: .white.opacity(0.02), location: 0.52),
+                    .init(color: .white.opacity(0.1), location: 0.56),
+                    .init(color: .white.opacity(0.02), location: 0.6),
+                    .init(color: .white.opacity(0.02), location: 1),
+                ], startPoint: .topLeading, endPoint: .bottomTrailing
+            )
+            .clipShape(lid)
+            // The lid's edge: a polished hairline with a faint shadow just inside it.
+            lid.inset(by: 0.8).stroke(Color.black.opacity(0.08), lineWidth: 1)
+            lid.stroke(
+                LinearGradient(
+                    colors: [.white.opacity(0.95), .white.opacity(0.35), .white.opacity(0.8)], startPoint: .topLeading,
+                    endPoint: .bottomTrailing), lineWidth: 0.8)
+        }
         .frame(width: layout.size.width, height: layout.size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

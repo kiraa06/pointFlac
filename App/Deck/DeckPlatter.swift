@@ -97,7 +97,8 @@ struct DeckPlatter: View, Equatable {
     private func mat(_ context: inout GraphicsContext, _ c: CGPoint) {
         let kind = paint.design.mat
         guard kind != .none else { return }
-        let r = layout.recordRadius * 1.012
+        // A little smaller than the record, as a real mat is, so the record's rim overhangs it.
+        let r = layout.recordRadius * 0.985
         let disc = Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
         let colour: UInt32 =
             switch kind {

@@ -14,8 +14,11 @@ struct RecordFace: Equatable {
     /// Track-gap radii, as fractions of the record's radius.
     let bands: [CGFloat]
     let style: RecordStyle
+    /// A generated record with no album: its label carries no names.
+    let placeholder: Bool
 
     init(album: AlbumCard, side: String, bands: [CGFloat], style: RecordStyle) {
+        placeholder = false
         albumID = album.id
         artwork = album.artwork
         title = album.title
@@ -25,12 +28,14 @@ struct RecordFace: Equatable {
         self.style = style
     }
 
-    /// A generated record with no album behind it (the Customize deck preview with nothing loaded).
+    /// A generated record with no album behind it (the Customize deck preview with nothing loaded). Its label prints
+    /// only the side and the speed, no names.
     init(placeholderStyle style: RecordStyle) {
+        placeholder = true
         albumID = "pointflac"
         artwork = nil
-        title = "pointFlac"
-        artist = "Side One"
+        title = ""
+        artist = ""
         side = "A"
         bands = [0.86, 0.74, 0.6]
         self.style = style
@@ -40,7 +45,7 @@ struct RecordFace: Equatable {
     /// compares faces every frame.
     nonisolated static func == (a: Self, b: Self) -> Bool {
         a.albumID == b.albumID && a.artwork?.count == b.artwork?.count && a.title == b.title && a.artist == b.artist
-            && a.side == b.side && a.bands == b.bands && a.style == b.style
+            && a.side == b.side && a.bands == b.bands && a.style == b.style && a.placeholder == b.placeholder
     }
 
     /// A side's track gaps as radii, fractions of the record's: the groove runs at an even pitch from the outer
@@ -55,11 +60,13 @@ struct RecordFace: Equatable {
 
     /// The label's curved rim text.
     var rimText: String {
-        "SIDE \(side) · \(title.uppercased()) · \(artist.uppercased()) · 33⅓ RPM · STEREO"
+        if placeholder { return "SIDE \(side) · 33⅓ RPM · STEREO · HIGH FIDELITY ·" }
+        return "SIDE \(side) · \(title.uppercased()) · \(artist.uppercased()) · 33⅓ RPM · STEREO"
     }
 
     /// The etched matrix number in the dead wax.
     var matrix: String {
+        if placeholder { return "PFL-0001-\(side)1" }
         let code = albumID.filter { $0.isLetter || $0.isNumber }.prefix(4).uppercased()
         return "PFL-\(code.isEmpty ? "0000" : code)-\(side)1"
     }
@@ -350,18 +357,23 @@ private struct RecordLight: View, Equatable {
         let half = 0.045 * spread
         let toward = 0.625  // 225°: up and to the left.
         let away = 0.125  // 45°: down and to the right.
-        func wedge(_ at: Double, _ alpha: Double) -> [Gradient.Stop] {
-            [
-                .init(color: .white.opacity(0), location: at - half * 2),
-                .init(color: .white.opacity(alpha * 0.55), location: at - half * 0.6),
-                .init(color: .white.opacity(alpha), location: at),
-                .init(color: .white.opacity(alpha * 0.55), location: at + half * 0.6),
-                .init(color: .white.opacity(0), location: at + half * 2),
-            ]
+        // A wedge's profile by its distance round the circle from its centre (in turns): full at the centre, half
+        // strength a little way out, gone at twice its half-width.
+        func wedge(_ centre: Double, _ t: Double) -> Double {
+            let raw = abs(t - centre).truncatingRemainder(dividingBy: 1)
+            let d = min(raw, 1 - raw)
+            if d >= half * 2 { return 0 }
+            if d <= half * 0.6 { return 1 - 0.45 * d / (half * 0.6) }
+            return 0.55 * (1 - (d - half * 0.6) / (half * 1.4))
         }
-        let stops =
-            [Gradient.Stop(color: .white.opacity(0), location: 0)] + wedge(away, far) + wedge(toward, near)
-            + [Gradient.Stop(color: .white.opacity(0), location: 1)]
+        // Sampled every 2° rather than placed as stops, so a wide wedge that wraps past 0° stays smooth and every
+        // stop is in order inside 0...1.
+        let steps = 180
+        let stops = (0...steps).map { k -> Gradient.Stop in
+            let t = Double(k) / Double(steps)
+            let alpha = far * wedge(away, t) + near * wedge(toward, t)
+            return Gradient.Stop(color: .white.opacity(alpha), location: t)
+        }
         return .conicGradient(Gradient(stops: stops), center: center, angle: .zero)
     }
 }

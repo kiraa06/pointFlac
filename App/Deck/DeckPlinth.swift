@@ -118,27 +118,58 @@ struct DeckPlinth: View, Equatable {
     }
 
     private func walnut(_ context: inout GraphicsContext, _ rect: CGRect, _ random: inout SeededRandom) {
-        // Veneer grain along the width: long gently waving lines in two or three tones, with a few broad dark streaks
-        // (the figure) and fine pores.
+        // Veneer grain along the width. Each line wanders with two waves of its own and a slow drift, and is drawn in
+        // runs of varying strength (some fading out altogether), in bands of tighter and looser grain, so no two lines
+        // and no two stretches look alike.
         let deep = paint(0x2E1A10)
         let honey = paint(0xA8714A)
         var y: CGFloat = -10
+        var density = 1.0
         while y < rect.height + 10 {
-            var line = Path()
-            let frequency = random.range(0.006, 0.018)
-            let amplitude = random.range(1.5, 5)
-            let phase = random.range(0, 10)
+            if random.unit() < 0.08 { density = random.range(0.6, 1.9) }
+            let f1 = random.range(0.004, 0.013)
+            let f2 = random.range(0.02, 0.055)
+            let a1 = random.range(1.2, 5.5)
+            let a2 = random.range(0.2, 1.3)
+            let p1 = random.range(0, 10)
+            let p2 = random.range(0, 10)
+            var drift = 0.0
+            var points: [CGPoint] = []
             var x: CGFloat = -6
-            line.move(to: CGPoint(x: x, y: y))
             while x <= rect.width + 6 {
-                x += 5
-                let wave = sin(x * frequency + phase) * amplitude + sin(x * 0.004 + y * 0.03) * 5
-                line.addLine(to: CGPoint(x: x, y: y + wave))
+                drift = (drift + random.range(-0.4, 0.4)) * 0.97
+                let wave = sin(x * f1 + p1) * a1 + sin(x * f2 + p2) * a2 + sin(x * 0.004 + y * 0.03) * 5 + drift
+                points.append(CGPoint(x: x, y: y + wave))
+                x += 4
             }
             let tone = random.unit() < 0.62 ? deep : honey
-            context.stroke(
-                line, with: .color(tone.opacity(random.range(0.08, 0.26))), lineWidth: random.range(0.5, 1.8))
-            y += random.range(1.1, 2.6)
+            let width = random.range(0.5, 1.8)
+            var i = 0
+            while i < points.count - 1 {
+                let end = min(points.count - 1, i + Int(random.range(5, 32)))
+                var run = Path()
+                run.move(to: points[i])
+                for k in (i + 1)...end { run.addLine(to: points[k]) }
+                let alpha = random.unit() < 0.12 ? 0 : random.range(0.06, 0.28)
+                context.stroke(run, with: .color(tone.opacity(alpha)), lineWidth: width)
+                i = end
+            }
+            y += random.range(0.9, 2.8) * density
+        }
+        // A cathedral figure: nested arches where the veneer was cut across a growth ring.
+        let arch = CGPoint(
+            x: random.range(rect.width * 0.2, rect.width * 0.8), y: random.range(rect.height * 0.25, rect.height * 0.8))
+        for k in 0..<8 {
+            let span = 26 + CGFloat(k) * 11
+            let rise = 10 + CGFloat(k) * 2.6
+            let base = arch.y + CGFloat(k) * 3.4
+            var curve = Path()
+            curve.move(to: CGPoint(x: arch.x - span * 2.2, y: base + rise * 0.4))
+            curve.addCurve(
+                to: CGPoint(x: arch.x + span * 2.2, y: base + rise * 0.3),
+                control1: CGPoint(x: arch.x - span * 0.6, y: base + rise * 0.2),
+                control2: CGPoint(x: arch.x - span * 0.2, y: base - rise * 1.6))
+            context.stroke(curve, with: .color(deep.opacity(random.range(0.1, 0.2))), lineWidth: random.range(0.6, 1.4))
         }
         for _ in 0..<5 {
             let cy = random.range(0, rect.height)
@@ -246,7 +277,8 @@ struct DeckPlinth: View, Equatable {
         context.stroke(seam, with: .color(paint(0xE8DFC8).opacity(0.85)), style: dash)
         // Brass corner caps.
         let metal = paint.hardware
-        let cap = rect.width * 0.075
+        // Small enough that the display's corner and the grille clear them.
+        let cap = rect.width * 0.046
         for (x, y) in [(rect.minX, rect.minY), (rect.maxX, rect.minY), (rect.minX, rect.maxY), (rect.maxX, rect.maxY)] {
             let c = CGPoint(x: x, y: y)
             let path = Path(ellipseIn: CGRect(x: c.x - cap, y: c.y - cap, width: cap * 2, height: cap * 2))
