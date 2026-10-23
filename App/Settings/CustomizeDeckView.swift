@@ -13,6 +13,10 @@ struct CustomizeDeckView: View {
     private var theme: Theme { .look(stage: .deck, dark: scheme == .dark, monochrome: mono) }
     private var design: DeckDesign { DeckDesign.design(id: designID) }
     private var recordStyle: RecordStyle { RecordStyle(rawValue: recordStyleRaw) ?? .standard }
+    /// The picker's selection, normalised so an unknown stored value shows the default.
+    private var recordStyleBinding: Binding<String> {
+        Binding(get: { recordStyle.rawValue }, set: { recordStyleRaw = $0 })
+    }
 
     /// One column at accessibility text sizes, so a name and tagline are never squeezed.
     private var columns: [GridItem] {
@@ -24,6 +28,8 @@ struct CustomizeDeckView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 DeckPreview(design: design, recordStyle: recordStyle, album: nil)
+                    .frame(maxHeight: 240)
+                    .frame(maxWidth: .infinity)
                     .padding(16)
                     .glassCard(theme)
                     .accessibilityHidden(true)
@@ -39,7 +45,7 @@ struct CustomizeDeckView: View {
                 }
 
                 section("Record") {
-                    Picker("Record style", selection: $recordStyleRaw) {
+                    Picker("Record style", selection: recordStyleBinding) {
                         Text("Black vinyl").tag(RecordStyle.black.rawValue)
                         Text("Coloured").tag(RecordStyle.coloured.rawValue)
                         Text("Picture disc").tag(RecordStyle.picture.rawValue)
@@ -58,7 +64,6 @@ struct CustomizeDeckView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
         }
-        .scrollContentBackground(.hidden)
         .background(theme.background.ignoresSafeArea())
         .foregroundStyle(theme.ink)
         .tint(theme.isMonochrome ? Theme.monochromeTint : theme.ink)
@@ -76,7 +81,7 @@ struct CustomizeDeckView: View {
     }
 
     private func card(_ item: DeckDesign) -> some View {
-        let selected = item.id == designID
+        let selected = item.id == design.id
         return Button {
             designID = item.id
         } label: {

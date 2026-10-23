@@ -32,6 +32,8 @@ struct SettingsView: View {
                         LabeledContent("Customize deck", value: DeckDesign.design(id: deckDesignID).name)
                     }
                     .accessibilityIdentifier("customizeDeckLink")
+                }
+                Section {
                     Toggle("Monochrome", isOn: $monochrome)
                         .accessibilityIdentifier("monochromeToggle")
                 } footer: {
