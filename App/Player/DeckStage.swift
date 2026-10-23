@@ -123,8 +123,16 @@ struct DeckStage: View {
             ZStack(alignment: .topLeading) {
                 // A new design cross-fades in over the old one.
                 deck(layout, paint)
+                    // VoiceOver names the turntable as it enters the deck.
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("\(design.name) turntable")
+                    .accessibilityIdentifier("deckStage")
                     .id(design.id)
-                    .transition(.opacity)
+                    // The outgoing design fades out over the incoming one, which is drawn whole beneath it: a
+                    // cross-fade with no dip to the background. A newer deck always sorts under the one it replaces
+                    // (a removed view keeps the order it last had).
+                    .zIndex(-Date.timeIntervalSinceReferenceDate)
+                    .transition(.asymmetric(insertion: .identity, removal: .opacity))
                 loupe(layout)
                 tracklistPanel(layout, paint)
             }
@@ -133,9 +141,8 @@ struct DeckStage: View {
                 $0.frame(in: .named(PlayerSpace.name))
             } action: { frame in
                 deckSize = frame.size
-                // The record's size and track gaps do not depend on the design.
+                // The record's size does not depend on the design.
                 let l = DeckLayout(size: frame.size)
-                handoff.deckLayout = l
                 handoff.platterRect = CGRect(
                     x: frame.minX + l.recordCenter.x - l.recordRadius,
                     y: frame.minY + l.recordCenter.y - l.recordRadius,
@@ -216,34 +223,33 @@ struct DeckStage: View {
 
     // MARK: The deck
 
-    @ViewBuilder
     private func deck(_ layout: DeckLayout, _ paint: DeckPaint) -> some View {
-        ZStack(alignment: .topLeading) {
-            DeckPlinth(paint: paint, layout: layout, live: true).equatable()
-            DeckControls(paint: paint, layout: layout).equatable()
-            DeckPlatter(paint: paint, layout: layout).equatable()
-            ArmFurniture(paint: paint, layout: layout).equatable()
+        DeckLayers(paint: paint, layout: layout, live: true, playing: playback.isPlaying) {
             TimelineView(.animation(minimumInterval: nil, paused: timelinePaused)) { context in
                 let now = context.date.timeIntervalSinceReferenceDate
+                let position = armPosition(layout, at: context.date)
                 ZStack(alignment: .topLeading) {
-                    StrobeCreep(paint: paint, layout: layout, phase: strobePhase(now))
-                        .position(layout.recordCenter)
-                    record(layout, angle: recordAngle(now))
-                        // A record Up Next pulls in arrives with a short settle (the hand-off's short form).
-                        // Not during the hand-off, whose own record lands exactly where this one appears.
-                        .transition(
-                            handoff.isRunning ? .identity : .scale(scale: 0.7).combined(with: .opacity)
-                        )
-                        .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
-                    DeckSpindle(paint: paint, layout: layout).equatable()
-                    tonearm(layout, paint, position: armPosition(layout, at: context.date), lift: lift.value(at: now))
-                        .opacity(armOpacity(at: context.date))
+                    DeckMovingParts(
+                        paint: paint, layout: layout, strobePhase: strobePhase(now), armPosition: position,
+                        lift: lift.value(at: now), armOpacity: armOpacity(at: context.date)
+                    ) {
+                        record(layout, angle: recordAngle(now))
+                            // A record Up Next pulls in arrives with a short settle (the hand-off's short form).
+                            // Not during the hand-off, whose own record lands exactly where this one appears.
+                            .transition(
+                                handoff.isRunning ? .identity : .scale(scale: 0.7).combined(with: .opacity)
+                            )
+                            .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
+                    }
+                    armHitArea(layout, position: position)
                 }
             }
             .accessibilityHidden(tracklistOpen)
-            DeckLamps(paint: paint, layout: layout, playing: playback.isPlaying).equatable()
+        } front: {
             if design.controls == .dj {
-                DeckStartStop(paint: paint, layout: layout, playing: playback.isPlaying) {
+                DeckStartStop(
+                    paint: paint, layout: layout, playing: playback.isPlaying, enabled: playback.album != nil
+                ) {
                     playback.togglePlayPause()
                 }
                 .accessibilityHidden(tracklistOpen)
@@ -253,9 +259,6 @@ struct DeckStage: View {
                 open: canUnfold ? { unfoldTracklist() } : nil
             )
             .accessibilityHidden(tracklistOpen)
-            if design.plinth == .lacquer {
-                LidReflection(paint: paint, layout: layout).equatable()
-            }
         }
     }
 
@@ -454,86 +457,51 @@ struct DeckStage: View {
         }
     }
 
+    /// Where a finger takes the arm, over the drawn arm (`TonearmAssembly`): the arm's gestures live here.
     @ViewBuilder
-    private func tonearm(_ layout: DeckLayout, _ paint: DeckPaint, position: Double, lift: Double) -> some View {
+    private func armHitArea(_ layout: DeckLayout, position: Double) -> some View {
         if let arm = layout.pivoted {
-            pivotedArm(arm, paint, angle: position, lift: lift)
+            pivotedHandle(arm, angle: position)
                 .gesture(armGesture(layout))
                 .simultaneousGesture(TapGesture().onEnded { tapTonearm() })
                 .sensoryFeedback(.selection, trigger: snapTrack)
-        } else if let arm = layout.linear {
-            carriage(arm, layout, paint, position: position, lift: lift)
+        } else {
+            carriageHandle(layout, position: position)
                 .gesture(armGesture(layout))
                 .simultaneousGesture(TapGesture().onEnded { tapTonearm() })
                 .sensoryFeedback(.selection, trigger: snapTrack)
         }
     }
 
-    /// A pivoted arm at `angle`: its shadow (tight while the stylus is down, spreading as the arm lifts), the arm,
-    /// the cue lever riding with the lift, and the pivot's cap. The arm and its shadow are drawn once and only
-    /// turned.
-    private func pivotedArm(_ arm: PivotedArm, _ paint: DeckPaint, angle: Double, lift: Double) -> some View {
+    /// A pivoted arm's targets, turned with it: a band 14 pt wide round the drawn tube, so a touch just beside it
+    /// reaches the record, and generous circles round the headshell (where a finger naturally takes the arm, and
+    /// what VoiceOver calls the tonearm) and the pivot.
+    private func pivotedHandle(_ arm: PivotedArm, angle: Double) -> some View {
         let m = ArmMetrics(arm: arm)
-        let anchor = UnitPoint(x: 0.5, y: m.top / m.height)
-        let center = CGPoint(x: arm.pivot.x, y: arm.pivot.y - m.top + m.height / 2)
+        let pad: CGFloat = 40
+        let size = CGSize(width: m.width + pad * 2, height: m.height + pad * 2)
+        let pivot = CGPoint(x: m.pivot.x + pad, y: m.pivot.y + pad)
+        let grip = CGPoint(x: m.grip.x + pad, y: m.grip.y + pad)
         return ZStack(alignment: .topLeading) {
-            CueLever(paint: paint, arm: arm, lift: lift)
-            // Two shadows, tight and soft, crossfaded by the lift: only their opacity and offset change per frame.
-            ArmBody(paint: paint, arm: arm, silhouette: true, blur: 1.2).equatable()
-                .opacity(0.5 * (1 - lift))
-                .rotationEffect(.degrees(angle), anchor: anchor)
-                .offset(x: 2 + lift * 7, y: 3 + lift * 9)
-                .position(center)
-            ArmBody(paint: paint, arm: arm, silhouette: true, blur: 4.5).equatable()
-                .opacity(0.34 * lift)
-                .rotationEffect(.degrees(angle), anchor: anchor)
-                .offset(x: 2 + lift * 7, y: 3 + lift * 9)
-                .position(center)
-            ArmBody(paint: paint, arm: arm, silhouette: false).equatable()
-                // Lifted, the arm comes a touch nearer.
-                .scaleEffect(1 + lift * 0.012, anchor: anchor)
-                .rotationEffect(.degrees(angle), anchor: anchor)
-                .position(center)
-            ArmCap(paint: paint, arm: arm).equatable()
-            armHandle(m, angle: angle, pivot: arm.pivot)
-        }
-    }
-
-    /// Where a finger takes the pivoted arm: along the tube, and a generous target round the headshell.
-    private func armHandle(_ m: ArmMetrics, angle: Double, pivot: CGPoint) -> some View {
-        let height = m.length + 40
-        return ZStack(alignment: .top) {
-            Rectangle().fill(Color.white.opacity(0.001)).frame(width: 30, height: m.length)
+            Color.clear
+                .contentShape(TubeBand(metrics: m, style: design.armStyle, pad: pad))
+            Circle().fill(Color.white.opacity(0.001)).frame(width: 48, height: 48)
+                .position(pivot)
             Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
-                .offset(x: m.grip.x - m.pivot.x, y: m.grip.y - m.pivot.y - 32)
                 .modifier(TonearmAccessibility(value: armValue, nudge: nudge))
+                .position(grip)
         }
-        .frame(width: 64, height: height, alignment: .top)
-        .rotationEffect(.degrees(angle), anchor: .top)
-        .position(x: pivot.x, y: pivot.y + height / 2)
+        .frame(width: size.width, height: size.height)
+        .rotationEffect(.degrees(angle), anchor: UnitPoint(x: pivot.x / size.width, y: pivot.y / size.height))
+        .position(x: arm.pivot.x - pivot.x + size.width / 2, y: arm.pivot.y - pivot.y + size.height / 2)
     }
 
-    /// The linear deck's carriage at `position` along its rail, with its shadow, and a target round it.
-    private func carriage(
-        _ arm: LinearArm, _ layout: DeckLayout, _ paint: DeckPaint, position: Double, lift: Double
-    ) -> some View {
+    /// The linear carriage's target: a generous circle round the carriage and its cartridge.
+    private func carriageHandle(_ layout: DeckLayout, position: Double) -> some View {
         let stylus = layout.needle(at: position)
-        let r = arm.recordRadius
-        return ZStack(alignment: .topLeading) {
-            LinearRailView(paint: paint, layout: layout).equatable()
-            CarriageBody(paint: paint, arm: arm, silhouette: true, blur: 1.2).equatable()
-                .opacity(0.5 * (1 - lift))
-                .position(x: stylus.x + 2 + lift * 6, y: stylus.y + 3 + lift * 8)
-            CarriageBody(paint: paint, arm: arm, silhouette: true, blur: 4.5).equatable()
-                .opacity(0.34 * lift)
-                .position(x: stylus.x + 2 + lift * 6, y: stylus.y + 3 + lift * 8)
-            CarriageBody(paint: paint, arm: arm, silhouette: false).equatable()
-                .scaleEffect(1 + lift * 0.02)
-                .position(stylus)
-            Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
-                .modifier(TonearmAccessibility(value: armValue, nudge: nudge))
-                .position(x: stylus.x, y: stylus.y - r * 0.08)
-        }
+        return Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
+            .modifier(TonearmAccessibility(value: armValue, nudge: nudge))
+            .position(x: stylus.x, y: stylus.y - layout.recordRadius * 0.08)
     }
 
     /// The display unfolded into the tracklist, over the platter, inset from the plinth's edge, in the display's ink.
@@ -745,7 +713,7 @@ struct DeckStage: View {
     // MARK: Text
 
     private func bands(_ layout: DeckLayout) -> [CGFloat] {
-        layout.bands(for: playback.sideTimeline(playback.currentSide))
+        RecordFace.bands(for: playback.sideTimeline(playback.currentSide))
     }
 
     private var armValue: String {

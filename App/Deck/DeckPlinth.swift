@@ -2,7 +2,8 @@ import PFDesign
 import SwiftUI
 
 /// The plinth: its material, bevel and edge, the ambient shadow under it and the well the platter sits in. Lit from
-/// the top left, like everything on the deck. Drawn once per design and size (Equatable): nothing in it moves.
+/// the top left, like everything on the deck. Drawn once per design and size (Equatable) and rasterised: nothing in
+/// it moves. Glasshouse's glass stays live, outside the rasterised layer, so it keeps picking up the colour wash.
 struct DeckPlinth: View, Equatable {
     let paint: DeckPaint
     let layout: DeckLayout
@@ -21,19 +22,20 @@ struct DeckPlinth: View, Equatable {
                         endPoint: .bottomTrailing))
                 if live {
                     frost.glassEffect(.regular.tint(paint.glassTop.opacity(0.2)), in: .rect(cornerRadius: radius))
+                        .shadow(color: .black.opacity(ambient), radius: 16, y: 10)
                 } else {
                     frost.background(shape.fill(paint.dark ? Color(white: 0.16) : Color(white: 0.9)))
+                        .shadow(color: .black.opacity(ambient), radius: 16, y: 10)
                 }
             } else {
-                shape.fill(paint.base)
+                shape.fill(paint.base).shadow(color: .black.opacity(ambient), radius: 16, y: 10)
             }
             Canvas { context, size in
                 draw(&context, size: size, corner: radius)
             }
             .clipShape(shape)
+            .drawingGroup()
         }
-        .compositingGroup()
-        .shadow(color: .black.opacity(ambient), radius: 16, y: 10)
         .accessibilityHidden(true)
     }
 

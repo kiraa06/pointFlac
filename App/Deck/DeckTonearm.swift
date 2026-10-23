@@ -40,12 +40,14 @@ struct LiftModel: Equatable {
 struct ArmMetrics {
     let length: CGFloat
     let r: CGFloat
+    /// The headshell's turn from the arm's line, in radians: the tested geometry's (`PivotedArm.headshellAngle`), in
+    /// the arm's own frame, where the arm hangs at 0°.
     let offset: Double
 
     init(arm: PivotedArm) {
         length = arm.length
         r = arm.recordRadius
-        offset = arm.offsetDegrees * .pi / 180
+        offset = arm.headshellAngle(atAngle: 0) * .pi / 180
     }
 
     var tube: CGFloat { max(4, r * 0.04) }
@@ -69,10 +71,53 @@ struct ArmMetrics {
             y: stylus.y + forward.dy * along + outward.dy * across)
     }
 
+    /// How far the cartridge's nose reaches past the stylus: the drawing is laid out from the nose, so the stylus
+    /// tip lands exactly on the solved needle point.
+    var nose: CGFloat { r * 0.036 }
     /// Where the tube meets the headshell.
-    var collar: CGPoint { head(-r * 0.3, 0) }
+    var collar: CGPoint { head(-r * 0.3 - nose, 0) }
     /// The headshell's centre, where a finger takes the arm.
-    var grip: CGPoint { head(-r * 0.13, 0) }
+    var grip: CGPoint { head(-r * 0.13 - nose, 0) }
+
+    /// The tube's centre line for an arm style, from just behind the pivot to the headshell's collar.
+    func tube(_ style: DeckDesign.ArmStyle) -> Path {
+        let p = pivot
+        let b = collar
+        var path = Path()
+        path.move(to: CGPoint(x: p.x, y: p.y - r * 0.12))
+        path.addLine(to: p)
+        switch style {
+        case .sShaped:
+            // Out of the pivot along the arm's line, a gentle bow toward the spindle, then back out to meet the
+            // headshell square on: the S that sets the offset without a cranked headshell.
+            path.addCurve(
+                to: b,
+                control1: CGPoint(x: p.x - length * 0.075, y: p.y + length * 0.42),
+                control2: CGPoint(x: b.x - forward.dx * length * 0.26, y: b.y - forward.dy * length * 0.26))
+        case .jShaped:
+            // Straight out of the pivot, then one tight bend into the headshell near the end.
+            let bend = CGPoint(x: b.x - forward.dx * length * 0.2, y: b.y - forward.dy * length * 0.2)
+            let straightEnd = CGPoint(x: p.x + (bend.x - p.x) * 0.8, y: p.y + (bend.y - p.y) * 0.8)
+            path.addLine(to: straightEnd)
+            path.addQuadCurve(to: b, control: bend)
+        case .straight, .linear:
+            path.addLine(to: b)
+        }
+        return path
+    }
+}
+
+/// The narrow band a finger can take a pivoted arm's tube by: 14 pt round the drawn tube, in the arm's frame moved
+/// by `pad`. A touch just beside the tube reaches the record under it.
+struct TubeBand: Shape {
+    let metrics: ArmMetrics
+    let style: DeckDesign.ArmStyle
+    let pad: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        metrics.tube(style).strokedPath(StrokeStyle(lineWidth: 14, lineCap: .round, lineJoin: .round))
+            .applying(CGAffineTransform(translationX: pad, y: pad))
+    }
 }
 
 /// A pivoted arm (S, J or straight) hanging straight down from its pivot: the tube, the counterweight behind the
@@ -93,39 +138,15 @@ struct ArmBody: View, Equatable {
             draw(&context, m)
         }
         .frame(width: m.width, height: m.height)
+        // Rasterised once; the deck only turns the image.
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 
-    private func tubePath(_ m: ArmMetrics) -> Path {
-        let p = m.pivot
-        let b = m.collar
-        var path = Path()
-        path.move(to: CGPoint(x: p.x, y: p.y - m.r * 0.12))
-        path.addLine(to: p)
-        switch paint.design.armStyle {
-        case .sShaped:
-            // Out of the pivot along the arm's line, a gentle bow toward the spindle, then back out to meet the
-            // headshell square on: the S that sets the offset without a cranked headshell.
-            path.addCurve(
-                to: b,
-                control1: CGPoint(x: p.x - m.length * 0.075, y: p.y + m.length * 0.42),
-                control2: CGPoint(x: b.x - m.forward.dx * m.length * 0.26, y: b.y - m.forward.dy * m.length * 0.26))
-        case .jShaped:
-            // Straight out of the pivot, then one tight bend into the headshell near the end.
-            let bend = CGPoint(x: b.x - m.forward.dx * m.length * 0.2, y: b.y - m.forward.dy * m.length * 0.2)
-            let straightEnd = CGPoint(x: p.x + (bend.x - p.x) * 0.8, y: p.y + (bend.y - p.y) * 0.8)
-            path.addLine(to: straightEnd)
-            path.addQuadCurve(to: b, control: bend)
-        case .straight, .linear:
-            path.addLine(to: b)
-        }
-        return path
-    }
-
     private func draw(_ context: inout GraphicsContext, _ m: ArmMetrics) {
         let metal = paint.armMetal
-        let tube = tubePath(m)
+        let tube = m.tube(paint.design.armStyle)
         let shade: GraphicsContext.Shading = .color(.black)
         // The tube: body, a bright line on its lit side and a dark one on the far side.
         context.stroke(
@@ -178,29 +199,32 @@ struct ArmBody: View, Equatable {
     private func headshell(_ context: inout GraphicsContext, _ m: ArmMetrics, _ metal: DeckPaint.Metal) {
         let r = m.r
         let half = r * 0.068
+        // Laid out from the cartridge's nose: `at(0, 0)` is the nose, and the stylus tip, `m.nose` behind it, is the
+        // solved needle point.
+        func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint { m.head(along - m.nose, across) }
         // The plate, from the collar to just short of the cartridge's nose, tapering a little toward the front.
         var plate = Path()
-        plate.move(to: m.head(-r * 0.3, -half * 0.8))
-        plate.addLine(to: m.head(-r * 0.05, -half))
-        plate.addQuadCurve(to: m.head(-r * 0.03, 0), control: m.head(-r * 0.03, -half))
-        plate.addQuadCurve(to: m.head(-r * 0.05, half), control: m.head(-r * 0.03, half))
-        plate.addLine(to: m.head(-r * 0.3, half * 0.8))
+        plate.move(to: at(-r * 0.3, -half * 0.8))
+        plate.addLine(to: at(-r * 0.05, -half))
+        plate.addQuadCurve(to: at(-r * 0.03, 0), control: at(-r * 0.03, -half))
+        plate.addQuadCurve(to: at(-r * 0.05, half), control: at(-r * 0.03, half))
+        plate.addLine(to: at(-r * 0.3, half * 0.8))
         plate.closeSubpath()
         // The cartridge: its coloured body under the plate, the nose showing in front, the stylus at its tip.
         let cartridgeHalf = r * 0.052
         var cartridge = Path()
-        cartridge.move(to: m.head(-r * 0.19, -cartridgeHalf))
-        cartridge.addLine(to: m.head(r * 0.022, -cartridgeHalf))
-        cartridge.addLine(to: m.head(r * 0.03, -cartridgeHalf * 0.6))
-        cartridge.addLine(to: m.head(r * 0.03, cartridgeHalf * 0.6))
-        cartridge.addLine(to: m.head(r * 0.022, cartridgeHalf))
-        cartridge.addLine(to: m.head(-r * 0.19, cartridgeHalf))
+        cartridge.move(to: at(-r * 0.19, -cartridgeHalf))
+        cartridge.addLine(to: at(r * 0.022, -cartridgeHalf))
+        cartridge.addLine(to: at(r * 0.03, -cartridgeHalf * 0.6))
+        cartridge.addLine(to: at(r * 0.03, cartridgeHalf * 0.6))
+        cartridge.addLine(to: at(r * 0.022, cartridgeHalf))
+        cartridge.addLine(to: at(-r * 0.19, cartridgeHalf))
         cartridge.closeSubpath()
         // The finger lift: a slim bent tab off the outer side, toward the front.
         var lift = Path()
-        lift.move(to: m.head(-r * 0.08, half * 0.9))
-        lift.addQuadCurve(to: m.head(-r * 0.115, half + r * 0.085), control: m.head(-r * 0.05, half + r * 0.06))
-        lift.addQuadCurve(to: m.head(-r * 0.15, half + r * 0.07), control: m.head(-r * 0.14, half + r * 0.1))
+        lift.move(to: at(-r * 0.08, half * 0.9))
+        lift.addQuadCurve(to: at(-r * 0.115, half + r * 0.085), control: at(-r * 0.05, half + r * 0.06))
+        lift.addQuadCurve(to: at(-r * 0.15, half + r * 0.07), control: at(-r * 0.14, half + r * 0.1))
         // The locking collar where the headshell plugs into the tube: a short knurled ring square to the headshell.
         let collarTransform = CGAffineTransform(translationX: m.collar.x, y: m.collar.y).rotated(by: m.offset)
         let collarRect = CGRect(x: -half * 0.78, y: -r * 0.03, width: half * 1.56, height: r * 0.05)
@@ -217,17 +241,17 @@ struct ArmBody: View, Equatable {
         context.stroke(cartridge, with: .color(.black.opacity(0.45)), lineWidth: 0.5)
         // The cartridge's lit top edge.
         var edge = Path()
-        edge.move(to: m.head(-r * 0.17, -cartridgeHalf * 0.75))
-        edge.addLine(to: m.head(r * 0.018, -cartridgeHalf * 0.75))
+        edge.move(to: at(-r * 0.17, -cartridgeHalf * 0.75))
+        edge.addLine(to: at(r * 0.018, -cartridgeHalf * 0.75))
         context.stroke(edge, with: .color(.white.opacity(0.28)), lineWidth: 0.7)
         context.fill(
             plate,
             with: .linearGradient(
-                metal.cylinder, startPoint: m.head(-r * 0.15, -half), endPoint: m.head(-r * 0.15, half)))
+                metal.cylinder, startPoint: at(-r * 0.15, -half), endPoint: at(-r * 0.15, half)))
         context.stroke(plate, with: .color(.black.opacity(0.4)), lineWidth: 0.5)
         // Two mounting screws, half an inch apart, through the plate.
         for along in [-r * 0.15, -r * 0.065] {
-            let s = m.head(along, 0)
+            let s = at(along, 0)
             let screw = Path(
                 ellipseIn: CGRect(x: s.x - r * 0.014, y: s.y - r * 0.014, width: r * 0.028, height: r * 0.028))
             context.fill(screw, with: .color(metal.shade))
@@ -240,7 +264,7 @@ struct ArmBody: View, Equatable {
         context.fill(
             collar,
             with: .linearGradient(
-                metal.cylinder, startPoint: m.head(-r * 0.3, -half * 0.78), endPoint: m.head(-r * 0.3, half * 0.78)))
+                metal.cylinder, startPoint: at(-r * 0.3, -half * 0.78), endPoint: at(-r * 0.3, half * 0.78)))
         var knurl = Path()
         for i in 1..<7 {
             let across = -half * 0.78 + half * 1.56 * CGFloat(i) / 7
@@ -251,10 +275,10 @@ struct ArmBody: View, Equatable {
         context.stroke(collar, with: .color(.black.opacity(0.4)), lineWidth: 0.5)
         // The stylus: a speck of diamond on its cantilever, just ahead of the body.
         var cantilever = Path()
-        cantilever.move(to: m.head(r * 0.012, 0))
-        cantilever.addLine(to: m.head(r * 0.034, 0))
+        cantilever.move(to: at(r * 0.012, 0))
+        cantilever.addLine(to: at(r * 0.034, 0))
         context.stroke(cantilever, with: .color(Color(white: 0.85)), lineWidth: 0.7)
-        let tip = m.head(r * 0.036, 0)
+        let tip = m.stylus
         context.fill(
             Path(ellipseIn: CGRect(x: tip.x - 0.7, y: tip.y - 0.7, width: 1.4, height: 1.4)), with: .color(.white))
     }
@@ -272,6 +296,7 @@ struct ArmFurniture: View, Equatable {
             if let arm = layout.pivoted { pivoted(&context, arm) }
         }
         .frame(width: layout.size.width, height: layout.size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -439,6 +464,7 @@ struct ArmCap: View, Equatable {
                 with: metal.dome(center: c, radius: boss))
         }
         .frame(width: r * 3, height: r * 3)
+        .drawingGroup()
         .position(arm.pivot)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -455,6 +481,7 @@ struct LinearRailView: View, Equatable {
             if let arm = layout.linear { LinearRail.draw(&context, paint: paint, arm: arm, layout: layout) }
         }
         .frame(width: layout.size.width, height: layout.size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -578,6 +605,7 @@ struct CarriageBody: View, Equatable {
                 with: .color(paint.accent))
         }
         .frame(width: size.width, height: size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

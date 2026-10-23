@@ -130,6 +130,7 @@ private struct RecordContactShadow: View, Equatable {
                 with: .color(.black.opacity(0.5)), lineWidth: 0.8)
         }
         .frame(width: diameter + 16, height: diameter + 16)
+        .drawingGroup()
         .allowsHitTesting(false)
     }
 }
@@ -153,6 +154,7 @@ private struct RecordGrooves: View, Equatable {
             draw(&context, CGPoint(x: size.width / 2, y: size.height / 2), diameter / 2)
         }
         .frame(width: diameter, height: diameter)
+        .drawingGroup()
         .allowsHitTesting(false)
     }
 
@@ -279,6 +281,7 @@ private struct RecordLabel: View, Equatable {
             }
         }
         .frame(width: diameter, height: diameter)
+        .drawingGroup()
         .allowsHitTesting(false)
     }
 }
@@ -307,6 +310,7 @@ private struct PictureArt: View, Equatable {
             }
         }
         .frame(width: diameter, height: diameter)
+        .drawingGroup()
         .allowsHitTesting(false)
     }
 }
@@ -348,6 +352,7 @@ private struct RecordLight: View, Equatable {
             context.stroke(punched, with: .color(.white.opacity(0.25)), lineWidth: 0.4)
         }
         .frame(width: diameter, height: diameter)
+        .drawingGroup()
         .allowsHitTesting(false)
     }
 

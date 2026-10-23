@@ -22,6 +22,8 @@ struct DeckPlatter: View, Equatable {
             }
         }
         .frame(width: side, height: side)
+        // Rasterised once: the finish is fixed to the light, so nothing here turns.
+        .drawingGroup()
         .position(layout.recordCenter)
         .accessibilityHidden(true)
     }
@@ -178,14 +180,24 @@ struct StrobeRows {
     /// The lamp's light on the rim, fixed to the deck: brightest at the front left, where the strobe lamp stands, and
     /// falling off round the platter. Glasshouse's rim is edge-lit all round.
     static func lamp(_ colour: Color, center: CGPoint, uniform: Bool) -> GraphicsContext.Shading {
-        if uniform { return .color(colour.opacity(0.75)) }
-        return .conicGradient(
-            Gradient(stops: [
-                .init(color: colour, location: 0), .init(color: colour.opacity(0.55), location: 0.18),
-                .init(color: colour.opacity(0.3), location: 0.5), .init(color: colour.opacity(0.55), location: 0.82),
-                .init(color: colour, location: 1),
-            ]), center: center, angle: .degrees(135))
+        if uniform { return .color(colour.opacity(glassLight)) }
+        return .conicGradient(lampGradient(colour), center: center, angle: lampAngle)
     }
+
+    /// The lamp's fall-off round the rim, from the lamp (at `lampAngle`) all the way round: the one definition both
+    /// the still rows and the creeping rows' mask use.
+    static func lampGradient(_ colour: Color) -> Gradient {
+        Gradient(stops: [
+            .init(color: colour, location: 0), .init(color: colour.opacity(0.55), location: 0.18),
+            .init(color: colour.opacity(0.3), location: 0.5), .init(color: colour.opacity(0.55), location: 0.82),
+            .init(color: colour, location: 1),
+        ])
+    }
+
+    /// Where the strobe lamp stands: the platter's front left.
+    static let lampAngle = Angle.degrees(135)
+    /// How brightly Glasshouse's edge light shows the dots, all round.
+    static let glassLight = 0.75
 
     /// How far the 45 rows appear to creep for a platter turned `degrees` at 33⅓: a fraction of the speed
     /// difference, so the wrong-speed rows drift slowly backward while the right ones stand still, and nothing moves
@@ -205,23 +217,22 @@ struct StrobeCreep: View {
     var body: some View {
         if let strobe = paint.design.strobe {
             let side = DeckPlatter.side(layout)
-            StrobeDots(layout: layout, colour: paint(strobe))
+            let dots = StrobeDots(layout: layout, colour: paint(strobe))
                 .equatable()
                 .frame(width: side, height: side)
                 .rotationEffect(.degrees(phase))
-                .mask {
-                    if paint.isGlass {
-                        Color.black.opacity(0.75)
-                    } else {
+            Group {
+                if paint.isGlass {
+                    // Lit evenly all round: a plain opacity, no mask to composite.
+                    dots.opacity(StrobeRows.glassLight)
+                } else {
+                    dots.mask {
                         AngularGradient(
-                            stops: [
-                                .init(color: .black, location: 0), .init(color: .black.opacity(0.55), location: 0.18),
-                                .init(color: .black.opacity(0.3), location: 0.5),
-                                .init(color: .black.opacity(0.55), location: 0.82), .init(color: .black, location: 1),
-                            ], center: .center, angle: .degrees(135))
+                            gradient: StrobeRows.lampGradient(.black), center: .center, angle: StrobeRows.lampAngle)
                     }
                 }
-                .accessibilityHidden(true)
+            }
+            .accessibilityHidden(true)
         }
     }
 }
@@ -236,5 +247,6 @@ private struct StrobeDots: View, Equatable {
             let c = CGPoint(x: size.width / 2, y: size.height / 2)
             context.fill(StrobeRows(layout: layout).dots(center: c, speeds: [45]), with: .color(colour))
         }
+        .drawingGroup()
     }
 }

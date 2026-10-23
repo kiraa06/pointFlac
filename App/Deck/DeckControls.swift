@@ -13,6 +13,7 @@ struct DeckControls: View, Equatable {
             draw(&context)
         }
         .frame(width: layout.size.width, height: layout.size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -409,17 +410,19 @@ struct DeckLamps: View, Equatable {
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
+        .drawingGroup()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 }
 
 /// The DJ layout's start/stop key: the one working control on the plinth. It plays and pauses, and its lamp lights
-/// while the record plays.
+/// while the record plays. With no record on the deck it does nothing, as the shared play button does.
 struct DeckStartStop: View {
     let paint: DeckPaint
     let layout: DeckLayout
     let playing: Bool
+    let enabled: Bool
     let toggle: () -> Void
     @State private var presses = 0
 
@@ -437,6 +440,7 @@ struct DeckStartStop: View {
             Color.clear
         }
         .buttonStyle(Key(paint: paint, playing: playing))
+        .disabled(!enabled)
         .frame(width: frame.width, height: frame.height)
         .contentShape(Rectangle().inset(by: -8))
         .position(x: frame.midX, y: frame.midY)
@@ -527,6 +531,7 @@ struct DeckSpindle: View, Equatable {
                 with: metal.dome(center: c, radius: spindle))
         }
         .frame(width: side, height: side)
+        .drawingGroup()
         .position(layout.recordCenter)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
