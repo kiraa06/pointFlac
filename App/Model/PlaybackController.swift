@@ -92,10 +92,16 @@ final class PlaybackController {
     private(set) var albumSegments: [AlbumSegment] = []
     /// The segment whose record the platter shows while the queue plays it, so it can follow the queue on.
     @ObservationIgnored private var platterSegment: Int?
+    /// Counts listens as the player plays (`ListenRule`); the library keeps them for the shelf's sorts.
+    @ObservationIgnored private let listenTracker: ListenTracker
 
     init(player: Player, library: any LibraryBrowsing) {
         self.player = player
         self.library = library
+        listenTracker = ListenTracker(player: player) { [library] id, date in
+            await library.recordListen(trackID: id, at: date)
+        }
+        listenTracker.start()
     }
 
     // MARK: What is playing

@@ -1,5 +1,6 @@
 import Foundation
 import PFAudio
+import PFCore
 
 // Contracts 2 and 3 of the overnight build (owned by stream D). The UI codes only against these protocols, never
 // against the library's or the downloaders' concrete types, so each side can change without the other noticing. The
@@ -16,6 +17,15 @@ struct AlbumCard: Identifiable, Hashable {
     let trackCount: Int
     /// The best format among its tracks, e.g. "FLAC 24/96".
     let bestFormat: String
+    /// When the newest of its tracks was added to the library.
+    let addedAt: Date
+    /// Listens summed over its tracks (`ListenRule` decides what counts).
+    let listens: Int
+    /// The latest listen of any of its tracks; nil if none was ever listened to.
+    let lastListened: Date?
+    /// Bit depth and sample rate (Hz) of the best format, for the Hi-res first sort.
+    let bestBits: Int
+    let bestRate: Int
 }
 
 /// A song as search and the shelf list it.
@@ -47,6 +57,12 @@ enum SearchFilter: CaseIterable {
 @MainActor protocol LibraryBrowsing: AnyObject {
     /// Every album, in shelf order.
     var albums: [AlbumCard] { get }
+    /// The albums in `sort`'s order. `fellBack` is true when Most played had no listens to go by and the order is Last
+    /// added instead.
+    func albums(sortedBy sort: AlbumSort) -> (albums: [AlbumCard], fellBack: Bool)
+    /// Counts one listen of `trackID` at `date`: the library stores it and the albums' counts follow at once, with no
+    /// new catalog.
+    func recordListen(trackID: TrackRow.ID, at date: Date) async
     /// An album's tracks, in album order.
     func tracks(of album: AlbumCard.ID) -> [TrackRow]
     /// Synchronous, because local results must be on screen within the frame of the keystroke (spec §8).

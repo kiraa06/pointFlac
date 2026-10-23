@@ -154,6 +154,9 @@ final class LibraryStore {
             album_id TEXT PRIMARY KEY,
             members TEXT NOT NULL);
         """,
+        // v5: listen history, keyed by track ID (the file's content identity). Not tied to `tracks` by a foreign key
+        // on purpose: the rows survive a track's removal, are harmless, and come back if the file returns.
+        "CREATE TABLE listens(track_id TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at REAL NOT NULL);",
     ]
 
     /// Probed files per transaction: each batch is committed and published, so a scan killed part-way keeps what it
@@ -1034,6 +1037,34 @@ final class LibraryStore {
             """, [.text(albumID), .text(key), .text(albumID)])
     }
 
+    // MARK: Listens
+
+    /// Counts one listen of `trackID` at `date` and returns the track's new total.
+    func recordListen(trackID: String, at date: Date) throws -> ListenStat {
+        let stamp = SQLValue.real(date.timeIntervalSince1970)
+        try database.query(
+            """
+            INSERT INTO listens(track_id, count, last_at) VALUES (?, 1, ?)
+            ON CONFLICT(track_id) DO UPDATE SET count = count + 1, last_at = excluded.last_at
+            """, [.text(trackID), stamp])
+        let row = try database.query("SELECT count, last_at FROM listens WHERE track_id = ?", [.text(trackID)])
+        return Self.listenStat(row.first)
+    }
+
+    /// Every track's listens, keyed by track ID.
+    func listenStats() throws -> [String: ListenStat] {
+        var stats: [String: ListenStat] = [:]
+        for row in try database.query("SELECT track_id, count, last_at FROM listens") {
+            if let id = row[0].string { stats[id] = Self.listenStat(Array(row.dropFirst())) }
+        }
+        return stats
+    }
+
+    private static func listenStat(_ row: [SQLValue]?) -> ListenStat {
+        ListenStat(
+            count: Int(row?[0].int ?? 0), lastAt: row?[1].double.map { Date(timeIntervalSince1970: $0) })
+    }
+
     // MARK: Reading
 
     /// Every track whose folder can be found this launch, as the catalog the UI and search see.
@@ -1042,7 +1073,7 @@ final class LibraryStore {
             """
             SELECT tracks.id, folder_id, rel_path, title, artist, album_artist, album, disc, track, year, sample_rate, bits,
                 channels, total_frames, tracks.album_id, artwork_id, cloud_pending, rg_track_gain, rg_track_peak,
-                rg_album_gain, rg_album_peak, r128_lufs, r128_peak
+                rg_album_gain, rg_album_peak, r128_lufs, r128_peak, tracks.added_at
             FROM tracks
             """)
         // An album's value is served only while the album's tracks are the ones it was measured over.
@@ -1073,7 +1104,8 @@ final class LibraryStore {
                         channels: Int(row[12].int ?? 0)),
                     totalFrames: row[13].int ?? 0, artworkID: row[15].string, isCloudPending: row[16].int == 1,
                     isInLibraryFolder: folder == Self.libraryFolderID,
-                    loudness: Self.loudness(row, album: albumValues[row[14].string ?? ""])))
+                    loudness: Self.loudness(row, album: albumValues[row[14].string ?? ""]),
+                    addedAt: Date(timeIntervalSince1970: row[23].double ?? 0)))
         }
         return LibraryCatalog(tracks: tracks)
     }

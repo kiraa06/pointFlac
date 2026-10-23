@@ -64,6 +64,9 @@ final class RealLibrary: LibraryBrowsing {
     @ObservationIgnored private let covers = CoverIndex()
     /// The track IDs of the latest catalog, to tell when tracks come in (`measureNewTracks`).
     @ObservationIgnored private var knownTrackIDs: Set<String> = []
+    /// Every track's listens, keyed by track ID: loaded once by `start()`, then kept up to date by `recordListen`, so
+    /// the albums' counts never wait for a catalog.
+    @ObservationIgnored private var listenStats: [String: ListenStat] = [:]
 
     init(library: Library) {
         self.library = library
@@ -77,6 +80,8 @@ final class RealLibrary: LibraryBrowsing {
         guard watcher == nil else { return }
         let library = library
         watcher = Task { [weak self] in
+            let stored = await library.listenStats()
+            self?.adopt(stored)
             for await catalog in library.changes() {
                 let snapshot = await Task.detached(priority: .userInitiated) { LibrarySnapshot(catalog) }.value
                 guard let self else { return }
@@ -104,22 +109,66 @@ final class RealLibrary: LibraryBrowsing {
         let summary = LoudnessSummary(snapshot.catalog.tracks.values.filter(\.isSupported))
         if summary != loudness { loudness = summary }
         measureNewTracks(in: snapshot.catalog)
-        var built: [AlbumCard] = []
-        var byID: [String: AlbumCard] = [:]
         var covers: [String: String] = [:]
         for album in snapshot.albums {
-            let playable = snapshot.tracks(of: album.id).filter(\.isSupported)
-            guard !playable.isEmpty else { continue }
-            let card = AlbumCard(
-                id: album.id, title: album.title, artist: album.artist, year: album.year, artwork: nil,
-                trackCount: playable.count, bestFormat: album.formatLabel)
-            built.append(card)
-            byID[album.id] = card
             if let cover = album.artworkID { covers[album.id] = cover }
         }
         self.covers.replace(with: covers)
+        rebuildCards()
+    }
+
+    /// Builds every card from the snapshot and the listens.
+    private func rebuildCards() {
+        var built: [AlbumCard] = []
+        var byID: [String: AlbumCard] = [:]
+        for album in snapshot.albums {
+            guard let card = card(for: album) else { continue }
+            built.append(card)
+            byID[album.id] = card
+        }
         cards = byID
         if built != albums { albums = built }
+    }
+
+    /// The card for `album`, or nil when none of its tracks is playable.
+    private func card(for album: LibraryAlbum) -> AlbumCard? {
+        let playable = snapshot.tracks(of: album.id).filter(\.isSupported)
+        guard !playable.isEmpty else { return nil }
+        let stats = playable.compactMap { listenStats[$0.id] }
+        return AlbumCard(
+            id: album.id, title: album.title, artist: album.artist, year: album.year, artwork: nil,
+            trackCount: playable.count, bestFormat: album.formatLabel, addedAt: album.addedAt,
+            listens: stats.reduce(0) { $0 + $1.count }, lastListened: stats.compactMap(\.lastAt).max(),
+            bestBits: album.bestFormat.bitsPerSample, bestRate: album.bestFormat.sampleRate)
+    }
+
+    /// Takes the stored listens in, keeping any higher count a listen recorded meanwhile already set, and shows them.
+    private func adopt(_ stored: [String: ListenStat]) {
+        listenStats.merge(stored) { current, stored in current.count >= stored.count ? current : stored }
+        rebuildCards()
+    }
+
+    func recordListen(trackID: TrackRow.ID, at date: Date) async {
+        let stat = await library.recordListen(trackID: trackID, at: date)
+        // A failed write comes back as a zero count: nothing to show.
+        guard stat.count > 0 else { return }
+        listenStats[trackID] = stat
+        // Only this track's album changes: its card is replaced in place, and no catalog or search index is rebuilt.
+        guard let albumID = snapshot.track(trackID)?.albumID, let album = snapshot.catalog.album(albumID),
+            let updated = card(for: album), let position = albums.firstIndex(where: { $0.id == albumID })
+        else { return }
+        cards[albumID] = updated
+        albums[position] = updated
+    }
+
+    func albums(sortedBy sort: AlbumSort) -> (albums: [AlbumCard], fellBack: Bool) {
+        let keys = albums.map {
+            AlbumOrderKey(
+                id: $0.id, title: $0.title, year: $0.year, addedAt: $0.addedAt, listens: $0.listens,
+                lastListened: $0.lastListened, bits: $0.bestBits, rate: $0.bestRate)
+        }
+        let order = AlbumSort.ordered(keys, by: sort)
+        return (order.ids.compactMap { cards[$0] }, order.fellBack)
     }
 
     func tracks(of album: AlbumCard.ID) -> [TrackRow] {
