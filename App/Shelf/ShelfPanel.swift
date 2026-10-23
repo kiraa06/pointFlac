@@ -1,11 +1,20 @@
+import PFCore
 import PFDesign
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The Shelf (spec §4.6): search at the top, the filter chips, the crate, and the results under it. Local results
-/// update on every keystroke; the search runs in `onChange`, never in `body`, and the field shows how long it took.
-/// Tapping the front sleeve starts the hand-off; holding a sleeve or a result offers Play Next, Add to Up Next and
-/// Delete, which asks first and says whether the songs leave this iPhone or only pointFlac.
+/// How the Shelf shows the albums: the crate's row of sleeves, or the galaxy (Plan 9).
+enum ShelfMode: String, CaseIterable {
+    case crate, galaxy
+}
+
+/// The Shelf (spec §4.6): search at the top, the filter chips, the Crate | Galaxy switch, then the crate and the results
+/// under it, or the galaxy. Local results update on every keystroke; the search runs in `onChange`, never in `body`,
+/// and the field shows how long it took. Tapping the front sleeve (or any sleeve in the galaxy) starts the hand-off;
+/// holding a sleeve or a result offers Play Next, Add to Up Next and Delete, which asks first and says whether the
+/// songs leave this iPhone or only pointFlac.
+///
+/// In Galaxy mode only the grabber closes the panel: every other drag on the galaxy moves a sleeve or the view.
 struct ShelfPanel: View {
     let library: any LibraryBrowsing
     /// For the online results that stream in under the local ones (spec §4.6).
@@ -34,6 +43,13 @@ struct ShelfPanel: View {
     /// The album or song waiting for the user to confirm its deletion.
     @State private var pendingRemoval: PendingRemoval?
     @FocusState private var searching: Bool
+    @Environment(\.dynamicTypeSize) private var typeSize
+    /// Crate or Galaxy, and the galaxy's order: kept between launches. A UI test passes `-shelfMode galaxy` or
+    /// `-galaxySort …`, which the argument domain answers first, so it pins the value for that launch and writes nothing.
+    @AppStorage("shelfMode") private var mode: ShelfMode = .crate
+    @AppStorage("galaxySort") private var galaxySort: AlbumSort = .mostPlayed
+    /// The galaxy sleeve last tapped: hidden while the hand-off flies its copy.
+    @State private var galaxyPicked: AlbumCard.ID?
 
     /// The front sleeve's size: smaller while typing, so the results stay above the keyboard.
     private var sleeve: CGFloat { searching && !query.isEmpty ? 96 : 150 }
@@ -55,19 +71,32 @@ struct ShelfPanel: View {
                 .accessibilityAction { close() }
             searchField
             chips
-            ScrollView {
-                VStack(spacing: 0) {
-                    crate
-                    caption
-                    resultsList
-                    footer
+            controls
+            if showsGalaxy {
+                // The galaxy has no footer, so the import or deletion note sits above it instead.
+                if let importNote {
+                    Text(importNote).font(.footnote).foregroundStyle(theme.inkSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
+                        .accessibilityIdentifier("importNote")
                 }
+                galaxy
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        crate
+                        caption
+                        resultsList
+                        footer
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
         }
         .background {
             UnevenRoundedRectangle(topLeadingRadius: 28, topTrailingRadius: 28, style: .continuous)
-                .fill(theme.isDark ? Color(white: 0.1).opacity(0.985) : Color(white: 0.99).opacity(0.985))
+                .fill(theme.shelfSurface.opacity(0.985))
                 .shadow(color: .black.opacity(0.2), radius: 20, y: -8)
                 .ignoresSafeArea(edges: .bottom)
         }
@@ -174,6 +203,123 @@ struct ShelfPanel: View {
             .padding(.horizontal, 16)
         }
         .padding(.vertical, 10)
+    }
+
+    // MARK: Crate | Galaxy
+
+    /// The galaxy shows while no query is typed; a query shows the normal results, as in Crate mode.
+    private var showsGalaxy: Bool { mode == .galaxy && query.isEmpty }
+
+    /// The Crate | Galaxy switch, and the galaxy's sort beside it. At the accessibility text sizes the sort goes under
+    /// the switch, which then spans the row, so neither is cut short or pushes the panel wider than the screen.
+    /// (Decided by the text size rather than `ViewThatFits`, which took the menu's label for narrower than it draws.)
+    @ViewBuilder
+    private var controls: some View {
+        if typeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 8) {
+                modePicker
+                if showsGalaxy { sortMenu }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        } else {
+            HStack(spacing: 12) {
+                modePicker.fixedSize()
+                Spacer(minLength: 0)
+                if showsGalaxy { sortMenu }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        }
+    }
+
+    private var modePicker: some View {
+        Picker("Shelf view", selection: $mode.animation(.spring(duration: 0.4))) {
+            Text("Crate").tag(ShelfMode.crate)
+            Text("Galaxy").tag(ShelfMode.galaxy)
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("shelfModePicker")
+    }
+
+    /// A plain menu, the current sort's name beside the sort symbol, with a checkmark on the current sort.
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $galaxySort) {
+                ForEach(AlbumSort.allCases, id: \.self) { sort in
+                    Text(sort.title).tag(sort)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.inkSecondary)
+                Text(galaxySort.title)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.ink)
+                    .lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
+            }
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Sort")
+        .accessibilityValue(galaxySort.title)
+        .accessibilityIdentifier("galaxySortMenu")
+    }
+
+    /// Every album in the galaxy's sort, narrowed as the crate is by the filter chips.
+    private var galaxyOrder: (albums: [AlbumCard], fellBack: Bool) {
+        var sorted = library.albums(sortedBy: galaxySort)
+        if filter != .all {
+            let shown = Set(crateAlbums.map(\.id))
+            sorted.albums = sorted.albums.filter { shown.contains($0.id) }
+        }
+        #if DEBUG
+            sorted.albums += GalaxyStress.albums
+        #endif
+        return sorted
+    }
+
+    private var galaxy: some View {
+        let order = galaxyOrder
+        return GalaxyView(
+            albums: order.albums, sort: galaxySort,
+            // `fellBack` is true for an empty library too: the note is about the albums shown, so it needs one.
+            fellBack: order.fellBack && !order.albums.isEmpty, theme: theme,
+            hidden: hidesFront ? galaxyPicked : nil,
+            pick: { album, rect in pickFromGalaxy(album, rect) },
+            playNext: { playback.playNext($0, startingAt: nil) },
+            addToUpNext: { playback.addToUpNext($0, startingAt: nil) }
+        ) { album, rect in
+            // A hold offers the crate's actions, and Play first: the galaxy has no front sleeve to tap twice.
+            Button("Play") { pickFromGalaxy(album, rect) }
+            upNextMenu(album)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .ignoresSafeArea(.keyboard)
+        .overlay {
+            if order.albums.isEmpty {
+                VStack(spacing: 10) {
+                    Text(filter == .all ? "Your shelf is empty" : "No records match")
+                        .font(.headline)
+                    if filter == .all {
+                        Button("Add music", systemImage: "plus") { getMusic() }
+                            .buttonStyle(.glassProminent)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hand-off from a galaxy sleeve's frame; that sleeve hides while its copy flies. Not while one already runs:
+    /// the hidden sleeve must stay the one in flight.
+    private func pickFromGalaxy(_ album: AlbumCard, _ rect: CGRect?) {
+        guard !hidesFront else { return }
+        galaxyPicked = album.id
+        pick(album, nil, rect)
     }
 
     // MARK: The crate
@@ -528,13 +674,27 @@ private struct PendingRemoval {
 /// A sleeve in the crate: the cover, with a thin edge highlight.
 struct Sleeve: View {
     let album: AlbumCard
+    /// Off for the galaxy, which draws one shadow under all its sleeves at once (`GalaxyView`).
+    var shadow = true
+    /// The art's decode size (`ArtworkView`).
+    var pixels = 300
 
+    @ViewBuilder
     var body: some View {
-        ArtworkView(albumID: album.id, artwork: album.artwork)
+        let cover = ArtworkView(albumID: album.id, artwork: album.artwork, pixels: pixels)
             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.22), radius: 8, y: 6)
+        if shadow {
+            cover.shadow(color: .black.opacity(0.22), radius: 8, y: 6)
+        } else {
+            cover
+        }
     }
+}
+
+extension Theme {
+    /// The Shelf panel's colour.
+    var shelfSurface: Color { isDark ? Color(white: 0.1) : Color(white: 0.99) }
 }
 
 extension SearchFilter {

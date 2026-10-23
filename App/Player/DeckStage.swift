@@ -86,6 +86,9 @@ struct DeckStage: View {
     let theme: Theme
     let handoff: HandoffDirector
     let discSpace: Namespace.ID
+    /// The display unfolded into the tracklist (plan 9 §3). The player owns it, so a tap anywhere off the stage folds
+    /// it back too.
+    @Binding var tracklistOpen: Bool
 
     @State private var spin = SpinModel()
     @State private var armDrag: Double?
@@ -96,8 +99,55 @@ struct DeckStage: View {
     /// banner, the app leaving the foreground), which `onEnded` does not report: the hold is let go then too.
     @GestureState private var touching = false
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var flip = 0.0
     @State private var restTick = 0
+    /// The tonearm on its way to a song the tracklist chose, until it lands.
+    @State private var swing: ArmSwing?
+    /// A jump to the other side turned the record over already: the side change it causes must not turn it again.
+    @State private var flipClaim: FlipClaim?
+    /// The plinth's size, for working out where the arm is when a jump arrives (outside the geometry reader).
+    @State private var deckSize: CGSize = .zero
+
+    /// The tonearm swinging to a song the tracklist chose (plan 9 §3), instead of snapping to it. On the same side it
+    /// swings straight there, over 0.6 s. On the other side the record turns over first while the arm parks at rest,
+    /// and then the arm drops. Under Reduce Motion the arm fades out where it was and in where it goes. Once it has
+    /// landed, the side's live position drives the arm again. A hand on the arm or the record, or the player landing on
+    /// another song (Next, Previous, a drop), ends it at once: the arm never pulls back to a song the music has left.
+    struct ArmSwing {
+        let serial: Int
+        /// The arm's angle when the jump came.
+        let from: Double
+        let track: Int
+        let side: Int
+        /// The song chosen is the one playing: the player only seeks back to its start, so the live position is the
+        /// old one until the seek lands, and the swing aims at the start throughout.
+        let restart: Bool
+        /// When the arm starts to move. A jump from the unfolded display holds it until the display has nearly
+        /// folded away, so the swing is seen rather than played out under the panel.
+        let began: Date
+        /// Seconds parked at rest while the record turns over first; zero on the same side.
+        let park: Double
+        let fades: Bool
+
+        static let swingSeconds = 0.6
+        static let fadeSeconds = 0.3
+
+        var duration: Double { park + (fades ? Self.fadeSeconds : Self.swingSeconds) }
+    }
+
+    /// How long a jump from the unfolded display holds the arm: the pick's beat before the fold (0.25 s), and most
+    /// of the fold.
+    static let holdUnderPanel = 0.5
+
+    /// The record turned over for a jump to `side`; claimed until `until`, in case the player never gets there.
+    struct FlipClaim {
+        let side: Int
+        let until: Date
+    }
+
+    /// The end-of-side flip's length, which a jump to the other side reuses.
+    static let flipSeconds = 0.9
 
     /// A finger on the record. Until it engages (it moves, or holds still for `holdToEngage`) it may still be a tap,
     /// and the record carries on as it was. Once engaged, the hand holds the record: the picture follows the finger
@@ -141,14 +191,22 @@ struct DeckStage: View {
                             )
                             .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
                         tonearm(layout, angle: armAngle(layout, at: context.date))
+                            .opacity(armOpacity(at: context.date))
                     }
                 }
-                DeckScreen(playback: playback, theme: theme, size: layout.size)
+                .accessibilityHidden(tracklistOpen)
+                DeckScreen(
+                    playback: playback, theme: theme, size: layout.size,
+                    open: canUnfold ? { unfoldTracklist() } : nil
+                )
+                .accessibilityHidden(tracklistOpen)
                 loupe(layout)
+                tracklistPanel(layout)
             }
             .onGeometryChange(for: CGRect.self) {
                 $0.frame(in: .named(PlayerSpace.name))
             } action: { frame in
+                deckSize = frame.size
                 let l = DeckLayout(size: frame.size)
                 handoff.deckLayout = l
                 handoff.platterRect = CGRect(
@@ -174,6 +232,7 @@ struct DeckStage: View {
         }
         .onDisappear {
             if jog != nil { letGo(asTap: false) }
+            tracklistOpen = false
         }
         .onChange(of: handoff.landed) { _, landed in
             if landed {
@@ -181,10 +240,35 @@ struct DeckStage: View {
             }
         }
         .onChange(of: playback.currentSide) { old, new in
+            guard old != new else { return }
+            // A jump to the other side turned the record over when it was asked for, before the player got there.
+            if let claim = flipClaim, claim.side == new, Date() < claim.until {
+                flipClaim = nil
+                return
+            }
             // End of side: the deck turns the record over while the audio carries on (spec §4.3). A whole turn, so
             // the picture disc never ends up mirrored.
-            guard old != new, playback.isPlaying else { return }
-            withAnimation(.spring(duration: 0.9, bounce: 0.1)) { flip += 360 }
+            guard playback.isPlaying else { return }
+            withAnimation(.spring(duration: Self.flipSeconds, bounce: 0.1)) { flip += 360 }
+        }
+        .onChange(of: playback.lastJump) { _, jump in
+            if let jump { startSwing(jump) }
+        }
+        .onChange(of: playback.trackIndex) { _, track in
+            // The player landed on another song than the one chosen (Next or Previous, a drop, the side playing on):
+            // the arm follows the music from here, not the jump.
+            if let swing, let track, track != swing.track { endSwing() }
+        }
+        .task(id: swing?.serial) {
+            // The swing hands the arm back once it has landed and the player has reached the song (a slow start
+            // would otherwise pull the arm back to the old groove for a moment), or after a second more regardless.
+            guard let current = swing else { return }
+            try? await Task.sleep(for: .seconds(max(0, current.began.timeIntervalSinceNow) + current.duration))
+            let deadline = Date().addingTimeInterval(1)
+            while !Task.isCancelled, !reached(current), Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if !Task.isCancelled, swing?.serial == current.serial { swing = nil }
         }
         .task(id: playback.isPlaying) {
             // Let the timeline run through the wind-down, then pause it.
@@ -198,7 +282,8 @@ struct DeckStage: View {
     private var timelinePaused: Bool {
         _ = restTick
         let now = Date.timeIntervalSinceReferenceDate
-        return !playback.isPlaying && !handoff.isRunning && jog == nil && armDrag == nil && spin.isAtRest(at: now)
+        return !playback.isPlaying && !handoff.isRunning && jog == nil && armDrag == nil && swing == nil
+            && spin.isAtRest(at: now)
     }
 
     private var showsRecord: Bool {
@@ -217,10 +302,136 @@ struct DeckStage: View {
             let p = handoff.timeline.progress(.arm, at: t)
             return layout.arm.restAngle + (layout.arm.leadInAngle - layout.arm.restAngle) * p
         }
+        if let swing { return swingAngle(swing, layout, at: date) }
+        return liveArmAngle(layout)
+    }
+
+    /// Where the side's position puts the needle; at rest when nothing plays.
+    private func liveArmAngle(_ layout: DeckLayout) -> Double {
         guard playback.trackIndex != nil, playback.player.status != .ended else { return layout.arm.restAngle }
         let total = playback.sideTimeline(playback.currentSide).total
         let fraction = total > 0 ? playback.sidePosition / total : 0
         return layout.arm.angle(forFraction: fraction)
+    }
+
+    // MARK: The swing
+
+    /// The swinging arm at `date`: parked towards rest while the record turns over, then on its way to the song's
+    /// groove, then holding there until the swing hands back.
+    private func swingAngle(_ swing: ArmSwing, _ layout: DeckLayout, at date: Date) -> Double {
+        let t = date.timeIntervalSince(swing.began)
+        let rest = layout.arm.restAngle
+        if t < 0 { return swing.from }
+        if t < swing.park {
+            return swing.from + (rest - swing.from) * Self.easeInOut(t / swing.park)
+        }
+        let start = swing.park > 0 ? rest : swing.from
+        let target = swingTarget(swing, layout)
+        let x = (t - swing.park) / (swing.fades ? ArmSwing.fadeSeconds : ArmSwing.swingSeconds)
+        if swing.fades { return x < 0.5 ? start : target }
+        return start + (target - start) * Self.springEase(x)
+    }
+
+    /// The song's groove: the live position once the player plays it (so the hand-back is seamless), its start until
+    /// then. A restart aims at the start throughout: until its seek lands, the live position is the old one.
+    private func swingTarget(_ swing: ArmSwing, _ layout: DeckLayout) -> Double {
+        if !swing.restart, playback.trackIndex == swing.track, playback.player.status != .ended {
+            return liveArmAngle(layout)
+        }
+        let total = playback.sideTimeline(swing.side).total
+        guard total > 0 else { return layout.arm.leadInAngle }
+        return layout.arm.angle(forFraction: playback.layout.offset(ofTrack: swing.track) / total)
+    }
+
+    /// The player is at the swing's song (back near its start, for a restart), so the live position can take over.
+    private func reached(_ swing: ArmSwing) -> Bool {
+        playback.trackIndex == swing.track && (!swing.restart || playback.player.position.seconds < 1.5)
+    }
+
+    /// A hand took over, or the music moved elsewhere: the arm goes back to following the needle at once. The
+    /// record's flip, if one ran, stays claimed, since the jump that caused it is still on its way to the player.
+    private func endSwing() {
+        swing = nil
+    }
+
+    /// Under Reduce Motion the arm does not travel: it fades out where it was and back in at the song.
+    private func armOpacity(at date: Date) -> Double {
+        guard let swing, swing.fades else { return 1 }
+        let x = date.timeIntervalSince(swing.began) / ArmSwing.fadeSeconds
+        return x >= 1 ? 1 : abs(1 - 2 * min(max(x, 0), 1))
+    }
+
+    /// A jump from the tracklist, the sheet's or the display's. The arm starts from where it is drawn: mid-swing, or
+    /// where the needle was when the song was chosen. A song on the other side turns the record over first (the
+    /// end-of-side flip, claimed so the side change does not run it again) while the arm parks. From the display,
+    /// all of it waits for the panel to fold out of the way.
+    private func startSwing(_ jump: PlaybackController.TrackJump) {
+        guard let side = playback.layout.side(ofTrack: jump.track), deckSize != .zero, !handoff.isRunning else {
+            return
+        }
+        let layout = DeckLayout(size: deckSize)
+        let now = Date()
+        let from: Double
+        if let swing {
+            from = swingAngle(swing, layout, at: now)
+        } else if let position = jump.fromPosition {
+            let total = playback.sideTimeline(jump.fromSide).total
+            from = total > 0 ? layout.arm.angle(forFraction: position / total) : layout.arm.restAngle
+        } else {
+            from = layout.arm.restAngle
+        }
+        let turns = side != jump.fromSide
+        let hold = tracklistOpen ? Self.holdUnderPanel : 0
+        if turns {
+            flipClaim = FlipClaim(side: side, until: now.addingTimeInterval(hold + 3))
+            if !reduceMotion {
+                withAnimation(.spring(duration: Self.flipSeconds, bounce: 0.1).delay(hold)) { flip += 360 }
+            }
+        }
+        swing = ArmSwing(
+            serial: jump.serial, from: from, track: jump.track, side: side, restart: playback.trackIndex == jump.track,
+            began: now.addingTimeInterval(hold), park: turns && !reduceMotion ? Self.flipSeconds : 0,
+            fades: reduceMotion)
+    }
+
+    /// The swing's easing: quick off the mark, a touch past the groove (a 1.8 % overshoot, like a light spring) and
+    /// settled exactly at the end, so the hand-back to the live position never jumps. An ease-out-back.
+    static func springEase(_ x: Double) -> Double {
+        let x = min(max(x, 0), 1)
+        let c1 = 0.7
+        let c3 = c1 + 1
+        return 1 + c3 * pow(x - 1, 3) + c1 * pow(x - 1, 2)
+    }
+
+    static func easeInOut(_ x: Double) -> Double {
+        let x = min(max(x, 0), 1)
+        return x * x * (3 - 2 * x)
+    }
+
+    // MARK: The display's tracklist
+
+    /// Something to list, and nothing else under way.
+    private var canUnfold: Bool {
+        playback.album != nil && !playback.tracks.isEmpty && !handoff.isRunning
+    }
+
+    private func unfoldTracklist() {
+        guard canUnfold else { return }
+        withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { tracklistOpen = true }
+    }
+
+    private func foldTracklist() {
+        withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { tracklistOpen = false }
+    }
+
+    /// A song picked on the display plays at once; the display folds back a beat later, once the inverted bar has
+    /// moved to it.
+    private func pickFromDisplay(_ index: Int) {
+        playback.jump(toTrack: index)
+        Task {
+            try? await Task.sleep(for: .milliseconds(250))
+            foldTracklist()
+        }
     }
 
     // MARK: Pieces
@@ -333,6 +544,31 @@ struct DeckStage: View {
         .sensoryFeedback(.selection, trigger: snapTrack)
     }
 
+    /// The display unfolded into the tracklist, over the platter, inset from the plinth's edge.
+    @ViewBuilder
+    private func tracklistPanel(_ layout: DeckLayout) -> some View {
+        if tracklistOpen {
+            // A tap beside the panel, on the plinth's rim, folds it back as well.
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { foldTracklist() }
+                .accessibilityHidden(true)
+                .zIndex(1)
+            // An explicit z-index: without one, a ZStack draws a view leaving it under its siblings, and the fold
+            // would play out hidden behind the plinth.
+            DeckTracklist(
+                playback: playback, theme: theme, pick: { pickFromDisplay($0) }, fold: { foldTracklist() }
+            )
+            .padding(DeckTracklist.inset)
+            .frame(width: layout.size.width, height: layout.size.height)
+            .transition(
+                DeckTracklist.unfold(
+                    from: DeckScreen.frame(in: layout.size), in: layout.size, reduceMotion: reduceMotion)
+            )
+            .zIndex(2)
+        }
+    }
+
     @ViewBuilder
     private func loupe(_ layout: DeckLayout) -> some View {
         if let armDrag {
@@ -370,6 +606,8 @@ struct DeckStage: View {
         DragGesture(minimumDistance: 2, coordinateSpace: .local)
             .onChanged { value in
                 guard playback.album != nil, !handoff.isRunning else { return }
+                // A hand on the arm takes it from a swing in flight, park included: it lands where the hand drops it.
+                if swing != nil { endSwing() }
                 let raw = min(max(layout.angle(toward: value.location), layout.arm.restAngle), layout.arm.runoutAngle)
                 let timeline = playback.sideTimeline(playback.currentSide)
                 let seconds = layout.arm.fraction(forAngle: raw) * timeline.total
@@ -452,6 +690,7 @@ struct DeckStage: View {
     /// The finger takes hold of the record: the picture stops under it, where it was, and the music follows the hand.
     private func engageJog() {
         guard var current = jog, !current.engaged else { return }
+        endSwing()
         current.engaged = true
         current.baseAngle = spin.angle(at: Date.timeIntervalSinceReferenceDate)
         current.degrees = 0
@@ -484,6 +723,7 @@ struct DeckStage: View {
 
     private func jogBy(_ seconds: Double) {
         guard playback.trackIndex != nil else { return }
+        endSwing()
         let side = playback.currentSide
         let target = playback.sidePosition + seconds
         Task { await playback.seek(side: side, to: target) }
@@ -495,6 +735,7 @@ struct DeckStage: View {
 
     private func tapTonearm() {
         guard !handoff.isRunning, playback.album != nil, !playback.isPlaying else { return }
+        endSwing()
         Task { await playback.dropNeedleOnCuedSide() }
     }
 
@@ -524,20 +765,50 @@ struct DeckStage: View {
 
 /// The deck's dot-matrix screen and what it says: track code, title, artist, time, and the rate and depth. A view of
 /// its own because it reads the player's position, which changes ten times a second: only this screen redraws.
+/// Tapping it unfolds the record's tracklist (plan 9 §3), when `open` is given.
 struct DeckScreen: View {
     let playback: PlaybackController
     let theme: Theme
     let size: CGSize
+    var open: (() -> Void)?
+
+    /// Where the screen sits on a plinth of `size`: bottom right, under the platter. The unfolding tracklist grows
+    /// out of this frame.
+    static func frame(in size: CGSize) -> CGRect {
+        let w = size.width * 0.5
+        let h: CGFloat = 38
+        return CGRect(x: size.width - w - size.width * 0.045, y: size.height - h - 12, width: w, height: h)
+    }
 
     var body: some View {
         let lines = lcdLines
-        let w = size.width * 0.5
+        let frame = Self.frame(in: size)
         DotMatrixScreen(lines: lines, ink: theme.lcdInk, back: theme.lcdBack)
-            .frame(width: w, height: 38)
-            .position(x: size.width - w / 2 - size.width * 0.045, y: size.height - 19 - 12)
+            .frame(width: frame.width, height: frame.height)
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .onTapGesture { open?() }
+            .position(x: frame.midX, y: frame.midY)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(lines.joined(separator: ", "))
-            .accessibilityIdentifier("deckScreen")
+            .modifier(UnfoldAction(open: open))
+            .accessibilityIdentifier("deckDisplay")
+    }
+
+    /// The screen is a button only while there is a tracklist to unfold: then it says so and activates; otherwise
+    /// it is plain text.
+    private struct UnfoldAction: ViewModifier {
+        let open: (() -> Void)?
+
+        func body(content: Content) -> some View {
+            if let open {
+                content
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Unfolds the record's tracklist")
+                    .accessibilityAction { open() }
+            } else {
+                content
+            }
+        }
     }
 
     private var sideLetter: String? {
@@ -667,24 +938,34 @@ struct DotMatrixScreen: View {
             .foregroundStyle(ink)
             .shadow(color: ink.opacity(0.6), radius: 3)
             .padding(.horizontal, 8)
-            Canvas { context, size in
-                // The pixel grid: dark lines between the dots break the glyphs into a matrix.
-                var x: CGFloat = 0
-                while x < size.width {
-                    context.fill(
-                        Path(CGRect(x: x, y: 0, width: 0.6, height: size.height)), with: .color(back.opacity(0.75)))
-                    x += 1.6
-                }
-                var y: CGFloat = 0
-                while y < size.height {
-                    context.fill(
-                        Path(CGRect(x: 0, y: y, width: size.width, height: 0.6)), with: .color(back.opacity(0.75)))
-                    y += 1.6
-                }
-            }
-            .allowsHitTesting(false)
+            DotGrid(back: back)
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// The pixel grid laid over the dot-matrix faces: dark lines between the dots break the glyphs into a matrix. It
+/// stays put while what is under it scrolls, as a real display's pixels do.
+struct DotGrid: View {
+    let back: Color
+
+    var body: some View {
+        Canvas { context, size in
+            var x: CGFloat = 0
+            while x < size.width {
+                context.fill(
+                    Path(CGRect(x: x, y: 0, width: 0.6, height: size.height)), with: .color(back.opacity(0.75)))
+                x += 1.6
+            }
+            var y: CGFloat = 0
+            while y < size.height {
+                context.fill(
+                    Path(CGRect(x: 0, y: y, width: size.width, height: 0.6)), with: .color(back.opacity(0.75)))
+                y += 1.6
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

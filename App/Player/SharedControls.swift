@@ -16,6 +16,9 @@ struct SharedControls: View {
     var getMusic: () -> Void = {}
     /// Shows the Sound tab, from the signal details.
     var openSound: () -> Void = {}
+    @State private var tracklistOpen = false
+    /// The song line's chevron, in step with the line's type up to a point.
+    @ScaledMetric(relativeTo: .subheadline) private var chevronSize: CGFloat = 9
 
     private var player: Player { playback.player }
 
@@ -78,15 +81,51 @@ struct SharedControls: View {
                             .accessibilityIdentifier("titleNote")
                     }
                 }
-                Text(subtitle)
-                    .font(Typeface.artist)
-                    .foregroundStyle(theme.inkSecondary)
-                    .lineLimit(1)
-                    .accessibilityIdentifier("nowPlayingSubtitle")
+                songLine
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.easeOut(duration: 0.3), value: title)
+    }
+
+    /// The song line, which opens the back-cover tracklist (plan 9 §3): the same words, with a small chevron saying
+    /// there is more. Its touch area reaches above and below the line, without moving anything.
+    private var songLine: some View {
+        Button {
+            tracklistOpen = true
+        } label: {
+            HStack(spacing: 5) {
+                Text(subtitle)
+                    .font(Typeface.artist)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up")
+                    .font(.system(size: min(chevronSize, 16), weight: .semibold))
+                    .fixedSize()
+            }
+            .foregroundStyle(theme.inkSecondary)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .padding(.vertical, -8)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Tracklist")
+        .accessibilityValue(subtitle)
+        .accessibilityHint("Shows the record's songs")
+        .accessibilityIdentifier("tracklistButton")
+        .sheet(isPresented: $tracklistOpen) {
+            TracklistSheet(playback: playback, theme: theme)
+        }
+        #if DEBUG
+            .task {
+                // `-PFTracklist sheet`: opens the back-cover tracklist once a record plays, for screenshots.
+                guard UserDefaults.standard.string(forKey: "PFTracklist") == "sheet" else { return }
+                for _ in 0..<100 where playback.trackIndex == nil {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+                tracklistOpen = true
+            }
+        #endif
     }
 
     private var title: String {

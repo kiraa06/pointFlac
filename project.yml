@@ -80,6 +80,10 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
+        # ProMotion: without this key an iPhone holds the app's own animation clocks (TimelineView, CADisplayLink) to
+        # 60 Hz. The Shelf galaxy, the hand-off and the disc spin are specified at 120 Hz (spec §8, Plan 9 §2); idle
+        # views still pick their own lower rates.
+        CADisableMinimumFrameDurationOnPhone: true
         # Portrait only for the soft launch: the Deck's layout is phone-portrait (UI review: landscape overflows and the
         # tonearm geometry degenerates on wide plinths). UIRequiresFullScreen opts out of iPad multitasking, which
         # would otherwise require every orientation. Revisit with the iPad layouts.

@@ -22,6 +22,10 @@ struct PlayerScreen: View {
     @State private var shelfOpen = false
     @State private var upNextOpen = false
     @State private var importing = false
+    /// The deck's display unfolded into the tracklist (plan 9 §3).
+    @State private var deckTracklistOpen = false
+    /// The stage's frame in the player's space: the hole in the tap-catcher that folds the deck's tracklist back.
+    @State private var stageFrame: CGRect = .zero
     @State private var handoff = HandoffDirector()
     @Namespace private var discSpace
 
@@ -52,6 +56,9 @@ struct PlayerScreen: View {
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
                 .gesture(swipeUp)
+                if deckTracklistOpen {
+                    foldCatcher
+                }
                 if shelfOpen || handoff.isRunning {
                     shelf(proxy.size)
                 }
@@ -89,6 +96,17 @@ struct PlayerScreen: View {
             UpNextSheet(playback: playback)
                 .presentationDetents([.medium, .large])
         }
+        #if DEBUG
+            .task {
+                // `-PFTracklist deck`: unfolds the deck's display once a record plays, for screenshots.
+                guard UserDefaults.standard.string(forKey: "PFTracklist") == "deck" else { return }
+                for _ in 0..<100 where playback.trackIndex == nil {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+                withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { deckTracklistOpen = true }
+            }
+        #endif
     }
 
     // MARK: Pieces
@@ -121,14 +139,33 @@ struct PlayerScreen: View {
     private func stageView(width: CGFloat) -> some View {
         ZStack {
             if stage == .deck {
-                DeckStage(playback: playback, theme: theme, handoff: handoff, discSpace: discSpace)
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                DeckStage(
+                    playback: playback, theme: theme, handoff: handoff, discSpace: discSpace,
+                    tracklistOpen: $deckTracklistOpen
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
             } else {
                 CoverStage(playback: playback, theme: theme, discSpace: discSpace)
                     .transition(.opacity.combined(with: .scale(scale: 1.04)))
             }
         }
+        .onGeometryChange(for: CGRect.self) {
+            $0.frame(in: .named(PlayerSpace.name))
+        } action: { frame in
+            stageFrame = frame
+        }
         .padding(.horizontal, 12)
+    }
+
+    /// While the deck's tracklist is unfolded, a tap anywhere off the stage folds it back and reaches nothing under
+    /// it (the stage itself folds it on a tap beside the panel).
+    private var foldCatcher: some View {
+        Color.clear
+            .contentShape(StageHole(hole: stageFrame), eoFill: true)
+            .onTapGesture {
+                withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { deckTracklistOpen = false }
+            }
+            .accessibilityHidden(true)
     }
 
     /// The deck's plinth sets the stage's height; the cover shares it, so switching never moves the controls. The
@@ -215,6 +252,17 @@ struct PlayerScreen: View {
 /// The player's coordinate space, which the hand-off measures the sleeve and the platter in.
 enum PlayerSpace {
     static let name = "player"
+}
+
+/// The whole player but the stage, filled even-odd: the fold catcher's touch area.
+private struct StageHole: Shape {
+    let hole: CGRect
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path(rect)
+        path.addRect(hole)
+        return path
+    }
 }
 
 /// The Deck / Cover switch at the top: a Liquid Glass capsule with two segments.

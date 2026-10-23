@@ -38,11 +38,14 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
     /// What the library knows about the track's loudness (ReplayGain tags and the background R128 scan), or nil when it
     /// knows nothing. It has no default, like `isInLibraryFolder`: a construction cannot forget it.
     public var loudness: TrackLoudness?
+    /// When the library first saw the file. A rescan or a tag edit keeps it. Feeds the Last added sort.
+    public var addedAt: Date
 
     public init(
         id: String, url: URL, title: String, artist: String, albumArtist: String, album: String, albumID: String,
         discNumber: Int?, trackNumber: Int?, year: Int?, format: AudioFormat, totalFrames: Int64,
-        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool, loudness: TrackLoudness?
+        artworkID: String?, isCloudPending: Bool = false, isInLibraryFolder: Bool, loudness: TrackLoudness?,
+        addedAt: Date = Date(timeIntervalSince1970: 0)
     ) {
         self.id = id
         self.url = url
@@ -60,6 +63,7 @@ public struct LibraryTrack: Sendable, Hashable, Identifiable {
         self.isCloudPending = isCloudPending
         self.isInLibraryFolder = isInLibraryFolder
         self.loudness = loudness
+        self.addedAt = addedAt
     }
 
     /// The track's length in seconds; zero when its frame count is unknown.
@@ -131,10 +135,12 @@ public struct LibraryAlbum: Sendable, Hashable, Identifiable {
     public var bestFormat: AudioFormat
     /// The first front cover in playing order.
     public var artworkID: String?
+    /// The latest `addedAt` among the tracks: an album counts as new when anything new arrived in it.
+    public var addedAt: Date
 
     public init(
         id: String, title: String, artist: String, year: Int?, trackIDs: [String], bestFormat: AudioFormat,
-        artworkID: String?
+        artworkID: String?, addedAt: Date = Date(timeIntervalSince1970: 0)
     ) {
         self.id = id
         self.title = title
@@ -143,6 +149,7 @@ public struct LibraryAlbum: Sendable, Hashable, Identifiable {
         self.trackIDs = trackIDs
         self.bestFormat = bestFormat
         self.artworkID = artworkID
+        self.addedAt = addedAt
     }
 
     /// For the crate caption and album cards: "FLAC 24/96", "FLAC 16/44.1".
@@ -230,7 +237,8 @@ public enum AlbumGrouping {
             albums.append(
                 LibraryAlbum(
                     id: id, title: title, artist: artist, year: year, trackIDs: ordered.map(\.id), bestFormat: best,
-                    artworkID: ordered.lazy.compactMap(\.artworkID).first))
+                    artworkID: ordered.lazy.compactMap(\.artworkID).first,
+                    addedAt: ordered.map(\.addedAt).max() ?? first.addedAt))
         }
         albums.sort(by: shelfOrder)
         return (albums, tracks)

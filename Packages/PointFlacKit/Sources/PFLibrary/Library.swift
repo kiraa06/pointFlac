@@ -197,6 +197,24 @@ public final class Library: Sendable {
         }
     }
 
+    /// Counts one listen of `trackID` (the library track's ID) at `date`, and returns its new total. Does not publish a
+    /// catalog: a listen changes no track, and the shelf keeps its own running counts (`listenStats()` seeds them).
+    /// Should the database fail, the failure is logged and the result is a zero count, which a caller ignores.
+    @discardableResult
+    public func recordListen(trackID: String, at date: Date) async -> ListenStat {
+        do {
+            return try await run(.never) { try $0.recordListen(trackID: trackID, at: date) }
+        } catch {
+            Self.log(error, during: "recordListen")
+            return ListenStat(count: 0, lastAt: nil)
+        }
+    }
+
+    /// Every listen the library has recorded, keyed by track ID. Includes tracks no longer in the library.
+    public func listenStats() async -> [String: ListenStat] {
+        (try? await run(.never) { try $0.listenStats() }) ?? [:]
+    }
+
     /// The stored cover for `artworkID` (a JPEG at most 600 px on its long side), or nil. Safe from any thread; held
     /// in a byte-bounded memory cache. A cover whose file has gone is regenerated from its track in the background,
     /// so a later call finds it again.

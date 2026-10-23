@@ -22,6 +22,10 @@ import PFLibrary
 ///   `-PFSoundSaveDelay <seconds>` stretches their save's debounce.
 /// - `-PFFakeRoute <profile key>` reports a made-up output route that the Sound tab can switch to the built-in speaker
 ///   and back (`FakeRouteSwitch`), for the per-device settings.
+/// - `-PFFreshLibrary` opens a new, empty library in a temporary folder for this launch only, so a UI test starts with
+///   no listen history and no albums left over from an earlier run (the Shelf galaxy's tests).
+/// - `-PFGalaxyStress <n>` adds `n` made-up albums to the Shelf galaxy, to profile it at a large library's size
+///   (`GalaxyStress`).
 @MainActor
 @Observable
 final class AppModel {
@@ -66,7 +70,11 @@ final class AppModel {
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         UserDefaults.standard.register(defaults: [Self.lookupNamesKey: true, Self.lookupArtworkKey: false])
-        let realLibrary = RealLibrary(library: Self.openLibrary())
+        #if DEBUG
+            let realLibrary = RealLibrary(library: Self.openLibrary(fresh: arguments.contains("-PFFreshLibrary")))
+        #else
+            let realLibrary = RealLibrary(library: Self.openLibrary())
+        #endif
         self.realLibrary = realLibrary
         #if DEBUG
             preloadFixtures = arguments.contains("-PFPreloadFixtures")
@@ -141,12 +149,19 @@ final class AppModel {
 
     /// The library database and covers live in Application Support (never Caches, which the system purges; the
     /// library refuses it). Should the database not open, a temporary one keeps the app usable, and the next launch
-    /// tries the real one again.
-    private static func openLibrary() -> Library {
-        let folder = URL.documentsDirectory.appending(path: "Library", directoryHint: .isDirectory)
+    /// tries the real one again. `fresh` (DEBUG's `-PFFreshLibrary`) puts the folder and the database in a new
+    /// temporary folder instead, so nothing an earlier launch recorded is there.
+    private static func openLibrary(fresh: Bool = false) -> Library {
+        let scratch = FileManager.default.temporaryDirectory.appending(
+            path: "PointFlacFresh-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let folder =
+            fresh
+            ? scratch.appending(path: "Library", directoryHint: .isDirectory)
+            : URL.documentsDirectory.appending(path: "Library", directoryHint: .isDirectory)
         // Created now rather than on the first import, so it shows in the Files app from the first launch.
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        for base in [URL.applicationSupportDirectory, FileManager.default.temporaryDirectory] {
+        let bases = fresh ? [scratch] : [URL.applicationSupportDirectory, FileManager.default.temporaryDirectory]
+        for base in bases {
             let root = base.appending(path: "PointFlacLibrary", directoryHint: .isDirectory)
             let artwork = root.appending(path: "Artwork", directoryHint: .isDirectory)
             try? FileManager.default.createDirectory(at: artwork, withIntermediateDirectories: true)
