@@ -1,3 +1,4 @@
+import PFDesign
 import SwiftUI
 
 /// Minimal Settings for the soft launch: the appearance override, Diagnostics (Plan 1's debug library and player,
@@ -6,6 +7,7 @@ struct SettingsView: View {
     let model: AppModel
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
     @AppStorage("monochrome") private var monochrome = false
+    @AppStorage(DeckPreferences.designKey) private var deckDesignID = DeckDesign.standard.id
     @AppStorage(AppModel.lookupNamesKey) private var lookupNames = true
     @AppStorage(AppModel.lookupArtworkKey) private var lookupArtwork = false
 
@@ -22,6 +24,14 @@ struct SettingsView: View {
                     Text("Appearance")
                 } footer: {
                     Text("Both the Deck and the Cover have a light and a dark look. System follows the phone.")
+                }
+                Section {
+                    NavigationLink {
+                        CustomizeDeckView()
+                    } label: {
+                        LabeledContent("Customize deck", value: DeckDesign.design(id: deckDesignID).name)
+                    }
+                    .accessibilityIdentifier("customizeDeckLink")
                 }
                 Section {
                     Toggle("Monochrome", isOn: $monochrome)

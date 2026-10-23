@@ -2,85 +2,15 @@ import PFAudio
 import PFDesign
 import SwiftUI
 
-/// The plinth's geometry, from its size: where the record, the pivot and the needle are, and the tonearm's lead-in and
-/// run-out angles, solved so the needle really sits on the outer and inner grooves.
-struct DeckLayout {
-    let size: CGSize
-    let recordCenter: CGPoint
-    let recordRadius: CGFloat
-    let pivot: CGPoint
-    let armLength: CGFloat
-    let arm: TonearmGeometry
-
-    init(size: CGSize) {
-        self.size = size
-        let w = size.width
-        let pad = w * 0.05
-        let platter = min(w * 0.76, size.height - pad - Self.screenBand)
-        recordRadius = platter / 2 * 0.94
-        recordCenter = CGPoint(x: pad + platter / 2, y: pad + platter / 2)
-        pivot = CGPoint(x: w - w * 0.1, y: w * 0.09)
-        let reach = hypot(pivot.x - recordCenter.x, pivot.y - recordCenter.y)
-        armLength = reach * 0.95
-        let closest = atan2(pivot.x - recordCenter.x, recordCenter.y - pivot.y) * 180 / .pi
-        let center = recordCenter
-        let pivot = pivot
-        let length = armLength
-        func distance(_ angle: Double) -> Double {
-            let r = angle * .pi / 180
-            let needle = CGPoint(x: pivot.x - length * sin(r), y: pivot.y + length * cos(r))
-            return hypot(needle.x - center.x, needle.y - center.y)
-        }
-        // Distance falls as the arm swings in, so bisect for the outer and inner groove radii.
-        func solve(_ target: Double) -> Double {
-            var lo = 0.0
-            var hi = closest
-            for _ in 0..<40 {
-                let mid = (lo + hi) / 2
-                if distance(mid) > target { lo = mid } else { hi = mid }
-            }
-            return (lo + hi) / 2
-        }
-        let radius = Double(recordRadius)
-        arm = TonearmGeometry(restAngle: 2, leadInAngle: solve(radius * 0.93), runoutAngle: solve(radius * 0.42))
-    }
-
-    /// Room under the platter for the dot-matrix screen.
-    static let screenBand: CGFloat = 58
-
-    /// The plinth's height for a width: the platter, its margin, and the screen's band.
-    static func height(forWidth w: CGFloat) -> CGFloat {
-        w * 0.05 + w * 0.76 + screenBand
-    }
-
-    func needle(at angle: Double) -> CGPoint {
-        let r = angle * .pi / 180
-        return CGPoint(x: pivot.x - armLength * sin(r), y: pivot.y + armLength * cos(r))
-    }
-
-    /// The arm angle pointing at `point` (a finger), from the pivot.
-    func angle(toward point: CGPoint) -> Double {
-        atan2(pivot.x - point.x, point.y - pivot.y) * 180 / .pi
-    }
-
-    /// The groove radius, as a fraction of the record's, under the needle at `fraction` of the side.
-    func bandRadius(forFraction fraction: Double) -> CGFloat {
-        let p = needle(at: arm.angle(forFraction: fraction))
-        return hypot(p.x - recordCenter.x, p.y - recordCenter.y) / recordRadius
-    }
-
-    /// The track gaps of a side, as `RecordDisc` draws them. The hand-off's record in flight uses it too, so the record
-    /// that lands looks exactly like the one that flew.
-    func bands(for timeline: SideTimeline) -> [CGFloat] {
-        guard timeline.total > 0 else { return [] }
-        return timeline.starts.dropFirst().map { bandRadius(forFraction: $0 / timeline.total) }
-    }
-}
-
-/// The glass turntable (spec §4.3): a frosted plinth, a strobe-dotted platter, the record as a picture disc, an
-/// S-shaped tonearm and a dot-matrix screen. Played by hand: drag the tonearm to seek across the side (snapping into
-/// track gaps, with a loupe), turn the record to jog (1.8 s a turn, applied on release), tap the tonearm at rest to
-/// drop the needle, and tap the record while the needle is up to turn it over.
+/// The turntable (spec §4.3), in the design chosen in Customize deck (`DeckDesign`), true to a real deck's
+/// proportions: a plinth, a platter with its mat and strobe, the record (black vinyl by default), the tonearm and a
+/// dot-matrix screen. Played by hand: drag the tonearm (or a linear deck's carriage) to seek across the side
+/// (snapping into track gaps, with a loupe), turn the record to jog (1.8 s a turn, applied on release), tap the
+/// tonearm at rest to drop the needle, and tap the record while the needle is up to turn it over.
+///
+/// This view owns the state and the gestures; the pieces it composes live in `App/Deck`. Everything that does not
+/// move is drawn once per design and size; per frame, only the record's print turns, the arm moves and the 45 rpm
+/// strobe rows creep.
 struct DeckStage: View {
     let playback: PlaybackController
     let theme: Theme
@@ -90,7 +20,15 @@ struct DeckStage: View {
     /// it back too.
     @Binding var tracklistOpen: Bool
 
+    @AppStorage(DeckPreferences.designKey) private var designID = DeckDesign.standard.id
+    @AppStorage(DeckPreferences.recordStyleKey) private var recordStyleRaw = RecordStyle.standard.rawValue
+
     @State private var spin = SpinModel()
+    /// The platter under the record: it keeps turning beneath a held record (the slipmat slips), and drives the
+    /// strobe.
+    @State private var platter = SpinModel()
+    @State private var lift = LiftModel()
+    /// The arm held by a hand, as a position along its travel (`ArmTravel`).
     @State private var armDrag: Double?
     @State private var snapTrack: Int?
     @State private var jog: Jog?
@@ -114,9 +52,10 @@ struct DeckStage: View {
     /// and then the arm drops. Under Reduce Motion the arm fades out where it was and in where it goes. Once it has
     /// landed, the side's live position drives the arm again. A hand on the arm or the record, or the player landing on
     /// another song (Next, Previous, a drop), ends it at once: the arm never pulls back to a song the music has left.
+    /// A linear deck's carriage slides the same way, along its rail.
     struct ArmSwing {
         let serial: Int
-        /// The arm's angle when the jump came.
+        /// The arm's position when the jump came.
         let from: Double
         let track: Int
         let side: Int
@@ -174,52 +113,57 @@ struct DeckStage: View {
     /// A finger that moves this far holds the record at once.
     static let travelToEngage: CGFloat = 3
 
+    private var design: DeckDesign { DeckDesign.design(id: designID) }
+    private var recordStyle: RecordStyle { RecordStyle(rawValue: recordStyleRaw) ?? .standard }
+
     var body: some View {
         GeometryReader { proxy in
-            let layout = DeckLayout(size: proxy.size)
+            let layout = DeckLayout(size: proxy.size, design: design)
+            let paint = DeckPaint(design: design, theme: theme)
             ZStack(alignment: .topLeading) {
-                plinth
-                platterBase(layout)
-                TimelineView(.animation(minimumInterval: nil, paused: timelinePaused)) { context in
-                    let now = context.date.timeIntervalSinceReferenceDate
-                    ZStack(alignment: .topLeading) {
-                        record(layout, angle: recordAngle(now))
-                            // A record Up Next pulls in arrives with a short settle (the hand-off's short form).
-                            // Not during the hand-off, whose own record lands exactly where this one appears.
-                            .transition(
-                                handoff.isRunning ? .identity : .scale(scale: 0.7).combined(with: .opacity)
-                            )
-                            .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
-                        tonearm(layout, angle: armAngle(layout, at: context.date))
-                            .opacity(armOpacity(at: context.date))
-                    }
-                }
-                .accessibilityHidden(tracklistOpen)
-                DeckScreen(
-                    playback: playback, theme: theme, size: layout.size,
-                    open: canUnfold ? { unfoldTracklist() } : nil
-                )
-                .accessibilityHidden(tracklistOpen)
+                // A new design cross-fades in over the old one.
+                deck(layout, paint)
+                    // VoiceOver names the turntable as it enters the deck.
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("\(design.name) turntable")
+                    .accessibilityIdentifier("deckStage")
+                    .id(design.id)
+                    // The outgoing design fades out over the incoming one, which is drawn whole beneath it: a
+                    // cross-fade with no dip to the background. A newer deck always sorts under the one it replaces
+                    // (a removed view keeps the order it last had).
+                    .zIndex(-Date.timeIntervalSinceReferenceDate)
+                    .transition(.asymmetric(insertion: .identity, removal: .opacity))
                 loupe(layout)
-                tracklistPanel(layout)
+                tracklistPanel(layout, paint)
             }
+            .animation(.easeInOut(duration: 0.45), value: design.id)
             .onGeometryChange(for: CGRect.self) {
                 $0.frame(in: .named(PlayerSpace.name))
             } action: { frame in
                 deckSize = frame.size
+                // The record's size does not depend on the design.
                 let l = DeckLayout(size: frame.size)
-                handoff.deckLayout = l
                 handoff.platterRect = CGRect(
                     x: frame.minX + l.recordCenter.x - l.recordRadius,
                     y: frame.minY + l.recordCenter.y - l.recordRadius,
                     width: l.recordRadius * 2, height: l.recordRadius * 2)
             }
         }
+        .onAppear {
+            lift.set(down: needleDown, at: Date.timeIntervalSinceReferenceDate, animated: false)
+        }
+        .onChange(of: needleDown) { _, down in
+            lift.set(down: down, at: Date.timeIntervalSinceReferenceDate, animated: !reduceMotion)
+        }
         .onChange(of: playback.isPlaying, initial: true) { _, playing in
-            spin.setSpinning(playing || handoff.spinning, at: Date.timeIntervalSinceReferenceDate)
+            let now = Date.timeIntervalSinceReferenceDate
+            spin.setSpinning(playing || handoff.spinning, at: now)
+            platter.setSpinning(playing || handoff.spinning, at: now)
         }
         .onChange(of: handoff.spinning) { _, spinning in
-            spin.setSpinning(spinning || playback.isPlaying, at: Date.timeIntervalSinceReferenceDate)
+            let now = Date.timeIntervalSinceReferenceDate
+            spin.setSpinning(spinning || playback.isPlaying, at: now)
+            platter.setSpinning(spinning || playback.isPlaying, at: now)
         }
         .onChange(of: touching) { _, touching in
             // A cancelled gesture resets `touching` without `onEnded`; a normal end runs `onEnded` first, which clears
@@ -271,9 +215,50 @@ struct DeckStage: View {
             if !Task.isCancelled, swing?.serial == current.serial { swing = nil }
         }
         .task(id: playback.isPlaying) {
-            // Let the timeline run through the wind-down, then pause it.
-            try? await Task.sleep(for: .seconds(spin.windDownSeconds + 0.1))
+            // Let the timeline run through the wind-down (and the arm's lift), then pause it.
+            try? await Task.sleep(for: .seconds(max(spin.windDownSeconds, LiftModel.lowerSeconds) + 0.1))
             restTick += 1
+        }
+    }
+
+    // MARK: The deck
+
+    private func deck(_ layout: DeckLayout, _ paint: DeckPaint) -> some View {
+        DeckLayers(paint: paint, layout: layout, live: true, playing: playback.isPlaying) {
+            TimelineView(.animation(minimumInterval: nil, paused: timelinePaused)) { context in
+                let now = context.date.timeIntervalSinceReferenceDate
+                let position = armPosition(layout, at: context.date)
+                ZStack(alignment: .topLeading) {
+                    DeckMovingParts(
+                        paint: paint, layout: layout, strobePhase: strobePhase(now), armPosition: position,
+                        lift: lift.value(at: now), armOpacity: armOpacity(at: context.date)
+                    ) {
+                        record(layout, angle: recordAngle(now))
+                            // A record Up Next pulls in arrives with a short settle (the hand-off's short form).
+                            // Not during the hand-off, whose own record lands exactly where this one appears.
+                            .transition(
+                                handoff.isRunning ? .identity : .scale(scale: 0.7).combined(with: .opacity)
+                            )
+                            .animation(.spring(duration: 0.6, bounce: 0.2), value: playback.album?.id)
+                    }
+                    armHitArea(layout, position: position)
+                }
+            }
+            .accessibilityHidden(tracklistOpen)
+        } front: {
+            if design.controls == .dj {
+                DeckStartStop(
+                    paint: paint, layout: layout, playing: playback.isPlaying, enabled: playback.album != nil
+                ) {
+                    playback.togglePlayPause()
+                }
+                .accessibilityHidden(tracklistOpen)
+            }
+            DeckScreen(
+                playback: playback, paint: paint, size: layout.size,
+                open: canUnfold ? { unfoldTracklist() } : nil
+            )
+            .accessibilityHidden(tracklistOpen)
         }
     }
 
@@ -283,7 +268,12 @@ struct DeckStage: View {
         _ = restTick
         let now = Date.timeIntervalSinceReferenceDate
         return !playback.isPlaying && !handoff.isRunning && jog == nil && armDrag == nil && swing == nil
-            && spin.isAtRest(at: now)
+            && spin.isAtRest(at: now) && platter.isAtRest(at: now) && lift.isSettled(at: now)
+    }
+
+    /// The stylus is in the groove: the record plays and no hand or swing holds the arm up.
+    private var needleDown: Bool {
+        playback.isPlaying && armDrag == nil && swing == nil && !handoff.isRunning
     }
 
     private var showsRecord: Bool {
@@ -295,32 +285,39 @@ struct DeckStage: View {
         return spin.angle(at: now)
     }
 
-    private func armAngle(_ layout: DeckLayout, at date: Date) -> Double {
+    /// The 45 rpm strobe rows' creep: still at rest, a slow drift while the platter turns at 33⅓. Still under Reduce
+    /// Motion.
+    private func strobePhase(_ now: Double) -> Double {
+        reduceMotion ? 0 : StrobeRows.creep(platterDegrees: platter.angle(at: now))
+    }
+
+    private func armPosition(_ layout: DeckLayout, at date: Date) -> Double {
+        let travel = layout.travel
         if let armDrag { return armDrag }
         if handoff.isRunning {
             let t = handoff.elapsed(at: date)
             let p = handoff.timeline.progress(.arm, at: t)
-            return layout.arm.restAngle + (layout.arm.leadInAngle - layout.arm.restAngle) * p
+            return travel.rest + (travel.leadIn - travel.rest) * p
         }
-        if let swing { return swingAngle(swing, layout, at: date) }
-        return liveArmAngle(layout)
+        if let swing { return swingPosition(swing, layout, at: date) }
+        return livePosition(layout)
     }
 
     /// Where the side's position puts the needle; at rest when nothing plays.
-    private func liveArmAngle(_ layout: DeckLayout) -> Double {
-        guard playback.trackIndex != nil, playback.player.status != .ended else { return layout.arm.restAngle }
+    private func livePosition(_ layout: DeckLayout) -> Double {
+        guard playback.trackIndex != nil, playback.player.status != .ended else { return layout.travel.rest }
         let total = playback.sideTimeline(playback.currentSide).total
         let fraction = total > 0 ? playback.sidePosition / total : 0
-        return layout.arm.angle(forFraction: fraction)
+        return layout.travel.position(forFraction: fraction)
     }
 
     // MARK: The swing
 
     /// The swinging arm at `date`: parked towards rest while the record turns over, then on its way to the song's
     /// groove, then holding there until the swing hands back.
-    private func swingAngle(_ swing: ArmSwing, _ layout: DeckLayout, at date: Date) -> Double {
+    private func swingPosition(_ swing: ArmSwing, _ layout: DeckLayout, at date: Date) -> Double {
         let t = date.timeIntervalSince(swing.began)
-        let rest = layout.arm.restAngle
+        let rest = layout.travel.rest
         if t < 0 { return swing.from }
         if t < swing.park {
             return swing.from + (rest - swing.from) * Self.easeInOut(t / swing.park)
@@ -336,11 +333,11 @@ struct DeckStage: View {
     /// then. A restart aims at the start throughout: until its seek lands, the live position is the old one.
     private func swingTarget(_ swing: ArmSwing, _ layout: DeckLayout) -> Double {
         if !swing.restart, playback.trackIndex == swing.track, playback.player.status != .ended {
-            return liveArmAngle(layout)
+            return livePosition(layout)
         }
         let total = playback.sideTimeline(swing.side).total
-        guard total > 0 else { return layout.arm.leadInAngle }
-        return layout.arm.angle(forFraction: playback.layout.offset(ofTrack: swing.track) / total)
+        guard total > 0 else { return layout.travel.leadIn }
+        return layout.travel.position(forFraction: playback.layout.offset(ofTrack: swing.track) / total)
     }
 
     /// The player is at the swing's song (back near its start, for a restart), so the live position can take over.
@@ -369,16 +366,16 @@ struct DeckStage: View {
         guard let side = playback.layout.side(ofTrack: jump.track), deckSize != .zero, !handoff.isRunning else {
             return
         }
-        let layout = DeckLayout(size: deckSize)
+        let layout = DeckLayout(size: deckSize, design: design)
         let now = Date()
         let from: Double
         if let swing {
-            from = swingAngle(swing, layout, at: now)
+            from = swingPosition(swing, layout, at: now)
         } else if let position = jump.fromPosition {
             let total = playback.sideTimeline(jump.fromSide).total
-            from = total > 0 ? layout.arm.angle(forFraction: position / total) : layout.arm.restAngle
+            from = total > 0 ? layout.travel.position(forFraction: position / total) : layout.travel.rest
         } else {
-            from = layout.arm.restAngle
+            from = layout.travel.rest
         }
         let turns = side != jump.fromSide
         let hold = tracklistOpen ? Self.holdUnderPanel : 0
@@ -436,60 +433,16 @@ struct DeckStage: View {
 
     // MARK: Pieces
 
-    private var plinth: some View {
-        RoundedRectangle(cornerRadius: 26, style: .continuous)
-            .fill(
-                LinearGradient(
-                    colors: [theme.plinthTop, theme.plinthBottom], startPoint: .topLeading, endPoint: .bottomTrailing)
-            )
-            .glassEffect(.regular.tint(theme.plinthTop.opacity(0.2)), in: .rect(cornerRadius: 26))
-            .overlay(
-                RoundedRectangle(cornerRadius: 26, style: .continuous).strokeBorder(theme.plinthEdge, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(theme.isDark ? 0.4 : 0.08), radius: 14, y: 10)
-    }
-
-    private func platterBase(_ layout: DeckLayout) -> some View {
-        let d = layout.recordRadius * 2 / 0.94
-        return ZStack {
-            Canvas { context, size in
-                // The strobe dots round the platter's rim.
-                let c = CGPoint(x: size.width / 2, y: size.height / 2)
-                let r = size.width / 2 - 2
-                for i in 0..<180 {
-                    let a = Double(i) * .pi / 90
-                    let p = CGPoint(x: c.x + r * cos(a), y: c.y + r * sin(a))
-                    context.fill(
-                        Path(ellipseIn: CGRect(x: p.x - 1, y: p.y - 1, width: 2, height: 2)), with: .color(theme.strobe)
-                    )
-                }
-            }
-            Circle().fill(
-                RadialGradient(
-                    colors: [Color(white: 0.24), Color(white: 0.12)], center: .center, startRadius: 0,
-                    endRadius: d / 2)
-            )
-            .padding(d * 0.035)
-            Circle().fill(Color(white: 0.88)).frame(width: 8, height: 8).shadow(radius: 1)
-        }
-        .frame(width: d, height: d)
-        .position(layout.recordCenter)
-        .accessibilityHidden(true)
-    }
-
     @ViewBuilder
     private func record(_ layout: DeckLayout, angle: Double) -> some View {
         if showsRecord, let album = playback.album {
             let d = layout.recordRadius * 2
-            RecordDisc(
-                albumID: album.id, artwork: album.artwork, bands: bands(layout), grooveInk: .black
+            RecordView(
+                face: RecordFace(album: album, side: sideLetter ?? "A", bands: bands(layout), style: recordStyle),
+                diameter: d, angle: angle
             )
-            .equatable()
-            .rotationEffect(.degrees(angle))
             .rotation3DEffect(.degrees(flip), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-            .overlay(RecordSheen())
             .frame(width: d, height: d)
-            .shadow(color: .black.opacity(0.35), radius: 8, y: 5)
             .contentShape(Circle())
             .gesture(jogGesture(layout))
             .position(layout.recordCenter)
@@ -504,49 +457,56 @@ struct DeckStage: View {
         }
     }
 
-    private func tonearm(_ layout: DeckLayout, angle: Double) -> some View {
-        let length = layout.armLength
-        return ZStack(alignment: .top) {
-            TonearmShape()
-                .fill(
-                    LinearGradient(
-                        colors: theme.isDark
-                            ? [Color(white: 0.85), Color(white: 0.45), Color(white: 0.8)]
-                            : [Color(white: 0.97), Color(white: 0.68), Color(white: 0.93)],
-                        startPoint: .leading, endPoint: .trailing)
-                )
-                .shadow(color: .black.opacity(0.28), radius: 3, x: 2, y: 3)
-                .frame(width: 44, height: length + 18)
-            // The handle: a generous target round the headshell, where a finger naturally grabs the arm.
-            Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
-                .offset(y: length - 24)
-                .accessibilityElement()
-                .accessibilityLabel("Tonearm")
-                .accessibilityValue(armValue)
-                .accessibilityIdentifier("tonearmHandle")
-                .accessibilityAdjustableAction { direction in
-                    nudge(direction == .increment ? 15 : -15)
-                }
+    /// Where a finger takes the arm, over the drawn arm (`TonearmAssembly`): the arm's gestures live here.
+    @ViewBuilder
+    private func armHitArea(_ layout: DeckLayout, position: Double) -> some View {
+        if let arm = layout.pivoted {
+            pivotedHandle(arm, angle: position)
+                .gesture(armGesture(layout))
+                .simultaneousGesture(TapGesture().onEnded { tapTonearm() })
+                .sensoryFeedback(.selection, trigger: snapTrack)
+        } else {
+            carriageHandle(layout, position: position)
+                .gesture(armGesture(layout))
+                .simultaneousGesture(TapGesture().onEnded { tapTonearm() })
+                .sensoryFeedback(.selection, trigger: snapTrack)
         }
-        .frame(width: 64, height: length + 48, alignment: .top)
-        .rotationEffect(.degrees(angle), anchor: .top)
-        .position(x: layout.pivot.x, y: layout.pivot.y + (length + 48) / 2)
-        .overlay {
-            Circle()
-                .fill(
-                    RadialGradient(colors: [.white, Color(white: 0.7)], center: .center, startRadius: 0, endRadius: 14)
-                )
-                .frame(width: 28, height: 28).shadow(color: .black.opacity(0.25), radius: 2, y: 2)
-                .position(layout.pivot)
-        }
-        .gesture(armGesture(layout))
-        .simultaneousGesture(TapGesture().onEnded { tapTonearm() })
-        .sensoryFeedback(.selection, trigger: snapTrack)
     }
 
-    /// The display unfolded into the tracklist, over the platter, inset from the plinth's edge.
+    /// A pivoted arm's targets, turned with it: a band 14 pt wide round the drawn tube, so a touch just beside it
+    /// reaches the record, and generous circles round the headshell (where a finger naturally takes the arm, and
+    /// what VoiceOver calls the tonearm) and the pivot.
+    private func pivotedHandle(_ arm: PivotedArm, angle: Double) -> some View {
+        let m = ArmMetrics(arm: arm)
+        let pad: CGFloat = 40
+        let size = CGSize(width: m.width + pad * 2, height: m.height + pad * 2)
+        let pivot = CGPoint(x: m.pivot.x + pad, y: m.pivot.y + pad)
+        let grip = CGPoint(x: m.grip.x + pad, y: m.grip.y + pad)
+        return ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(TubeBand(metrics: m, style: design.armStyle, pad: pad))
+            Circle().fill(Color.white.opacity(0.001)).frame(width: 48, height: 48)
+                .position(pivot)
+            Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
+                .modifier(TonearmAccessibility(value: armValue, nudge: nudge))
+                .position(grip)
+        }
+        .frame(width: size.width, height: size.height)
+        .rotationEffect(.degrees(angle), anchor: UnitPoint(x: pivot.x / size.width, y: pivot.y / size.height))
+        .position(x: arm.pivot.x - pivot.x + size.width / 2, y: arm.pivot.y - pivot.y + size.height / 2)
+    }
+
+    /// The linear carriage's target: a generous circle round the carriage and its cartridge.
+    private func carriageHandle(_ layout: DeckLayout, position: Double) -> some View {
+        let stylus = layout.needle(at: position)
+        return Circle().fill(Color.white.opacity(0.001)).frame(width: 64, height: 64)
+            .modifier(TonearmAccessibility(value: armValue, nudge: nudge))
+            .position(x: stylus.x, y: stylus.y - layout.recordRadius * 0.08)
+    }
+
+    /// The display unfolded into the tracklist, over the platter, inset from the plinth's edge, in the display's ink.
     @ViewBuilder
-    private func tracklistPanel(_ layout: DeckLayout) -> some View {
+    private func tracklistPanel(_ layout: DeckLayout, _ paint: DeckPaint) -> some View {
         if tracklistOpen {
             // A tap beside the panel, on the plinth's rim, folds it back as well.
             Color.clear
@@ -557,7 +517,8 @@ struct DeckStage: View {
             // An explicit z-index: without one, a ZStack draws a view leaving it under its siblings, and the fold
             // would play out hidden behind the plinth.
             DeckTracklist(
-                playback: playback, theme: theme, pick: { pickFromDisplay($0) }, fold: { foldTracklist() }
+                playback: playback, theme: theme.withDisplay(ink: paint.displayInk, back: paint.displayBack),
+                pick: { pickFromDisplay($0) }, fold: { foldTracklist() }
             )
             .padding(DeckTracklist.inset)
             .frame(width: layout.size.width, height: layout.size.height)
@@ -573,7 +534,7 @@ struct DeckStage: View {
     private func loupe(_ layout: DeckLayout) -> some View {
         if let armDrag {
             let timeline = playback.sideTimeline(playback.currentSide)
-            let raw = layout.arm.fraction(forAngle: armDrag) * timeline.total
+            let raw = layout.travel.fraction(forPosition: armDrag) * timeline.total
             let (local, offset) = timeline.locate(raw)
             let index = sideFirstTrack + local
             let title = playback.tracks.indices.contains(index) ? playback.tracks[index].title : ""
@@ -602,19 +563,22 @@ struct DeckStage: View {
         return sides.indices.contains(playback.currentSide) ? sides[playback.currentSide].tracks.lowerBound : 0
     }
 
+    /// The arm (or the carriage) under a finger: it follows the finger along its travel, clicking into track gaps,
+    /// and drops the needle where it is let go.
     private func armGesture(_ layout: DeckLayout) -> some Gesture {
-        DragGesture(minimumDistance: 2, coordinateSpace: .local)
+        let travel = layout.travel
+        return DragGesture(minimumDistance: 2, coordinateSpace: .local)
             .onChanged { value in
                 guard playback.album != nil, !handoff.isRunning else { return }
                 // A hand on the arm takes it from a swing in flight, park included: it lands where the hand drops it.
                 if swing != nil { endSwing() }
-                let raw = min(max(layout.angle(toward: value.location), layout.arm.restAngle), layout.arm.runoutAngle)
+                let raw = travel.clamped(travel.position(toward: value.location))
                 let timeline = playback.sideTimeline(playback.currentSide)
-                let seconds = layout.arm.fraction(forAngle: raw) * timeline.total
+                let seconds = travel.fraction(forPosition: raw) * timeline.total
                 // Gaps are bands about 1.5 % of the side wide: wide enough to feel, narrow enough to pass.
                 let snapped = timeline.snapped(seconds, tolerance: timeline.total * 0.015)
-                if raw >= layout.arm.leadInAngle, let track = snapped.track, timeline.total > 0 {
-                    armDrag = layout.arm.angle(forFraction: snapped.seconds / timeline.total)
+                if raw >= travel.leadIn, let track = snapped.track, timeline.total > 0 {
+                    armDrag = travel.position(forFraction: snapped.seconds / timeline.total)
                     snapTrack = track
                 } else {
                     armDrag = raw
@@ -622,12 +586,13 @@ struct DeckStage: View {
                 }
             }
             .onEnded { _ in
-                guard let angle = armDrag else { return }
+                guard let position = armDrag else { return }
                 armDrag = nil
                 snapTrack = nil
-                guard angle >= layout.arm.leadInAngle - 1 else { return }
+                // Let go short of the record, the arm goes back to its rest without seeking.
+                guard position >= travel.leadIn - 1 else { return }
                 let timeline = playback.sideTimeline(playback.currentSide)
-                let seconds = layout.arm.fraction(forAngle: angle) * timeline.total
+                let seconds = travel.fraction(forPosition: position) * timeline.total
                 let side = playback.currentSide
                 Task { await playback.seek(side: side, to: seconds) }
             }
@@ -748,7 +713,7 @@ struct DeckStage: View {
     // MARK: Text
 
     private func bands(_ layout: DeckLayout) -> [CGFloat] {
-        layout.bands(for: playback.sideTimeline(playback.currentSide))
+        RecordFace.bands(for: playback.sideTimeline(playback.currentSide))
     }
 
     private var armValue: String {
@@ -763,256 +728,19 @@ struct DeckStage: View {
     }
 }
 
-/// The deck's dot-matrix screen and what it says: track code, title, artist, time, and the rate and depth. A view of
-/// its own because it reads the player's position, which changes ten times a second: only this screen redraws.
-/// Tapping it unfolds the record's tracklist (plan 9 §3), when `open` is given.
-struct DeckScreen: View {
-    let playback: PlaybackController
-    let theme: Theme
-    let size: CGSize
-    var open: (() -> Void)?
-
-    /// Where the screen sits on a plinth of `size`: bottom right, under the platter. The unfolding tracklist grows
-    /// out of this frame.
-    static func frame(in size: CGSize) -> CGRect {
-        let w = size.width * 0.5
-        let h: CGFloat = 38
-        return CGRect(x: size.width - w - size.width * 0.045, y: size.height - h - 12, width: w, height: h)
-    }
-
-    var body: some View {
-        let lines = lcdLines
-        let frame = Self.frame(in: size)
-        DotMatrixScreen(lines: lines, ink: theme.lcdInk, back: theme.lcdBack)
-            .frame(width: frame.width, height: frame.height)
-            .contentShape(RoundedRectangle(cornerRadius: 6))
-            .onTapGesture { open?() }
-            .position(x: frame.midX, y: frame.midY)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(lines.joined(separator: ", "))
-            .modifier(UnfoldAction(open: open))
-            .accessibilityIdentifier("deckDisplay")
-    }
-
-    /// The screen is a button only while there is a tracklist to unfold: then it says so and activates; otherwise
-    /// it is plain text.
-    private struct UnfoldAction: ViewModifier {
-        let open: (() -> Void)?
-
-        func body(content: Content) -> some View {
-            if let open {
-                content
-                    .accessibilityAddTraits(.isButton)
-                    .accessibilityHint("Unfolds the record's tracklist")
-                    .accessibilityAction { open() }
-            } else {
-                content
-            }
-        }
-    }
-
-    private var sideLetter: String? {
-        let sides = playback.layout.sides
-        return sides.indices.contains(playback.currentSide) ? sides[playback.currentSide].letter : nil
-    }
-
-    private var lcdLines: [String] {
-        guard let album = playback.album else { return ["NO RECORD", "—"] }
-        let format = playback.player.signal.source.map { "\($0.sampleRate / 1000)K/\($0.bitsPerSample)" } ?? ""
-        if let index = playback.trackIndex {
-            let track = playback.tracks[index]
-            return [
-                "\(playback.layout.code(ofTrack: index)) \(track.title.uppercased())·\(track.artist.uppercased())",
-                "\(ClockFormat.clock(playback.player.position.seconds))  33⅓  \(format)",
-            ]
-        }
-        return ["\(album.title.uppercased())·\(album.artist.uppercased())", "CUE \(sideLetter ?? "A")1  33⅓"]
-    }
-}
-
-/// A record: the art as a picture disc under fine grooves, lighter bands at the track gaps, a centre label and the
-/// spindle hole. Its inputs are plain values, so SwiftUI redraws it only when the record changes, never per frame:
-/// the spin is a rotation applied to it.
-struct RecordDisc: View, Equatable {
-    let albumID: String
-    let artwork: Data?
-    /// Track-gap radii, as fractions of the record's radius.
-    let bands: [CGFloat]
-    let grooveInk: Color
-
-    var body: some View {
-        ZStack {
-            ArtworkView(albumID: albumID, artwork: artwork, pixels: 900)
-            Canvas { context, size in
-                let c = CGPoint(x: size.width / 2, y: size.height / 2)
-                let r = size.width / 2
-                var radius = r * 0.98
-                while radius > r * 0.36 {
-                    let ring = Path(
-                        ellipseIn: CGRect(x: c.x - radius, y: c.y - radius, width: radius * 2, height: radius * 2))
-                    context.stroke(ring, with: .color(grooveInk.opacity(0.22)), lineWidth: 0.7)
-                    radius -= 2.4
-                }
-                for band in bands {
-                    let b = r * band
-                    let ring = Path(ellipseIn: CGRect(x: c.x - b, y: c.y - b, width: b * 2, height: b * 2))
-                    context.stroke(ring, with: .color(.white.opacity(0.55)), lineWidth: 1.6)
-                }
-            }
-            Circle().strokeBorder(.black.opacity(0.35), lineWidth: 1.5).padding(0)
-            // The label.
-            GeometryReader { proxy in
-                let s = proxy.size.width
-                ZStack {
-                    ArtworkView(albumID: albumID, artwork: artwork)
-                        .frame(width: s * 0.3, height: s * 0.3)
-                        .clipShape(Circle())
-                        .overlay(Circle().strokeBorder(.white.opacity(0.4), lineWidth: 1))
-                    Circle().fill(Color(white: 0.86)).frame(width: max(6, s * 0.03), height: max(6, s * 0.03))
-                }
-                .frame(width: s, height: s)
-            }
-        }
-        .clipShape(Circle())
-        .compositingGroup()
-    }
-}
-
-/// The still light sheen on the record: it stays put while the record turns under it.
-struct RecordSheen: View {
-    var body: some View {
-        AngularGradient(
-            stops: [
-                .init(color: .clear, location: 0), .init(color: .clear, location: 0.06),
-                .init(color: .white.opacity(0.26), location: 0.08), .init(color: .clear, location: 0.12),
-                .init(color: .clear, location: 0.52), .init(color: .white.opacity(0.16), location: 0.56),
-                .init(color: .clear, location: 0.6), .init(color: .clear, location: 1),
-            ], center: .center, angle: .degrees(300)
-        )
-        .clipShape(Circle())
-        .allowsHitTesting(false)
-    }
-}
-
-/// The S-shaped tonearm, hanging down from its pivot at the top centre of its frame, with the headshell at the
-/// bottom. The deck rotates it about the pivot.
-struct TonearmShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        var tube = Path()
-        let x = rect.midX
-        let h = rect.height - 18
-        tube.move(to: CGPoint(x: x, y: 8))
-        tube.addCurve(
-            to: CGPoint(x: x, y: h * 0.88), control1: CGPoint(x: x + 9, y: h * 0.45),
-            control2: CGPoint(x: x - 11, y: h * 0.7))
-        var path = tube.strokedPath(StrokeStyle(lineWidth: 5, lineCap: .round))
-        // The headshell, angled as on a real S-arm.
-        let head = CGRect(x: x - 6, y: h * 0.86, width: 12, height: 26)
-        path.addPath(
-            Path(roundedRect: head, cornerRadius: 3)
-                .applying(
-                    CGAffineTransform(translationX: head.midX, y: head.minY).rotated(by: -0.28)
-                        .translatedBy(x: -head.midX, y: -head.minY)))
-        // The counterweight behind the pivot.
-        path.addPath(Path(roundedRect: CGRect(x: x - 7, y: -2, width: 14, height: 14), cornerRadius: 4))
-        return path
-    }
-}
-
-/// The deck's dot-matrix screen: SF Mono through a pixel grid, with a faint glow.
-struct DotMatrixScreen: View {
-    let lines: [String]
-    let ink: Color
-    let back: Color
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 6).fill(back)
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                    Text(line).lineLimit(1)
-                }
-            }
-            .font(.system(size: 10, weight: .bold, design: .monospaced))
-            .tracking(0.8)
-            .foregroundStyle(ink)
-            .shadow(color: ink.opacity(0.6), radius: 3)
-            .padding(.horizontal, 8)
-            DotGrid(back: back)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-/// The pixel grid laid over the dot-matrix faces: dark lines between the dots break the glyphs into a matrix. It
-/// stays put while what is under it scrolls, as a real display's pixels do.
-struct DotGrid: View {
-    let back: Color
-
-    var body: some View {
-        Canvas { context, size in
-            var x: CGFloat = 0
-            while x < size.width {
-                context.fill(
-                    Path(CGRect(x: x, y: 0, width: 0.6, height: size.height)), with: .color(back.opacity(0.75)))
-                x += 1.6
-            }
-            var y: CGFloat = 0
-            while y < size.height {
-                context.fill(
-                    Path(CGRect(x: 0, y: y, width: size.width, height: 0.6)), with: .color(back.opacity(0.75)))
-                y += 1.6
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-}
-
-/// The dark loupe that follows a hand on the deck: what is under the needle, to the millisecond, over a waveform
-/// hint. The waveform is a placeholder drawn from the track's index until the library supplies real peaks.
-struct Loupe: View {
-    let heading: String
+/// The tonearm's handle as VoiceOver reads it: "Tonearm", where the needle is on the side, and adjustable by 15 s.
+private struct TonearmAccessibility: ViewModifier {
     let value: String
-    let detail: String?
-    let seed: Int
-    let phase: Double
-    @Environment(\.isMonochrome) private var mono
+    let nudge: (Double) -> Void
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(heading).font(.system(size: 10, weight: .semibold, design: .monospaced)).lineLimit(1)
-            Text(value).font(.system(size: 22, weight: .bold, design: .monospaced)).monospacedDigit()
-                .accessibilityIdentifier("loupeValue")
-            if let detail {
-                Text(detail).font(.system(size: 11, design: .monospaced)).opacity(0.75)
+    func body(content: Content) -> some View {
+        content
+            .accessibilityElement()
+            .accessibilityLabel("Tonearm")
+            .accessibilityValue(value)
+            .accessibilityIdentifier("tonearmHandle")
+            .accessibilityAdjustableAction { direction in
+                nudge(direction == .increment ? 15 : -15)
             }
-            Canvas { context, size in
-                let bars = 44
-                let w = size.width / CGFloat(bars)
-                for i in 0..<bars {
-                    let x = Double(i) + phase * 8
-                    let h = 0.25 + 0.75 * abs(sin(x * 0.37 + Double(seed)) * cos(x * 0.11 + Double(seed) * 0.7))
-                    let fade = 1 - abs(Double(i) - Double(bars) / 2) / Double(bars) * 1.4
-                    let bar = CGRect(
-                        x: CGFloat(i) * w, y: size.height * (1 - h) / 2, width: w * 0.55, height: size.height * h)
-                    context.fill(
-                        Path(bar),
-                        with: .color(
-                            (mono ? Color(white: 0.9) : Color(red: 0.49, green: 1, blue: 0.7)).opacity(max(0.2, fade))))
-                }
-                context.fill(
-                    Path(CGRect(x: size.width / 2 - 0.75, y: -2, width: 1.5, height: size.height + 4)),
-                    with: .color(.white))
-            }
-            .frame(width: 150, height: 20)
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color(white: 0.07)))
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 8)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("deckLoupe")
     }
 }
