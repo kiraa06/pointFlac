@@ -112,13 +112,17 @@ struct DeckStage: View {
     /// The tonearm swinging to a song the tracklist chose (plan 9 §3), instead of snapping to it. On the same side it
     /// swings straight there, over 0.6 s. On the other side the record turns over first while the arm parks at rest,
     /// and then the arm drops. Under Reduce Motion the arm fades out where it was and in where it goes. Once it has
-    /// landed, the side's live position drives the arm again.
+    /// landed, the side's live position drives the arm again. A hand on the arm or the record, or the player landing on
+    /// another song (Next, Previous, a drop), ends it at once: the arm never pulls back to a song the music has left.
     struct ArmSwing {
         let serial: Int
         /// The arm's angle when the jump came.
         let from: Double
         let track: Int
         let side: Int
+        /// The song chosen is the one playing: the player only seeks back to its start, so the live position is the
+        /// old one until the seek lands, and the swing aims at the start throughout.
+        let restart: Bool
         /// When the arm starts to move. A jump from the unfolded display holds it until the display has nearly
         /// folded away, so the swing is seen rather than played out under the panel.
         let began: Date
@@ -250,13 +254,18 @@ struct DeckStage: View {
         .onChange(of: playback.lastJump) { _, jump in
             if let jump { startSwing(jump) }
         }
+        .onChange(of: playback.trackIndex) { _, track in
+            // The player landed on another song than the one chosen (Next or Previous, a drop, the side playing on):
+            // the arm follows the music from here, not the jump.
+            if let swing, let track, track != swing.track { endSwing() }
+        }
         .task(id: swing?.serial) {
             // The swing hands the arm back once it has landed and the player has reached the song (a slow start
             // would otherwise pull the arm back to the old groove for a moment), or after a second more regardless.
             guard let current = swing else { return }
             try? await Task.sleep(for: .seconds(max(0, current.began.timeIntervalSinceNow) + current.duration))
             let deadline = Date().addingTimeInterval(1)
-            while !Task.isCancelled, playback.trackIndex != current.track, Date() < deadline {
+            while !Task.isCancelled, !reached(current), Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(50))
             }
             if !Task.isCancelled, swing?.serial == current.serial { swing = nil }
@@ -324,12 +333,25 @@ struct DeckStage: View {
     }
 
     /// The song's groove: the live position once the player plays it (so the hand-back is seamless), its start until
-    /// then.
+    /// then. A restart aims at the start throughout: until its seek lands, the live position is the old one.
     private func swingTarget(_ swing: ArmSwing, _ layout: DeckLayout) -> Double {
-        if playback.trackIndex == swing.track, playback.player.status != .ended { return liveArmAngle(layout) }
+        if !swing.restart, playback.trackIndex == swing.track, playback.player.status != .ended {
+            return liveArmAngle(layout)
+        }
         let total = playback.sideTimeline(swing.side).total
         guard total > 0 else { return layout.arm.leadInAngle }
         return layout.arm.angle(forFraction: playback.layout.offset(ofTrack: swing.track) / total)
+    }
+
+    /// The player is at the swing's song (back near its start, for a restart), so the live position can take over.
+    private func reached(_ swing: ArmSwing) -> Bool {
+        playback.trackIndex == swing.track && (!swing.restart || playback.player.position.seconds < 1.5)
+    }
+
+    /// A hand took over, or the music moved elsewhere: the arm goes back to following the needle at once. The
+    /// record's flip, if one ran, stays claimed, since the jump that caused it is still on its way to the player.
+    private func endSwing() {
+        swing = nil
     }
 
     /// Under Reduce Motion the arm does not travel: it fades out where it was and back in at the song.
@@ -367,8 +389,9 @@ struct DeckStage: View {
             }
         }
         swing = ArmSwing(
-            serial: jump.serial, from: from, track: jump.track, side: side, began: now.addingTimeInterval(hold),
-            park: turns && !reduceMotion ? Self.flipSeconds : 0, fades: reduceMotion)
+            serial: jump.serial, from: from, track: jump.track, side: side, restart: playback.trackIndex == jump.track,
+            began: now.addingTimeInterval(hold), park: turns && !reduceMotion ? Self.flipSeconds : 0,
+            fades: reduceMotion)
     }
 
     /// The swing's easing: quick off the mark, a touch past the groove (a 1.8 % overshoot, like a light spring) and
@@ -387,9 +410,6 @@ struct DeckStage: View {
 
     // MARK: The display's tracklist
 
-    /// How far the unfolded display sits inside the plinth's edge.
-    static let panelInset: CGFloat = 8
-
     /// Something to list, and nothing else under way.
     private var canUnfold: Bool {
         playback.album != nil && !playback.tracks.isEmpty && !handoff.isRunning
@@ -397,15 +417,11 @@ struct DeckStage: View {
 
     private func unfoldTracklist() {
         guard canUnfold else { return }
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.25) : .spring(duration: 0.45, bounce: 0.15)) {
-            tracklistOpen = true
-        }
+        withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { tracklistOpen = true }
     }
 
     private func foldTracklist() {
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.25) : .spring(duration: 0.45, bounce: 0.15)) {
-            tracklistOpen = false
-        }
+        withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { tracklistOpen = false }
     }
 
     /// A song picked on the display plays at once; the display folds back a beat later, once the inverted bar has
@@ -416,26 +432,6 @@ struct DeckStage: View {
             try? await Task.sleep(for: .milliseconds(250))
             foldTracklist()
         }
-    }
-
-    /// The panel grows out of the display: scaled about the point that maps the panel's frame onto the display's, so
-    /// at the start it is exactly the display, and fading in on the way. Under Reduce Motion, a cross-fade.
-    private func unfold(_ layout: DeckLayout) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        let size = layout.size
-        let inset = Self.panelInset
-        let display = DeckScreen.frame(in: size)
-        let panel = CGSize(width: size.width - inset * 2, height: size.height - inset * 2)
-        guard panel.width > display.width, panel.height > display.height else { return .opacity }
-        let scale = CGSize(width: display.width / panel.width, height: display.height / panel.height)
-        // The fixed point A of a scale s that takes the panel's edge (at `inset`) to the display's: A + s(inset - A)
-        // is the display's edge.
-        let anchor = UnitPoint(
-            x: (display.minX - inset * scale.width) / (1 - scale.width) / size.width,
-            y: (display.minY - inset * scale.height) / (1 - scale.height) / size.height)
-        return .modifier(
-            active: Unfold(scale: scale, anchor: anchor, opacity: 0),
-            identity: Unfold(scale: CGSize(width: 1, height: 1), anchor: anchor, opacity: 1))
     }
 
     // MARK: Pieces
@@ -563,9 +559,12 @@ struct DeckStage: View {
             DeckTracklist(
                 playback: playback, theme: theme, pick: { pickFromDisplay($0) }, fold: { foldTracklist() }
             )
-            .padding(Self.panelInset)
+            .padding(DeckTracklist.inset)
             .frame(width: layout.size.width, height: layout.size.height)
-            .transition(unfold(layout))
+            .transition(
+                DeckTracklist.unfold(
+                    from: DeckScreen.frame(in: layout.size), in: layout.size, reduceMotion: reduceMotion)
+            )
             .zIndex(2)
         }
     }
@@ -607,6 +606,8 @@ struct DeckStage: View {
         DragGesture(minimumDistance: 2, coordinateSpace: .local)
             .onChanged { value in
                 guard playback.album != nil, !handoff.isRunning else { return }
+                // A hand on the arm takes it from a swing in flight, park included: it lands where the hand drops it.
+                if swing != nil { endSwing() }
                 let raw = min(max(layout.angle(toward: value.location), layout.arm.restAngle), layout.arm.runoutAngle)
                 let timeline = playback.sideTimeline(playback.currentSide)
                 let seconds = layout.arm.fraction(forAngle: raw) * timeline.total
@@ -689,6 +690,7 @@ struct DeckStage: View {
     /// The finger takes hold of the record: the picture stops under it, where it was, and the music follows the hand.
     private func engageJog() {
         guard var current = jog, !current.engaged else { return }
+        endSwing()
         current.engaged = true
         current.baseAngle = spin.angle(at: Date.timeIntervalSinceReferenceDate)
         current.degrees = 0
@@ -721,6 +723,7 @@ struct DeckStage: View {
 
     private func jogBy(_ seconds: Double) {
         guard playback.trackIndex != nil else { return }
+        endSwing()
         let side = playback.currentSide
         let target = playback.sidePosition + seconds
         Task { await playback.seek(side: side, to: target) }
@@ -732,6 +735,7 @@ struct DeckStage: View {
 
     private func tapTonearm() {
         guard !handoff.isRunning, playback.album != nil, !playback.isPlaying else { return }
+        endSwing()
         Task { await playback.dropNeedleOnCuedSide() }
     }
 
@@ -786,10 +790,25 @@ struct DeckScreen: View {
             .position(x: frame.midX, y: frame.midY)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(lines.joined(separator: ", "))
-            .accessibilityAddTraits(open == nil ? [] : .isButton)
-            .accessibilityHint(open == nil ? "" : "Unfolds the record's tracklist")
-            .accessibilityAction { open?() }
+            .modifier(UnfoldAction(open: open))
             .accessibilityIdentifier("deckDisplay")
+    }
+
+    /// The screen is a button only while there is a tracklist to unfold: then it says so and activates; otherwise
+    /// it is plain text.
+    private struct UnfoldAction: ViewModifier {
+        let open: (() -> Void)?
+
+        func body(content: Content) -> some View {
+            if let open {
+                content
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Unfolds the record's tracklist")
+                    .accessibilityAction { open() }
+            } else {
+                content
+            }
+        }
     }
 
     private var sideLetter: String? {
@@ -947,160 +966,6 @@ struct DotGrid: View {
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-}
-
-/// The deck's display unfolded over the platter (plan 9 §3): the record's songs in the dot-matrix face, side by side,
-/// as `A1  IGNITION  3:10`, with the playing song inverted. A song tapped plays and the display folds back; the header
-/// folds it back without playing anything.
-struct DeckTracklist: View {
-    let playback: PlaybackController
-    let theme: Theme
-    let pick: (Int) -> Void
-    let fold: () -> Void
-    /// The rows' face, growing with Dynamic Type up to what the panel can hold.
-    @ScaledMetric(relativeTo: .subheadline) private var face: CGFloat = 14
-    /// The song just tapped: inverted at once, before the player has moved to it.
-    @State private var picked: Int?
-
-    private var playing: Int? { picked ?? playback.trackIndex }
-    private var size: CGFloat { min(face, 22) }
-    /// 34 pt at the 14 pt face, and in step with it: the rows keep their rhythm as the face grows.
-    private var rowHeight: CGFloat { size * 34 / 14 }
-    private var ink: Color { theme.lcdInk }
-    private var back: Color { theme.lcdBack }
-
-    var body: some View {
-        let list = Tracklist(tracks: playback.tracks, layout: playback.layout)
-        ZStack {
-            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(back)
-            VStack(alignment: .leading, spacing: 0) {
-                header(list)
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            ForEach(list.sides) { side in
-                                Text("— SIDE \(side.letter) —")
-                                    .font(.system(size: size * 0.8, weight: .bold, design: .monospaced))
-                                    .tracking(1)
-                                    .foregroundStyle(ink.opacity(0.6))
-                                    .padding(.horizontal, 8)
-                                    .padding(.top, 10)
-                                    .padding(.bottom, 4)
-                                    .accessibilityLabel("Side \(side.letter)")
-                                    .accessibilityAddTraits(.isHeader)
-                                ForEach(side.songs) { song in
-                                    row(song, codeWidth: codeWidth(list)).id(song.index)
-                                }
-                            }
-                        }
-                        .padding(.bottom, 8)
-                    }
-                    .scrollIndicators(.hidden)
-                    .scrollBounceBehavior(.basedOnSize)
-                    .onAppear {
-                        if let playing { proxy.scrollTo(playing, anchor: .center) }
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 10)
-            DotGrid(back: back)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(ink.opacity(0.12), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(theme.isDark ? 0.45 : 0.3), radius: 20, y: 12)
-        .sensoryFeedback(.selection, trigger: picked)
-        .accessibilityElement(children: .contain)
-        .accessibilityAddTraits(.isModal)
-        .accessibilityAction(.escape) { fold() }
-        .accessibilityIdentifier("deckTracklist")
-    }
-
-    /// `NIGHT DRIVE   5 TRK 19:05`, a shade dimmer than the rows. Tapping it folds the display back.
-    private func header(_ list: Tracklist) -> some View {
-        let album = playback.album
-        return Button(action: fold) {
-            HStack(spacing: 12) {
-                Text((album?.title ?? "").uppercased())
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                Text("\(list.songCount) TRK \(Tracklist.clock(list.seconds))")
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .font(.system(size: size * 0.82, weight: .bold, design: .monospaced))
-            .tracking(1)
-            .foregroundStyle(ink.opacity(0.72))
-            .shadow(color: ink.opacity(0.35), radius: 3)
-            .padding(.horizontal, 8)
-            .frame(minHeight: 30)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(album?.title ?? ""), \(list.spokenSummary)")
-        .accessibilityHint("Folds the display back")
-        .accessibilityIdentifier("deckTracklistHeader")
-    }
-
-    /// The code column: as wide as the longest code in the face (SF Mono's glyphs are 0.6 em, plus the tracking), so
-    /// the titles line up and an "A10" never pushes its title out of line.
-    private func codeWidth(_ list: Tracklist) -> CGFloat {
-        let longest = list.sides.flatMap(\.songs).map(\.code.count).max() ?? 2
-        return CGFloat(longest) * (size * 0.6 + 1)
-    }
-
-    private func row(_ song: Tracklist.Song, codeWidth: CGFloat) -> some View {
-        let current = song.index == playing
-        return Button {
-            withAnimation(.easeOut(duration: 0.15)) { picked = song.index }
-            pick(song.index)
-        } label: {
-            HStack(spacing: 14) {
-                Text(song.code)
-                    .fixedSize()
-                    .frame(minWidth: codeWidth, alignment: .leading)
-                Text(song.title.uppercased())
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(Tracklist.clock(song.seconds))
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .font(.system(size: size, weight: .bold, design: .monospaced))
-            .tracking(1)
-            .foregroundStyle(current ? back : ink)
-            .shadow(color: current ? .clear : ink.opacity(0.5), radius: 3)
-            .padding(.horizontal, 8)
-            .frame(minHeight: rowHeight)
-            .background {
-                if current {
-                    RoundedRectangle(cornerRadius: 4, style: .continuous).fill(ink)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Tracklist.label(song))
-        .accessibilityValue(current ? "Playing" : "")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityIdentifier("deckTrack-\(song.index)")
-    }
-}
-
-/// The unfolding display's in-between: scaled about `anchor` and faded.
-private struct Unfold: ViewModifier {
-    let scale: CGSize
-    let anchor: UnitPoint
-    let opacity: Double
-
-    func body(content: Content) -> some View {
-        content
-            .scaleEffect(x: scale.width, y: scale.height, anchor: anchor)
-            .opacity(opacity)
     }
 }
 

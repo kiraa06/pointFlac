@@ -133,7 +133,7 @@ final class PlayerUITests: XCTestCase {
         let button = app.buttons["tracklistButton"]
         XCTAssertTrue(button.waitForExistence(timeout: 3))
         button.tap()
-        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Last Exit'")).firstMatch
+        let row = app.buttons["tracklistTrack-4"]
         XCTAssertTrue(row.waitForExistence(timeout: 3))
         // VoiceOver reads the row as the record's back does: code, title, exact time.
         XCTAssertEqual(row.label, "B2, Last Exit, 3 minutes 40 seconds")

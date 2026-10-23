@@ -104,7 +104,7 @@ struct PlayerScreen: View {
                     try? await Task.sleep(for: .milliseconds(100))
                 }
                 try? await Task.sleep(for: .milliseconds(500))
-                withAnimation(.spring(duration: 0.45, bounce: 0.15)) { deckTracklistOpen = true }
+                withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { deckTracklistOpen = true }
             }
         #endif
     }
@@ -163,9 +163,7 @@ struct PlayerScreen: View {
         Color.clear
             .contentShape(StageHole(hole: stageFrame), eoFill: true)
             .onTapGesture {
-                withAnimation(reduceMotion ? .easeInOut(duration: 0.25) : .spring(duration: 0.45, bounce: 0.15)) {
-                    deckTracklistOpen = false
-                }
+                withAnimation(DeckTracklist.animation(reduceMotion: reduceMotion)) { deckTracklistOpen = false }
             }
             .accessibilityHidden(true)
     }

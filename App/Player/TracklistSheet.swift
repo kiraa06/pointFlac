@@ -2,84 +2,6 @@ import PFDesign
 import SwiftUI
 import UIKit
 
-/// The record's songs as the back of its sleeve lists them (plan 9 §3): side by side, each with its code, title and
-/// exact time, and each side's total. The sheet and the deck's unfolded display both read from it, so they never
-/// disagree about a time or a code.
-struct Tracklist {
-    struct Song: Identifiable {
-        /// The album track index, which `PlaybackController.jump(toTrack:)` takes.
-        let index: Int
-        /// "A1", "B2": side letter and place on the side.
-        let code: String
-        let title: String
-        let seconds: Double
-        var id: Int { index }
-    }
-
-    struct Side: Identifiable {
-        let letter: String
-        let seconds: Double
-        let songs: [Song]
-        var id: String { letter }
-    }
-
-    let sides: [Side]
-    let songCount: Int
-    let seconds: Double
-
-    init(tracks: [TrackRow], layout: SideLayout) {
-        sides = layout.sides.map { side in
-            Side(
-                letter: side.letter, seconds: side.duration,
-                songs: side.tracks.compactMap { index in
-                    guard tracks.indices.contains(index) else { return nil }
-                    let length = tracks[index].durationSeconds
-                    return Song(
-                        index: index, code: layout.code(ofTrack: index), title: tracks[index].title,
-                        seconds: length.isFinite && length > 0 ? length : 0)
-                })
-        }
-        songCount = tracks.count
-        seconds = layout.sides.reduce(0) { $0 + $1.duration }
-    }
-
-    /// "5 SONGS · 19:05 · 2 SIDES", as the sleeve's back prints it.
-    var summary: String {
-        "\(songCount) \(songCount == 1 ? "SONG" : "SONGS") · \(Self.clock(seconds)) · \(sides.count) "
-            + (sides.count == 1 ? "SIDE" : "SIDES")
-    }
-
-    /// The summary as VoiceOver reads it: "5 songs, 19 minutes 5 seconds, 2 sides".
-    var spokenSummary: String {
-        "\(Self.count(songCount, "song")), \(Self.spoken(seconds)), \(Self.count(sides.count, "side"))"
-    }
-
-    /// A row as VoiceOver reads it: "A1, Ignition, 3 minutes 10 seconds".
-    static func label(_ song: Song) -> String {
-        "\(song.code), \(song.title), \(spoken(song.seconds))"
-    }
-
-    /// m:ss to the nearest second. A length, not a position: a 3:09.998 song is a 3:10 song, so the sheet and the
-    /// display print what VoiceOver says.
-    static func clock(_ seconds: Double) -> String {
-        ClockFormat.clock(seconds.rounded())
-    }
-
-    /// "3 minutes 10 seconds", "4 minutes", "45 seconds".
-    static func spoken(_ seconds: Double) -> String {
-        let whole = seconds.isFinite ? max(0, Int(seconds.rounded())) : 0
-        let minutes = whole / 60
-        let rest = whole % 60
-        if minutes == 0 { return count(rest, "second") }
-        if rest == 0 { return count(minutes, "minute") }
-        return "\(count(minutes, "minute")) \(count(rest, "second"))"
-    }
-
-    private static func count(_ n: Int, _ word: String) -> String {
-        "\(n) \(word)\(n == 1 ? "" : "s")"
-    }
-}
-
 /// The back-cover tracklist (plan 9 §3), opened from the song line under the title in Deck and Cover alike: the
 /// sleeve, title, artist and year, and format, then the record's songs by side. The playing song is tinted in the
 /// record's colour, with moving bars in place of its code. Tapping a song plays the record from it, and the sheet
@@ -93,8 +15,15 @@ struct TracklistSheet: View {
     /// The code column, wide enough for "A10" in the row's caption face, growing with Dynamic Type.
     @ScaledMetric(relativeTo: .footnote) private var codeWidth: CGFloat = 28
     @ScaledMetric(relativeTo: .body) private var rowHeight: CGFloat = 46
+    /// The playing bars grow with the code they stand in for, up to a point.
+    @ScaledMetric(relativeTo: .footnote) private var barScale: CGFloat = 1
     /// The song just tapped: tinted at once, before the player has moved to it.
     @State private var picked: Int?
+    /// For the opening scroll: the scroll view's height, the playing row's bottom edge in it, and whether the scroll
+    /// has been decided (once, when the sheet opens).
+    @State private var viewport: CGFloat = 0
+    @State private var playingBottom: CGFloat?
+    @State private var positioned = false
 
     private var playing: Int? { picked ?? playback.trackIndex }
 
@@ -108,8 +37,12 @@ struct TracklistSheet: View {
     /// The playing row's wash.
     private var wash: Color { accent.opacity(0.12) }
 
-    /// The playing title: the accent, darkened (or, on a dark sheet, lightened) until it reads at 4.5:1 on the wash.
+    /// The bars' colour: the accent, darkened (or, on a dark sheet, lightened) until it reads at 4.5:1 on the wash.
     private var tint: Color { accent.readable(on: theme.background, under: wash) }
+
+    /// The playing title: the tint, or under Monochrome the ink itself. A grey lifted only to 4.5:1 would read
+    /// quieter than the songs around it, as if disabled; the bars, the wash and the weight mark it already.
+    private var titleTint: Color { theme.isMonochrome ? theme.ink : tint }
 
     var body: some View {
         let list = Tracklist(tracks: playback.tracks, layout: playback.layout)
@@ -120,19 +53,22 @@ struct TracklistSheet: View {
                         header(album)
                             .padding(.horizontal, 12)
                     }
-                    Text(list.summary)
-                        .font(.caption2.monospaced().weight(.semibold))
-                        .tracking(1.2)
-                        .foregroundStyle(theme.inkSecondary)
+                    summary(list)
                         .padding(.horizontal, 12)
                         .padding(.top, 18)
-                        .accessibilityLabel(list.spokenSummary)
                     ForEach(list.sides) { side in
                         sideHeader(side)
                             .padding(.horizontal, 12)
                         ForEach(side.songs) { song in
                             row(song)
                                 .id(song.index)
+                                .onGeometryChange(for: CGFloat.self) {
+                                    $0.frame(in: .scrollView).maxY
+                                } action: { bottom in
+                                    guard song.index == playback.trackIndex else { return }
+                                    playingBottom = bottom
+                                    openingScroll(list, proxy)
+                                }
                         }
                     }
                 }
@@ -141,9 +77,11 @@ struct TracklistSheet: View {
                 .padding(.bottom, 24)
             }
             .scrollBounceBehavior(.basedOnSize)
-            .onAppear {
-                // No anchor: only as far as it takes to show the playing row, so the header stays when it can.
-                if let playing { proxy.scrollTo(playing) }
+            .onGeometryChange(for: CGFloat.self) {
+                $0.size.height
+            } action: { height in
+                viewport = height
+                openingScroll(list, proxy)
             }
         }
         .presentationDetents([.medium, .large])
@@ -154,10 +92,23 @@ struct TracklistSheet: View {
 
     // MARK: Pieces
 
-    /// The sleeve, title, artist and year, and the format; at the accessibility sizes the format moves under the
-    /// artist, so the title keeps the width.
+    /// The sheet opens with the playing song in view, scrolling only when it has to: never for the record's first
+    /// song (the header above it matters more), nor for one already in view. Otherwise the song lands in the lower
+    /// part of the sheet, keeping as much of what is above it as it can.
+    private func openingScroll(_ list: Tracklist, _ proxy: ScrollViewProxy) {
+        guard !positioned, viewport > 0, let bottom = playingBottom, let playing = playback.trackIndex else { return }
+        positioned = true
+        let first = list.sides.first?.songs.first?.index
+        guard playing != first, bottom > viewport - 4 else { return }
+        proxy.scrollTo(playing, anchor: UnitPoint(x: 0.5, y: 0.75))
+    }
+
+    /// The sleeve, title, artist and year, and the format. At the accessibility sizes the text takes the full height
+    /// beside the sleeve, top-aligned: the artist, the year and the format each on a line of their own, so nothing is
+    /// left dangling where a long line breaks.
     private func header(_ album: AlbumCard) -> some View {
-        HStack(alignment: .center, spacing: 14) {
+        let large = typeSize.isAccessibilitySize
+        return HStack(alignment: large ? .top : .center, spacing: 14) {
             ArtworkView(albumID: album.id, artwork: album.artwork)
                 .frame(width: 58, height: 58)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -171,15 +122,22 @@ struct TracklistSheet: View {
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(theme.ink)
                     .lineLimit(2)
-                Text(album.year.map { "\(album.artist) · \($0)" } ?? album.artist)
+                if large {
+                    Group {
+                        Text(album.artist)
+                        if let year = album.year { Text(verbatim: String(year)) }
+                    }
                     .font(.subheadline)
                     .foregroundStyle(theme.inkSecondary)
-                    .lineLimit(2)
-                if typeSize.isAccessibilitySize {
                     format(album)
+                } else {
+                    Text(album.year.map { "\(album.artist) · \($0)" } ?? album.artist)
+                        .font(.subheadline)
+                        .foregroundStyle(theme.inkSecondary)
+                        .lineLimit(2)
                 }
             }
-            if !typeSize.isAccessibilitySize {
+            if !large {
                 Spacer(minLength: 10)
                 format(album)
             }
@@ -195,6 +153,23 @@ struct TracklistSheet: View {
             .foregroundStyle(theme.inkSecondary)
             .lineLimit(1)
             .fixedSize()
+    }
+
+    /// `5 SONGS · 19:05 · 2 SIDES` on one line when it fits, else its three parts stacked, so no separator is left
+    /// dangling at a line's end.
+    private func summary(_ list: Tracklist) -> some View {
+        ViewThatFits(in: .horizontal) {
+            Text(list.summary)
+                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(list.summaryParts, id: \.self) { Text($0) }
+            }
+        }
+        .font(.caption2.monospaced().weight(.semibold))
+        .tracking(1.2)
+        .foregroundStyle(theme.inkSecondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(list.spokenSummary)
     }
 
     /// "SIDE A  10:05", then a hairline across the rest of the row.
@@ -223,8 +198,10 @@ struct TracklistSheet: View {
             HStack(spacing: 14) {
                 ZStack(alignment: .leading) {
                     if current {
-                        PlayingBars(colour: tint, moving: playback.isPlaying && !reduceMotion)
-                            .transition(.opacity)
+                        PlayingBars(
+                            colour: tint, moving: playback.isPlaying && !reduceMotion, scale: min(barScale, 1.6)
+                        )
+                        .transition(.opacity)
                     } else {
                         Text(song.code)
                             .font(.footnote.monospaced().weight(.semibold))
@@ -236,7 +213,7 @@ struct TracklistSheet: View {
                 .frame(width: codeWidth, alignment: .leading)
                 Text(song.title)
                     .font(current ? .body.weight(.semibold) : .body)
-                    .foregroundStyle(current ? tint : theme.ink)
+                    .foregroundStyle(current ? titleTint : theme.ink)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Text(Tracklist.clock(song.seconds))
@@ -256,10 +233,8 @@ struct TracklistSheet: View {
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(RowPress(wash: theme.ink.opacity(0.05)))
-        .accessibilityElement(children: .ignore)
         .accessibilityLabel(Tracklist.label(song))
         .accessibilityValue(current ? "Playing" : "")
-        .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("tracklistTrack-\(song.index)")
     }
 
@@ -289,23 +264,24 @@ private struct RowPress: ButtonStyle {
 }
 
 /// The playing song's three bars, in place of its code: 3.5 pt wide, rising from 4 to 14 pt and back once a second,
-/// each a third of a beat behind the last. They stand still at mid height while the record is paused, and under
-/// Reduce Motion.
+/// each a third of a beat behind the last, all scaled by `scale` with the type. They stand still at mid height while
+/// the record is paused, and under Reduce Motion.
 struct PlayingBars: View {
     let colour: Color
     let moving: Bool
+    var scale: CGFloat = 1
 
     var body: some View {
         TimelineView(.animation(minimumInterval: nil, paused: !moving)) { context in
             let now = context.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .bottom, spacing: 2.5) {
+            HStack(alignment: .bottom, spacing: 2.5 * scale) {
                 ForEach(0..<3, id: \.self) { bar in
-                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    RoundedRectangle(cornerRadius: scale, style: .continuous)
                         .fill(colour)
-                        .frame(width: 3.5, height: height(bar, at: now))
+                        .frame(width: 3.5 * scale, height: height(bar, at: now) * scale)
                 }
             }
-            .frame(height: 14, alignment: .bottom)
+            .frame(height: 14 * scale, alignment: .bottom)
         }
         .accessibilityHidden(true)
     }

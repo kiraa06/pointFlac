@@ -17,6 +17,8 @@ struct SharedControls: View {
     /// Shows the Sound tab, from the signal details.
     var openSound: () -> Void = {}
     @State private var tracklistOpen = false
+    /// The song line's chevron, in step with the line's type up to a point.
+    @ScaledMetric(relativeTo: .subheadline) private var chevronSize: CGFloat = 9
 
     private var player: Player { playback.player }
 
@@ -96,9 +98,8 @@ struct SharedControls: View {
                 Text(subtitle)
                     .font(Typeface.artist)
                     .lineLimit(1)
-                    .accessibilityIdentifier("nowPlayingSubtitle")
                 Image(systemName: "chevron.up")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: min(chevronSize, 16), weight: .semibold))
                     .fixedSize()
             }
             .foregroundStyle(theme.inkSecondary)
