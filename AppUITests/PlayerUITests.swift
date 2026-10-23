@@ -123,6 +123,45 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// The tracklist (plan 9 §3): the song line opens the back-cover sheet, and a song tapped there plays, on the
+    /// other side of the record here (Last Exit is B2).
+    @MainActor
+    func testTracklistJumpsToLastTrack() {
+        let app = launch(demoPlay: true)
+        let title = app.staticTexts["nowPlayingTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 8))
+        let button = app.buttons["tracklistButton"]
+        XCTAssertTrue(button.waitForExistence(timeout: 3))
+        button.tap()
+        let row = app.buttons["tracklistTrack-4"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        // VoiceOver reads the row as the record's back does: code, title, exact time.
+        XCTAssertEqual(row.label, "B2, Last Exit, 3 minutes 40 seconds")
+        row.tap()
+        expectation(for: NSPredicate(format: "label == 'Last Exit'"), evaluatedWith: title)
+        waitForExpectations(timeout: 5)
+    }
+
+    /// The deck's own tracklist (plan 9 §3): the dot-matrix display unfolds over the platter, and a song picked there
+    /// plays while the display folds back.
+    @MainActor
+    func testDeckDisplayUnfoldsAndJumps() {
+        let app = launch(demoPlay: true)
+        let title = app.staticTexts["nowPlayingTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 8))
+        let display = app.descendants(matching: .any)["deckDisplay"]
+        XCTAssertTrue(display.waitForExistence(timeout: 3))
+        display.tap()
+        let list = app.descendants(matching: .any)["deckTracklist"]
+        XCTAssertTrue(list.waitForExistence(timeout: 3))
+        let row = app.descendants(matching: .any)["deckTrack-1"]
+        XCTAssertTrue(row.waitForExistence(timeout: 2))
+        row.tap()
+        expectation(for: NSPredicate(format: "label == 'Neon Mile'"), evaluatedWith: title)
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: list)
+        waitForExpectations(timeout: 5)
+    }
+
     /// Spec §4.3 and §6.4: turning the record scrubs (the music follows the hand), and letting go spins it back up and
     /// plays on, with the strip back from "Scrubbing".
     @MainActor
@@ -284,7 +323,7 @@ final class PlayerUITests: XCTestCase {
         XCTAssertTrue(confirm.waitForExistence(timeout: 3))
         confirm.tap()
 
-        let screen = app.descendants(matching: .any)["deckScreen"]
+        let screen = app.descendants(matching: .any)["deckDisplay"]
         expectation(for: NSPredicate(format: "label BEGINSWITH 'NO RECORD'"), evaluatedWith: screen)
         waitForExpectations(timeout: 5)
         XCTAssertFalse(app.buttons["result-album-Night Drive"].exists)
