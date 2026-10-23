@@ -86,7 +86,12 @@ let package = Package(
         // Stream D: the player UI's maths (sides, spin, tonearm, jog, the hand-off timeline). Foundation only.
         .target(
             name: "PFDesign",
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                // The Galaxy layout and physics run inside a frame budget, so they are optimised in Debug builds too
+                // (as PFSearch is): unoptimised, placing a thousand albums takes seconds and misstates the cost.
+                .unsafeFlags(["-O"], .when(configuration: .debug)),
+            ]
         ),
         .testTarget(
             name: "PFDesignTests",
