@@ -73,6 +73,14 @@ struct ShelfPanel: View {
             chips
             controls
             if showsGalaxy {
+                // The galaxy has no footer, so the import or deletion note sits above it instead.
+                if let importNote {
+                    Text(importNote).font(.footnote).foregroundStyle(theme.inkSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
+                        .accessibilityIdentifier("importNote")
+                }
                 galaxy
             } else {
                 ScrollView {
