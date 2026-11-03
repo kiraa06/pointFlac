@@ -44,6 +44,22 @@ public enum SafeFileName {
         return result
     }
 
+    /// A remote name (an artist, an album) as one folder name, for filing a download in a folder the user picked:
+    /// the same cleaning as a file name, so no separator, control or bidi character survives, and no leading dot or
+    /// space, so the folder is never hidden, "." or "..". `nil` when nothing usable is left.
+    public static func folderName(_ remote: String) -> String? {
+        let name = cleaned(cleaned(remote).precomposedStringWithCanonicalMapping)
+        let visible = String(
+            String.UnicodeScalarView(
+                name.unicodeScalars.drop { $0 == "." || CharacterSet.whitespacesAndNewlines.contains($0) })
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = truncated(visible, toBytes: maxBytes)
+        guard !result.isEmpty, !result.unicodeScalars.contains(where: forbidden.contains),
+            result.unicodeScalars.first != "."
+        else { return nil }
+        return result
+    }
+
     /// Splits `path` at the given separator scalars, keeping empty components.
     public static func components(of path: String, separators: Set<Unicode.Scalar>) -> [String] {
         var parts: [String] = []
