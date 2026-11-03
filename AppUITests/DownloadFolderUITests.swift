@@ -64,7 +64,8 @@ final class DownloadFolderUITests: XCTestCase {
     }
 
     /// The folder disappears after launch: the download still finishes, in the app, its row says so, and Settings
-    /// shows the folder as unavailable with a way to choose it again.
+    /// shows the folder as unavailable, with downloads going to pointFlac and a way to choose it again. Once the folder
+    /// is back, returning to the app finds it and clears the mark on its own.
     @MainActor
     func testDownloadFallsBackWhenTheFolderIsUnreachable() throws {
         let folder = try makeFolder()
@@ -84,6 +85,17 @@ final class DownloadFolderUITests: XCTestCase {
         link.tap()
         XCTAssertTrue(app.descendants(matching: .any)["downloadFolderUnavailable"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["downloadDestinationChooseAgain"].exists)
+        // Downloads go to pointFlac now, so that is what is ticked.
+        XCTAssertTrue(app.buttons["downloadDestinationApp"].isSelected)
+        XCTAssertFalse(app.descendants(matching: .any)["downloadDestinationFolder"].isSelected)
+
+        // The folder comes back; back in the app, the check finds it.
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(app.buttons["downloadDestinationChange"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.descendants(matching: .any)["downloadFolderUnavailable"].exists)
+        XCTAssertFalse(app.buttons["downloadDestinationApp"].isSelected)
 
         // The song was saved in the app, so it is on the shelf all the same.
         _ = findOnShelf(app, "Paper Moons")

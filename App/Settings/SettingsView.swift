@@ -100,9 +100,15 @@ struct SettingsView: View {
                 DownloadFolderView(folder: folder)
             } label: {
                 LabeledContent("Save downloads to") {
-                    Text(folder.summary)
-                        .foregroundStyle(unavailable ? AnyShapeStyle(warn) : AnyShapeStyle(.secondary))
-                        .accessibilityIdentifier("downloadFolderValue")
+                    // The icon says it without colour, for Monochrome and for anyone who can't tell the warn colour.
+                    HStack(spacing: 4) {
+                        if unavailable {
+                            Image(systemName: "exclamationmark.triangle.fill").accessibilityHidden(true)
+                        }
+                        Text(folder.summary)
+                    }
+                    .foregroundStyle(unavailable ? AnyShapeStyle(warn) : AnyShapeStyle(.secondary))
+                    .accessibilityIdentifier("downloadFolderValue")
                 }
             }
             .accessibilityIdentifier("downloadFolderLink")

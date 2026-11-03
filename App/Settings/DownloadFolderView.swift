@@ -52,7 +52,13 @@ struct DownloadFolderView: View {
         }
     }
 
-    private var appSelected: Bool { folder.status == .app }
+    /// Where downloads actually go: the app by default, and while the picked folder can't be reached.
+    private var appSelected: Bool {
+        switch folder.status {
+        case .app, .unavailable: true
+        case .folder: false
+        }
+    }
 
     private var appOption: some View {
         Button {
@@ -82,8 +88,9 @@ struct DownloadFolderView: View {
         .accessibilityIdentifier("downloadDestinationApp")
     }
 
-    /// "A folder in Files…" until one is picked; then the folder, ticked, with "Change…" (or "Choose again…" below,
-    /// while it can't be reached).
+    /// "A folder in Files…" until one is picked; then the folder with "Change…", ticked while downloads go there.
+    /// While it can't be reached it is not ticked ("In pointFlac" is, since downloads go there), and the warning below
+    /// offers "Choose again…".
     @ViewBuilder
     private var folderOption: some View {
         switch folder.status {
@@ -93,15 +100,16 @@ struct DownloadFolderView: View {
                 .accessibilityHint("Opens Files to pick the folder downloads are saved to.")
                 .accessibilityIdentifier("downloadDestinationFolder")
         case .folder(let name), .unavailable(let name):
+            let selected = !appSelected
             HStack {
                 Label(name, systemImage: "folder")
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(selected ? .primary : .secondary)
                 Spacer(minLength: 8)
-                checkmark(true)
+                checkmark(selected)
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Folder \(name)")
-            .accessibilityAddTraits(.isSelected)
+            .accessibilityLabel(selected ? "Folder \(name)" : "Folder \(name), unavailable")
+            .accessibilityAddTraits(selected ? .isSelected : [])
             .accessibilityIdentifier("downloadDestinationFolder")
             if case .folder = folder.status {
                 Button("Change…") { picking = true }
