@@ -172,19 +172,73 @@ struct DownloadDestinationTests {
         let album = root.appending(path: "Ada Vale/Paper Moons")
         try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
         let stale = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
-        let fresh = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
         let theirs = album.appending(path: ".notes")
-        for url in [stale, fresh, theirs] { try Data("partial".utf8).write(to: url) }
-        let old = Date().addingTimeInterval(-120)
-        for url in [stale, theirs] {
-            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
-        }
+        for url in [stale, theirs] { try Data("partial".utf8).write(to: url) }
+        // Age is measured from the file's last status change, which can't be set back: the test waits instead.
+        Thread.sleep(forTimeInterval: 0.6)
+        let fresh = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
+        try Data("partial".utf8).write(to: fresh)
 
-        _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+        _ = try DownloadDestination(partialsStaleAfter: 0.4).save(
+            try Self.staged(folder), track: Self.track(), into: root)
 
         #expect(!FileManager.default.fileExists(atPath: stale.path))
         #expect(FileManager.default.fileExists(atPath: fresh.path))
         #expect(FileManager.default.fileExists(atPath: theirs.path))
+    }
+
+    @Test("a partial just made is not swept, though a clone keeps its source's old dates")
+    func freshCloneIsNotSwept() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let album = root.appending(path: "Ada Vale/Paper Moons")
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        // Another save's copy in flight: cloned from a staged file downloaded long ago, so its dates are old.
+        let inFlight = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
+        try Data("partial".utf8).write(to: inFlight)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3600), .creationDate: Date().addingTimeInterval(-3600)],
+            ofItemAtPath: inFlight.path)
+
+        _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+
+        #expect(FileManager.default.fileExists(atPath: inFlight.path))
+    }
+
+    @Test("a root that can't even be looked at (a file where a parent folder should be) is unreachable")
+    func unreadableRootIsUnreachable() throws {
+        let folder = try TempFolder()
+        let file = folder.url.appending(path: "File")
+        try Data("x".utf8).write(to: file)
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(
+                try Self.staged(folder), track: Self.track(), into: file.appending(path: "Picked"))
+        }
+        #expect(failure?.folderUnreachable == true)
+    }
+
+    @Test("a fault below a root that still takes files is this download's only")
+    func faultBelowAHealthyRoot() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let artist = root.appending(path: "Ada Vale")
+        try FileManager.default.createDirectory(at: artist, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: artist.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: artist.path) }
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+        }
+        #expect(failure?.folderUnreachable == false)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: artist.path).isEmpty)
+    }
+
+    @Test("running out of space is never the folder's fault: an empty probe file would pass, and flip it back")
+    func noSpaceIsThisDownloads() {
+        for code in [ENOSPC, EDQUOT] {
+            let failure = DownloadDestination.classify(code, doing: "couldn't write it")
+            #expect(!failure.folderUnreachable)
+            #expect(failure.reason == "not enough space in the folder")
+        }
     }
 
     @Test("an artist or album named like an app or a bundle gets a folder a library scan still reads")

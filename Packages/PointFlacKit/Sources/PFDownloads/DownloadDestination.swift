@@ -19,9 +19,11 @@ import Synchronization
 /// download goes into that folder. The write is coordinated (`NSFileCoordinator`), as a file provider's folder
 /// (iCloud Drive) expects, and gives up after `coordinationTimeout` if the provider never grants it.
 ///
-/// Every failure says whether the folder itself is at fault (`Failure.folderUnreachable`: it is gone, refused, full,
-/// or its storage is not responding, so later downloads would fail too) or only this download is (a file in the
-/// way, too many copies, a provider that took too long).
+/// Every failure says whether the folder itself is at fault (`Failure.folderUnreachable`: it is gone or not a folder,
+/// refuses access, or its storage is not responding, so later downloads would fail too) or only this download is.
+/// Only the picked folder itself decides that: a fault below it (in an artist or album folder, or writing the file)
+/// is this download's, unless the folder then fails the same probe Settings uses to tell a folder that is back.
+/// Running out of space is always this download's: an empty probe file would still fit, and flip the folder back.
 ///
 /// There are no bookmarks or security scope here: the caller resolves the folder and holds access while this runs,
 /// so tests can use a plain temporary directory. Every call does blocking file I/O: run it off Swift's cooperative
@@ -78,8 +80,9 @@ public struct DownloadDestination: Sendable {
     /// Hidden names this type writes: a copy on its way into place, and the reachability probe.
     static let partialPrefix = ".pointflac-saving-"
     static let probePrefix = ".pointflac-probe-"
-    /// A temporary file of ours this old, that this process is not writing, was left by a run that was killed.
-    static let staleAfter: TimeInterval = 60
+    /// A temporary file of ours whose status last changed this long ago, that this process is not writing, was left
+    /// by a run that was killed.
+    public static let staleAfter: TimeInterval = 60
     /// The temporary names this process is writing right now: never swept.
     private static let inFlight = Mutex<Set<String>>([])
 
@@ -89,14 +92,18 @@ public struct DownloadDestination: Sendable {
     let coordinationTimeout: Duration
     /// Whether a file's bytes are on the device; injectable, since a test has no iCloud.
     let isDownloaded: @Sendable (URL) -> Bool
+    /// The age past which a partial copy of ours is a killed run's (`staleAfter`); shorter in tests.
+    let partialsStaleAfter: TimeInterval
 
     public init(
         maxCopies: Int = 999, coordinationTimeout: Duration = .seconds(120),
-        isDownloaded: @escaping @Sendable (URL) -> Bool = DownloadDestination.bytesAreLocal
+        isDownloaded: @escaping @Sendable (URL) -> Bool = DownloadDestination.bytesAreLocal,
+        partialsStaleAfter: TimeInterval = DownloadDestination.staleAfter
     ) {
         self.maxCopies = max(1, maxCopies)
         self.coordinationTimeout = coordinationTimeout
         self.isDownloaded = isDownloaded
+        self.partialsStaleAfter = partialsStaleAfter
     }
 
     /// The folders below the picked one that `track` is filed in: its album artist (or artist), then its album; none
@@ -116,16 +123,26 @@ public struct DownloadDestination: Sendable {
         guard lstat(staged.path, &source) == 0, source.st_mode & S_IFMT == S_IFREG else {
             throw .fileOnly("the downloaded file is missing")
         }
+        do {
+            return try saveBelow(folder, staged: staged, size: source.st_size, track: track)
+        } catch {
+            // A fault below the folder is this download's, unless the folder itself no longer takes a file.
+            do { try Self.probe(folder) } catch let root where root.folderUnreachable { throw root } catch {}
+            throw error
+        }
+    }
+
+    private func saveBelow(_ folder: URL, staged: URL, size: off_t, track: RemoteTrack) throws(Failure) -> Saved {
         let name =
             SafeFileName.sanitize(track.fileName) ?? SafeFileName.sanitize(staged.lastPathComponent) ?? "track.flac"
         let directory = try Self.makeFolders(Self.folders(for: track), under: folder)
-        Self.sweepPartials(in: directory)
+        Self.sweepPartials(in: directory, olderThan: partialsStaleAfter)
         // `sanitize` always ends a name in a lower-case ".flac".
         let stem = String(name.dropLast(5))
         for copy in 1...maxCopies {
             let candidate = directory.appending(
                 path: copy == 1 ? name : "\(stem) (\(copy)).flac", directoryHint: .notDirectory)
-            switch try place(staged, size: source.st_size, at: candidate) {
+            switch try place(staged, size: size, at: candidate) {
             case .placed(let identity): return Saved(url: candidate, isNew: true, identity: identity)
             case .identical: return Saved(url: candidate, isNew: false)
             case .taken: continue
@@ -152,13 +169,13 @@ public struct DownloadDestination: Sendable {
     /// would, so a folder that is back can be told from one still gone, refused or full.
     public static func probe(_ folder: URL) throws(Failure) {
         try requireFolder(folder)
-        sweepPartials(in: folder)
+        sweepPartials(in: folder, olderThan: staleAfter)
         let name = probePrefix + UUID().uuidString
         let url = folder.appending(path: name, directoryHint: .notDirectory)
         inFlight.withLock { _ = $0.insert(name) }
         defer { inFlight.withLock { _ = $0.remove(name) } }
         let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw classify(errno, doing: "couldn't write a test file") }
+        guard descriptor >= 0 else { throw rootFailure(errno) }
         close(descriptor)
         unlink(url.path)
     }
@@ -178,11 +195,15 @@ public struct DownloadDestination: Sendable {
 
     // MARK: Folders
 
-    /// The picked folder must be there and be a folder; it is never made here.
+    /// The picked folder must be there and be a folder; it is never made here. Anything wrong with it is the
+    /// folder's fault.
     private static func requireFolder(_ folder: URL) throws(Failure) {
         var info = stat()
         guard stat(folder.path, &info) == 0 else {
-            throw errno == ENOENT ? .unreachable("the folder is not there") : classify(errno, doing: "couldn't open it")
+            let code = errno
+            throw code == ENOENT
+                ? .unreachable("the folder is not there")
+                : .unreachable("the folder can't be opened (\(String(cString: strerror(code))))")
         }
         guard info.st_mode & S_IFMT == S_IFDIR else { throw .unreachable("the folder is not a folder any more") }
     }
@@ -208,32 +229,42 @@ public struct DownloadDestination: Sendable {
         return directory
     }
 
-    /// Deletes our own temporary files in `directory` that a killed run left: older than `staleAfter`, and not being
-    /// written by this process. Nothing else is touched.
-    static func sweepPartials(in directory: URL) {
+    /// Deletes our own temporary files in `directory` that a killed run left: not being written by this process, and
+    /// whose status last changed (`st_ctime`) more than `age` ago. Not the modification date: a clone keeps its
+    /// source's dates, so a copy made a moment ago can carry the date of a download from last week. Nothing else is
+    /// touched.
+    static func sweepPartials(in directory: URL, olderThan age: TimeInterval) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
         let mine = inFlight.withLock { $0 }
-        let cutoff = Date().addingTimeInterval(-staleAfter).timeIntervalSince1970
+        let cutoff = Date().addingTimeInterval(-age).timeIntervalSince1970
         for name in names where name.hasPrefix(partialPrefix) || name.hasPrefix(probePrefix) {
             guard !mine.contains(name) else { continue }
             let path = directory.appending(path: name).path
             var info = stat()
-            guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
-                TimeInterval(info.st_mtimespec.tv_sec) < cutoff
-            else { continue }
+            guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { continue }
+            let changed = TimeInterval(info.st_ctimespec.tv_sec) + TimeInterval(info.st_ctimespec.tv_nsec) / 1e9
+            guard changed < cutoff else { continue }
             unlink(path)
         }
     }
 
-    /// Sorts an `errno` into the folder's fault (later downloads would fail too) or this download's.
+    /// A fault below the picked folder: this download's (`save` then asks the folder itself, with `probe`).
     static func classify(_ code: Int32, doing: String) -> Failure {
         switch code {
+        case ENOSPC, EDQUOT: .fileOnly("not enough space in the folder")
+        default: .fileOnly("\(doing) (\(String(cString: strerror(code))))")
+        }
+    }
+
+    /// A fault writing in the picked folder itself (the probe): the folder's, except running out of space.
+    static func rootFailure(_ code: Int32) -> Failure {
+        switch code {
+        case ENOSPC, EDQUOT: .fileOnly("not enough space in the folder")
         case EACCES, EPERM, EROFS: .unreachable("pointFlac isn't allowed to write there")
-        case ENOSPC, EDQUOT: .unreachable("there's no space left")
-        case ENOENT: .unreachable("the folder is not there")
+        case ENOENT, ENOTDIR: .unreachable("the folder is not there")
         case EIO, ENXIO, ETIMEDOUT, ENOTCONN, ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH:
             .unreachable("the folder's storage isn't responding")
-        default: .fileOnly("\(doing) (\(String(cString: strerror(code))))")
+        default: .unreachable("the folder can't take files (\(String(cString: strerror(code))))")
         }
     }
 
@@ -272,11 +303,11 @@ public struct DownloadDestination: Sendable {
         }
         guard copyfile(staged.path, temporary.path, nil, copyfile_flags_t(COPYFILE_CLONE | COPYFILE_NOFOLLOW_SRC)) == 0
         else { throw classify(errno, doing: "couldn't write it") }
-        if renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 {
-            var info = stat()
-            guard lstat(target.path, &info) == 0 else { throw classify(errno, doing: "couldn't find it after saving") }
-            return .placed(FileIdentity(info))
-        }
+        // Taken before the rename, which keeps the file's volume, inode and size: once the copy has its name, nothing
+        // can stop it being admitted, or taken back as ours.
+        var copied = stat()
+        guard lstat(temporary.path, &copied) == 0 else { throw classify(errno, doing: "couldn't write it") }
+        if renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 { return .placed(FileIdentity(copied)) }
         let failure = errno
         switch failure {
         case EEXIST:
@@ -337,7 +368,8 @@ public struct DownloadDestination: Sendable {
 
     /// Runs `body` under a coordinated write of `target`, waiting at most `timeout` for the file provider to grant it.
     /// Not granted in time: given up, as this download's failure, not the folder's. Once `body` has started it is left
-    /// to finish: a copy is never cut off half way. A provider that refuses outright counts as unreachable.
+    /// to finish: a copy is never cut off half way. A provider that refuses outright fails this file (`save` then asks
+    /// the folder itself).
     private static func coordinatedWrite<T: Sendable>(
         at target: URL, options: NSFileCoordinator.WritingOptions, timeout: Duration,
         _ body: @escaping @Sendable (URL) throws(Failure) -> T
@@ -351,9 +383,9 @@ public struct DownloadDestination: Sendable {
         coordinator.coordinate(with: [intent], queue: queue) { error in
             let proceed = box.phase.withLock { phase -> Bool in
                 guard case .waiting = phase else { return false }
-                if let error {
-                    phase = .finished(
-                        .failure(.unreachable("the folder's storage refused (\(error.localizedDescription))")))
+                if error != nil {
+                    // The provider refused this file; whether the folder is at fault is `save`'s probe to tell.
+                    phase = .finished(.failure(.fileOnly("the folder's storage refused it")))
                     return false
                 }
                 phase = .working
