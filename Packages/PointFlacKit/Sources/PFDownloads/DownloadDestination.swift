@@ -343,7 +343,7 @@ public struct DownloadDestination: Sendable {
         _ body: @escaping @Sendable (URL) throws(Failure) -> T
     ) throws(Failure) -> T {
         let coordinator = NSFileCoordinator(filePresenter: nil)
-        nonisolated(unsafe) let intent = NSFileAccessIntent.writingIntent(with: target, options: options)
+        let intent = NSFileAccessIntent.writingIntent(with: target, options: options)
         let box = PhaseBox<T>()
         let done = DispatchSemaphore(value: 0)
         let queue = OperationQueue()
