@@ -55,10 +55,14 @@ public actor DownloadManager {
 
     /// Hands a validated file to the library. It may move or copy the file; it must throw if it did not keep it.
     public typealias Publish = @Sendable (URL) async throws -> Void
+    /// `Publish`, told which track the file is, so it can file the song by artist and album in a folder the user
+    /// picked. It returns a short line for the Downloads list when the song went somewhere other than asked (the
+    /// folder could not be reached, so it was saved in the app), or `nil`; the line is kept as the job's `note`.
+    public typealias PublishTrack = @Sendable (URL, RemoteTrack) async throws -> String?
 
     private let configuration: Configuration
     private let providers: [String: any DownloadProvider]
-    private let publish: Publish
+    private let publish: PublishTrack
     private let store: DownloadQueueStore?
     private static let log = Logger(subsystem: "io.github.kiraa06.pointflac", category: "downloads")
 
@@ -71,9 +75,18 @@ public actor DownloadManager {
     private var lastGrowthCheck: [String: ContinuousClock.Instant] = [:]
 
     public init(providers: [any DownloadProvider], configuration: Configuration, publish: @escaping Publish) {
+        self.init(providers: providers, configuration: configuration) { file, _ in
+            try await publish(file)
+            return nil
+        }
+    }
+
+    public init(
+        providers: [any DownloadProvider], configuration: Configuration, publishTrack: @escaping PublishTrack
+    ) {
         self.providers = Dictionary(providers.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         self.configuration = configuration
-        self.publish = publish
+        self.publish = publishTrack
         self.store = configuration.stateFile.map(DownloadQueueStore.init(url:))
     }
 
@@ -268,13 +281,15 @@ public actor DownloadManager {
             try setStaged(id, admitted.lastPathComponent)
             // Past this point cancel() refuses, so the library never receives a file from a cancelled job.
             try setState(id, .saving)
+            let note: String?
             do {
-                try await publish(admitted)
+                note = try await publish(admitted, item.track)
             } catch {
                 throw DownloadFailure("the library could not save it: \(error.localizedDescription)", retryable: true)
             }
             update(id) {
                 $0.stagedFileName = nil
+                $0.note = note
                 $0.state = .published
             }
             removeStaging(id)
