@@ -45,11 +45,14 @@ public enum LibraryError: Error, Equatable, Sendable, CustomStringConvertible {
     case overlappingFolder(String)
     /// Artwork must live where the system never purges it (Application Support), not in Caches (§5.4).
     case artworkFolderInCaches
+    /// A file to admit (`Library.admitFile`) is in no folder the library reads, so a scan would never find it.
+    case outsideFolders(String)
 
     public var description: String {
         switch self {
         case .overlappingFolder(let name): "“\(name)” overlaps a folder the library already reads"
         case .artworkFolderInCaches: "The artwork folder must not be in Caches"
+        case .outsideFolders(let name): "“\(name)” is not in a folder the library reads"
         }
     }
 }
@@ -249,6 +252,12 @@ final class LibraryStore {
         try database.query("DELETE FROM folders WHERE id = ?", [.integer(id)])
         roots[id] = nil
         scoped.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+    }
+
+    /// The folder that is, or holds, `url` this launch, if any (the library folder included).
+    func folder(containing url: URL) -> Int64? {
+        let path = Self.comparablePath(url)
+        return roots.first { path.hasPrefix(Self.comparablePath($0.value)) }?.key
     }
 
     var folders: [(id: Int64, name: String)] {
@@ -536,6 +545,50 @@ final class LibraryStore {
                 id: id, folderID: folder, relativePath: file.relativePath, size: file.size, modified: file.modified,
                 contentID: probed.contentID, cloudPending: false))
         report.added.append(id)
+    }
+
+    /// Reads the one file `url`, inside a folder the library reads, as a scan of that folder would read it, and returns
+    /// its track ID: nil when the admission rule refuses it, or it cannot be read now. A file already known, unchanged,
+    /// is not read again. The rest of the folder is not listed, so this costs one file however large the folder is.
+    ///
+    /// For a download just saved into the folder the user picked for downloads. The download is the user asking for
+    /// the song, so a file they removed from the library before (`removed`) comes back. A file a full scan would pass
+    /// over (hidden, or inside a hidden folder) is not admitted, so the next scan cannot take it away again.
+    func admit(file url: URL) throws -> AdmitScan {
+        let parent = Self.comparablePath(url.deletingLastPathComponent())
+        guard
+            let (folder, root) = roots.first(where: { parent.hasPrefix(Self.comparablePath($0.value)) }).map({
+                ($0.key, $0.value)
+            })
+        else { throw LibraryError.outsideFolders(url.lastPathComponent) }
+        let relativePath = String(parent.dropFirst(Self.comparablePath(root).count)) + url.lastPathComponent
+        var report = ScanReport()
+        let components = relativePath.split(separator: "/")
+        guard relativePath.lowercased().hasSuffix(".flac"), !components.contains(where: { $0.hasPrefix(".") }) else {
+            return AdmitScan(report: report, id: nil)
+        }
+        let disk = root.appending(path: relativePath)
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let values = try? disk.resourceValues(forKeys: keys), values.isRegularFile == true else {
+            return AdmitScan(report: report, id: nil)
+        }
+        let file = DiskFile(
+            relativePath: relativePath, url: disk, size: Int64(values.fileSize ?? 0),
+            modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+        let known = try knownTracks()
+        let here = Dictionary(known.filter { $0.folderID == folder }.map { ($0.relativePath, $0) }) { a, _ in a }
+        if let track = here[relativePath], track.size == file.size, track.modified == file.modified {
+            return AdmitScan(report: report, id: track.id)
+        }
+        var missing: [String: KnownTrack] = [:]
+        var byContent: [String: [KnownTrack]] = [:]
+        for track in known { byContent[track.contentID, default: []].append(track) }
+        try database.transaction {
+            try database.query(
+                "DELETE FROM removed WHERE folder_id = ? AND rel_path = ?", [.integer(folder), .text(relativePath)])
+            try scanFile(file, folder: folder, here: here, report: &report, missing: &missing, byContent: &byContent)
+        }
+        return AdmitScan(report: report, id: try trackID(folder: folder, relativePath: relativePath))
     }
 
     /// Remembers `file` as refused, and removes the track that was there: it was music and is not any more.

@@ -168,6 +168,27 @@ public final class Library: Sendable {
         }
     }
 
+    /// Takes in one file just saved inside a folder the library reads, without scanning the rest of that folder, and
+    /// publishes the catalog when it changed: for a download filed into the folder the user picked for downloads,
+    /// which may hold thousands of songs. Returns the file's track ID, so the caller can confirm the catalog has it
+    /// before deleting its own copy; nil when the admission rule refuses the file or it cannot be read now. A file
+    /// the user removed from the library before comes back (`LibraryStore.admit(file:)`). Throws
+    /// `LibraryError.outsideFolders` when no folder the library reads holds the file.
+    public func admitFile(_ url: URL) async throws -> String? {
+        try await run(.ifChanged) { try $0.admit(file: url) }.id
+    }
+
+    /// The folder the library reads that is, or holds, `url`: the library folder, a folder added in place, or nil.
+    /// Lets a caller tell whether a folder inside one already read needs adding (`addFolder` refuses it as
+    /// overlapping, though its files are read already).
+    public func folder(containing url: URL) async -> LibraryFolder? {
+        try? await run(.never) { store in
+            store.folder(containing: url).map { id in
+                LibraryFolder(id: id, name: store.folders.first { $0.id == id }?.name ?? url.lastPathComponent)
+            }
+        }
+    }
+
     /// The folders the library reads: the library folder first, then the folders added in place.
     public func folders() async -> [LibraryFolder] {
         (try? await run(.never) { $0.folders.map { LibraryFolder(id: $0.id, name: $0.name) } })
@@ -348,6 +369,16 @@ private protocol ChangeReporting {
 
 extension ScanReport: ChangeReporting {
     var changedLibrary: Bool { !changedNothing }
+}
+
+/// What admitting one file did (`LibraryStore.admit(file:)`): the scan of that file, and its track, if admitted.
+struct AdmitScan: Sendable {
+    var report: ScanReport
+    var id: String?
+}
+
+extension AdmitScan: ChangeReporting {
+    var changedLibrary: Bool { !report.changedNothing }
 }
 
 private struct ImportScan: Sendable, ChangeReporting {
