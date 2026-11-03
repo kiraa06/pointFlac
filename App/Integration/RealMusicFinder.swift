@@ -19,8 +19,9 @@ import os
 /// - Internet Archive is searched only on Search or a picked suggestion, never per keystroke: one search costs about
 ///   21 requests (one listing, then a metadata call per item).
 /// - Every provider's batches are accumulated here, so each emission is the full list so far, as the UI expects.
-/// - Downloads go through one `DownloadManager`, whose `publish` hands the validated file to the library and then
-///   deletes the staged copy, so a finished download is moved, not duplicated.
+/// - Downloads go through one `DownloadManager`, whose publish step (`DownloadPublisher`) puts the validated file in
+///   the folder the user picked for downloads, or in the app's library, and then deletes the staged copy, so a
+///   finished download is moved, not duplicated.
 @MainActor
 @Observable
 final class RealMusicFinder: MusicFinding {
@@ -46,7 +47,10 @@ final class RealMusicFinder: MusicFinding {
     #endif
 
     #if SOULSEEK
-        init(library: RealLibrary, soulseek client: SoulseekClient, registryEnabled: Bool, artworkEnabled: Bool) {
+        init(
+            library: RealLibrary, soulseek client: SoulseekClient, publisher: DownloadPublisher, registryEnabled: Bool,
+            artworkEnabled: Bool
+        ) {
             self.client = client
             let caches = URL.cachesDirectory
             let soulseek = SoulseekProvider(
@@ -59,11 +63,11 @@ final class RealMusicFinder: MusicFinding {
             self.registryEnabled = registryEnabled
             self.artworkEnabled = artworkEnabled
             smartSearch = Self.makeSmartSearch(library.box, registry: registryEnabled, artwork: artworkEnabled)
-            manager = Self.makeManager(providers: [archive, soulseek], library: library.library)
+            manager = Self.makeManager(providers: [archive, soulseek], publisher: publisher)
             observer = DownloadsObserver(manager: manager)
         }
     #else
-        init(library: RealLibrary, registryEnabled: Bool, artworkEnabled: Bool) {
+        init(library: RealLibrary, publisher: DownloadPublisher, registryEnabled: Bool, artworkEnabled: Bool) {
             let archive = ArchiveProvider()
             self.archive = archive
             providers = [(archive.id, archive.displayName)]
@@ -71,7 +75,7 @@ final class RealMusicFinder: MusicFinding {
             self.registryEnabled = registryEnabled
             self.artworkEnabled = artworkEnabled
             smartSearch = Self.makeSmartSearch(library.box, registry: registryEnabled, artwork: artworkEnabled)
-            manager = Self.makeManager(providers: [archive], library: library.library)
+            manager = Self.makeManager(providers: [archive], publisher: publisher)
             observer = DownloadsObserver(manager: manager)
         }
     #endif
@@ -99,7 +103,8 @@ final class RealMusicFinder: MusicFinding {
             let id = Self.rowID(item.track)
             guard seen.insert(id).inserted else { return nil }
             return DownloadRow(
-                id: id, title: item.track.title, state: Self.label(item.state), progress: Self.progress(item.state))
+                id: id, title: item.track.title, state: Self.label(item.state), progress: Self.progress(item.state),
+                note: item.state == .published ? item.note : nil)
         }
     }
 
@@ -426,10 +431,11 @@ final class RealMusicFinder: MusicFinding {
         }
     }
 
-    /// The manager publishes into the library and deletes the staged file once the library has it (or already had
-    /// it), so a download is moved rather than copied, and publishing the same file twice is harmless. A refusal
-    /// throws, so the job shows as failed instead of done.
-    private static func makeManager(providers: [any DownloadProvider], library: Library) -> DownloadManager {
+    /// The manager publishes through `DownloadPublisher`: into the folder picked for downloads or into the library,
+    /// deleting the staged file once the library has it (or already had it). A refusal throws, so the job shows as
+    /// failed instead of done; a song saved in the app because the folder could not be reached says so in its row.
+    private static func makeManager(providers: [any DownloadProvider], publisher: DownloadPublisher) -> DownloadManager
+    {
         let support = URL.applicationSupportDirectory
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         let configuration = DownloadManager.Configuration(
@@ -441,21 +447,8 @@ final class RealMusicFinder: MusicFinding {
             // On a phone every connection dies whenever iOS suspends the app, so one long transfer can be cut short
             // several times; each retry resumes from the part file. Backoff 1, 2, 4, 8, 16 s.
             maxAttempts: 6)
-        return DownloadManager(providers: providers, configuration: configuration) { file in
-            let result = await library.importFiles([file])
-            if let rejection = result.rejected.first {
-                throw PublishError(message: "\(rejection.fileName): \(rejection.message)")
-            }
-            if let error = result.error { throw PublishError(message: error) }
-            guard !result.added.isEmpty || result.duplicates > 0 else {
-                throw PublishError(message: "the library did not take the file")
-            }
-            try? FileManager.default.removeItem(at: file)
+        return DownloadManager(providers: providers, configuration: configuration) { file, track in
+            try await publisher.publish(file, track: track)
         }
-    }
-
-    struct PublishError: LocalizedError {
-        var message: String
-        var errorDescription: String? { message }
     }
 }

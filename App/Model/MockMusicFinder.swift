@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import PFDownloads
 
 #if DEBUG
 
@@ -8,6 +9,10 @@ import Observation
     /// tester's build, nothing pretends to be a real result.
     ///
     /// Suggestions follow contract 3's shape: the library's hits at once, then the registry's after a short delay.
+    ///
+    /// Given a publisher (DEBUG's `-PFDownloadFolder`), a finished demo download is real: a copy of a bundled demo song,
+    /// Ada Vale's "Fold" from Paper Moons, goes through the app's own publish step, so a UI test can follow a real file
+    /// into the chosen folder and onto the shelf. Without one, nothing is saved, as before.
     @MainActor
     @Observable
     final class MockMusicFinder: MusicFinding {
@@ -15,9 +20,11 @@ import Observation
         private(set) var downloads: [DownloadRow] = []
         @ObservationIgnored private let library: any LibraryBrowsing
         @ObservationIgnored private var transfers: [String: Task<Void, Never>] = [:]
+        @ObservationIgnored private let publisher: DownloadPublisher?
 
-        init(library: any LibraryBrowsing) {
+        init(library: any LibraryBrowsing, publisher: DownloadPublisher? = nil) {
             self.library = library
+            self.publisher = publisher
         }
 
         func search(_ query: String, provider: String) -> AsyncStream<[RemoteResultRow]> {
@@ -82,8 +89,39 @@ import Observation
                 try? await Task.sleep(for: .milliseconds(500))
                 self?.set(row, "Saving", nil)
                 try? await Task.sleep(for: .milliseconds(300))
-                self?.set(row, "Done (demo, nothing saved)", nil)
+                guard let publisher = self?.publisher else {
+                    self?.set(row, "Done (demo, nothing saved)", nil)
+                    return
+                }
+                do {
+                    let note = try await Self.publishDemoSong(for: row, through: publisher)
+                    self?.set(row, "Done", nil, note: note)
+                } catch {
+                    self?.set(row, "Failed: \(error.localizedDescription)", nil)
+                }
             }
+        }
+
+        /// Stages a copy of the bundled "Fold" as a provider would leave a validated download, and publishes it with
+        /// the demo song's own artist and album, so the folder it is filed in matches the album the shelf shows.
+        private static func publishDemoSong(for row: RemoteResultRow, through publisher: DownloadPublisher)
+            async throws -> String?
+        {
+            guard
+                let fixture = Bundle.main.url(
+                    forResource: "demo-paper-moons-01", withExtension: "flac",
+                    subdirectory: "Fixtures")
+            else { throw CocoaError(.fileNoSuchFile) }
+            let staging = FileManager.default.temporaryDirectory.appending(
+                path: "MockDownload-\(UUID().uuidString)", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let staged = staging.appending(path: "01 Fold.flac")
+            try FileManager.default.copyItem(at: fixture, to: staged)
+            let track = RemoteTrack(
+                id: row.id, provider: row.provider, title: "Fold", artist: "Ada Vale", album: "Paper Moons",
+                fileName: "01 Fold.flac")
+            return try await publisher.publish(staged, track: track)
         }
 
         /// Only finished rows go, as with the real manager; the demo's row can then be downloaded again.
@@ -104,9 +142,9 @@ import Observation
             state.hasPrefix("Done") || state.hasPrefix("Failed") || state.hasPrefix("Cancelled")
         }
 
-        private func set(_ row: RemoteResultRow, _ state: String, _ progress: Double?) {
+        private func set(_ row: RemoteResultRow, _ state: String, _ progress: Double?, note: String? = nil) {
             guard let index = downloads.firstIndex(where: { $0.id == row.id }) else { return }
-            downloads[index] = DownloadRow(id: row.id, title: row.title, state: state, progress: progress)
+            downloads[index] = DownloadRow(id: row.id, title: row.title, state: state, progress: progress, note: note)
         }
 
         private func localSuggestions(_ partial: String) -> [Suggestion] {

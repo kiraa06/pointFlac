@@ -1,10 +1,12 @@
 import PFDesign
 import SwiftUI
 
-/// Minimal Settings for the soft launch: the appearance override, Diagnostics (Plan 1's debug library and player,
-/// which the UI tests and the S1 listening checks use), the licences and the version.
+/// Minimal Settings for the soft launch: the appearance override, where downloads are saved, Diagnostics (Plan 1's
+/// debug library and player, which the UI tests and the S1 listening checks use), the licences and the version.
 struct SettingsView: View {
     let model: AppModel
+    @Environment(\.isMonochrome) private var mono
+    @Environment(\.colorScheme) private var scheme
     @AppStorage("appearance") private var appearance: AppearanceOverride = .system
     @AppStorage("monochrome") private var monochrome = false
     @AppStorage(DeckPreferences.designKey) private var deckDesignID = DeckDesign.standard.id
@@ -33,6 +35,7 @@ struct SettingsView: View {
                     }
                     .accessibilityIdentifier("customizeDeckLink")
                 }
+                downloadsSection
                 Section {
                     Toggle("Monochrome", isOn: $monochrome)
                         .accessibilityIdentifier("monochromeToggle")
@@ -83,6 +86,26 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+        }
+    }
+
+    /// Where downloads go: "pointFlac", the picked folder's name, or "Unavailable" in the warning colour while the
+    /// folder can't be reached (then downloads are saved in the app).
+    private var downloadsSection: some View {
+        let folder = model.downloadFolder
+        let unavailable = if case .unavailable = folder.status { true } else { false }
+        let warn = Theme.look(stage: .deck, dark: scheme == .dark, monochrome: mono).warn
+        return Section("Downloads") {
+            NavigationLink {
+                DownloadFolderView(folder: folder)
+            } label: {
+                LabeledContent("Save downloads to") {
+                    Text(folder.summary)
+                        .foregroundStyle(unavailable ? AnyShapeStyle(warn) : AnyShapeStyle(.secondary))
+                        .accessibilityIdentifier("downloadFolderValue")
+                }
+            }
+            .accessibilityIdentifier("downloadFolderLink")
         }
     }
 

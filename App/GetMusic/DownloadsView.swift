@@ -90,8 +90,9 @@ struct DownloadsView: View {
         state.hasPrefix("Failed") || state.hasPrefix("Cancelled")
     }
 
+    /// The state, with progress while transferring; a finished row's note, when it has one, replaces its "Done".
     private func stateLine(_ row: DownloadRow) -> String {
-        guard let progress = row.progress else { return row.state }
+        guard let progress = row.progress else { return row.note ?? row.state }
         return "\(row.state) · \(Int((progress * 100).rounded()))%"
     }
 
