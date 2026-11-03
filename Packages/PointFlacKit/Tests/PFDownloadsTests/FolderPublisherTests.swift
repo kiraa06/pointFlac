@@ -24,7 +24,11 @@ struct FolderPublisherTests {
         let target = Mutex(DownloadTarget.folder(FolderPublisherTests.choice))
         let openFault = Mutex<DownloadDestination.Failure?>(nil)
         let reads = Mutex([true])
-        let addFails = Mutex(false)
+        let reattachment = Mutex(FolderReattachment.reattached)
+        let removed = Mutex<[UUID]>([])
+        /// Run inside `save`, before it answers: a test's way to act mid-publish.
+        let duringSave = Mutex<(@Sendable () -> Void)?>(nil)
+        let saveEntered = Mutex<AsyncStream<Void>.Continuation?>(nil)
         let saveFault = Mutex<DownloadDestination.Failure?>(nil)
         let savedIsNew = Mutex(true)
         let admitted = Mutex<String?>("track-1")
@@ -49,13 +53,16 @@ struct FolderPublisherTests {
                     self.log("reads")
                     return self.reads.withLock { $0.count > 1 ? $0.removeFirst() : $0[0] }
                 },
-                addToLibrary: { _ in
-                    self.log("add")
-                    if self.addFails.withLock({ $0 }) { throw CocoaError(.fileReadUnknown) }
+                reattach: { _ in
+                    self.log("reattach")
+                    return self.reattachment.withLock { $0 }
                 },
+                folderRemoved: { id in self.removed.withLock { $0.append(id) } },
                 save: { _, track, _ in
                     self.log("save \(track.artist ?? "")")
+                    self.saveEntered.withLock { $0 }?.yield()
                     if let gate = self.saveGate.withLock({ $0 }) { await gate.wait() }
+                    self.duringSave.withLock { $0 }?()
                     if let fault = self.saveFault.withLock({ $0 }) { throw fault }
                     return DownloadDestination.Saved(
                         url: FolderPublisherTests.savedURL, isNew: self.savedIsNew.withLock { $0 })
@@ -123,21 +130,46 @@ struct FolderPublisherTests {
         #expect(!world.log.contains("takeBack true"))
     }
 
-    @Test("a folder the library does not read is added first, then the song saved there")
-    func libraryAddsTheFolderFirst() async throws {
+    @Test("a folder the library lost track of (moved, renamed) is found again first, then the song saved there")
+    func libraryFindsTheFolderAgainFirst() async throws {
         let world = World()
         world.reads.withLock { $0 = [false, true] }
         let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
         #expect(note == nil)
-        #expect(world.log.prefix(4) == ["open", "reads", "add", "reads"])
+        #expect(world.log.prefix(4) == ["open", "reads", "reattach", "reads"])
         #expect(world.log.contains("deleteStaged"))
+    }
+
+    @Test("a folder the user removed from the library is not added back: downloads go to the app from now on")
+    func folderRemovedFromTheLibrary() async throws {
+        let world = World()
+        world.reads.withLock { $0 = [false] }
+        world.reattachment.withLock { $0 = .removed }
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        #expect(note == FolderPublisher.inAppNote)
+        #expect(world.removed.withLock { $0 } == [Self.choice])
+        #expect(world.marked.withLock { $0 }.isEmpty)
+        #expect(!world.log.contains { $0.hasPrefix("save") })
+        #expect(world.log.suffix(2) == ["import", "deleteStaged"])
+    }
+
+    @Test("switching to In pointFlac while a download was on its way to the folder: the row says just that")
+    func switchedMidPublish() async throws {
+        let world = World()
+        world.saveFault.withLock { $0 = .unreachable("the folder is not there") }
+        world.duringSave.withLock { $0 = { world.target.withLock { $0 = .app } } }
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        #expect(note == FolderPublisher.inAppNote)
+        // A choice the user has moved on from is not marked.
+        #expect(world.marked.withLock { $0 }.isEmpty)
+        #expect(world.log.suffix(2) == ["import", "deleteStaged"])
     }
 
     @Test("a folder the library still can't read: nothing is copied, the app imports it, the folder stays chosen")
     func libraryNotReadingTheFolder() async throws {
         let world = World()
         world.reads.withLock { $0 = [false] }
-        world.addFails.withLock { $0 = true }
+        world.reattachment.withLock { $0 = .failed }
         let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
         #expect(note == FolderPublisher.notReadNote)
         #expect(!world.log.contains { $0.hasPrefix("save") })
@@ -148,7 +180,7 @@ struct FolderPublisherTests {
     @Test("a folder already known unavailable is not tried: the app imports it, and the row says why")
     func alreadyUnavailable() async throws {
         let world = World()
-        world.target.withLock { $0 = .unavailable }
+        world.target.withLock { $0 = .unavailable(Self.choice) }
         let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
         #expect(note == FolderPublisher.unavailableNote)
         #expect(world.log == ["import", "deleteStaged"])
@@ -204,16 +236,21 @@ struct FolderPublisherTests {
         let world = World()
         let gate = Gate()
         world.saveGate.withLock { $0 = gate }
+        let (entered, enteredContinuation) = AsyncStream.makeStream(of: Void.self)
+        world.saveEntered.withLock { $0 = enteredContinuation }
+        var saves = entered.makeAsyncIterator()
         let publisher = FolderPublisher(steps: world.steps)
-        async let first = publisher.publish(Self.staged, track: Self.track)
-        try await Task.sleep(for: .milliseconds(100))
-        async let second = publisher.publish(Self.staged, track: Self.track)
-        try await Task.sleep(for: .milliseconds(100))
-        // The second has not opened the folder while the first is still saving.
+
+        let first = Task { try await publisher.publish(Self.staged, track: Self.track) }
+        await saves.next()  // The first is inside its save, held at the gate.
+        let second = Task { try await publisher.publish(Self.staged, track: Self.track) }
+        await publisher.gate.untilQueued(1)  // The second is waiting its turn.
+
         #expect(world.log == ["open", "reads", "save Ada Vale"])
         await gate.open()
-        _ = try await (first, second)
-        #expect(world.log.filter { $0 == "open" }.count == 2)
-        #expect(world.log.firstIndex(of: "close")! < world.log.lastIndex(of: "open")!)
+        _ = try await (first.value, second.value)
+        let log = world.log
+        #expect(log.filter { $0 == "open" }.count == 2)
+        #expect(log.firstIndex(of: "close")! < log.lastIndex(of: "open")!)
     }
 }
