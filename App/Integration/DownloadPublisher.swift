@@ -30,7 +30,18 @@ final class DownloadPublisher: Sendable {
                 },
                 open: { try await DownloadFolderStore.perform { try store.open() } },
                 libraryReads: { url in await library.folder(containing: url) != nil },
-                addToLibrary: { url in try await library.addFolder(url) },
+                reattach: { url in
+                    do {
+                        return try await library.reattachFolder(url) ? .reattached : .removed
+                    } catch {
+                        return .failed
+                    }
+                },
+                folderRemoved: { id in
+                    DownloadFolderStore.log.info("download folder removed from the library; downloads go to the app")
+                    store.forget(id)
+                    await folderChanged()
+                },
                 save: { staged, track, folder in
                     try await DownloadFolderStore.perform { try destination.save(staged, track: track, into: folder) }
                 },

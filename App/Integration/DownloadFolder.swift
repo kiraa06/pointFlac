@@ -16,8 +16,9 @@ import os
 /// A choice has an identity (`id`) of its own, so marking it unavailable or refreshing its bookmark never touches a
 /// choice the user has made since, and a refreshed bookmark is still the same choice. `unavailable` is set only when
 /// the folder itself can't take files (it can't be found or is in the trash, access is refused, it is gone or full),
-/// and cleared when a later check finds it reachable again, or when it is chosen again. Every change is saved before
-/// it takes effect, so what Settings shows is what the next launch finds.
+/// and cleared when a later check finds it reachable again, or when it is chosen again. Every change is checked,
+/// saved and applied under one lock, so a change based on an older choice can never overwrite a newer one, and a
+/// change takes effect only once it is saved: what Settings shows is what the next launch finds.
 final class DownloadFolderStore: Sendable {
     struct Choice: Codable, Equatable, Sendable {
         var id = UUID()
@@ -81,7 +82,7 @@ final class DownloadFolderStore: Sendable {
     var target: DownloadTarget {
         switch choice {
         case nil: .app
-        case let choice? where choice.unavailable: .unavailable
+        case let choice? where choice.unavailable: .unavailable(choice.id)
         case let choice?: .folder(choice.id)
         }
     }
@@ -89,23 +90,54 @@ final class DownloadFolderStore: Sendable {
     /// Saves `choice` (nil: "In pointFlac", deleting the saved file), then makes it current. A failed save changes
     /// nothing.
     func choose(_ choice: Choice?) throws {
-        try save(choice)
-        state.withLock { $0 = choice }
+        try state.withLock { current in
+            try save(choice)
+            current = choice
+        }
+    }
+
+    /// Back to "In pointFlac", if the choice is still `id`: its folder was removed from the library.
+    func forget(_ id: UUID) {
+        update(id, "could not forget the download folder") { _ in .forget }
     }
 
     /// Marks the choice `id` unreachable, unless the user has chosen again since.
-    func markUnavailable(_ id: UUID) { setUnavailable(true, id) }
+    func markUnavailable(_ id: UUID) {
+        update(id, "could not save the download folder's state") { choice in
+            choice.unavailable ? .keep : .replace(with(choice) { $0.unavailable = true })
+        }
+    }
 
     /// Clears the mark on the choice `id`: its folder takes files again.
-    func markAvailable(_ id: UUID) { setUnavailable(false, id) }
+    func markAvailable(_ id: UUID) {
+        update(id, "could not save the download folder's state") { choice in
+            choice.unavailable ? .replace(with(choice) { $0.unavailable = false }) : .keep
+        }
+    }
 
-    private func setUnavailable(_ unavailable: Bool, _ id: UUID) {
-        guard var changed = choice, changed.id == id, changed.unavailable != unavailable else { return }
-        changed.unavailable = unavailable
-        do { try save(changed) } catch { Self.log.error("could not save the download folder's state") }
-        // Kept for this launch even if the save failed: the folder's state is a fact, not a preference.
+    private enum Change {
+        case keep
+        case replace(Choice)
+        case forget
+    }
+
+    /// Applies `change` to the current choice if it is still `id`: checked, saved and made current under the lock, so
+    /// no other change can come between. A failed save is logged and changes nothing.
+    private func update(_ id: UUID, _ failure: String, _ change: (Choice) -> Change) {
         state.withLock { current in
-            if current?.id == id { current?.unavailable = unavailable }
+            guard let choice = current, choice.id == id else { return }
+            let next: Choice?
+            switch change(choice) {
+            case .keep: return
+            case .replace(let replacement): next = replacement
+            case .forget: next = nil
+            }
+            do {
+                try save(next)
+                current = next
+            } catch {
+                Self.log.error("\(failure, privacy: .public)")
+            }
         }
     }
 
@@ -148,11 +180,8 @@ final class DownloadFolderStore: Sendable {
 
     /// Swaps a stale bookmark for a fresh one, if the choice is still `id`.
     private func refreshBookmark(of id: UUID, to fresh: Data) {
-        guard var changed = choice, changed.id == id else { return }
-        changed.bookmark = fresh
-        do { try save(changed) } catch { Self.log.error("could not save the refreshed download folder bookmark") }
-        state.withLock { current in
-            if current?.id == id { current?.bookmark = fresh }
+        update(id, "could not save the refreshed download folder bookmark") { choice in
+            .replace(with(choice) { $0.bookmark = fresh })
         }
     }
 
@@ -257,7 +286,7 @@ final class DownloadFolder {
         switch outcome {
         case .success:
             store.markAvailable(choice.id)
-            await readInLibrary()
+            await readInLibrary(choice.id)
         case .failure(let failure):
             if failure.folderUnreachable { store.markUnavailable(choice.id) }
         }
@@ -311,12 +340,15 @@ final class DownloadFolder {
         refresh()
     }
 
-    /// Adds the chosen folder to the library when the library does not read it (its bookmark failed at launch, say).
-    private func readInLibrary() async {
+    /// Finds the chosen folder in the library again when the library has lost track of it (moved or renamed since
+    /// launch, or not found at launch). A folder the user removed from the library is not added back: downloads go to
+    /// "In pointFlac" from now on.
+    private func readInLibrary(_ id: UUID) async {
         let store = store
         guard let folder = try? await DownloadFolderStore.perform({ try store.open() }) else { return }
         defer { folder.close() }
-        if await library.library.folder(containing: folder.url) == nil { try? await addToLibrary(folder.url) }
+        guard await library.library.folder(containing: folder.url) == nil else { return }
+        if (try? await library.library.reattachFolder(folder.url)) == false { store.forget(id) }
     }
 
     /// Adds `url` to the library as a folder read in place, through the library's own `addFolder` (which reuses the
@@ -331,4 +363,11 @@ final class DownloadFolder {
             }
         }
     }
+}
+
+/// `value`, changed by `change`: for building an updated copy in an expression.
+private func with<T>(_ value: T, _ change: (inout T) -> Void) -> T {
+    var copy = value
+    change(&copy)
+    return copy
 }
