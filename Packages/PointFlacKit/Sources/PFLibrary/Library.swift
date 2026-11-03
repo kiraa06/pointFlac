@@ -192,6 +192,19 @@ public final class Library: Sendable {
         }
     }
 
+    /// Points the library's record of the folder at `url` there and reads it, when the library has one: a folder
+    /// renamed, moved or restored from the trash since launch, or not found at launch. Never adds a folder: false when
+    /// there is no record (the user removed it from the library), so a removed folder is never added back behind the
+    /// user's back. For automatic checks; a folder the user picks goes through `addFolder`.
+    public func reattachFolder(_ url: URL) async throws -> Bool {
+        try await run(.always) { store in
+            guard let id = try store.reattachFolder(url) else { return false }
+            var report = ScanReport()
+            try store.scan(folder: id, into: &report)
+            return true
+        }
+    }
+
     /// The folders the library reads: the library folder first, then the folders added in place.
     public func folders() async -> [LibraryFolder] {
         (try? await run(.never) { $0.folders.map { LibraryFolder(id: $0.id, name: $0.name) } })

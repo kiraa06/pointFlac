@@ -202,3 +202,92 @@ private final class AdmitSandbox {
     }
     #expect(library.current.tracks.isEmpty)
 }
+
+/// Review fix round 2: the folder is renamed in Files while the app runs. The library still knows it by its launch
+/// path, so adding the new path must find the same record (its bookmark follows the folder), not insert a second one
+/// that, at the next launch, resolves to the same place and lists every song twice.
+@Test func addingARenamedFolderReusesItsRecord() async throws {
+    let box = try AdmitSandbox()
+    try TaggedFlac.write(
+        "s16-44100", to: box.picked.appending(path: "Ada Vale/Paper Moons/01 Fold.flac"),
+        tags: [("TITLE", "Fold"), ("ALBUM", "Paper Moons")])
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    let renamed = box.root.appending(path: "iCloud Drive/Downloads", directoryHint: .isDirectory)
+    try FileManager.default.moveItem(at: box.picked, to: renamed)
+
+    _ = try await library.addFolder(renamed)
+
+    #expect(await library.folders().count == 2)
+    #expect(library.current.tracks.count == 1)
+    #expect(await library.folder(containing: renamed) != nil)
+    let relaunched = try box.open()
+    #expect(await relaunched.folders().count == 2)
+    #expect(relaunched.current.tracks.count == 1)
+    #expect(await relaunched.folder(containing: renamed) != nil)
+}
+
+/// The same for a folder deleted into the trash and restored elsewhere while the app runs.
+@Test func addingAFolderRestoredFromTheTrashReusesItsRecord() async throws {
+    let box = try AdmitSandbox()
+    try TaggedFlac.write("s16-44100", to: box.picked.appending(path: "A/B/01.flac"), tags: [("TITLE", "One")])
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    let trash = box.root.appending(path: ".Trash", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+    let trashed = trash.appending(path: "pointFlac", directoryHint: .isDirectory)
+    try FileManager.default.moveItem(at: box.picked, to: trashed)
+    let restored = box.root.appending(path: "Restored/pointFlac", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: restored.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.moveItem(at: trashed, to: restored)
+
+    _ = try await library.addFolder(restored)
+
+    #expect(await library.folders().count == 2)
+    let relaunched = try box.open()
+    #expect(await relaunched.folders().count == 2)
+    #expect(relaunched.current.tracks.count == 1)
+}
+
+/// A record found again is checked for overlap like a new one: moved inside another folder the library reads, it
+/// would list its songs twice.
+@Test func aRecordFoundAgainInsideAnotherFolderIsRefused() async throws {
+    let box = try AdmitSandbox()
+    let other = box.root.appending(path: "Music", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    _ = try await library.addFolder(other)
+    let inside = other.appending(path: "pointFlac", directoryHint: .isDirectory)
+    try FileManager.default.moveItem(at: box.picked, to: inside)
+
+    await #expect(throws: LibraryError.self) { try await library.addFolder(inside) }
+    #expect(await library.folders().count == 3)
+}
+
+/// What the download folder's automatic checks use: a folder the library has a record of is found again wherever it
+/// went, but one the user removed from the library is never added back behind their back.
+@Test func reattachingFindsMovedFoldersButNeverAddsOne() async throws {
+    let box = try AdmitSandbox()
+    try TaggedFlac.write("s16-44100", to: box.picked.appending(path: "A/B/01.flac"), tags: [("TITLE", "One")])
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    let id = try #require(await library.folders().last?.id)
+    let renamed = box.root.appending(path: "iCloud Drive/Renamed", directoryHint: .isDirectory)
+    try FileManager.default.moveItem(at: box.picked, to: renamed)
+
+    #expect(try await library.reattachFolder(renamed))
+    #expect(await library.folder(containing: renamed)?.id == id)
+    #expect(library.current.tracks.count == 1)
+
+    try await library.removeFolder(id)
+    #expect(try await library.reattachFolder(renamed) == false)
+    #expect(await library.folders().count == 1)
+    #expect(library.current.tracks.isEmpty)
+    // Never-seen folders are not added either.
+    let elsewhere = box.root.appending(path: "Elsewhere", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+    #expect(try await library.reattachFolder(elsewhere) == false)
+    #expect(await library.folders().count == 1)
+}

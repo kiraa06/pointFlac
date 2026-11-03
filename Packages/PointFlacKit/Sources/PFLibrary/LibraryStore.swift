@@ -202,25 +202,14 @@ final class LibraryStore {
 
     // MARK: Folders
 
-    /// Adds a folder to be read in place, remembering access to it, and returns its ID. A folder already added
-    /// returns its existing ID, whether it was found at this launch or not: a folder whose bookmark did not resolve
-    /// (deleted, then restored; its volume back) is recognised by the path its bookmark recorded, and gets the new
-    /// bookmark in place of the old one, so picking it again never lists its songs twice.
+    /// Adds a folder to be read in place, remembering access to it, and returns its ID. A folder the library has a
+    /// record of returns that record (`reattachFolder`), so picking a folder again never lists its songs twice.
     ///
     /// A folder inside or around one already read (the library folder included) is refused: its files would be listed
     /// twice, and removing one folder would take the other's tracks.
     func addFolder(_ url: URL) throws -> Int64 {
-        let candidate = Self.comparablePath(url)
-        if let existing = roots.first(where: { Self.comparablePath($0.value) == candidate })?.key { return existing }
-        let unresolved = try unresolvedFolder(at: candidate)
-        if unresolved == nil {
-            for root in roots.values {
-                let other = Self.comparablePath(root)
-                if candidate.hasPrefix(other) || other.hasPrefix(candidate) {
-                    throw LibraryError.overlappingFolder(url.lastPathComponent)
-                }
-            }
-        }
+        if let id = try reattachFolder(url) { return id }
+        try refuseOverlap(url, except: nil)
         let scopedNow = url.startAccessingSecurityScopedResource()
         var kept = false
         // Whatever fails below, a scope this call opened and did not hand to `scoped` is closed again.
@@ -229,20 +218,11 @@ final class LibraryStore {
         }
         let bookmark = try url.bookmarkData(
             options: Self.bookmarkCreation, includingResourceValuesForKeys: nil, relativeTo: nil)
-        let id: Int64
-        if let unresolved {
-            try database.query(
-                "UPDATE folders SET bookmark = ?, name = ? WHERE id = ?",
-                [.blob(bookmark), .text(url.lastPathComponent), .integer(unresolved)])
-            id = unresolved
-        } else {
-            try database.query(
-                "INSERT INTO folders(kind, bookmark, name, added_at) VALUES ('bookmark', ?, ?, ?)",
-                [.blob(bookmark), .text(url.lastPathComponent), .real(Date().timeIntervalSince1970)])
-            guard let inserted = try database.query("SELECT last_insert_rowid()").first?.first?.int else {
-                throw LibraryDatabaseError(code: 0, message: "no folder id")
-            }
-            id = inserted
+        try database.query(
+            "INSERT INTO folders(kind, bookmark, name, added_at) VALUES ('bookmark', ?, ?, ?)",
+            [.blob(bookmark), .text(url.lastPathComponent), .real(Date().timeIntervalSince1970)])
+        guard let id = try database.query("SELECT last_insert_rowid()").first?.first?.int else {
+            throw LibraryDatabaseError(code: 0, message: "no folder id")
         }
         roots[id] = url
         if scopedNow {
@@ -252,15 +232,65 @@ final class LibraryStore {
         return id
     }
 
-    /// The folder added in place whose bookmark did not resolve at this launch but recorded `path` (comparable), if any.
-    /// The path comes from the bookmark data itself, without resolving it, so a folder that is gone can still be
-    /// recognised when it comes back.
-    private func unresolvedFolder(at path: String) throws -> Int64? {
+    /// The record of the folder at `url`, pointed at `url`, or nil when the library has none: never a new record.
+    ///
+    /// The library knows a folder by the path it resolved at launch, but the folder may have moved since: renamed in
+    /// Files, restored from the trash, or not found at launch at all (deleted, then restored as new files). Each stored
+    /// bookmark is resolved again, which follows a moved folder; one that no longer resolves is matched by the path it
+    /// recorded. A match gets a fresh bookmark from `url` and is read from there, after the same overlap check a new
+    /// folder gets. A folder the user removed from the library has no record, so it is never added back this way.
+    func reattachFolder(_ url: URL) throws -> Int64? {
+        let candidate = Self.comparablePath(url)
+        if let existing = roots.first(where: { Self.comparablePath($0.value) == candidate })?.key { return existing }
+        guard let id = try recordedFolder(at: candidate) else { return nil }
+        try refuseOverlap(url, except: id)
+        let scopedNow = url.startAccessingSecurityScopedResource()
+        var kept = false
+        defer {
+            if scopedNow, !kept { url.stopAccessingSecurityScopedResource() }
+        }
+        let bookmark = try url.bookmarkData(
+            options: Self.bookmarkCreation, includingResourceValuesForKeys: nil, relativeTo: nil)
+        try database.query(
+            "UPDATE folders SET bookmark = ?, name = ? WHERE id = ?",
+            [.blob(bookmark), .text(url.lastPathComponent), .integer(id)])
+        roots[id] = url
+        scoped.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+        if scopedNow {
+            scoped[id] = url
+            kept = true
+        }
+        return id
+    }
+
+    /// Refuses `url` when it is inside or around a folder already read, other than `except` (its own record).
+    private func refuseOverlap(_ url: URL, except: Int64?) throws {
+        let candidate = Self.comparablePath(url)
+        for (id, root) in roots where id != except {
+            let other = Self.comparablePath(root)
+            if candidate.hasPrefix(other) || other.hasPrefix(candidate) {
+                throw LibraryError.overlappingFolder(url.lastPathComponent)
+            }
+        }
+    }
+
+    /// The folder record whose bookmark, resolved now, leads to `path` (comparable); or, for a bookmark that no longer
+    /// resolves, whose bookmark recorded `path`. A bookmark follows its folder by identity, so this finds a folder
+    /// renamed, moved or restored from the trash since launch, wherever the launch put its root.
+    private func recordedFolder(at path: String) throws -> Int64? {
         for row in try database.query("SELECT id, bookmark FROM folders WHERE kind = 'bookmark' ORDER BY id") {
-            guard let id = row[0].int, roots[id] == nil, let bookmark = row[1].data,
-                let recorded = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
-            else { continue }
-            if Self.comparablePath(URL(filePath: recorded, directoryHint: .isDirectory)) == path { return id }
+            guard let id = row[0].int, let bookmark = row[1].data else { continue }
+            var stale = false
+            if let now = try? URL(
+                resolvingBookmarkData: bookmark, options: Self.bookmarkResolution.union(.withoutUI), relativeTo: nil,
+                bookmarkDataIsStale: &stale)
+            {
+                if Self.comparablePath(now) == path { return id }
+            } else if let recorded = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path,
+                Self.comparablePath(URL(filePath: recorded, directoryHint: .isDirectory)) == path
+            {
+                return id
+            }
         }
         return nil
     }
