@@ -158,9 +158,12 @@ public final class Library: Sendable {
     /// Adds a folder the user picked to be read in place (spec §4.7 "Add folder"), remembers access to it with a
     /// security-scoped bookmark, and scans it. Throws `LibraryError.overlappingFolder` for a folder inside or around
     /// one already read.
+    ///
+    /// Always publishes a catalog: a folder found again (one whose bookmark did not resolve at launch) brings its
+    /// songs back even when the scan finds every file unchanged.
     @discardableResult
     public func addFolder(_ url: URL) async throws -> ScanReport {
-        try await run(.ifChanged) { store in
+        try await run(.always) { store in
             let id = try store.addFolder(url)
             var report = ScanReport()
             try store.scan(folder: id, into: &report)

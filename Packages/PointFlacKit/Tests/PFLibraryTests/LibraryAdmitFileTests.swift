@@ -135,3 +135,70 @@ private final class AdmitSandbox {
     #expect(await library.folder(containing: box.root.appending(path: "iCloud Drive")) == nil)
     #expect(await library.folder(containing: box.libraryFolder.appending(path: "x"))?.id == 1)
 }
+
+/// Review fix: "Choose again…" re-adds a folder whose bookmark did not resolve at launch (deleted, then restored).
+/// The library must recognise its record and replace the bookmark, not add a second row with every song twice.
+@Test func rePickingAFolderTheLibraryCouldNotFindReusesItsRecord() async throws {
+    let box = try AdmitSandbox()
+    try TaggedFlac.write(
+        "s16-44100", to: box.picked.appending(path: "Ada Vale/Paper Moons/01 Fold.flac"),
+        tags: [("TITLE", "Fold"), ("ALBUM", "Paper Moons")])
+    var first: Library? = try box.open()
+    _ = try await first?.addFolder(box.picked)
+    #expect(first?.current.tracks.count == 1)
+    first = nil
+    // Gone at the next launch: copied aside, then deleted, so its bookmark finds nothing.
+    let aside = box.root.appending(path: "Aside", directoryHint: .isDirectory)
+    try FileManager.default.copyItem(at: box.picked, to: aside)
+    try FileManager.default.removeItem(at: box.picked)
+    let library = try box.open()
+    #expect(await library.folder(containing: box.picked) == nil)
+
+    // Restored (new files at the same path), and picked again.
+    try FileManager.default.copyItem(at: aside, to: box.picked)
+    _ = try await library.addFolder(box.picked)
+
+    #expect(await library.folders().count == 2)
+    #expect(library.current.tracks.count == 1)
+    #expect(library.current.albums.map(\.title) == ["Paper Moons"])
+    // The replaced bookmark is the one the next launch resolves.
+    let relaunched = try box.open()
+    #expect(await relaunched.folder(containing: box.picked) != nil)
+    #expect(await relaunched.folders().count == 2)
+}
+
+/// Review fix: the relative path is built from the names on disk, as a scan lists them, so a name the caller spelled
+/// in another Unicode normalisation cannot make a second track (or a "move") at the next scan.
+@Test func admitKeepsTheNamesOnDisk() async throws {
+    let box = try AdmitSandbox()
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    // Decomposed on disk ("e" + combining acute), as some tools write it.
+    let onDisk = box.picked.appending(path: "Cafe\u{301}/Album/Re\u{301}sume\u{301}.flac")
+    try TaggedFlac.write("s16-44100", to: onDisk, tags: [("TITLE", "Song"), ("ALBUM", "Album")])
+    let composed = box.picked.appending(path: "Caf\u{E9}/Album/R\u{E9}sum\u{E9}.flac")
+
+    let id = try #require(try await library.admitFile(composed))
+
+    // Stored as spelled on disk, scalar for scalar (Swift's string equality alone would hide the difference).
+    let stored = try #require(library.current.tracks[id]?.url.pathComponents.suffix(3))
+    let expected = ["Cafe\u{301}", "Album", "Re\u{301}sume\u{301}.flac"]
+    #expect(stored.map { Array($0.unicodeScalars) } == expected.map { Array($0.unicodeScalars) })
+    let rescan = await library.rescan()
+    #expect(rescan.added.isEmpty && rescan.moved.isEmpty && rescan.removed.isEmpty)
+    #expect(library.current.tracks.keys.sorted() == [id])
+}
+
+/// Review fix: a scan never reads inside a folder named like an app or a bundle, so admitting a file there would only
+/// last until the next scan took it away.
+@Test func admitRefusesWhatAScanSkips() async throws {
+    let box = try AdmitSandbox()
+    let library = try box.open()
+    _ = try await library.addFolder(box.picked)
+    for path in ["Tools.app/01.flac", "Kit.bundle/Album/02.flac"] {
+        let file = box.picked.appending(path: path)
+        try TaggedFlac.write("s16-44100", to: file, tags: [("TITLE", path)])
+        #expect(try await library.admitFile(file) == nil)
+    }
+    #expect(library.current.tracks.isEmpty)
+}
