@@ -165,45 +165,209 @@ struct DownloadDestinationTests {
         #expect(saved.url.path == root.appending(path: "01 Fold.flac").path)
     }
 
-    @Test("a folder that is gone throws, and is not created again")
+    @Test("a partial copy left by an earlier run that was killed is swept; a fresh one, and other files, are not")
+    func sweepsStalePartials() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let album = root.appending(path: "Ada Vale/Paper Moons")
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        let stale = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
+        let fresh = album.appending(path: ".pointflac-saving-\(UUID().uuidString)")
+        let theirs = album.appending(path: ".notes")
+        for url in [stale, fresh, theirs] { try Data("partial".utf8).write(to: url) }
+        let old = Date().addingTimeInterval(-120)
+        for url in [stale, theirs] {
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        }
+
+        _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        #expect(FileManager.default.fileExists(atPath: fresh.path))
+        #expect(FileManager.default.fileExists(atPath: theirs.path))
+    }
+
+    @Test("an artist or album named like an app or a bundle gets a folder a library scan still reads")
+    func appLikeNames() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let saved = try DownloadDestination().save(
+            try Self.staged(folder), track: Self.track(artist: "Tools.app", album: "Kit.Bundle"), into: root)
+        #expect(saved.url.path == root.appending(path: "Tools.app_/Kit.Bundle_/01 Fold.flac").path)
+    }
+
+    /// The failure `body` throws, or a recorded issue when it throws nothing (or something else).
+    static func failure(_ body: () throws -> Void) -> DownloadDestination.Failure? {
+        do {
+            try body()
+            Issue.record("nothing was thrown")
+        } catch let failure as DownloadDestination.Failure {
+            return failure
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+        return nil
+    }
+
+    @Test("a folder that is gone is unreachable, and is not created again")
     func missingFolderThrows() throws {
         let folder = try TempFolder()
         let gone = folder.sub("Gone")
-        #expect(throws: DownloadDestination.Unreachable.self) {
-            try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: gone)
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: gone)
         }
+        #expect(failure?.folderUnreachable == true)
         #expect(!FileManager.default.fileExists(atPath: gone.path))
     }
 
-    @Test("a file where the folder should be throws")
+    @Test("a file where the folder should be is unreachable")
     func fileInsteadOfFolderThrows() throws {
         let folder = try TempFolder()
         let notAFolder = folder.url.appending(path: "Picked")
         try Data("x".utf8).write(to: notAFolder)
-        #expect(throws: DownloadDestination.Unreachable.self) {
-            try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: notAFolder)
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: notAFolder)
         }
+        #expect(failure?.folderUnreachable == true)
     }
 
-    @Test("a folder that can't be written to throws, and nothing is left in it")
+    @Test("a folder that can't be written to is unreachable, and nothing is left in it")
     func readOnlyFolderThrows() throws {
         let folder = try TempFolder()
         let root = try Self.picked(folder)
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: root.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path) }
-        #expect(throws: DownloadDestination.Unreachable.self) {
-            try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
         }
+        #expect(failure?.folderUnreachable == true)
         #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
     }
 
-    @Test("a staged file that has gone throws rather than saving nothing")
+    @Test("a staged file that has gone fails this download only: the folder is fine")
     func missingStagedFileThrows() throws {
         let folder = try TempFolder()
         let staged = try Self.staged(folder)
         try FileManager.default.removeItem(at: staged)
-        #expect(throws: DownloadDestination.Unreachable.self) {
-            try DownloadDestination().save(staged, track: Self.track(), into: try Self.picked(folder))
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(staged, track: Self.track(), into: try Self.picked(folder))
         }
+        #expect(failure?.folderUnreachable == false)
+    }
+
+    @Test("a file standing where the artist folder should be fails this download only, and is left alone")
+    func fileInTheWay() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let inTheWay = root.appending(path: "Ada Vale")
+        try Data("not a folder".utf8).write(to: inTheWay)
+        let failure = Self.failure {
+            _ = try DownloadDestination().save(try Self.staged(folder), track: Self.track(), into: root)
+        }
+        #expect(failure?.folderUnreachable == false)
+        #expect(try Data(contentsOf: inTheWay) == Data("not a folder".utf8))
+    }
+
+    @Test("running out of numbered names fails this download only")
+    func tooManyCopies() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let album = root.appending(path: "Ada Vale/Paper Moons")
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        for name in ["01 Fold.flac", "01 Fold (2).flac", "01 Fold (3).flac"] {
+            try Data("theirs \(name)".utf8).write(to: album.appending(path: name))
+        }
+        let failure = Self.failure {
+            _ = try DownloadDestination(maxCopies: 3).save(try Self.staged(folder), track: Self.track(), into: root)
+        }
+        #expect(failure?.folderUnreachable == false)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: album.path).count == 3)
+    }
+
+    @Test("a file provider that holds the name too long fails this download only, and writes nothing")
+    func coordinationTimesOut() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let album = root.appending(path: "Ada Vale/Paper Moons")
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        let target = album.appending(path: "01 Fold.flac")
+        let staged = try Self.staged(folder)
+        // Another writer holds the name, as a provider busy with it would.
+        let holding = DispatchSemaphore(value: 0)
+        let released = DispatchSemaphore(value: 0)
+        let holder = Thread {
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: target, options: [], error: nil) { _ in
+                holding.signal()
+                Thread.sleep(forTimeInterval: 1.5)
+            }
+            released.signal()
+        }
+        holder.start()
+        holding.wait()
+
+        let failure = Self.failure {
+            _ = try DownloadDestination(coordinationTimeout: .milliseconds(200)).save(
+                staged, track: Self.track(), into: root)
+        }
+
+        #expect(failure?.folderUnreachable == false)
+        #expect(!FileManager.default.fileExists(atPath: target.path))
+        released.wait()
+        #expect(!FileManager.default.fileExists(atPath: target.path))
+    }
+
+    @Test("a same-size file whose bytes are not on the device is a collision, never downloaded to compare")
+    func notDownloadedIsACollision() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let staged = try Self.staged(folder)
+        let first = try DownloadDestination().save(staged, track: Self.track(), into: root)
+        // As if iCloud had evicted the first copy: same name, same size, bytes elsewhere.
+        let evicted = DownloadDestination(isDownloaded: { $0.lastPathComponent != first.url.lastPathComponent })
+
+        let again = try evicted.save(staged, track: Self.track(), into: root)
+
+        #expect(again.url.lastPathComponent == "01 Fold (2).flac")
+        #expect(again.isNew)
+    }
+
+    @Test("taking a copy back deletes it only while it is still the very file this save placed")
+    func takeBackOnlyOurOwn() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        let staged = try Self.staged(folder)
+        let destination = DownloadDestination()
+
+        let ours = try destination.save(staged, track: Self.track(), into: root)
+        #expect(destination.takeBack(ours))
+        #expect(!FileManager.default.fileExists(atPath: ours.url.path))
+
+        // Replaced meanwhile by another file of the same name and bytes (a new inode): left alone.
+        let placed = try destination.save(staged, track: Self.track(), into: root)
+        try FileManager.default.removeItem(at: placed.url)
+        try FileManager.default.copyItem(at: staged, to: placed.url)
+        #expect(!destination.takeBack(placed))
+        #expect(FileManager.default.fileExists(atPath: placed.url.path))
+
+        // A file that was already there is never ours to take back.
+        let adopted = try destination.save(staged, track: Self.track(), into: root)
+        #expect(!adopted.isNew)
+        #expect(!destination.takeBack(adopted))
+        #expect(FileManager.default.fileExists(atPath: adopted.url.path))
+    }
+
+    @Test("the reachability probe writes and removes a hidden file, and fails for a folder that can't take one")
+    func probe() throws {
+        let folder = try TempFolder()
+        let root = try Self.picked(folder)
+        try DownloadDestination.probe(root)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+
+        let gone = Self.failure { try DownloadDestination.probe(folder.sub("Gone")) }
+        #expect(gone?.folderUnreachable == true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: root.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path) }
+        let readOnly = Self.failure { try DownloadDestination.probe(root) }
+        #expect(readOnly?.folderUnreachable == true)
     }
 }

@@ -46,7 +46,9 @@ public enum SafeFileName {
 
     /// A remote name (an artist, an album) as one folder name, for filing a download in a folder the user picked:
     /// the same cleaning as a file name, so no separator, control or bidi character survives, and no leading dot or
-    /// space, so the folder is never hidden, "." or "..". `nil` when nothing usable is left.
+    /// space, so the folder is never hidden, "." or "..". A name ending in ".app" or ".bundle" gets an underscore:
+    /// library scans skip folders named like apps and bundles, so songs inside one would never reach the shelf.
+    /// `nil` when nothing usable is left.
     public static func folderName(_ remote: String) -> String? {
         let name = cleaned(cleaned(remote).precomposedStringWithCanonicalMapping)
         let visible = String(
@@ -57,7 +59,8 @@ public enum SafeFileName {
         guard !result.isEmpty, !result.unicodeScalars.contains(where: forbidden.contains),
             result.unicodeScalars.first != "."
         else { return nil }
-        return result
+        let lowered = result.lowercased()
+        return lowered.hasSuffix(".app") || lowered.hasSuffix(".bundle") ? result + "_" : result
     }
 
     /// Splits `path` at the given separator scalars, keeping empty components.

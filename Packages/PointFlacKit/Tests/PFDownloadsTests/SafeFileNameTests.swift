@@ -69,6 +69,13 @@ struct SafeFileNameTests {
         #expect(SafeFileName.folderName(input) == expected)
     }
 
+    @Test(
+        "a name a library scan would skip as an app or a bundle gets an underscore",
+        arguments: [("Tools.app", "Tools.app_"), ("Kit.BUNDLE", "Kit.BUNDLE_"), ("Apple", "Apple")])
+    func appLikeFolderNames(input: String, expected: String) {
+        #expect(SafeFileName.folderName(input) == expected)
+    }
+
     @Test("nothing usable left is no folder name at all", arguments: ["", "  ", ".", "..", "/", ". . .", "\u{202E}"])
     func emptyFolderNames(input: String) {
         #expect(SafeFileName.folderName(input) == nil)
