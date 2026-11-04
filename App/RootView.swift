@@ -49,7 +49,11 @@ struct RootView: View {
         .onChange(of: scenePhase) { old, new in
             // Back from the background: pick up files added in the Files app meanwhile (stream A: rescan on every
             // foreground). Launch already scans in `load()`.
-            if old == .background, new != .background { Task { await model.reload() } }
+            if old == .background, new != .background {
+                Task { await model.reload() }
+                // The download folder may be back (or gone) since: Settings, and the next download, should know.
+                Task { await model.downloadFolder.recheck() }
+            }
             if new == .background, activeDownloads > 0 { grace.begin() }
             // Leaving the foreground: the Sound settings' pending save is written now, not half a second later.
             if new != .active { model.sound.flush() }

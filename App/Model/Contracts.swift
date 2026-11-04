@@ -165,6 +165,9 @@ struct DownloadRow: Identifiable, Hashable {
     let state: String
     /// 0...1 while transferring; nil when indeterminate or finished.
     let progress: Double?
+    /// Shown in place of a finished download's "Done" when it was saved somewhere other than asked: "Saved in
+    /// pointFlac (folder unavailable)".
+    var note: String? = nil
 }
 
 /// A typeahead suggestion (contract 3).

@@ -59,6 +59,35 @@ struct SafeFileNameTests {
         #expect(SafeFileName.sanitize(String(repeating: "\u{301}", count: 300) + ".flac") == "track.flac")
     }
 
+    @Test(
+        "an artist or album becomes one visible folder name",
+        arguments: [
+            ("AC/DC", "ACDC"), ("Back: In Black", "Back In Black"), ("..\\..\\Windows", "Windows"),
+            (" . .x", "x"), ("Cafe\u{301}", "Caf\u{E9}"), ("Ev\u{202E}il", "Evil"),
+        ])
+    func folderNames(input: String, expected: String) {
+        #expect(SafeFileName.folderName(input) == expected)
+    }
+
+    @Test(
+        "a name a library scan would skip as an app or a bundle gets an underscore",
+        arguments: [("Tools.app", "Tools.app_"), ("Kit.BUNDLE", "Kit.BUNDLE_"), ("Apple", "Apple")])
+    func appLikeFolderNames(input: String, expected: String) {
+        #expect(SafeFileName.folderName(input) == expected)
+    }
+
+    @Test("nothing usable left is no folder name at all", arguments: ["", "  ", ".", "..", "/", ". . .", "\u{202E}"])
+    func emptyFolderNames(input: String) {
+        #expect(SafeFileName.folderName(input) == nil)
+    }
+
+    @Test("an overlong folder name is cut on a character boundary")
+    func longFolderNames() throws {
+        let name = try #require(SafeFileName.folderName(String(repeating: "é", count: 300)))
+        #expect(name.utf8.count <= SafeFileName.maxBytes)
+        #expect(name.hasPrefix("éé"))
+    }
+
     @Test("dots and spaces in any order cannot produce a hidden file")
     func noHiddenNames() {
         #expect(SafeFileName.sanitize(".. .x.flac") == "x.flac")

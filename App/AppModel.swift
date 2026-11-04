@@ -26,6 +26,10 @@ import PFLibrary
 ///   no listen history and no albums left over from an earlier run (the Shelf galaxy's tests).
 /// - `-PFGalaxyStress <n>` adds `n` made-up albums to the Shelf galaxy, to profile it at a large library's size
 ///   (`GalaxyStress`).
+/// - `-PFDownloadFolder <absolute path>` saves downloads to that plain folder for this launch (no bookmark, nothing
+///   saved), as if it had been picked in Settings, and with `-PFMockFinder` makes the demo downloads real files, so a
+///   UI test can follow one into the folder. `-PFResetDownloadFolder` forgets a folder picked earlier, so Settings
+///   starts from "In pointFlac".
 @MainActor
 @Observable
 final class AppModel {
@@ -49,6 +53,8 @@ final class AppModel {
     let realLibrary: RealLibrary
     /// The real finder, unless a DEBUG launch asked for the mock.
     @ObservationIgnored let realFinder: RealMusicFinder?
+    /// Where downloads are saved (Settings → Downloads). Set once, before the UI mounts.
+    @ObservationIgnored let downloadFolder: DownloadFolder
     #if SOULSEEK
         /// The one Soulseek session (Settings → Soulseek).
         let soulseek: SoulseekAccount
@@ -116,24 +122,38 @@ final class AppModel {
         #endif
         let names = UserDefaults.standard.bool(forKey: Self.lookupNamesKey)
         let artwork = UserDefaults.standard.bool(forKey: Self.lookupArtworkKey)
+        #if DEBUG
+            let folderStore = Self.downloadFolderStore(arguments: arguments)
+        #else
+            let folderStore = DownloadFolderStore(file: DownloadFolderStore.defaultFile)
+        #endif
+        let downloadFolder = DownloadFolder(store: folderStore, library: realLibrary)
+        self.downloadFolder = downloadFolder
+        let publisher = DownloadPublisher(library: realLibrary.library, store: folderStore) {
+            await downloadFolder.refresh()
+        }
         #if SOULSEEK
             let soulseek = SoulseekAccount()
             self.soulseek = soulseek
             let makeReal = {
                 RealMusicFinder(
-                    library: realLibrary, soulseek: soulseek.client, registryEnabled: names, artworkEnabled: artwork)
+                    library: realLibrary, soulseek: soulseek.client, publisher: publisher, registryEnabled: names,
+                    artworkEnabled: artwork)
             }
         #else
             let makeReal = {
-                RealMusicFinder(library: realLibrary, registryEnabled: names, artworkEnabled: artwork)
+                RealMusicFinder(
+                    library: realLibrary, publisher: publisher, registryEnabled: names, artworkEnabled: artwork)
             }
         #endif
         library = realLibrary
         #if DEBUG
-            // The demo finder exists only in Debug builds, and only under the UI tests' launch arguments.
+            // The demo finder exists only in Debug builds, and only under the UI tests' launch arguments. It saves real
+            // files only when a test chose a download folder.
             if useMock {
                 realFinder = nil
-                finder = MockMusicFinder(library: realLibrary)
+                let demoPublisher = folderStore.choice?.path == nil ? nil : publisher
+                finder = MockMusicFinder(library: realLibrary, publisher: demoPublisher)
             } else {
                 let real = makeReal()
                 realFinder = real
@@ -182,9 +202,10 @@ final class AppModel {
     }
 
     /// Starts the library and the download queue, and lists the library, after importing the bundled fixtures when
-    /// asked to.
+    /// asked to. The download folder is checked first, so no download restored from the queue publishes before it.
     func load() async {
         realLibrary.start()
+        await downloadFolder.start()
         if let realFinder { Task { await realFinder.start() } }
         #if SOULSEEK
             if realFinder != nil { Task { await soulseek.resume() } }
@@ -247,6 +268,18 @@ final class AppModel {
     }
 
     #if DEBUG
+        /// `-PFDownloadFolder <path>`'s plain folder for this launch, or the saved choice, forgotten first under
+        /// `-PFResetDownloadFolder`.
+        private static func downloadFolderStore(arguments: [String]) -> DownloadFolderStore {
+            if let path = UserDefaults.standard.string(forKey: "PFDownloadFolder"), !path.isEmpty {
+                return DownloadFolderStore(debugPath: path)
+            }
+            if arguments.contains("-PFResetDownloadFolder") {
+                try? FileManager.default.removeItem(at: DownloadFolderStore.defaultFile)
+            }
+            return DownloadFolderStore(file: DownloadFolderStore.defaultFile)
+        }
+
         /// The fixtures in the app bundle's `Fixtures` folder, which only Debug builds carry (ruling R4).
         private static func bundledFixtures() -> [URL] {
             let urls = Bundle.main.urls(forResourcesWithExtension: "flac", subdirectory: "Fixtures") ?? []

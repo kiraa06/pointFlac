@@ -45,11 +45,14 @@ public enum LibraryError: Error, Equatable, Sendable, CustomStringConvertible {
     case overlappingFolder(String)
     /// Artwork must live where the system never purges it (Application Support), not in Caches (§5.4).
     case artworkFolderInCaches
+    /// A file to admit (`Library.admitFile`) is in no folder the library reads, so a scan would never find it.
+    case outsideFolders(String)
 
     public var description: String {
         switch self {
         case .overlappingFolder(let name): "“\(name)” overlaps a folder the library already reads"
         case .artworkFolderInCaches: "The artwork folder must not be in Caches"
+        case .outsideFolders(let name): "“\(name)” is not in a folder the library reads"
         }
     }
 }
@@ -200,17 +203,22 @@ final class LibraryStore {
     // MARK: Folders
 
     /// Adds a folder to be read in place, remembering access to it, and returns its ID. A folder already added
-    /// returns its existing ID.
+    /// returns its existing ID, whether it was found at this launch or not: a folder whose bookmark did not resolve
+    /// (deleted, then restored; its volume back) is recognised by the path its bookmark recorded, and gets the new
+    /// bookmark in place of the old one, so picking it again never lists its songs twice.
     ///
     /// A folder inside or around one already read (the library folder included) is refused: its files would be listed
     /// twice, and removing one folder would take the other's tracks.
     func addFolder(_ url: URL) throws -> Int64 {
         let candidate = Self.comparablePath(url)
         if let existing = roots.first(where: { Self.comparablePath($0.value) == candidate })?.key { return existing }
-        for root in roots.values {
-            let other = Self.comparablePath(root)
-            if candidate.hasPrefix(other) || other.hasPrefix(candidate) {
-                throw LibraryError.overlappingFolder(url.lastPathComponent)
+        let unresolved = try unresolvedFolder(at: candidate)
+        if unresolved == nil {
+            for root in roots.values {
+                let other = Self.comparablePath(root)
+                if candidate.hasPrefix(other) || other.hasPrefix(candidate) {
+                    throw LibraryError.overlappingFolder(url.lastPathComponent)
+                }
             }
         }
         let scopedNow = url.startAccessingSecurityScopedResource()
@@ -221,11 +229,20 @@ final class LibraryStore {
         }
         let bookmark = try url.bookmarkData(
             options: Self.bookmarkCreation, includingResourceValuesForKeys: nil, relativeTo: nil)
-        try database.query(
-            "INSERT INTO folders(kind, bookmark, name, added_at) VALUES ('bookmark', ?, ?, ?)",
-            [.blob(bookmark), .text(url.lastPathComponent), .real(Date().timeIntervalSince1970)])
-        guard let id = try database.query("SELECT last_insert_rowid()").first?.first?.int else {
-            throw LibraryDatabaseError(code: 0, message: "no folder id")
+        let id: Int64
+        if let unresolved {
+            try database.query(
+                "UPDATE folders SET bookmark = ?, name = ? WHERE id = ?",
+                [.blob(bookmark), .text(url.lastPathComponent), .integer(unresolved)])
+            id = unresolved
+        } else {
+            try database.query(
+                "INSERT INTO folders(kind, bookmark, name, added_at) VALUES ('bookmark', ?, ?, ?)",
+                [.blob(bookmark), .text(url.lastPathComponent), .real(Date().timeIntervalSince1970)])
+            guard let inserted = try database.query("SELECT last_insert_rowid()").first?.first?.int else {
+                throw LibraryDatabaseError(code: 0, message: "no folder id")
+            }
+            id = inserted
         }
         roots[id] = url
         if scopedNow {
@@ -233,6 +250,19 @@ final class LibraryStore {
             kept = true
         }
         return id
+    }
+
+    /// The folder added in place whose bookmark did not resolve at this launch but recorded `path` (comparable), if any.
+    /// The path comes from the bookmark data itself, without resolving it, so a folder that is gone can still be
+    /// recognised when it comes back.
+    private func unresolvedFolder(at path: String) throws -> Int64? {
+        for row in try database.query("SELECT id, bookmark FROM folders WHERE kind = 'bookmark' ORDER BY id") {
+            guard let id = row[0].int, roots[id] == nil, let bookmark = row[1].data,
+                let recorded = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
+            else { continue }
+            if Self.comparablePath(URL(filePath: recorded, directoryHint: .isDirectory)) == path { return id }
+        }
+        return nil
     }
 
     /// A folder's path for overlap checks: symlinks resolved (so /var and /private/var agree), with a trailing slash so
@@ -249,6 +279,12 @@ final class LibraryStore {
         try database.query("DELETE FROM folders WHERE id = ?", [.integer(id)])
         roots[id] = nil
         scoped.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+    }
+
+    /// The folder that is, or holds, `url` this launch, if any (the library folder included).
+    func folder(containing url: URL) -> Int64? {
+        let path = Self.comparablePath(url)
+        return roots.first { path.hasPrefix(Self.comparablePath($0.value)) }?.key
     }
 
     var folders: [(id: Int64, name: String)] {
@@ -536,6 +572,72 @@ final class LibraryStore {
                 id: id, folderID: folder, relativePath: file.relativePath, size: file.size, modified: file.modified,
                 contentID: probed.contentID, cloudPending: false))
         report.added.append(id)
+    }
+
+    /// Reads the one file `url`, inside a folder the library reads, as a scan of that folder would read it, and returns
+    /// its track ID: nil when the admission rule refuses it, or it cannot be read now. A file already known, unchanged,
+    /// is not read again. The rest of the folder is not listed, so this costs one file however large the folder is.
+    ///
+    /// For a download just saved into the folder the user picked for downloads. The download is the user asking for
+    /// the song, so a file they removed from the library before (`removed`) comes back. A file a full scan would pass
+    /// over (hidden, inside a hidden folder, or inside a folder named like an app or a bundle) is not admitted, so the
+    /// next scan cannot take it away again. The path is stored as the folder spells it on disk, as a scan lists it.
+    func admit(file url: URL) throws -> AdmitScan {
+        let parent = Self.comparablePath(url.deletingLastPathComponent())
+        guard
+            let (folder, root) = roots.first(where: { parent.hasPrefix(Self.comparablePath($0.value)) }).map({
+                ($0.key, $0.value)
+            })
+        else { throw LibraryError.outsideFolders(url.lastPathComponent) }
+        var report = ScanReport()
+        let asGiven = String(parent.dropFirst(Self.comparablePath(root).count)) + url.lastPathComponent
+        guard let relativePath = Self.onDiskSpelling(of: asGiven, under: root) else {
+            return AdmitScan(report: report, id: nil)
+        }
+        let components = relativePath.split(separator: "/")
+        let skippedByScans =
+            components.contains { $0.hasPrefix(".") }
+            || components.dropLast().contains { $0.hasSuffix(".app") || $0.hasSuffix(".bundle") }
+        guard relativePath.lowercased().hasSuffix(".flac"), !skippedByScans else {
+            return AdmitScan(report: report, id: nil)
+        }
+        let disk = root.appending(path: relativePath)
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let values = try? disk.resourceValues(forKeys: keys), values.isRegularFile == true else {
+            return AdmitScan(report: report, id: nil)
+        }
+        let file = DiskFile(
+            relativePath: relativePath, url: disk, size: Int64(values.fileSize ?? 0),
+            modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+        let known = try knownTracks()
+        let here = Dictionary(known.filter { $0.folderID == folder }.map { ($0.relativePath, $0) }) { a, _ in a }
+        if let track = here[relativePath], track.size == file.size, track.modified == file.modified {
+            return AdmitScan(report: report, id: track.id)
+        }
+        var missing: [String: KnownTrack] = [:]
+        var byContent: [String: [KnownTrack]] = [:]
+        for track in known { byContent[track.contentID, default: []].append(track) }
+        try database.transaction {
+            try database.query(
+                "DELETE FROM removed WHERE folder_id = ? AND rel_path = ?", [.integer(folder), .text(relativePath)])
+            try scanFile(file, folder: folder, here: here, report: &report, missing: &missing, byContent: &byContent)
+        }
+        return AdmitScan(report: report, id: try trackID(folder: folder, relativePath: relativePath))
+    }
+
+    /// `relativePath` spelled as the folder lists it, component by component, whatever Unicode normalisation the
+    /// caller used; nil when a component is not there.
+    private static func onDiskSpelling(of relativePath: String, under root: URL) -> String? {
+        var directory = root
+        var spelled: [String] = []
+        for component in relativePath.split(separator: "/").map(String.init) {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return nil }
+            let exact = names.first { $0.unicodeScalars.elementsEqual(component.unicodeScalars) }
+            guard let name = exact ?? names.first(where: { $0 == component }) else { return nil }
+            spelled.append(name)
+            directory.append(path: name)
+        }
+        return spelled.joined(separator: "/")
     }
 
     /// Remembers `file` as refused, and removes the track that was there: it was music and is not any more.

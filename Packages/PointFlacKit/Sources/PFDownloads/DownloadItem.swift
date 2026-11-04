@@ -63,6 +63,9 @@ public struct DownloadItem: Sendable, Hashable, Identifiable, Codable {
     public let createdAt: Date
     /// The validated file waiting in staging after a failed `publish`, so a retry need not download again.
     var stagedFileName: String?
+    /// Set when the job was published somewhere other than asked, in words for the Downloads list ("Saved in
+    /// pointFlac (folder unavailable)"); `nil` for a plain "Done". Optional, so queues saved before it existed load.
+    public var note: String?
 
     init(id: String, track: RemoteTrack, state: DownloadState = .queued, attempts: Int = 0, createdAt: Date = Date()) {
         self.id = id
