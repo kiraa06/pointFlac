@@ -55,8 +55,9 @@ public final class FolderPublisher: Sendable {
         public var inCatalog: @Sendable (String) -> Bool
         /// Deletes a copy this download placed, if it is still the very file placed.
         public var takeBack: @Sendable (DownloadDestination.Saved) async -> Void
-        /// The import into the app's own library folder; throws when the library did not keep the file.
-        public var importIntoApp: @Sendable (URL) async throws -> Void
+        /// The import into the app's own library folder; throws when the library did not keep the file. Returns the
+        /// library track it became (added, or already there), or nil when the library can't say.
+        public var importIntoApp: @Sendable (URL) async throws -> String?
         public var deleteStaged: @Sendable (URL) -> Void
 
         public init(
@@ -69,7 +70,7 @@ public final class FolderPublisher: Sendable {
             admit: @escaping @Sendable (URL) async throws -> String?,
             inCatalog: @escaping @Sendable (String) -> Bool,
             takeBack: @escaping @Sendable (DownloadDestination.Saved) async -> Void,
-            importIntoApp: @escaping @Sendable (URL) async throws -> Void,
+            importIntoApp: @escaping @Sendable (URL) async throws -> String?,
             deleteStaged: @escaping @Sendable (URL) -> Void
         ) {
             self.target = target
@@ -100,9 +101,10 @@ public final class FolderPublisher: Sendable {
         self.steps = steps
     }
 
-    /// Publishes `staged` (`track`'s validated file) and returns the Downloads row's note, nil for a plain "Done".
-    /// Throws only when the song is safe nowhere, so the job fails with its staged file kept for a retry.
-    public func publish(_ staged: URL, track: RemoteTrack) async throws -> String? {
+    /// Publishes `staged` (`track`'s validated file) and returns the Downloads row's note (nil for a plain "Done")
+    /// with the library track the song became: the one admitted from the folder, or the one the app's import added or
+    /// already had. Throws only when the song is safe nowhere, so the job fails with its staged file kept for a retry.
+    public func publish(_ staged: URL, track: RemoteTrack) async throws -> Publication {
         let note: String?
         switch steps.target() {
         case .app:
@@ -111,20 +113,20 @@ public final class FolderPublisher: Sendable {
             note = Self.unavailableNote
         case .folder(let choice):
             switch await gate.run({ await self.saveToFolder(staged, track: track) }) {
-            case .saved:
-                return nil
+            case .saved(let trackID):
+                return Publication(note: nil, trackID: trackID)
             case .fellBack(let why, let unreachable):
                 if unreachable { await steps.markUnavailable(choice) }
                 note = why
             }
         }
-        try await steps.importIntoApp(staged)
+        let trackID = try await steps.importIntoApp(staged)
         steps.deleteStaged(staged)
-        return note
+        return Publication(note: note, trackID: trackID)
     }
 
     private enum FolderOutcome: Sendable {
-        case saved
+        case saved(trackID: String)
         case fellBack(note: String, unreachable: Bool)
 
         static func failed(_ failure: DownloadDestination.Failure) -> FolderOutcome {
@@ -165,7 +167,7 @@ public final class FolderPublisher: Sendable {
             return .fellBack(note: Self.notAdmittedNote, unreachable: false)
         }
         steps.deleteStaged(staged)
-        return .saved
+        return .saved(trackID: id)
     }
 }
 

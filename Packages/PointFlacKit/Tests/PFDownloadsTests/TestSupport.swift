@@ -36,6 +36,14 @@ actor Gate {
         for waiter in waiters { waiter.resume() }
         waiters.removeAll()
     }
+
+    /// Waits for the gate like `wait`, but throws `CancellationError` when the task is cancelled meanwhile, as a real
+    /// transfer stops when its job is paused or cancelled.
+    nonisolated func waitCancellably() async throws {
+        while await !isOpen {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
 }
 
 /// A provider whose behaviour each test scripts. `attempt` counts calls to `download` for that track, from 1.

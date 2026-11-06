@@ -153,7 +153,7 @@ final class RealMusicFinder: MusicFinding {
                     switch state {
                     case .published: finished
                     case .failed, .cancelled: failed
-                    case .queued, .downloading, .waiting, .validating, .saving: false
+                    case .queued, .downloading, .waiting, .validating, .saving, .paused: false
                     }
                 return cleared ? row : nil
             })
@@ -184,18 +184,21 @@ final class RealMusicFinder: MusicFinding {
         case .waiting: "Waiting for peer"
         case .validating: "Validating"
         case .saving: "Saving"
+        // As the manager words it: "Paused", or "Paused · 42%" with the progress so far.
+        case .paused: state.label
         case .published: "Done"
         case .failed(let reason): "Failed: \(reason)"
         case .cancelled: "Cancelled"
         }
     }
 
-    /// Non-nil exactly while the job is under way, so the progress bar and the tab badge track live transfers only.
+    /// Non-nil exactly while the job is under way, so the progress bar and the tab badge track live transfers only. A
+    /// paused job is not under way: its label carries how far it got.
     static func progress(_ state: DownloadState) -> Double? {
         switch state {
         case .downloading(let progress): progress ?? 0
         case .validating, .saving: 1
-        case .queued, .waiting, .published, .failed, .cancelled: nil
+        case .queued, .waiting, .paused, .published, .failed, .cancelled: nil
         }
     }
 

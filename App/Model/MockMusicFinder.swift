@@ -94,8 +94,8 @@ import PFDownloads
                     return
                 }
                 do {
-                    let note = try await Self.publishDemoSong(for: row, through: publisher)
-                    self?.set(row, "Done", nil, note: note)
+                    let published = try await Self.publishDemoSong(for: row, through: publisher)
+                    self?.set(row, "Done", nil, note: published.note)
                 } catch {
                     self?.set(row, "Failed: \(error.localizedDescription)", nil)
                 }
@@ -105,7 +105,7 @@ import PFDownloads
         /// Stages a copy of the bundled "Fold" as a provider would leave a validated download, and publishes it with
         /// the demo song's own artist and album, so the folder it is filed in matches the album the shelf shows.
         private static func publishDemoSong(for row: RemoteResultRow, through publisher: DownloadPublisher)
-            async throws -> String?
+            async throws -> Publication
         {
             guard
                 let fixture = Bundle.main.url(
