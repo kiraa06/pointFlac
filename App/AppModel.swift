@@ -293,14 +293,15 @@ final class AppModel {
         }
 
         /// `-PFTrashFolder`'s stand-in for Recently Deleted: the file moves into `bin`, under a fresh name should one
-        /// already be there.
-        nonisolated private static func moveToStandInTrash(_ file: URL, bin: URL) throws {
+        /// already be there, and that is where it went.
+        nonisolated private static func moveToStandInTrash(_ file: URL, bin: URL) throws -> URL? {
             try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
             var target = bin.appending(path: file.lastPathComponent)
             if FileManager.default.fileExists(atPath: target.path) {
                 target = bin.appending(path: "\(UUID().uuidString) \(file.lastPathComponent)")
             }
             try FileManager.default.moveItem(at: file, to: target)
+            return target
         }
 
         /// The fixtures in the app bundle's `Fixtures` folder, which only Debug builds carry (ruling R4).

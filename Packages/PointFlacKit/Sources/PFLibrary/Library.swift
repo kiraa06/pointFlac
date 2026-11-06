@@ -423,33 +423,98 @@ extension LibraryRemoval: ChangeReporting {
 public struct TrashFolder: Sendable {
     /// The folder, as the app resolved it (its security scope is opened around the removal).
     public var folder: URL
-    /// Moves one file to Recently Deleted, or throws. Injectable, so a test can make it fail without filling the Mac's
-    /// own Trash.
-    public var trash: @Sendable (URL) throws -> Void
+    /// How long a file's provider (iCloud Drive) may take to grant the coordinated write before the move is given up.
+    public var timeout: Duration
+    /// The move itself, run inside the coordinated write: the system trash (`systemTrash`) unless a test or the
+    /// simulator's stand-in replaces it. Returns where the file went, or nil when the trash did not say.
+    public var move: @Sendable (URL) throws -> URL?
 
-    public init(_ folder: URL, trash: @escaping @Sendable (URL) throws -> Void = TrashFolder.moveToRecentlyDeleted) {
+    public init(
+        _ folder: URL, timeout: Duration = .seconds(30),
+        move: @escaping @Sendable (URL) throws -> URL? = TrashFolder.systemTrash
+    ) {
         self.folder = folder
-        self.trash = trash
+        self.timeout = timeout
+        self.move = move
     }
 
-    /// Moves `file` to the trash of its volume (Recently Deleted in the Files app, for iCloud Drive and On My iPhone),
-    /// inside a coordinated write for deleting, so a file provider (iCloud Drive) takes part and nobody writes the
-    /// file meanwhile. Blocking: called on the library's queue. Throws when the coordination or the move fails, or a
-    /// provider has no trash; the file is then left where it was.
-    public static func moveToRecentlyDeleted(_ file: URL) throws {
-        var coordinationError: NSError?
-        var moveError: (any Error)?
-        NSFileCoordinator(filePresenter: nil).coordinate(
-            writingItemAt: file, options: .forDeleting, error: &coordinationError
-        ) { url in
-            do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-            } catch {
-                moveError = error
+    /// Why a move did not happen.
+    public enum Failure: Error, Sendable {
+        /// The file's provider did not grant the coordinated write within `timeout`; the move was called off.
+        case timedOut
+    }
+
+    /// `FileManager.trashItem`: Recently Deleted in the Files app, for iCloud Drive and On My iPhone; the Trash on a
+    /// Mac. Throws when the volume has none (the simulator's never do: Cocoa error 3328).
+    public static func systemTrash(_ file: URL) throws -> URL? {
+        var resulting: NSURL?
+        try FileManager.default.trashItem(at: file, resultingItemURL: &resulting)
+        return resulting as URL?
+    }
+
+    /// Whether the volume holding `url` has a trash to move files into.
+    public static func volumeHasTrash(_ url: URL) -> Bool {
+        (try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false))
+            != nil
+    }
+
+    /// Moves `file` to Recently Deleted inside a coordinated write for deleting, so a file provider takes part and
+    /// nobody writes the file meanwhile, and returns where it went. Blocking: called on the library's queue.
+    ///
+    /// The provider gets `timeout` to grant the write; past that the move is called off and the coordinator cancelled,
+    /// so the move never runs later, and this throws `Failure.timedOut`. A move that has started is left to finish. A
+    /// refused coordination, or a move that fails, throws; the file is then left where it was.
+    public func moveToRecentlyDeleted(_ file: URL) throws -> URL? {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        let intent = NSFileAccessIntent.writingIntent(with: file, options: .forDeleting)
+        let box = MoveBox()
+        let done = DispatchSemaphore(value: 0)
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let move = move
+        coordinator.coordinate(with: [intent], queue: queue) { error in
+            let proceed = box.phase.withLock { phase -> Bool in
+                guard case .waiting = phase else { return false }
+                if let error {
+                    phase = .finished(.failure(error))
+                    return false
+                }
+                phase = .working
+                return true
             }
+            if proceed {
+                let result = Result { try move(intent.url) }
+                box.phase.withLock { $0 = .finished(result) }
+            }
+            done.signal()
         }
-        if let coordinationError { throw coordinationError }
-        if let moveError { throw moveError }
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        if done.wait(timeout: .now() + seconds) == .timedOut {
+            let gaveUp = box.phase.withLock { phase -> Bool in
+                guard case .waiting = phase else { return false }
+                phase = .abandoned
+                return true
+            }
+            if gaveUp {
+                coordinator.cancel()
+                throw Failure.timedOut
+            }
+            done.wait()
+        }
+        guard case .finished(let result) = box.phase.withLock({ $0 }) else { throw Failure.timedOut }
+        return try result.get()
+    }
+
+    /// Where a coordinated move is: waiting for the grant, running, done, or given up before it was granted.
+    private enum Phase: Sendable {
+        case waiting
+        case working
+        case finished(Result<URL?, any Error>)
+        case abandoned
+    }
+
+    private final class MoveBox: Sendable {
+        let phase = Mutex<Phase>(.waiting)
     }
 }
 

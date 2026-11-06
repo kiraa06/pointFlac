@@ -72,8 +72,9 @@ final class RealLibrary: LibraryBrowsing {
     /// file to Recently Deleted. Set by the app model once the folder's store exists; read at each plan and removal,
     /// so a folder chosen or forgotten since applies at once.
     @ObservationIgnored var downloadFolder: () -> URL? = { nil }
-    /// Moves a file to Recently Deleted. DEBUG's `-PFTrashFolder` replaces it, as the simulator has no trash.
-    @ObservationIgnored var trash: @Sendable (URL) throws -> Void = TrashFolder.moveToRecentlyDeleted
+    /// The move to Recently Deleted, run inside the library's coordinated write. DEBUG's `-PFTrashFolder` replaces it,
+    /// as the simulator has no trash.
+    @ObservationIgnored var trash: @Sendable (URL) throws -> URL? = TrashFolder.systemTrash
 
     init(library: Library) {
         self.library = library
@@ -251,7 +252,7 @@ final class RealLibrary: LibraryBrowsing {
     /// leaving pointFlac only; the outcome counts those, for the UI to say so.
     @discardableResult
     func remove(tracks: [TrackRow.ID]) async -> RemovalOutcome {
-        let trashing = downloadFolder().map { TrashFolder($0, trash: trash) }
+        let trashing = downloadFolder().map { TrashFolder($0, move: trash) }
         // A failure is logged by the library; either way the shelf then shows what the library holds.
         let removal = try? await library.remove(trackIDs: tracks, trashing: trashing)
         await sync()

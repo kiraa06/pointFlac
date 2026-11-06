@@ -11,7 +11,8 @@ import Testing
 /// other track keeps today's rule. Should the move fail, the file is never deleted: the song leaves pointFlac only, as
 /// for any folder read in place, and the removal says so.
 ///
-/// The trash operation is injected (`TrashFolder.trash`): the real one would fill the Mac's Trash from a host test.
+/// The move itself is injected (`TrashFolder.move`), inside the real coordinated write: the system trash would fill the
+/// Mac's Trash from a host test. `realTrashOnThisVolume` runs the real one once, and empties what it trashed.
 private final class TrashSandbox {
     let root: URL
     var libraryFolder: URL { root.appending(path: "Documents/Library", directoryHint: .isDirectory) }
@@ -44,14 +45,16 @@ private final class TrashSandbox {
         try Library(databaseURL: database, libraryFolder: libraryFolder, artworkFolder: artwork)
     }
 
-    /// The download folder's rule, with a trash that moves the file into `bin`, or fails.
-    func rule(_ folder: URL? = nil, failing: Bool = false) -> TrashFolder {
+    /// The download folder's rule, with a move that puts the file in `bin`, or fails.
+    func rule(_ folder: URL? = nil, failing: Bool = false, timeout: Duration = .seconds(30)) -> TrashFolder {
         let bin = bin
         let trashed = trashed
-        return TrashFolder(folder ?? downloads) { file in
+        return TrashFolder(folder ?? downloads, timeout: timeout) { file in
             trashed.append(file.lastPathComponent)
             if failing { throw CocoaError(.featureUnsupported) }
-            try FileManager.default.moveItem(at: file, to: bin.appending(path: file.lastPathComponent))
+            let target = bin.appending(path: file.lastPathComponent)
+            try FileManager.default.moveItem(at: file, to: target)
+            return target
         }
     }
 
@@ -185,4 +188,144 @@ private final class TrashSandbox {
     #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 1, trashedFiles: 0, trashFailures: 1))
     #expect(box.trashed.all.isEmpty)
     #expect(box.exists(file.appending(path: "notes.txt")))
+}
+
+/// Review fix: the folder picked for downloads gone as a whole (moved, its volume ejected) is not "the file is already
+/// gone": the song leaves pointFlac, remembered as removed, so it does not come back with the folder.
+@Test func aFileWhoseDownloadFolderIsGoneIsRememberedAsRemoved() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    let file = box.downloads.appending(path: "A/01.flac")
+    try TaggedFlac.write("s16-44100", to: file, tags: [("TITLE", "Away")])
+    _ = try await library.addFolder(box.downloads)
+    let track = try #require(library.current.tracks.values.first)
+    let away = box.root.appending(path: "Moved Away", directoryHint: .isDirectory)
+    try FileManager.default.moveItem(at: box.downloads, to: away)
+
+    let removal = try await library.remove(trackIDs: [track.id], trashing: box.rule())
+
+    #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 1, trashedFiles: 0, trashFailures: 1))
+    #expect(box.trashed.all.isEmpty)
+    #expect(try await box.removedRows(library) == 1)
+    try FileManager.default.moveItem(at: away, to: box.downloads)
+    let rescan = await library.rescan()
+    #expect(rescan.added.isEmpty, "the song came back with its folder")
+    #expect(box.exists(file))
+}
+
+/// Review fix: the move happens before the database transaction, never inside it, so a slow file provider never holds
+/// the library's write lock. A second connection tries to start a write while the move runs.
+@Test func theMoveRunsOutsideTheDatabaseTransaction() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    let file = box.downloads.appending(path: "01.flac")
+    try TaggedFlac.write("s16-44100", to: file, tags: [("TITLE", "Song")])
+    _ = try await library.addFolder(box.downloads)
+    let track = try #require(library.current.tracks.values.first)
+    let database = box.database
+    let bin = box.bin
+    let writable = Flag()
+    let rule = TrashFolder(box.downloads) { file in
+        let other = try SQLiteDatabase(url: database)
+        do {
+            try other.execute("BEGIN IMMEDIATE")
+            try other.execute("ROLLBACK")
+            writable.set(true)
+        } catch {
+            writable.set(false)
+        }
+        let target = bin.appending(path: file.lastPathComponent)
+        try FileManager.default.moveItem(at: file, to: target)
+        return target
+    }
+
+    let removal = try await library.remove(trackIDs: [track.id], trashing: rule)
+
+    #expect(removal.trashedFiles == 1)
+    #expect(writable.value == true, "the move ran while the library held its write lock")
+    #expect(library.current.tracks.isEmpty)
+}
+
+/// Review fix: a file provider that never grants the coordinated write (a stalled iCloud Drive) is given up on after
+/// the timeout, and the coordination cancelled, so the move never runs later. The file is kept: the song leaves
+/// pointFlac only, with a `removed` row, and the removal reports the failure.
+@Test func aMoveTheProviderNeverGrantsIsGivenUpAndTheFileKept() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    let file = box.downloads.appending(path: "01.flac")
+    try TaggedFlac.write("s16-44100", to: file, tags: [("TITLE", "Stalled")])
+    _ = try await library.addFolder(box.downloads)
+    let track = try #require(library.current.tracks.values.first)
+    let holder = CoordinationHolder(file)
+    try await holder.hold()
+
+    let start = ContinuousClock.now
+    let removal = try await library.remove(
+        trackIDs: [track.id], trashing: box.rule(timeout: .milliseconds(300)))
+    let took = ContinuousClock.now - start
+    await holder.release()
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 1, trashedFiles: 0, trashFailures: 1))
+    #expect(took < .seconds(2), "the removal waited \(took) for the provider")
+    #expect(box.trashed.all.isEmpty, "the cancelled coordination ran the move after all")
+    #expect(box.exists(file))
+    #expect(try await box.removedRows(library) == 1)
+    #expect(library.current.tracks.isEmpty)
+}
+
+/// The real move, once: the coordinated write and `FileManager.trashItem` on a temporary file, on a volume with a
+/// trash (the Mac's own). What it trashed is deleted again, so nothing piles up in the Trash.
+@Test(.enabled(if: TrashFolder.volumeHasTrash(FileManager.default.temporaryDirectory)))
+func realTrashOnThisVolume() throws {
+    let folder = FileManager.default.temporaryDirectory.appending(
+        path: "LibraryRealTrash-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appending(path: "pointFlac trash test \(UUID().uuidString).flac")
+    try Data([1, 2, 3]).write(to: file)
+
+    let trashed = try TrashFolder(folder).moveToRecentlyDeleted(file)
+
+    let resulting = try #require(trashed, "the trash did not say where the file went")
+    defer { try? FileManager.default.removeItem(at: resulting) }
+    #expect(!FileManager.default.fileExists(atPath: file.path), "the file is still in its folder")
+    #expect(FileManager.default.fileExists(atPath: resulting.path), "nothing at \(resulting.path)")
+}
+
+/// A Boolean set from a `@Sendable` closure.
+private final class Flag: Sendable {
+    private let state = Mutex<Bool?>(nil)
+    func set(_ value: Bool) { state.withLock { $0 = value } }
+    var value: Bool? { state.withLock { $0 } }
+}
+
+/// Holds a coordinated write of a file on a thread of its own until released (three seconds at most), as a file
+/// provider that has not granted access yet would.
+private final class CoordinationHolder: Sendable {
+    let file: URL
+    private let held = Mutex(false)
+    private let finished = Mutex(false)
+    private let released = DispatchSemaphore(value: 0)
+
+    init(_ file: URL) { self.file = file }
+
+    func hold() async throws {
+        let file = file
+        Thread.detachNewThread { [self] in
+            var error: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: file, options: [], error: &error) { _ in
+                held.withLock { $0 = true }
+                // Let go after three seconds at most, so code that never gives up fails the test rather than hangs it.
+                _ = released.wait(timeout: .now() + 3)
+            }
+            finished.withLock { $0 = true }
+        }
+        while !held.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    func release() async {
+        released.signal()
+        while !finished.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(5)) }
+    }
 }
