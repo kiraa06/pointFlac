@@ -166,9 +166,13 @@ func makeManager(
 }
 
 /// Polls until `predicate` holds for the queue, failing the test after `timeout`.
+///
+/// The deadline is generous, and the queue is checked once more after it: in a whole-package run every suite shares
+/// one cooperative pool, and some audio tests hold its threads for twenty seconds or so, during which neither a
+/// provider's task nor this loop runs. A passing test still returns within milliseconds.
 @discardableResult
 func waitFor(
-    _ manager: DownloadManager, timeout: Duration = .seconds(10), sourceLocation: SourceLocation = #_sourceLocation,
+    _ manager: DownloadManager, timeout: Duration = .seconds(60), sourceLocation: SourceLocation = #_sourceLocation,
     _ predicate: @Sendable ([DownloadItem]) -> Bool
 ) async throws -> [DownloadItem] {
     let deadline = ContinuousClock.now + timeout
@@ -178,6 +182,7 @@ func waitFor(
         try await Task.sleep(for: .milliseconds(5))
     }
     let items = await manager.items
+    if predicate(items) { return items }
     Issue.record("timed out; states: \(items.map(\.state))", sourceLocation: sourceLocation)
     return items
 }
