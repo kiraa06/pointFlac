@@ -143,6 +143,55 @@ final class DownloadControlsUITests: XCTestCase {
         XCTAssertFalse(isOnShelf(app, "Paper Moons"), "the album is still on the shelf")
     }
 
+    /// Review fix: a download folder that can't be reached is not treated as the download folder. Deleting its song
+    /// says the file stays, removes the song from pointFlac only, and the song does not come back with the folder.
+    @MainActor
+    func testDeletingFromAnUnavailableDownloadFolderKeepsTheFile() throws {
+        let folder = try makeFolder()
+        let bin = try makeFolder()
+        let app = XCUIApplication.pointFlac([
+            "-PFMockFinder", "-PFFreshLibrary", "-PFDownloadFolder", folder.path, "-PFTrashFolder", bin.path,
+        ])
+        app.launch()
+        let row = download(app, "ia-Test-1")
+        wait(for: row, "label CONTAINS 'Done'", timeout: 15)
+        let saved = folder.appending(path: "Ada Vale/Paper Moons/01 Fold.flac")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: saved.path))
+
+        // The folder goes away; back in the app, the check finds it unavailable.
+        let away = folder.deletingLastPathComponent().appending(
+            path: folder.lastPathComponent + "-away", directoryHint: .isDirectory)
+        try FileManager.default.moveItem(at: folder, to: away)
+        addTeardownBlock { try? FileManager.default.removeItem(at: away) }
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        let link = app.buttons["downloadFolderLink"]
+        open(app, tab: "Settings", showing: link)
+        wait(for: link, "label CONTAINS 'Unavailable'", timeout: 10)
+        app.tabBars.buttons["Downloads"].tap()
+
+        row.press(forDuration: 1.2)
+        let delete = app.buttons["Delete Song…"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let message = "Removes this song from pointFlac. The file stays in its folder."
+        XCTAssertTrue(app.staticTexts[message].waitForExistence(timeout: 3), "the dialog promised something else")
+        let confirm = app.buttons["deleteDownloadedSong"].firstMatch
+        XCTAssertEqual(confirm.label, "Remove Song")
+        confirm.tap()
+        wait(for: row, "exists == false", timeout: 5)
+
+        // The folder comes back: the song stays out of pointFlac, and its file is where it was.
+        try FileManager.default.moveItem(at: away, to: folder)
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: saved.path), "the file left the folder")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: bin.path), [], "something was trashed")
+        XCTAssertFalse(isOnShelf(app, "Paper Moons"), "the song came back with its folder")
+    }
+
     /// Remove from List takes the row only: the song stays on the shelf, and its file in the folder.
     @MainActor
     func testRemoveFromListKeepsTheSong() throws {
@@ -211,12 +260,22 @@ final class DownloadControlsUITests: XCTestCase {
         item.tap()
     }
 
+    /// Taps the tab `name` until `element` shows: a tap made while the app is still coming back to the foreground
+    /// can be lost.
+    @MainActor
+    private func open(_ app: XCUIApplication, tab name: String, showing element: XCUIElement) {
+        for _ in 0..<3 where !element.exists {
+            app.tabBars.buttons[name].tap()
+            _ = element.waitForExistence(timeout: 3)
+        }
+        XCTAssertTrue(element.exists, "the \(name) tab did not open")
+    }
+
     /// Opens the shelf and searches it for `album`: whether its result shows.
     @MainActor
     private func isOnShelf(_ app: XCUIApplication, _ album: String) -> Bool {
-        app.tabBars.buttons["Player"].tap()
         let shelf = app.buttons["shelfButton"]
-        XCTAssertTrue(shelf.waitForExistence(timeout: 5))
+        open(app, tab: "Player", showing: shelf)
         shelf.tap()
         let field = app.textFields["shelfSearch"]
         XCTAssertTrue(field.waitForExistence(timeout: 3))

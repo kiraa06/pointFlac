@@ -134,7 +134,7 @@ final class AppModel {
         let downloadFolder = DownloadFolder(store: folderStore, library: realLibrary)
         self.downloadFolder = downloadFolder
         // Songs whose file is in the download folder move to Recently Deleted when deleted (Shelf and Downloads).
-        realLibrary.downloadFolder = { folderStore.folderURL }
+        realLibrary.downloadFolder = { folderStore.downloadFolder }
         #if DEBUG
             if let path = UserDefaults.standard.string(forKey: "PFTrashFolder"), !path.isEmpty {
                 let bin = URL(filePath: path, directoryHint: .isDirectory)

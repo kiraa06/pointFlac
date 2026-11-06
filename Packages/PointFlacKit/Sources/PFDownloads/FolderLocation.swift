@@ -18,10 +18,17 @@ public enum FolderLocation {
     /// Whether `url` is `container` or inside it. Symlinks are resolved and `/private` is ignored, so `/var/…` and
     /// `/private/var/…` agree, and a trailing slash keeps "ABC2" from counting as inside "ABC".
     public static func isInside(_ url: URL, container: URL) -> Bool {
-        comparable(url).hasPrefix(comparable(container))
+        isInside(url, comparableContainer: comparablePath(container))
     }
 
-    private static func comparable(_ url: URL) -> String {
+    /// `isInside` with the container's `comparablePath` worked out beforehand, so checking many files resolves only
+    /// theirs.
+    public static func isInside(_ url: URL, comparableContainer: String) -> Bool {
+        comparablePath(url).hasPrefix(comparableContainer)
+    }
+
+    /// `url`'s path as `isInside` compares paths. Reads the file system, to resolve symlinks.
+    public static func comparablePath(_ url: URL) -> String {
         var path = url.standardizedFileURL.resolvingSymlinksInPath().path
         if path.hasPrefix("/private/") { path.removeFirst("/private".count) }
         return path.hasSuffix("/") ? path : path + "/"

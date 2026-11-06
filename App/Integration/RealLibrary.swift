@@ -70,8 +70,8 @@ final class RealLibrary: LibraryBrowsing {
     @ObservationIgnored private var listenStats: [String: ListenStat] = [:]
     /// The folder picked for downloads, as last resolved, or nil: deleting a song whose file is inside it moves the
     /// file to Recently Deleted. Set by the app model once the folder's store exists; read at each plan and removal,
-    /// so a folder chosen or forgotten since applies at once.
-    @ObservationIgnored var downloadFolder: () -> URL? = { nil }
+    /// so a folder chosen, forgotten or found unavailable since applies at once.
+    @ObservationIgnored var downloadFolder: () -> DownloadFolderStore.ResolvedFolder? = { nil }
     /// The move to Recently Deleted, run inside the library's coordinated write. DEBUG's `-PFTrashFolder` replaces it,
     /// as the simulator has no trash.
     @ObservationIgnored var trash: @Sendable (URL) throws -> URL? = TrashFolder.systemTrash
@@ -223,7 +223,8 @@ final class RealLibrary: LibraryBrowsing {
     ///
     /// Three kinds, decided as the library decides them: the app's own copies are deleted; files inside the folder
     /// picked for downloads move to Recently Deleted; files in any other folder added in place stay, and only leave
-    /// pointFlac. The download folder is judged by the file's folder, as the library judges it.
+    /// pointFlac. The download folder is judged by the file's folder, as the library judges it; its own path was
+    /// resolved once, when it was found, so each track costs one resolution here.
     func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan {
         var ids = album.map { snapshot.tracks(of: $0).map(\.id) } ?? []
         ids += tracks.filter { !ids.contains($0) }
@@ -235,7 +236,8 @@ final class RealLibrary: LibraryBrowsing {
                 plan.deletes += 1
                 if !track.isSupported { plan.unplayableDeletes += 1 }
             } else if let downloads,
-                FolderLocation.isInside(track.url.deletingLastPathComponent(), container: downloads)
+                FolderLocation.isInside(
+                    track.url.deletingLastPathComponent(), comparableContainer: downloads.comparablePath)
             {
                 plan.trashes += 1
                 if !track.isSupported { plan.unplayableTrashes += 1 }
@@ -252,7 +254,7 @@ final class RealLibrary: LibraryBrowsing {
     /// leaving pointFlac only; the outcome counts those, for the UI to say so.
     @discardableResult
     func remove(tracks: [TrackRow.ID]) async -> RemovalOutcome {
-        let trashing = downloadFolder().map { TrashFolder($0, move: trash) }
+        let trashing = downloadFolder().map { TrashFolder($0.url, move: trash) }
         // A failure is logged by the library; either way the shelf then shows what the library holds.
         let removal = try? await library.remove(trackIDs: tracks, trashing: trashing)
         await sync()
