@@ -452,12 +452,6 @@ public struct TrashFolder: Sendable {
         return resulting as URL?
     }
 
-    /// Whether the volume holding `url` has a trash to move files into.
-    public static func volumeHasTrash(_ url: URL) -> Bool {
-        (try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false))
-            != nil
-    }
-
     /// Moves `file` to Recently Deleted inside a coordinated write for deleting, so a file provider takes part and
     /// nobody writes the file meanwhile, and returns where it went. Blocking: called on the library's queue.
     ///

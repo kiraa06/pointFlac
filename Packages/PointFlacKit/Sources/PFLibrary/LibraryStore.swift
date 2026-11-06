@@ -973,6 +973,9 @@ final class LibraryStore {
     /// Moves the files of `rows` that lie inside `trashing`'s folder to Recently Deleted, with the folder's security
     /// scope open around the moves, and says for each such track whether its file left the folder. Tracks elsewhere
     /// are not in the result.
+    ///
+    /// Once one move times out, the provider is taken to be stalled: the files after it are not tried, and stay, so a
+    /// removal costs one timeout at most, not one per song.
     private func moveToTrash(_ rows: [RemovalRow], _ trashing: TrashFolder) -> [String: Bool] {
         let container = Self.comparablePath(trashing.folder)
         // False when the URL needs no scope.
@@ -981,12 +984,36 @@ final class LibraryStore {
             if scoped { trashing.folder.stopAccessingSecurityScopedResource() }
         }
         var moved: [String: Bool] = [:]
+        var stalled = false
         for row in rows where row.folder != Self.libraryFolderID {
             guard let root = roots[row.folder], let file = Self.trashable(row.path, in: root, under: container)
             else { continue }
-            moved[row.id] = Self.moveToTrash(file, trashing)
+            guard !stalled else {
+                moved[row.id] = false
+                continue
+            }
+            switch Self.moveToTrash(file, trashing) {
+            case .moved: moved[row.id] = true
+            case .kept: moved[row.id] = false
+            case .timedOut:
+                moved[row.id] = false
+                stalled = true
+            }
+        }
+        if stalled {
+            Library.logger.error("Remove: the file provider did not answer; the rest of the removal kept its files")
         }
         return moved
+    }
+
+    /// What became of one file handed to the trash.
+    private enum TrashOutcome {
+        /// It left the folder: moved to Recently Deleted, or already gone.
+        case moved
+        /// It is still there, or can't be told to be gone.
+        case kept
+        /// Kept, because the file's provider did not grant the move in time.
+        case timedOut
     }
 
     /// The file at `relativePath` in a folder read in place, when it lies inside the folder whose comparable path is
@@ -1001,34 +1028,71 @@ final class LibraryStore {
         return file
     }
 
-    /// Moves a file of the download folder to Recently Deleted. True when it is gone from the folder afterwards, moved
-    /// now or already gone; false when it is still there or can't be told: the move failed or timed out, something
+    /// Moves a file of the download folder to Recently Deleted. Moved when it is gone from the folder afterwards,
+    /// moved now or already gone; kept when it is still there or can't be told: the move failed or timed out, something
     /// other than a file or a link (a folder that took its name) is there, which is never handed to the trash, or the
     /// download folder itself is gone (moved, its volume ejected), so the file may come back with it.
-    private static func moveToTrash(_ url: URL, _ trashing: TrashFolder) -> Bool {
-        let manager = FileManager.default
-        let type: FileAttributeType?
-        do {
-            type = try manager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
-            var folder: ObjCBool = false
-            return manager.fileExists(atPath: trashing.folder.path, isDirectory: &folder) && folder.boolValue
-        } catch {
-            return false
+    ///
+    /// A file iCloud evicted may be there only as its placeholder, ".Name.flac.icloud", beside where it was. The
+    /// placeholder is what goes to Recently Deleted then, as the file would: otherwise the next scan would download the
+    /// song back. Only a placeholder that is a plain file is moved.
+    private static func moveToTrash(_ url: URL, _ trashing: TrashFolder) -> TrashOutcome {
+        switch itemType(url) {
+        case .present(let type):
+            guard type == .typeRegular || type == .typeSymbolicLink else { return .kept }
+            return move(url, trashing)
+        case .unreadable:
+            return .kept
+        case .absent:
+            break
         }
-        guard type == .typeRegular || type == .typeSymbolicLink else { return false }
+        let placeholder = url.deletingLastPathComponent().appending(path: ".\(url.lastPathComponent).icloud")
+        switch itemType(placeholder) {
+        case .present(let type):
+            return type == .typeRegular ? move(placeholder, trashing) : .kept
+        case .unreadable:
+            return .kept
+        case .absent:
+            var folder: ObjCBool = false
+            let present = FileManager.default.fileExists(atPath: trashing.folder.path, isDirectory: &folder)
+            return present && folder.boolValue ? .moved : .kept
+        }
+    }
+
+    /// One item handed to the trash under the coordinated write, then checked gone.
+    private static func move(_ item: URL, _ trashing: TrashFolder) -> TrashOutcome {
         do {
-            _ = try trashing.moveToRecentlyDeleted(url)
+            _ = try trashing.moveToRecentlyDeleted(item)
         } catch {
             // The kind of failure only, never the name: a provider without a trash is Cocoa error 3328.
             let failure = error as NSError
             Library.logger.error(
                 "Remove: the move to Recently Deleted failed (\(failure.domain, privacy: .public) \(failure.code, privacy: .public))"
             )
-            return false
+            if case TrashFolder.Failure.timedOut = error { return .timedOut }
+            return .kept
         }
-        // A provider that reported success but left the file has not moved it.
-        return (try? manager.attributesOfItem(atPath: url.path)) == nil
+        // A provider that reported success but left the item has not moved it.
+        return itemType(item) == .absent ? .moved : .kept
+    }
+
+    /// What is at `url`, without following a final link.
+    private enum ItemType: Equatable {
+        case present(FileAttributeType)
+        case absent
+        /// Something that could not be looked at (no permission, an unreachable volume).
+        case unreadable
+    }
+
+    private static func itemType(_ url: URL) -> ItemType {
+        do {
+            let type = try FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+            return .present(type ?? .typeUnknown)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            return .absent
+        } catch {
+            return .unreadable
+        }
     }
 
     /// The library folder's file at `relativePath`, or nil when that path would lead out of the library folder: only

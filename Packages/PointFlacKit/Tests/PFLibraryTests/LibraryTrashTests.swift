@@ -274,9 +274,81 @@ private final class TrashSandbox {
     #expect(library.current.tracks.isEmpty)
 }
 
+/// Re-review fix: a song whose file iCloud evicted shows only as its placeholder, ".Name.flac.icloud". Deleting it moves
+/// the placeholder to Recently Deleted, so the next scan does not download the song back.
+@Test func anEvictedFilesPlaceholderMovesToRecentlyDeleted() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    let (file, placeholder, track) = try await evicted(box, library)
+
+    let removal = try await library.remove(trackIDs: [track], trashing: box.rule())
+
+    #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 0, trashedFiles: 1, trashFailures: 0))
+    #expect(box.trashed.all == [placeholder.lastPathComponent])
+    #expect(!box.exists(placeholder), "the placeholder is still in the folder")
+    #expect(!box.exists(file))
+    #expect(try await box.removedRows(library) == 0)
+}
+
+/// Its placeholder that would not move is kept, and the song is remembered as removed, so the scan leaves it in iCloud.
+@Test func anEvictedFilesPlaceholderThatWillNotMoveIsKept() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    let (_, placeholder, track) = try await evicted(box, library)
+
+    let removal = try await library.remove(trackIDs: [track], trashing: box.rule(failing: true))
+
+    #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 1, trashedFiles: 0, trashFailures: 1))
+    #expect(box.trashed.all == [placeholder.lastPathComponent], "the move was tried")
+    #expect(box.exists(placeholder))
+    #expect(try await box.removedRows(library) == 1)
+}
+
+/// A song in the download folder whose file iCloud then evicted, leaving only ".01 Fold.flac.icloud": the file, the
+/// placeholder and the track.
+private func evicted(_ box: TrashSandbox, _ library: Library) async throws -> (URL, URL, String) {
+    let file = box.downloads.appending(path: "Ada Vale/Paper Moons/01 Fold.flac")
+    try TaggedFlac.write("s16-44100", to: file, tags: [("TITLE", "Fold")])
+    _ = try await library.addFolder(box.downloads)
+    let track = try #require(library.current.tracks.values.first).id
+    let placeholder = file.deletingLastPathComponent().appending(path: ".01 Fold.flac.icloud")
+    try FileManager.default.removeItem(at: file)
+    try Data("placeholder".utf8).write(to: placeholder)
+    return (file, placeholder, track)
+}
+
+/// Re-review fix: one stalled provider costs a removal one timeout, not one per song. After the first file times out
+/// the rest are not tried: each is kept, remembered as removed, and reported.
+@Test func afterOneTimeoutTheRestAreNotTried() async throws {
+    let box = try TrashSandbox()
+    let library = try box.open()
+    for number in 1...3 {
+        try TaggedFlac.write(
+            ["s16-44100", "s24-48000", "s24-96000"][number - 1], to: box.downloads.appending(path: "0\(number).flac"),
+            tags: [("TITLE", "Song \(number)")])
+    }
+    _ = try await library.addFolder(box.downloads)
+    let ids = library.current.tracks.values.map(\.id)
+    #expect(ids.count == 3)
+    // Every file held, so whichever is tried first times out. (A write held on the folder does not hold the files.)
+    let holders = (1...3).map { CoordinationHolder(box.downloads.appending(path: "0\($0).flac")) }
+    for holder in holders { try await holder.hold() }
+
+    let start = ContinuousClock.now
+    let removal = try await library.remove(trackIDs: ids, trashing: box.rule(timeout: .seconds(1)))
+    let took = ContinuousClock.now - start
+    for holder in holders { await holder.release() }
+
+    #expect(removal == LibraryRemoval(deletedFiles: 0, removedFromLibrary: 3, trashedFiles: 0, trashFailures: 3))
+    #expect(took < .seconds(2), "the removal waited \(took): a timeout per song")
+    #expect(box.trashed.all.isEmpty)
+    for number in 1...3 { #expect(box.exists(box.downloads.appending(path: "0\(number).flac"))) }
+    #expect(try await box.removedRows(library) == 3)
+}
+
 /// The real move, once: the coordinated write and `FileManager.trashItem` on a temporary file, on a volume with a
 /// trash (the Mac's own). What it trashed is deleted again, so nothing piles up in the Trash.
-@Test(.enabled(if: TrashFolder.volumeHasTrash(FileManager.default.temporaryDirectory)))
+@Test(.enabled(if: volumeHasTrash(FileManager.default.temporaryDirectory)))
 func realTrashOnThisVolume() throws {
     let folder = FileManager.default.temporaryDirectory.appending(
         path: "LibraryRealTrash-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -288,9 +360,16 @@ func realTrashOnThisVolume() throws {
     let trashed = try TrashFolder(folder).moveToRecentlyDeleted(file)
 
     let resulting = try #require(trashed, "the trash did not say where the file went")
-    defer { try? FileManager.default.removeItem(at: resulting) }
     #expect(!FileManager.default.fileExists(atPath: file.path), "the file is still in its folder")
     #expect(FileManager.default.fileExists(atPath: resulting.path), "nothing at \(resulting.path)")
+    #expect(throws: Never.self, "the trashed copy is left in the Trash") {
+        try FileManager.default.removeItem(at: resulting)
+    }
+}
+
+/// Whether the volume holding `url` has a trash to move files into (the simulator's never do).
+private func volumeHasTrash(_ url: URL) -> Bool {
+    (try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false)) != nil
 }
 
 /// A Boolean set from a `@Sendable` closure.
