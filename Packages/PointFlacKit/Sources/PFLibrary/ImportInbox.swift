@@ -133,8 +133,13 @@ public actor ImportInbox {
     ///
     /// - Returns: the files added, in the order given, and the files refused. Duplicates appear in neither.
     public func importFiles(_ urls: [URL]) async -> (added: [ImportedFile], rejected: [ImportRejection]) {
-        let result = await worker.run { $0.importFiles(urls) }
+        let result = await importReporting(urls)
         return (result.added, result.rejected)
+    }
+
+    /// `importFiles`, also naming the library file each duplicate matched (`InboxWorker.ImportResult.existing`).
+    func importReporting(_ urls: [URL]) async -> InboxWorker.ImportResult {
+        await worker.run { $0.importFiles(urls) }
     }
 
     /// The library's FLAC files, ordered by name as the Files app orders them. Files that no longer read as FLAC are
@@ -181,6 +186,8 @@ final class InboxWorker: @unchecked Sendable {
     struct ImportResult: Sendable {
         var added: [ImportedFile] = []
         var rejected: [ImportRejection] = []
+        /// For each source skipped as a duplicate, the name of the library file it matched.
+        var existing: [String] = []
     }
 
     func importFiles(_ urls: [URL]) -> ImportResult {
@@ -188,7 +195,7 @@ final class InboxWorker: @unchecked Sendable {
         for source in urls {
             switch importFile(source) {
             case .added(let file): result.added.append(file)
-            case .duplicate: break
+            case .duplicate(let name): result.existing.append(name)
             case .rejected(let reason, let tooLarge):
                 result.rejected.append(
                     ImportRejection(fileName: source.lastPathComponent, reason: reason, exceedsSizeLimit: tooLarge))
@@ -227,7 +234,8 @@ final class InboxWorker: @unchecked Sendable {
 
     private enum Outcome {
         case added(ImportedFile)
-        case duplicate
+        /// The library file, by name, that the source matched.
+        case duplicate(String)
         case rejected(FlacRejection, tooLarge: Bool = false)
     }
 
@@ -260,7 +268,11 @@ final class InboxWorker: @unchecked Sendable {
         } catch {
             return .rejected(error)
         }
-        guard let destination = destination(for: name, size: size) else { return .duplicate }
+        let destination: URL
+        switch self.destination(for: name, size: size) {
+        case .free(let url): destination = url
+        case .taken(let existing): return .duplicate(existing)
+        }
 
         let temporary = libraryFolder.appending(
             path: ImportInbox.temporaryPrefix + UUID().uuidString + ImportInbox.temporarySuffix)
@@ -291,19 +303,25 @@ final class InboxWorker: @unchecked Sendable {
                 name: destination.lastPathComponent, url: destination, metadata: metadata, contentID: contentID))
     }
 
-    /// Where a source called `name` of `size` bytes goes: `name`, or else the first free "stem N.ext". Nil when the
+    private enum Destination {
+        case free(URL)
+        /// The library already has the file, under this name.
+        case taken(String)
+    }
+
+    /// Where a source called `name` of `size` bytes goes: `name`, or else the first free "stem N.ext". Taken when the
     /// library already has it, under `name` or one of those numbered names, at the same size. A name taken by anything
     /// else, a folder say, is never free.
-    private func destination(for name: String, size: Int64) -> URL? {
+    private func destination(for name: String, size: Int64) -> Destination {
         let stem = Self.stem(name)
         let pathExtension = (name as NSString).pathExtension
         for number in 1... {
             let candidate = number == 1 ? name : "\(stem) \(number).\(pathExtension)"
             let url = libraryFolder.appending(path: candidate)
-            guard fileManager.fileExists(atPath: url.path) else { return url }
-            if Self.size(of: url) == size { return nil }
+            guard fileManager.fileExists(atPath: url.path) else { return .free(url) }
+            if Self.size(of: url) == size { return .taken(candidate) }
         }
-        return nil
+        return .taken(name)
     }
 
     /// The library file `name` at `url`, described by `metadata`.
