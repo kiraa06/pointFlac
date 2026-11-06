@@ -79,8 +79,10 @@ public actor DownloadManager {
     /// Jobs whose transfer was stopped by `pause` and has not ended yet: their task keeps the staging folder, even if
     /// the job was resumed meanwhile (the next transfer continues from it). `cancel` takes a job out again.
     private var pausing: Set<String> = []
-    /// For tests: awaited as a job starts validating, so a test can act while it is there.
-    private var validationHook: (@Sendable (String) async -> Void)?
+    #if DEBUG
+        /// For tests: awaited as a job starts validating, so a test can act while it is there. Debug builds only.
+        private var validationHook: (@Sendable (String) async -> Void)?
+    #endif
     private var lastGrowthCheck: [String: ContinuousClock.Instant] = [:]
 
     public init(providers: [any DownloadProvider], configuration: Configuration, publish: @escaping Publish) {
@@ -158,13 +160,18 @@ public actor DownloadManager {
         }
     }
 
-    /// Queues `track`, or returns the job already downloading it.
+    /// Queues `track`, or returns the job already downloading it. A paused job for it is resumed: asking for the song
+    /// again is asking for it to come.
     @discardableResult
     public func enqueue(_ track: RemoteTrack) -> String {
         // Only a job still in flight absorbs a repeat request; after it ends the user may want the file again.
         if let existing = queue.first(where: {
             $0.track.id == track.id && $0.track.provider == track.provider && !$0.state.isFinal
         }) {
+            if release(existing.id) {
+                changed(persist: true)
+                pump()
+            }
             return existing.id
         }
         let item = DownloadItem(id: UUID().uuidString, track: track)
@@ -351,7 +358,9 @@ public actor DownloadManager {
                 // The download already passed validation; the library refused it last time. Check it again
                 // (spec §5.4 step 5) rather than trusting the earlier run, then publish.
                 try setState(id, .validating)
-                await validationHook?(id)
+                #if DEBUG
+                    await validationHook?(id)
+                #endif
                 admitted = try await Self.admit(
                     staging.appending(path: staged), staging: staging, track: item.track,
                     maxBytes: configuration.maxFileBytes)
@@ -367,7 +376,9 @@ public actor DownloadManager {
                 let file = try await download(id, track: item.track, from: provider, into: staging)
                 watchdog.cancel()
                 try setState(id, .validating)
-                await validationHook?(id)
+                #if DEBUG
+                    await validationHook?(id)
+                #endif
                 admitted = try await Self.admit(
                     file, staging: staging, track: item.track, maxBytes: configuration.maxFileBytes)
             }
@@ -604,10 +615,12 @@ public actor DownloadManager {
 
     private func unsubscribe(_ token: UUID) { subscribers[token] = nil }
 
-    /// For tests: `hook` is awaited each time a job starts validating.
-    func setValidationHook(_ hook: (@Sendable (String) async -> Void)?) {
-        validationHook = hook
-    }
+    #if DEBUG
+        /// For tests: `hook` is awaited each time a job starts validating.
+        func setValidationHook(_ hook: (@Sendable (String) async -> Void)?) {
+            validationHook = hook
+        }
+    #endif
 
     // MARK: Files
 

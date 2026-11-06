@@ -288,6 +288,33 @@ struct PauseResumeTests {
         #expect(await manager.cancelAll() == 0)
     }
 
+    @Test("downloading a paused track again resumes that job, behind the same limits, and starts no second one")
+    func reEnqueueResumesThePausedJob() async throws {
+        let folder = try TempFolder()
+        let library = try LibrarySpy(folder: folder.sub("Library"))
+        let gate = Gate()
+        let provider = ScriptedProvider { track, staging, _, events in
+            try await gate.waitCancellably()
+            events.yield(.finished(try deliverFixture(track, staging)))
+        }
+        let manager = makeManager(folder, provider: provider, library: library) { $0.maxConcurrent = 1 }
+        let paused = await manager.enqueue(fixtureTrack("s16-44100", id: "a", fileName: "A.flac"))
+        try await waitFor(manager) { $0.first?.state == .downloading(progress: nil) }
+        #expect(await manager.pause(paused))
+        let other = await manager.enqueue(fixtureTrack("s16-44100", id: "b", fileName: "B.flac"))
+        try await waitFor(manager) { $0.last?.state == .downloading(progress: nil) }
+
+        let again = await manager.enqueue(fixtureTrack("s16-44100", id: "a", fileName: "A.flac"))
+
+        #expect(again == paused, "the paused job, not a new one")
+        #expect(await manager.items.map(\.id) == [paused, other])
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await manager.items.first?.state == .queued, "resumed, and waiting for the one slot")
+        await gate.open()
+        let items = try await waitFor(manager) { $0.count == 2 && allFinal($0) }
+        #expect(items.allSatisfy { $0.state == .published })
+    }
+
     @Test("cancelling a paused job deletes its staging folder")
     func cancelAPausedJob() async throws {
         let folder = try TempFolder()
