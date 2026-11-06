@@ -990,6 +990,11 @@ final class LibraryStore {
         do {
             try trashing.trash(url)
         } catch {
+            // The kind of failure only, never the name: a provider without a trash is Cocoa error 3328.
+            let failure = error as NSError
+            Library.logger.error(
+                "Remove: the move to Recently Deleted failed (\(failure.domain, privacy: .public) \(failure.code, privacy: .public))"
+            )
             return false
         }
         // A provider that reported success but left the file has not moved it.
