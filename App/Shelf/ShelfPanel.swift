@@ -604,17 +604,21 @@ struct ShelfPanel: View {
     /// The deck lets go of the songs first, so nothing plays a file as it is deleted; then the library removes them,
     /// and the crate follows. The deck is asked again afterwards: the removal may have waited behind a scan, and the
     /// record been put back on meanwhile from the crate, which still showed it. Songs still listed afterwards could
-    /// not be taken (a file that would not go, a database failure), and the shelf says so.
+    /// not be taken (a file that would not go, a database failure), and the shelf says so; so are files that would
+    /// not move to Recently Deleted, whose songs left pointFlac while the files stay in their folder.
     private func delete(_ removal: PendingRemoval) {
         let tracks = removal.plan.tracks
         Task {
             await playback.willRemove(tracks: Set(tracks))
-            await library.remove(tracks: tracks)
+            let outcome = await library.remove(tracks: tracks)
             await playback.willRemove(tracks: Set(tracks))
             runSearch()
             let left = library.removalPlan(album: nil, tracks: tracks)
-            let verb = left.deletes == 0 ? "removed" : "deleted"
-            importNote = left.tracks.isEmpty ? nil : "\(PendingRemoval.songs(left.tracks.count)) could not be \(verb)."
+            let verb = left.deletes + left.trashes == 0 ? "removed" : "deleted"
+            let songs = PendingRemoval.songs(left.tracks.count)
+            let notDeleted = left.tracks.isEmpty ? nil : "\(songs) could not be \(verb)."
+            let lines = [notDeleted, outcome.note].compactMap { $0 }
+            importNote = lines.isEmpty ? nil : lines.joined(separator: " ")
         }
     }
 
@@ -644,13 +648,19 @@ private struct PendingRemoval {
     let title: String
     let plan: RemovalPlan
 
-    /// One sentence for each kind of song in the selection, so a mixed album says both. Songs pointFlac can't play
+    /// One sentence for each kind of song in the selection, so a mixed album says each. Songs pointFlac can't play
     /// are not on the shelf, so the count names them rather than surprise anyone who counts the sleeve's songs.
     var message: String {
         var sentences: [String] = []
         if plan.deletes > 0 {
             sentences.append(
                 "Deletes \(Self.songs(plan.deletes)) from this iPhone\(Self.including(plan.unplayableDeletes)).")
+        }
+        if plan.trashes > 0 {
+            let restore = plan.trashes == 1 ? "it" : "them"
+            sentences.append(
+                "Moves \(Self.songs(plan.trashes)) to Recently Deleted in Files\(Self.including(plan.unplayableTrashes))."
+                    + " You can restore \(restore) there for 30 days.")
         }
         if plan.removes > 0 {
             let files = plan.removes == 1 ? "The file stays in its folder." : "The files stay in their folder."
@@ -660,8 +670,9 @@ private struct PendingRemoval {
         return sentences.joined(separator: " ")
     }
 
-    /// "Remove" when nothing would leave the iPhone, "Delete" otherwise.
-    var action: String { plan.deletes == 0 ? "Remove" : "Delete" }
+    /// "Remove" when every file stays where it is, "Delete" when any leaves its place (deleted, or moved to Recently
+    /// Deleted).
+    var action: String { plan.deletes + plan.trashes == 0 ? "Remove" : "Delete" }
 
     static func songs(_ count: Int) -> String { count == 1 ? "1 song" : "\(count) songs" }
 

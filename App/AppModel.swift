@@ -30,6 +30,10 @@ import PFLibrary
 ///   saved), as if it had been picked in Settings, and with `-PFMockFinder` makes the demo downloads real files, so a
 ///   UI test can follow one into the folder. `-PFResetDownloadFolder` forgets a folder picked earlier, so Settings
 ///   starts from "In pointFlac".
+/// - `-PFSlowDownloads` stretches the demo downloads to about half a minute each, so a UI test can pause one.
+/// - `-PFTrashFolder <absolute path>` stands in for Recently Deleted, which the simulator lacks (its volumes have no
+///   trash, so `FileManager.trashItem` always fails there): a song deleted from the download folder has its file moved
+///   into that plain folder instead, so a UI test can see it leave.
 @MainActor
 @Observable
 final class AppModel {
@@ -129,6 +133,14 @@ final class AppModel {
         #endif
         let downloadFolder = DownloadFolder(store: folderStore, library: realLibrary)
         self.downloadFolder = downloadFolder
+        // Songs whose file is in the download folder move to Recently Deleted when deleted (Shelf and Downloads).
+        realLibrary.downloadFolder = { folderStore.folderURL }
+        #if DEBUG
+            if let path = UserDefaults.standard.string(forKey: "PFTrashFolder"), !path.isEmpty {
+                let bin = URL(filePath: path, directoryHint: .isDirectory)
+                realLibrary.trash = { file in try Self.moveToStandInTrash(file, bin: bin) }
+            }
+        #endif
         let publisher = DownloadPublisher(library: realLibrary.library, store: folderStore) {
             await downloadFolder.refresh()
         }
@@ -278,6 +290,17 @@ final class AppModel {
                 try? FileManager.default.removeItem(at: DownloadFolderStore.defaultFile)
             }
             return DownloadFolderStore(file: DownloadFolderStore.defaultFile)
+        }
+
+        /// `-PFTrashFolder`'s stand-in for Recently Deleted: the file moves into `bin`, under a fresh name should one
+        /// already be there.
+        nonisolated private static func moveToStandInTrash(_ file: URL, bin: URL) throws {
+            try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+            var target = bin.appending(path: file.lastPathComponent)
+            if FileManager.default.fileExists(atPath: target.path) {
+                target = bin.appending(path: "\(UUID().uuidString) \(file.lastPathComponent)")
+            }
+            try FileManager.default.moveItem(at: file, to: target)
         }
 
         /// The fixtures in the app bundle's `Fixtures` folder, which only Debug builds carry (ruling R4).

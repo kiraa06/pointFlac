@@ -102,9 +102,10 @@ final class RealMusicFinder: MusicFinding {
         return observer.items.reversed().compactMap { item in
             let id = Self.rowID(item.track)
             guard seen.insert(id).inserted else { return nil }
+            let published = item.state == .published
             return DownloadRow(
                 id: id, title: item.track.title, state: Self.label(item.state), progress: Self.progress(item.state),
-                note: item.state == .published ? item.note : nil)
+                note: published ? item.note : nil, trackID: published ? item.publishedTrackID : nil)
         }
     }
 
@@ -131,6 +132,35 @@ final class RealMusicFinder: MusicFinding {
         guard let job = latestJob(for: id) else { return }
         let manager = manager
         Task { _ = await manager.retry(job) }
+    }
+
+    /// The manager refuses a job already validating or saving: too late to pause, it is moments from the library.
+    func pauseDownload(_ id: DownloadRow.ID) {
+        guard let job = latestJob(for: id) else { return }
+        let manager = manager
+        Task { _ = await manager.pause(job) }
+    }
+
+    func resumeDownload(_ id: DownloadRow.ID) {
+        guard let job = latestJob(for: id) else { return }
+        let manager = manager
+        Task { _ = await manager.resume(job) }
+    }
+
+    func pauseAllDownloads() {
+        let manager = manager
+        Task { _ = await manager.pauseAll() }
+    }
+
+    func resumeAllDownloads() {
+        let manager = manager
+        Task { _ = await manager.resumeAll() }
+    }
+
+    /// Every job still under way or paused; one already saving finishes, so no song the library has taken is lost.
+    func cancelAllDownloads() {
+        let manager = manager
+        Task { _ = await manager.cancelAll() }
     }
 
     /// A row stands for every job of its track, so every finished one goes with it: an older job left behind would

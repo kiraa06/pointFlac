@@ -56,6 +56,8 @@ final class DownloadFolderStore: Sendable {
     private static let queue = DispatchQueue(label: "io.github.kiraa06.pointflac.download-folder", qos: .utility)
 
     private let state: Mutex<Choice?>
+    /// The chosen folder as `open` last resolved it, with the choice it belongs to.
+    private let resolved = Mutex<(id: UUID, url: URL)?>(nil)
     /// Where the choice is saved; nil keeps it for this launch only (DEBUG's `-PFDownloadFolder`).
     private let file: URL?
 
@@ -76,6 +78,19 @@ final class DownloadFolderStore: Sendable {
     #endif
 
     var choice: Choice? { state.withLock { $0 } }
+
+    /// The chosen folder as last resolved this launch (DEBUG's plain folder at once): deleting a song whose file is
+    /// inside it moves the file to Recently Deleted. Read without blocking, so a delete dialog can count on it. Nil when
+    /// no folder is chosen, when it has not been resolved yet (no song is trashed then: they only leave pointFlac), or
+    /// when the folder is itself in a trash, where its files already are.
+    var folderURL: URL? {
+        guard let choice else { return nil }
+        let url =
+            choice.path.map { URL(filePath: $0, directoryHint: .isDirectory) }
+            ?? resolved.withLock { $0?.id == choice.id ? $0?.url : nil }
+        guard let url, !FolderLocation.isInTrash(url) else { return nil }
+        return url
+    }
 
     /// Where the publish step sends the next download.
     var target: DownloadTarget {
@@ -129,6 +144,7 @@ final class DownloadFolderStore: Sendable {
             throw .unreachable("the folder can't be found")
         }
         guard !FolderLocation.isInTrash(url) else { throw .unreachable("the folder is in the trash") }
+        resolved.withLock { $0 = (choice.id, url) }
         // False when the URL needs no scope; a folder that does need one and refuses fails at the copy instead.
         let scoped = url.startAccessingSecurityScopedResource()
         if stale, let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
@@ -290,6 +306,8 @@ final class DownloadFolder {
             try await addToLibrary(url)
             try store.choose(.init(bookmark: bookmark, path: nil, name: name))
             DownloadFolderStore.log.info("download folder chosen")
+            // Resolves the new choice at once, so deleting a song already in it moves the file to Recently Deleted.
+            await recheck()
         } catch LibraryError.overlappingFolder {
             pickError = "pointFlac already reads a folder inside “\(name)”. Choose that folder, or another one."
         } catch {

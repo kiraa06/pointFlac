@@ -25,7 +25,7 @@ struct RootView: View {
                 GetMusicView(finder: model.finder, library: model.library)
             }
             Tab("Downloads", systemImage: "arrow.down.circle", value: AppTab.downloads) {
-                DownloadsView(finder: model.finder)
+                DownloadsView(finder: model.finder, library: model.library, playback: model.playback)
             }
             .badge(activeDownloads)
             Tab("Sound", systemImage: "slider.vertical.3", value: AppTab.sound) {
