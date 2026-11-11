@@ -34,6 +34,7 @@ import PFLibrary
 /// - `-PFTrashFolder <absolute path>` stands in for Recently Deleted, which the simulator lacks (its volumes have no
 ///   trash, so `FileManager.trashItem` always fails there): a song deleted from the download folder has its file moved
 ///   into that plain folder instead, so a UI test can see it leave.
+/// - `-PFPressingGallery` opens the playlist pressings' gallery (`PressingGalleryView`) over the app.
 @MainActor
 @Observable
 final class AppModel {

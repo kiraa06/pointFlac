@@ -16,9 +16,12 @@ struct RecordFace: Equatable {
     let style: RecordStyle
     /// A generated record with no album: its label carries no names.
     let placeholder: Bool
+    /// A playlist's custom pressing: drawn in its own colour with its own label, whatever `style` says.
+    let pressing: PressingLook?
 
     init(album: AlbumCard, side: String, bands: [CGFloat], style: RecordStyle) {
         placeholder = false
+        pressing = nil
         albumID = album.id
         artwork = album.artwork
         title = album.title
@@ -32,6 +35,7 @@ struct RecordFace: Equatable {
     /// only the side and the speed, no names.
     init(placeholderStyle style: RecordStyle) {
         placeholder = true
+        pressing = nil
         albumID = "pointflac"
         artwork = nil
         title = ""
@@ -41,11 +45,26 @@ struct RecordFace: Equatable {
         self.style = style
     }
 
+    /// A playlist's pressing (spec §3): translucent vinyl in its pressing colour, whatever the record style, with
+    /// the label made from its covers. Its ID is the playlist's card's, `playlist:<id>`.
+    init(pressing look: PressingLook, side: String, bands: [CGFloat]) {
+        placeholder = false
+        pressing = look
+        albumID = "playlist:\(look.id)"
+        artwork = nil
+        title = look.title
+        artist = ""
+        self.side = side
+        self.bands = bands
+        style = .coloured
+    }
+
     /// Covers can be large: two faces of the same album compare by their art's size, not byte by byte, since the deck
     /// compares faces every frame.
     nonisolated static func == (a: Self, b: Self) -> Bool {
         a.albumID == b.albumID && a.artwork?.count == b.artwork?.count && a.title == b.title && a.artist == b.artist
             && a.side == b.side && a.bands == b.bands && a.style == b.style && a.placeholder == b.placeholder
+            && a.pressing == b.pressing
     }
 
     /// A side's track gaps as radii, fractions of the record's: the groove runs at an even pitch from the outer
@@ -60,12 +79,14 @@ struct RecordFace: Equatable {
 
     /// The label's curved rim text.
     var rimText: String {
+        if let pressing { return pressing.rimText(side: side) }
         if placeholder { return "SIDE \(side) · 33⅓ RPM · STEREO · HIGH FIDELITY ·" }
         return "SIDE \(side) · \(title.uppercased()) · \(artist.uppercased()) · 33⅓ RPM · STEREO"
     }
 
     /// The etched matrix number in the dead wax.
     var matrix: String {
+        if let pressing { return pressing.matrix(side: side) }
         if placeholder { return "PFL-0001-\(side)1" }
         let code = albumID.filter { $0.isLetter || $0.isNumber }.prefix(4).uppercased()
         return "PFL-\(code.isEmpty ? "0000" : code)-\(side)1"
@@ -89,19 +110,35 @@ struct RecordView: View {
     var body: some View {
         ZStack {
             RecordContactShadow(diameter: diameter).equatable()
-            if face.style == .picture {
-                PictureArt(face: face, diameter: diameter).equatable()
+            if let look = face.pressing {
+                let ink = PressingInk(colour: look.colour, monochrome: mono)
+                RecordGrooves(
+                    face: face, diameter: diameter, tint: look.colour.isBlackVinyl ? nil : ink.vinyl,
+                    pressing: look.colour.isBlackVinyl ? .black : .translucent(ink.vinylRGB)
+                )
+                .equatable()
+                PressingPrint(look: look, side: face.side, diameter: diameter, mono: mono).equatable()
                     .rotationEffect(.degrees(angle))
+                RecordLight(diameter: diameter, picture: false).equatable()
+            } else {
+                albumRecord
             }
-            RecordGrooves(face: face, diameter: diameter, tint: tint).equatable()
-            if face.style != .picture {
-                RecordLabel(face: face, diameter: diameter).equatable()
-                    .rotationEffect(.degrees(angle))
-            }
-            RecordLight(diameter: diameter, picture: face.style == .picture).equatable()
         }
         .frame(width: diameter, height: diameter)
         .accessibilityHidden(true)
+    }
+
+    @ViewBuilder private var albumRecord: some View {
+        if face.style == .picture {
+            PictureArt(face: face, diameter: diameter).equatable()
+                .rotationEffect(.degrees(angle))
+        }
+        RecordGrooves(face: face, diameter: diameter, tint: tint).equatable()
+        if face.style != .picture {
+            RecordLabel(face: face, diameter: diameter).equatable()
+                .rotationEffect(.degrees(angle))
+        }
+        RecordLight(diameter: diameter, picture: face.style == .picture).equatable()
     }
 
     /// Coloured vinyl's tint, from the album's palette: greys in Monochrome, like everything the album tints.
@@ -143,10 +180,12 @@ private struct RecordGrooves: View, Equatable {
     let face: RecordFace
     let diameter: CGFloat
     let tint: Color?
+    /// A pressing's finish, nil for an album's record.
+    var pressing: PressingVinyl? = nil
 
     nonisolated static func == (a: Self, b: Self) -> Bool {
         a.face.albumID == b.face.albumID && a.face.bands == b.face.bands && a.face.style == b.face.style
-            && a.diameter == b.diameter && a.tint == b.tint
+            && a.diameter == b.diameter && a.tint == b.tint && a.pressing == b.pressing
     }
 
     var body: some View {
@@ -168,7 +207,9 @@ private struct RecordGrooves: View, Equatable {
         let outer = r * VinylGeometry.outerGrooveToRecord
         let picture = face.style == .picture
         // The vinyl.
-        if let tint {
+        if case .translucent(let tone) = pressing {
+            PressingVinyl.body(&context, center: c, radius: r, label: label, tone: tone)
+        } else if let tint {
             // Translucent: the platter shows faintly through, denser toward the rim where light crosses more vinyl.
             context.fill(
                 disc,
@@ -202,21 +243,37 @@ private struct RecordGrooves: View, Equatable {
             }
             radius += pitch * random.range(0.85, 1.15)
         }
+        // A pressing's tracks each sit at their own level: a band a shade lighter or darker, track by track.
+        if pressing != nil {
+            for i in 0..<(edges.count - 1) {
+                let band = circle(edges[i + 1] - gap * 0.6).subtracting(circle(edges[i] + gap * 0.6))
+                let level = levels[i] - 1.03
+                context.fill(
+                    band, with: .color(level > 0 ? .white.opacity(level * 0.09) : .black.opacity(-level * 0.16)))
+            }
+        }
         // On black vinyl a groove shows as a faint light ring; on a picture disc or coloured vinyl, as a darker one
-        // with a lighter edge.
+        // with a lighter edge (a pressing's a little softer, as its vinyl is lit through).
         let clear = picture || tint != nil
+        let cut = pressing == nil ? (2.4, 0.9) : (1.6, 0.8)
         for ring in rings {
             if clear {
-                context.stroke(circle(ring.radius), with: .color(.black.opacity(ring.alpha * 2.4)), lineWidth: 0.45)
+                context.stroke(circle(ring.radius), with: .color(.black.opacity(ring.alpha * cut.0)), lineWidth: 0.45)
                 context.stroke(
-                    circle(ring.radius + 0.35), with: .color(.white.opacity(ring.alpha * 0.9)), lineWidth: 0.3)
+                    circle(ring.radius + 0.35), with: .color(.white.opacity(ring.alpha * cut.1)), lineWidth: 0.3)
             } else {
                 context.stroke(circle(ring.radius), with: .color(.white.opacity(ring.alpha)), lineWidth: 0.45)
             }
         }
-        // The gaps: smooth, so a shade darker and glossier than the grooves either side.
+        // The gaps: smooth, so a shade darker and glossier than the grooves either side. On a translucent pressing
+        // the light comes through them too, so they are fainter, with a lit lip.
         for g in gaps {
-            context.stroke(circle(g), with: .color(.black.opacity(picture ? 0.3 : 0.4)), lineWidth: gap * 1.4)
+            if case .translucent = pressing {
+                context.stroke(circle(g), with: .color(.black.opacity(0.16)), lineWidth: gap * 1.2)
+                context.stroke(circle(g + gap * 0.7), with: .color(.white.opacity(0.05)), lineWidth: 0.4)
+            } else {
+                context.stroke(circle(g), with: .color(.black.opacity(picture ? 0.3 : 0.4)), lineWidth: gap * 1.4)
+            }
         }
         // The streaks, lit into the grooves: the same rings far brighter, kept only inside two wedges that face the
         // light (top left) and its opposite.
@@ -315,9 +372,42 @@ private struct PictureArt: View, Equatable {
     }
 }
 
+/// What a pressing prints and turns: its label at the record's label size, and the matrix etched in the dead wax.
+private struct PressingPrint: View, Equatable {
+    let look: PressingLook
+    let side: String
+    let diameter: CGFloat
+    let mono: Bool
+
+    var body: some View {
+        let r = diameter / 2
+        ZStack {
+            PressingLabelArt(
+                look: look, side: side, diameter: diameter * VinylGeometry.labelToRecord, detail: .full, mono: mono)
+            Canvas { context, size in
+                let c = CGPoint(x: size.width / 2, y: size.height / 2)
+                let label = r * VinylGeometry.labelToRecord
+                let inner = r * VinylGeometry.innerGrooveToRecord
+                // Etched: a dark cut with a lit edge beside it.
+                let radius = label + (inner - label) * 0.62
+                let size = max(2, r * 0.022)
+                RecordPrint.arc(
+                    &context, look.matrix(side: side), center: c, radius: radius - 0.4, size: size,
+                    color: .black.opacity(0.32), start: 150, monospaced: true, tracking: 0.18)
+                RecordPrint.arc(
+                    &context, look.matrix(side: side), center: c, radius: radius, size: size,
+                    color: .white.opacity(0.34), start: 150, monospaced: true, tracking: 0.18)
+            }
+        }
+        .frame(width: diameter, height: diameter)
+        .drawingGroup()
+        .allowsHitTesting(false)
+    }
+}
+
 /// The light that stays put over the record: a softer, weaker sheen on the paper label (matte, so it barely
 /// catches the lamp), and the spindle hole.
-private struct RecordLight: View, Equatable {
+struct RecordLight: View, Equatable {
     let diameter: CGFloat
     let picture: Bool
 
@@ -357,8 +447,11 @@ private struct RecordLight: View, Equatable {
     }
 
     /// Two soft wedges of light at fixed screen angles: one toward the lamp at the top left, brighter, and one
-    /// opposite. `spread` widens them. The wedges never turn with the record.
-    static func streaks(center: CGPoint, near: Double, far: Double, spread: Double = 1) -> GraphicsContext.Shading {
+    /// opposite. `spread` widens them; `colour` tints them (light through coloured vinyl). The wedges never turn with
+    /// the record.
+    static func streaks(
+        center: CGPoint, near: Double, far: Double, spread: Double = 1, colour: Color = .white
+    ) -> GraphicsContext.Shading {
         let half = 0.045 * spread
         let toward = 0.625  // 225°: up and to the left.
         let away = 0.125  // 45°: down and to the right.
@@ -377,7 +470,7 @@ private struct RecordLight: View, Equatable {
         let stops = (0...steps).map { k -> Gradient.Stop in
             let t = Double(k) / Double(steps)
             let alpha = far * wedge(away, t) + near * wedge(toward, t)
-            return Gradient.Stop(color: .white.opacity(alpha), location: t)
+            return Gradient.Stop(color: colour.opacity(alpha), location: t)
         }
         return .conicGradient(Gradient(stops: stops), center: center, angle: .zero)
     }
@@ -411,10 +504,13 @@ enum RecordPrint {
     }
 
     /// `text` laid round a circle of `radius`, its middle at `start` degrees (−90 is the top), reading clockwise. Too
-    /// long a text shrinks to fit the circle. In small caps, each word's first letter is a size larger.
+    /// long a text shrinks to fit the circle. In small caps, each word's first letter is a size larger. `tracking` is
+    /// the space after each glyph, as a fraction of `size`. With `baseline`, every glyph stands on one baseline (set so
+    /// the capitals straddle `radius`), as type on a printed label does; otherwise each is centred on the circle.
     static func arc(
         _ context: inout GraphicsContext, _ text: String, center c: CGPoint, radius: CGFloat, size: CGFloat,
-        color: Color, start: Double, smallCaps: Bool = false, monospaced: Bool = false
+        color: Color, start: Double, smallCaps: Bool = false, monospaced: Bool = false, tracking: CGFloat = 0.16,
+        baseline: Bool = false
     ) {
         let chars = Array(text)
         func glyphs(_ size: CGFloat) -> [(GraphicsContext.ResolvedText, CGFloat)] {
@@ -429,7 +525,7 @@ enum RecordPrint {
                     : .system(size: s, weight: .semibold, design: .default)
                 let resolved = context.resolve(Text(String(ch)).font(font).foregroundStyle(color))
                 let width = resolved.measure(in: CGSize(width: 200, height: 200)).width
-                return (resolved, width + size * 0.16)
+                return (resolved, width + size * tracking)
             }
         }
         var size = size
@@ -447,7 +543,14 @@ enum RecordPrint {
             var g = context
             g.translateBy(x: c.x, y: c.y)
             g.rotate(by: .radians(a + .pi / 2))
-            g.draw(glyph, at: CGPoint(x: 0, y: -radius), anchor: .center)
+            if baseline {
+                let box = CGSize(width: 200, height: 200)
+                let height = max(glyph.measure(in: box).height, 0.01)
+                let base = glyph.firstBaseline(in: box)
+                g.draw(glyph, at: CGPoint(x: 0, y: -radius + size * 0.36), anchor: UnitPoint(x: 0.5, y: base / height))
+            } else {
+                g.draw(glyph, at: CGPoint(x: 0, y: -radius), anchor: .center)
+            }
             angle += Double(width / radius)
         }
     }
