@@ -199,3 +199,18 @@ The app shows a playlist to the player as an `AlbumCard` with the ID `playlist:<
 - The disc shadow.
 - The spring constants.
 - Small layout spacing, within the existing shelf metrics.
+
+## 8. Rulings after the mockup (2026-11-11)
+
+The mockup is at `.superpowers/brainstorm/playlists-1/content/pressings.html`. Drawing it showed these corrections, which are now binding:
+
+1. **Monogram.** Two letters are drawn interlocked, the second as a lighter impression, with the spindle hole through them. A one-letter name gets one large letter with the hole through it. The monogram only has to read at deck and sheet-preview sizes; on the shelf disc it may be only a hint.
+2. **Pressing vinyl opacity.** Pressings get their own opacity curve: about 0.52 / 0.62 / 0.76 (centre / middle / rim), with an 8 % black wash instead of 16 %, plus the streak glow and a bright rim. Otherwise Ruby turns muddy brown over the platter.
+3. **Onyx** is drawn as opaque black vinyl with light grooves, not translucent.
+4. **Ink on light colours.** For Amber and Citrine, the heart, monogram and badge ring ink is darkened 30 % toward `#2B2A27`, so it prints on cream.
+5. **Rim text counts:**
+   - an empty playlist reads `<TITLE> · NO SONGS YET · SIDE A · 33⅓ RPM`;
+   - one song reads `1 SONG`.
+6. **Colour for a new playlist when all eight are in use:** the least-used colour, with ties broken by the spec's rotation order.
+7. **The heart follows the cued song.** With a record on the deck and the needle up, it acts on the song that would play. It is disabled only when the deck is empty.
+8. **Covers on the label.** The first wedge starts at 12 o'clock. With 3–6 albums, each cover turns so its top faces outward. With 1–2 albums, covers are drawn upright.
