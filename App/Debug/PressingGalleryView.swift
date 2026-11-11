@@ -4,14 +4,20 @@
 
     /// The playlist pressings, every way they are drawn, for checking the art (Plan 11, Task B): Favourites on the real
     /// Glasshouse deck, the shelf strip's discs, the square cover mosaics, and each example as a deck-size record on
-    /// the platter with its disc and mosaic beside it. The eight examples are built from the fixture albums, repeated
-    /// where one needs six covers.
+    /// the platter with its disc and mosaic beside it, and the 180 pt record a sheet's preview shows. The eight examples
+    /// are the mockup's, drawn on its ten albums: the five fixture albums, then stand-ins (generated sleeves).
     ///
     /// `-PFPressingGallery -PFPreloadFixtures` opens it over the app; `-PFGalleryAnchor <id>` scrolls it to a section
-    /// (`deck`, `strip`, `covers`, `record-0` … `record-7`) for screenshots, and `-PFGallerySpin YES` turns the records
-    /// at 33⅓.
+    /// (`deck`, `strip`, `covers`, `preview`, `record-0` … `record-7`) for screenshots; `-PFGallerySpin YES` turns the
+    /// records at 33⅓; and `-PFGalleryRealCovers` gives all ten albums realistic stand-in art (`GalleryCovers`).
     struct PressingGalleryView: View {
         let model: AppModel
+
+        init(model: AppModel) {
+            self.model = model
+            if GalleryCovers.isRequested { GalleryCovers.install() }
+        }
+
         @Environment(\.colorScheme) private var scheme
         @Environment(\.isMonochrome) private var mono
         @Environment(\.dynamicTypeSize) private var typeSize
@@ -31,6 +37,7 @@
                         }
                         section("Shelf strip", id: "strip") { strip(looks, theme: theme) }
                         section("Cover mosaics", id: "covers") { mosaics(looks) }
+                        section("Sheet preview, 180 pt", id: "preview") { previews(looks) }
                         ForEach(Array(looks.enumerated()), id: \.offset) { index, look in
                             GalleryRecord(look: look, spinning: spinning)
                                 .id("record-\(index)")
@@ -106,6 +113,17 @@
             .scrollClipDisabled()
         }
 
+        /// The size the playlist sheets preview a pressing at: the monogram must still read there (spec §8.1).
+        private func previews(_ looks: [PressingLook]) -> some View {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
+                ForEach([1, 5, 4, 7], id: \.self) { index in
+                    RecordView(
+                        face: RecordFace(pressing: looks[index], side: "A", bands: galleryBands(looks[index])),
+                        diameter: 180, angle: 0)
+                }
+            }
+        }
+
         private func mosaics(_ looks: [PressingLook]) -> some View {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4), spacing: 12) {
                 ForEach(Array(looks.enumerated()), id: \.offset) { _, look in
@@ -116,11 +134,12 @@
             }
         }
 
-        /// The mockup's eight examples, built from the fixture albums' IDs (or made-up ones before the fixtures load:
-        /// the art then shows generated sleeves, as it would anyway). The mockup draws on ten albums; the five
-        /// fixtures stand in for them in turn, so some labels repeat a cover.
+        /// The mockup's eight examples, on its ten albums by index.
         static func examples(_ ids: [String]) -> [PressingLook] {
-            let pool = ids.isEmpty ? ["a", "b", "c", "d", "e"] : ids
+            // Ten distinct albums, as the mockup has: the fixtures first, then stand-ins; or, with realistic covers,
+            // the stand-ins alone, as only they carry art.
+            let fixtures = GalleryCovers.isRequested ? [] : ids
+            let pool = Array((fixtures + GalleryCovers.ids.dropFirst(fixtures.count)).prefix(10))
             func pick(_ indices: [Int]) -> [String] { indices.map { pool[$0 % pool.count] } }
             return [
                 PressingLook(

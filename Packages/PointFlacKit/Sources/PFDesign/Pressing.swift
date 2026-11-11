@@ -51,13 +51,99 @@ public enum PressingColour: String, CaseIterable, Sendable {
 /// The letters on a playlist's centre badge.
 public enum PressingMonogram {
     /// The initials of the name's first two words, upper-cased: "Late Night Drives" is "LN". A word's initial is its
-    /// first letter or digit, past any leading punctuation; a word with neither (an emoji) gives its first character.
-    /// Never a heart for Favourites: the badge draws that itself.
+    /// first letter or digit, past any leading punctuation, and a word with neither ("&", "-", an emoji) is skipped,
+    /// so "Rock & Roll" is "RR". A name with no letter or digit anywhere keeps its first characters, so an emoji name
+    /// still has a mark. Never a heart for Favourites: the badge draws that itself.
     public static func letters(_ name: String) -> String {
-        let words = name.split(whereSeparator: { $0.isWhitespace }).prefix(2)
-        return words.map { word -> String in
-            let initial = word.first(where: { $0.isLetter || $0.isNumber }) ?? word.first
-            return initial.map { String($0).uppercased() } ?? ""
-        }.joined()
+        let words = name.split(whereSeparator: { $0.isWhitespace })
+        func initial(_ word: Substring) -> Character? { word.first(where: { $0.isLetter || $0.isNumber }) }
+        let lettered = words.compactMap(initial)
+        let picked = lettered.isEmpty ? words.compactMap(\.first) : lettered
+        return picked.prefix(2).map { String($0).uppercased() }.joined()
+    }
+}
+
+/// A playlist's IDs as the pressing prints and plays them. The library's ID is `favourites` or a lower-case UUID; the
+/// player knows the playlist as a card `playlist:<id>`. Either may be passed: one leading `playlist:` is dropped.
+public enum PressingID {
+    public static let prefix = "playlist:"
+
+    /// The playlist's own ID.
+    public static func bare(_ id: String) -> String {
+        id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
+    }
+
+    /// The card's ID: `playlist:<bare id>`.
+    public static func card(_ id: String) -> String { prefix + bare(id) }
+
+    /// The matrix etched in the dead wax: `PFL-FAV-A1`, or `PFL-MIX-<first 4 alphanumerics of the ID>-A1`, with the
+    /// side's letter in place of the `A`.
+    public static func matrix(id: String, isFavourites: Bool, side: String) -> String {
+        if isFavourites { return "PFL-FAV-\(side)1" }
+        let code = bare(id).filter { $0.isLetter || $0.isNumber }.prefix(4).uppercased()
+        return "PFL-MIX-\(code.isEmpty ? "0000" : code)-\(side)1"
+    }
+}
+
+/// The words curved round a pressing's label (spec §3, §8.5).
+public enum PressingRim {
+    /// "NO SONGS YET", "1 SONG", "24 SONGS".
+    public static func count(_ songs: Int) -> String {
+        switch songs {
+        case ...0: "NO SONGS YET"
+        case 1: "1 SONG"
+        default: "\(songs) SONGS"
+        }
+    }
+
+    /// `FAVOURITES · 24 SONGS · SIDE A · 33⅓ RPM`.
+    public static func text(title: String, songs: Int, side: String) -> String {
+        title.uppercased() + suffix(songs: songs, side: side)
+    }
+
+    /// The rim text as it fits round a circle with `room` for it, measured by `width`. The print may shrink to
+    /// `minimumScale` of its size to fit; past that the title is cut short with an ellipsis instead, keeping as much
+    /// of it as fits, so a long name never prints as specks.
+    public static func fitted(
+        title: String, songs: Int, side: String, room: Double, minimumScale: Double = 0.8,
+        width: (String) -> Double
+    ) -> String {
+        let full = text(title: title, songs: songs, side: side)
+        let limit = room / minimumScale
+        if width(full) <= limit { return full }
+        let letters = Array(title.uppercased())
+        let tail = suffix(songs: songs, side: side)
+        func cut(_ kept: Int) -> String {
+            var head = letters.prefix(kept)
+            while head.last?.isWhitespace == true { head.removeLast() }
+            return String(head) + "…" + tail
+        }
+        // The longest cut that fits: the text grows with every letter kept.
+        var low = 0
+        var high = letters.count
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if width(cut(middle)) <= limit { low = middle } else { high = middle - 1 }
+        }
+        return cut(low)
+    }
+
+    private static func suffix(songs: Int, side: String) -> String { " · \(count(songs)) · SIDE \(side) · 33⅓ RPM" }
+}
+
+/// The albums whose covers make a pressing's label.
+public enum PressingCovers {
+    /// The most wedges a label has.
+    public static let maximum = 6
+
+    /// The label's covers, in playlist order: each album once, at its first song, and no more than six.
+    public static func distinct(_ albumIDs: [String]) -> [String] {
+        var seen = Set<String>()
+        var covers: [String] = []
+        for id in albumIDs where seen.insert(id).inserted {
+            covers.append(id)
+            if covers.count == maximum { break }
+        }
+        return covers
     }
 }

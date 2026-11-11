@@ -60,7 +60,8 @@ struct PressingLabelArt: View, Equatable {
                     &context, center: CGPoint(x: size.width / 2, y: size.height / 2), radius: r, detail: detail,
                     seed: look.id)
             }
-            ForEach(Array(covers.enumerated()), id: \.offset) { index, albumID in
+            ForEach(PressingSlot.slots(covers), id: \.id) { slot in
+                let (index, albumID) = (slot.index, slot.albumID)
                 let wedge = PressingWedge(
                     index: index, count: covers.count, inner: PressingGeometry.badge * 0.9,
                     outer: PressingGeometry.rimInner, gap: gap)
@@ -91,6 +92,19 @@ struct PressingLabelArt: View, Equatable {
         }
         .drawingGroup()
         .allowsHitTesting(false)
+    }
+}
+
+/// A cover's place in a label or a mosaic, identified by its position and album together, so a cover that changes
+/// in place is a new view and never shows the old art.
+struct PressingSlot: Hashable {
+    let index: Int
+    let albumID: String
+
+    var id: String { "\(index)|\(albumID)" }
+
+    static func slots(_ albumIDs: [String]) -> [PressingSlot] {
+        albumIDs.enumerated().map { PressingSlot(index: $0.offset, albumID: $0.element) }
     }
 }
 
@@ -133,7 +147,9 @@ struct PressingWedge: Shape {
         case 2:
             return (CGPoint(x: c.x + cos(middle) * ro * 0.42, y: c.y), ro * 2, .zero)
         default:
-            let side = max(ro - ri, 2 * ro * sin(.pi / Double(count))) * 1.1
+            // A little larger than the wedge needs, so it shows the heart of the cover, where the picture is, and
+            // less of the type round its edges, which reads oddly once turned.
+            let side = max(ro - ri, 2 * ro * sin(.pi / Double(count))) * 1.3
             let at = (ri + ro) / 2
             return (
                 CGPoint(x: c.x + cos(middle) * at, y: c.y + sin(middle) * at), side, .radians(middle + .pi / 2)
@@ -233,15 +249,49 @@ enum PressingPaint {
             context.stroke(
                 circle(c, w1), with: .color(Color(red: 60 / 255, green: 40 / 255, blue: 20 / 255, opacity: 0.25)),
                 lineWidth: max(0.3, r * 0.004))
+            wedgeEdges(&context, center: c, inner: w0 * 0.9, outer: w1, count: look.covers.count, detail: detail)
         }
         if detail == .full {
             context.stroke(
                 circle(c, r * 0.965), with: .color(ink.text.opacity(0.35)), lineWidth: max(0.3, r * 0.005))
+            // Shrunk to fit no further than four-fifths; past that the title is cut short with an ellipsis.
+            let radius = r * 0.875
+            let size = max(2.4, r * 0.112)
+            let measure = context
+            let rim = PressingRim.fitted(
+                title: look.title, songs: look.songCount, side: side,
+                room: Double(RecordPrint.room(radius: radius))
+            ) { text in
+                Double(RecordPrint.length(measure, text, size: size, smallCaps: true, tracking: 0.2))
+            }
             RecordPrint.arc(
-                &context, look.rimText(side: side), center: c, radius: r * 0.875, size: max(2.4, r * 0.112),
-                color: ink.text, start: -90, smallCaps: true, tracking: 0.2, baseline: true)
+                &context, rim, center: c, radius: radius, size: size, color: ink.text, start: -90, smallCaps: true,
+                tracking: 0.2, baseline: true)
         }
         badge(&context, look: look, center: c, radius: w0, hole: r * PressingGeometry.hole, ink: ink, mono: mono)
+    }
+
+    /// Each wedge framed as its own print: a soft shade either side of the cream gaps, so turned covers read as
+    /// separate tiles rather than one muddle of pictures and type.
+    static func wedgeEdges(
+        _ context: inout GraphicsContext, center c: CGPoint, inner: CGFloat, outer: CGFloat, count: Int,
+        detail: PressingDetail
+    ) {
+        guard count > 1 else { return }
+        let gap = gap(labelRadius: outer / PressingGeometry.rimInner, detail: detail)
+        var lines = Path()
+        for i in 0..<count {
+            let a = -Double.pi / 2 + Double(i) * 2 * .pi / Double(count)
+            lines.move(to: CGPoint(x: c.x + cos(a) * inner, y: c.y + sin(a) * inner))
+            lines.addLine(to: CGPoint(x: c.x + cos(a) * outer, y: c.y + sin(a) * outer))
+        }
+        var shade = context
+        shade.clip(to: circle(c, outer).subtracting(circle(c, inner)))
+        shade.addFilter(.blur(radius: gap * 1.3))
+        shade.stroke(lines, with: .color(.black.opacity(0.42)), lineWidth: gap * 2.4)
+        var paper = context
+        paper.clip(to: circle(c, outer + gap).subtracting(circle(c, inner)))
+        paper.stroke(lines, with: .color(Color(PressingInk.paperRGB)), lineWidth: gap)
     }
 
     /// The centre badge: a cream disc with a faint printed edge, ringed in the pressing colour, with the heart or the
@@ -258,38 +308,60 @@ enum PressingPaint {
             context.fill(heart(center: CGPoint(x: c.x, y: c.y + b * 0.025), width: b * 1.42), with: .color(ink.print))
             if hole > 0 { context.fill(circle(c, hole + b * 0.083), with: .color(ink.paper)) }
         } else {
-            monogram(&context, look.monogram, center: c, badge: b, ink: ink, mono: mono)
+            monogram(&context, look.monogram, center: c, badge: b, hole: hole, ink: ink, mono: mono)
         }
     }
 
-    /// The monogram (spec §8.1): two letters interlocked, the second a lighter impression set down and to the right
-    /// of the first; or one large letter. Either way the spindle hole goes through it.
+    /// The monogram (spec §8.1). Two letters are interlocked, the second a lighter impression set lower than the
+    /// first: round a spindle hole they stand either side of it, each clear of it, so the hole never eats a stroke;
+    /// with no hole (the square cover) they overlap in the middle. One letter is drawn large, with the hole through it.
     static func monogram(
-        _ context: inout GraphicsContext, _ letters: String, center c: CGPoint, badge b: CGFloat, ink: PressingInk,
-        mono: Bool
+        _ context: inout GraphicsContext, _ letters: String, center c: CGPoint, badge b: CGFloat, hole: CGFloat,
+        ink: PressingInk, mono: Bool
     ) {
         let chars = Array(letters.prefix(2))
         guard !chars.isEmpty else { return }
         var ctx = context
         // An emoji keeps its own colours, so Monochrome greys it here.
         if mono { ctx.addFilter(.grayscale(1)) }
-        func draw(_ ch: Character, size: CGFloat, x: CGFloat, baseline y: CGFloat, opacity: Double) {
-            let text = ctx.resolve(
+        func resolve(_ ch: Character, size: CGFloat, opacity: Double) -> GraphicsContext.ResolvedText {
+            ctx.resolve(
                 Text(String(ch)).font(.system(size: size, weight: .bold, design: .serif))
                     .foregroundStyle(ink.print.opacity(opacity)))
+        }
+        func draw(_ text: GraphicsContext.ResolvedText, size: CGFloat, x: CGFloat, baseline y: CGFloat) {
             let box = CGSize(width: size * 4, height: size * 4)
             let height = max(text.measure(in: box).height, 0.01)
             let anchor = UnitPoint(x: 0.5, y: text.firstBaseline(in: box) / height)
             ctx.draw(text, at: CGPoint(x: c.x + x, y: c.y + y), anchor: anchor)
         }
-        if chars.count == 2 {
+        if chars.count == 1 {
+            let size = b * 1.4
+            draw(resolve(chars[0], size: size, opacity: 1), size: size, x: 0, baseline: size * 0.35)
+        } else if hole <= 0 {
             let size = b * 1.04
             let dx = b * 0.19
-            draw(chars[1], size: size, x: dx, baseline: size * 0.35 + b * 0.1, opacity: 0.5)
-            draw(chars[0], size: size, x: -dx, baseline: size * 0.35 - b * 0.06, opacity: 1)
+            draw(resolve(chars[1], size: size, opacity: 0.5), size: size, x: dx, baseline: size * 0.35 + b * 0.1)
+            draw(resolve(chars[0], size: size, opacity: 1), size: size, x: -dx, baseline: size * 0.35 - b * 0.06)
         } else {
-            let size = b * 1.4
-            draw(chars[0], size: size, x: 0, baseline: size * 0.35, opacity: 1)
+            // Each letter in the half-moon beside the hole: as large as the room there allows, its inner edge just
+            // clear of the hole and its outer edge inside the ring.
+            let clearance = hole + b * 0.07
+            let room = b * 0.84 - clearance
+            var size = b * 0.86
+            let widest =
+                chars.map { resolve($0, size: size, opacity: 1).measure(in: CGSize(width: 400, height: 400)) }
+                .map(\.width).max() ?? 1
+            if widest > room { size *= room / widest }
+            let stagger = b * 0.07
+            for (i, ch) in chars.enumerated().reversed() {
+                let text = resolve(ch, size: size, opacity: i == 0 ? 1 : 0.5)
+                let width = min(room, text.measure(in: CGSize(width: 400, height: 400)).width)
+                let x = clearance + width / 2
+                draw(
+                    text, size: size, x: i == 0 ? -x : x,
+                    baseline: size * 0.35 + (i == 0 ? -stagger : stagger))
+            }
         }
     }
 

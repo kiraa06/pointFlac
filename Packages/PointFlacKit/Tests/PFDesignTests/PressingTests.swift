@@ -78,11 +78,19 @@ struct PressingMonogramTests {
         #expect(PressingMonogram.letters("“quiet” hours") == "QH")
     }
 
-    @Test("an emoji-only name gives its first character")
+    @Test("words with no letter or digit are skipped: an ampersand or a dash is not an initial")
+    func symbolWords() {
+        #expect(PressingMonogram.letters("Rock & Roll") == "RR")
+        #expect(PressingMonogram.letters("Me - Time") == "MT")
+        #expect(PressingMonogram.letters("& more") == "M")
+        #expect(PressingMonogram.letters("🌊 waves") == "W")
+    }
+
+    @Test("a name with no letter or digit at all gives its first characters, so an emoji name still has a mark")
     func emoji() {
         #expect(PressingMonogram.letters("🔥🔥🔥") == "🔥")
         #expect(PressingMonogram.letters("🌊") == "🌊")
-        #expect(PressingMonogram.letters("🌊 waves") == "🌊W")
+        #expect(PressingMonogram.letters("🔥 🌊 ✨") == "🔥🌊")
     }
 
     @Test("Favourites gets its letter like any name: the heart is the badge's, never the monogram's")
@@ -94,5 +102,87 @@ struct PressingMonogramTests {
     func blank() {
         #expect(PressingMonogram.letters("") == "")
         #expect(PressingMonogram.letters("   ") == "")
+    }
+}
+
+@Suite("Pressing IDs")
+struct PressingIDTests {
+    @Test("a playlist's own ID loses one leading playlist: prefix, so a card's ID can be passed as well")
+    func bare() {
+        #expect(PressingID.bare("favourites") == "favourites")
+        #expect(PressingID.bare("playlist:favourites") == "favourites")
+        #expect(PressingID.bare("playlist:7c3e9b1a-52d0") == "7c3e9b1a-52d0")
+        #expect(PressingID.bare("playlist:playlist:x") == "playlist:x")
+    }
+
+    @Test("the card ID is playlist:<bare id>, never doubled")
+    func card() {
+        #expect(PressingID.card("favourites") == "playlist:favourites")
+        #expect(PressingID.card("playlist:favourites") == "playlist:favourites")
+    }
+
+    @Test("the matrix: PFL-FAV-A1 for Favourites, PFL-MIX-<first 4 of the bare ID>-A1 otherwise")
+    func matrix() {
+        #expect(PressingID.matrix(id: "favourites", isFavourites: true, side: "A") == "PFL-FAV-A1")
+        #expect(PressingID.matrix(id: "playlist:favourites", isFavourites: true, side: "B") == "PFL-FAV-B1")
+        let uuid = "7c3e9b1a-52d0-4f8e-a1c2-9e7d3b5f0a14"
+        #expect(PressingID.matrix(id: uuid, isFavourites: false, side: "A") == "PFL-MIX-7C3E-A1")
+        #expect(PressingID.matrix(id: "playlist:" + uuid, isFavourites: false, side: "B") == "PFL-MIX-7C3E-B1")
+        #expect(PressingID.matrix(id: "playlist:", isFavourites: false, side: "A") == "PFL-MIX-0000-A1")
+    }
+}
+
+@Suite("Pressing rim text")
+struct PressingRimTests {
+    @Test("the count reads NO SONGS YET, 1 SONG, 24 SONGS (spec §8.5)")
+    func count() {
+        #expect(PressingRim.count(0) == "NO SONGS YET")
+        #expect(PressingRim.count(1) == "1 SONG")
+        #expect(PressingRim.count(24) == "24 SONGS")
+        #expect(
+            PressingRim.text(title: "Favourites", songs: 24, side: "A") == "FAVOURITES · 24 SONGS · SIDE A · 33⅓ RPM")
+        #expect(PressingRim.text(title: "Demos", songs: 0, side: "B") == "DEMOS · NO SONGS YET · SIDE B · 33⅓ RPM")
+    }
+
+    /// One unit per character: enough to test the fitting without a font.
+    private func width(_ text: String) -> Double { Double(text.count) }
+
+    @Test("a title that fits at four-fifths size or more is kept whole")
+    func fits() {
+        let full = PressingRim.text(title: "Late Night Drives", songs: 6, side: "A")
+        let room = width(full) * 0.85
+        #expect(PressingRim.fitted(title: "Late Night Drives", songs: 6, side: "A", room: room, width: width) == full)
+    }
+
+    @Test("a 60-character title is cut short with an ellipsis rather than shrunk below four-fifths size")
+    func longTitle() {
+        let title = String(repeating: "Long Name ", count: 6)
+        #expect(title.count == 60)
+        let room = 64.0
+        let fitted = PressingRim.fitted(title: title, songs: 24, side: "A", room: room, width: width)
+        #expect(fitted.hasSuffix(" · 24 SONGS · SIDE A · 33⅓ RPM"))
+        #expect(fitted.hasPrefix("LONG NAME LONG"))
+        #expect(fitted.contains("… · 24 SONGS"))
+        #expect(!fitted.contains(" … "))
+        #expect(width(fitted) <= room / 0.8)
+        #expect(width(fitted) >= room / 0.8 - 2)
+    }
+
+    @Test("with no room for any of the title, the ellipsis stands for it")
+    func noRoom() {
+        let fitted = PressingRim.fitted(title: "Anything", songs: 3, side: "A", room: 10, width: width)
+        #expect(fitted == "… · 3 SONGS · SIDE A · 33⅓ RPM")
+    }
+}
+
+@Suite("Pressing covers")
+struct PressingCoversTests {
+    @Test("the label's covers: repeats dropped, the first occurrence kept, then the first six")
+    func distinct() {
+        #expect(
+            PressingCovers.distinct(["a", "b", "a", "c", "b", "d", "e", "f", "g"]) == ["a", "b", "c", "d", "e", "f"])
+        #expect(PressingCovers.distinct(["x", "x", "x"]) == ["x"])
+        #expect(PressingCovers.distinct([]) == [])
+        #expect(PressingCovers.maximum == 6)
     }
 }
