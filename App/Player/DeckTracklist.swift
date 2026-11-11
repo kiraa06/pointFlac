@@ -15,6 +15,8 @@ struct DeckTracklist: View {
     @State private var picked: Int?
     /// Rows run on below the panel's edge: the last visible one fades out, so a cut-off row reads as "more".
     @State private var moreBelow = false
+    /// The playlists, for each song's long-press menu (spec "Playlists as custom pressings" §4).
+    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     /// How far the panel sits inside the plinth's edge.
     static let inset: CGFloat = 8
@@ -175,6 +177,11 @@ struct DeckTracklist: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            if let desk, playback.tracks.indices.contains(song.index) {
+                SongPlaylistItems(desk: desk, song: playback.tracks[song.index], playlist: playback.album?.playlistID)
+            }
+        }
         .accessibilityLabel(Tracklist.label(song))
         .accessibilityValue(current ? "Playing" : "")
         .accessibilityIdentifier("deckTrack-\(song.index)")

@@ -24,11 +24,13 @@ struct TracklistSheet: View {
     @State private var viewport: CGFloat = 0
     @State private var playingBottom: CGFloat?
     @State private var positioned = false
+    /// The playlists, for each song's long-press menu (spec "Playlists as custom pressings" §4).
+    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     private var playing: Int? { picked ?? playback.trackIndex }
 
-    /// The record's colours, in greys under Monochrome (the sleeve keeps its own).
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
+    /// The record's colours (a playlist's pressing colour), in greys under Monochrome (the sleeve keeps its own).
+    private var palette: ArtPalette { ArtPalette.record(playback.album).tint(for: theme) }
 
     /// The tint's colour: `line` is the record's hue deep enough for a light page, `base` its bright twin for a dark
     /// one, as the progress wave draws them.
@@ -88,6 +90,8 @@ struct TracklistSheet: View {
         .presentationDragIndicator(.visible)
         .sensoryFeedback(.selection, trigger: picked)
         .accessibilityIdentifier("tracklistSheet")
+        // Add to Playlist… opens over this sheet, which can't be presented from the player while this is up.
+        .playlistSheets(desk)
     }
 
     // MARK: Pieces
@@ -109,20 +113,33 @@ struct TracklistSheet: View {
     private func header(_ album: AlbumCard) -> some View {
         let large = typeSize.isAccessibilitySize
         return HStack(alignment: large ? .top : .center, spacing: 14) {
-            ArtworkView(albumID: album.id, artwork: album.artwork)
-                .frame(width: 58, height: 58)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(theme.hairline, lineWidth: 0.5)
-                )
-                .shadow(color: .black.opacity(theme.isDark ? 0.4 : 0.16), radius: 8, y: 5)
-                .accessibilityHidden(true)
+            if let look = album.pressing {
+                // A playlist's back cover shows its pressing.
+                PressingDisc(look: look, size: 58)
+            } else {
+                ArtworkView(albumID: album.id, artwork: album.artwork)
+                    .frame(width: 58, height: 58)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(
+                            theme.hairline, lineWidth: 0.5)
+                    )
+                    .shadow(color: .black.opacity(theme.isDark ? 0.4 : 0.16), radius: 8, y: 5)
+                    .accessibilityHidden(true)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(album.title)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(theme.ink)
                     .lineLimit(2)
-                if large {
+                if album.pressing != nil {
+                    // The summary under it counts the songs.
+                    Text("Playlist")
+                        .font(.subheadline)
+                        .foregroundStyle(theme.inkSecondary)
+                        .lineLimit(2)
+                    if large { format(album) }
+                } else if large {
                     Group {
                         Text(album.artist)
                         if let year = album.year { Text(verbatim: String(year)) }
@@ -211,11 +228,20 @@ struct TracklistSheet: View {
                     }
                 }
                 .frame(width: codeWidth, alignment: .leading)
-                Text(song.title)
-                    .font(current ? .body.weight(.semibold) : .body)
-                    .foregroundStyle(current ? titleTint : theme.ink)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(song.title)
+                        .font(current ? .body.weight(.semibold) : .body)
+                        .foregroundStyle(current ? titleTint : theme.ink)
+                        .lineLimit(2)
+                    // A playlist's songs come from many records: each says whose it is.
+                    if let artist = playlistArtist(song) {
+                        Text(artist)
+                            .font(.footnote)
+                            .foregroundStyle(theme.inkSecondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Text(Tracklist.clock(song.seconds))
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(theme.inkSecondary)
@@ -233,9 +259,21 @@ struct TracklistSheet: View {
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(RowPress(wash: theme.ink.opacity(0.05)))
+        .contextMenu {
+            if let desk, playback.tracks.indices.contains(song.index) {
+                SongPlaylistItems(desk: desk, song: playback.tracks[song.index], playlist: playback.album?.playlistID)
+            }
+        }
         .accessibilityLabel(Tracklist.label(song))
         .accessibilityValue(current ? "Playing" : "")
         .accessibilityIdentifier("tracklistTrack-\(song.index)")
+    }
+
+    /// For a playlist on the deck, the song's artist and album; nil for an album, whose songs are all its own.
+    private func playlistArtist(_ song: Tracklist.Song) -> String? {
+        guard playback.album?.pressing != nil, playback.tracks.indices.contains(song.index) else { return nil }
+        let track = playback.tracks[song.index]
+        return "\(track.artist) · \(track.album)"
     }
 
     /// The tint moves to the song at once, the record plays from it, and the sheet drops a beat later.

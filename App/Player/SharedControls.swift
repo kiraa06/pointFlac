@@ -19,6 +19,8 @@ struct SharedControls: View {
     @State private var tracklistOpen = false
     /// The song line's chevron, in step with the line's type up to a point.
     @ScaledMetric(relativeTo: .subheadline) private var chevronSize: CGFloat = 9
+    /// The playlists, for the heart (spec "Playlists as custom pressings" §4).
+    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     private var player: Player { playback.player }
 
@@ -157,7 +159,7 @@ struct SharedControls: View {
             .accessibilityLabel("Repeat")
             .accessibilityValue(repeatLabel)
             .accessibilityIdentifier("repeatButton")
-            Spacer()
+            Spacer(minLength: desk == nil ? 8 : 0)
             Button {
                 Task { await playback.previous() }
             } label: {
@@ -177,7 +179,8 @@ struct SharedControls: View {
             }
             .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
             .accessibilityIdentifier("playButton")
-            .padding(.horizontal, 18)
+            // Narrower than before the heart joined, so the row still fits a 375-point phone.
+            .padding(.horizontal, desk == nil ? 18 : 12)
             Button {
                 Task { await playback.next() }
             } label: {
@@ -185,7 +188,10 @@ struct SharedControls: View {
             }
             .accessibilityLabel("Next")
             .accessibilityIdentifier("nextButton")
-            Spacer()
+            Spacer(minLength: desk == nil ? 8 : 0)
+            if let desk {
+                FavouriteButton(desk: desk, theme: theme)
+            }
             Button {
                 upNextOpen = true
             } label: {
@@ -226,8 +232,8 @@ struct ProgressRow: View {
 
     private var player: Player { playback.player }
 
-    /// The playing record's colours: the played part of the bar is drawn in them.
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
+    /// The playing record's colours (a playlist's pressing colour): the played part of the bar is drawn in them.
+    private var palette: ArtPalette { ArtPalette.record(playback.album).tint(for: theme) }
 
     var body: some View { progress }
 
@@ -513,12 +519,22 @@ struct AlbumLine: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            ArtworkView(albumID: album.id, artwork: album.artwork)
-                .frame(width: 40, height: 40)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+            if let look = album.pressing {
+                // A playlist is its pressing, not a sleeve.
+                PressingDisc(look: look, size: 40)
+            } else {
+                ArtworkView(albumID: album.id, artwork: album.artwork)
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(album.title).font(.body.weight(.semibold))
-                Text("\(album.artist) · \(album.trackCount) tracks").font(.footnote).foregroundStyle(.secondary)
+                Text(
+                    album.pressing == nil
+                        ? "\(album.artist) · \(album.trackCount) tracks"
+                        : "Playlist · \(PlaylistCard.songs(album.trackCount))"
+                )
+                .font(.footnote).foregroundStyle(.secondary)
             }
             Spacer()
             Text(album.bestFormat.replacingOccurrences(of: "FLAC ", with: ""))

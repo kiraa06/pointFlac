@@ -50,6 +50,11 @@ struct ShelfPanel: View {
     @AppStorage("galaxySort") private var galaxySort: AlbumSort = .mostPlayed
     /// The galaxy sleeve last tapped: hidden while the hand-off flies its copy.
     @State private var galaxyPicked: AlbumCard.ID?
+    /// The strip's disc last tapped: hidden while the hand-off flies its pressing.
+    @State private var discPicked: PlaylistCard.ID?
+    /// The playlists, for the strip and the menus (spec "Playlists as custom pressings" §4).
+    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
+    @Environment(\.playlistRouter) private var router
 
     /// The front sleeve's size: smaller while typing, so the results stay above the keyboard.
     private var sleeve: CGFloat { searching && !query.isEmpty ? 96 : 150 }
@@ -73,6 +78,8 @@ struct ShelfPanel: View {
             chips
             controls
             if showsGalaxy {
+                strip
+                    .padding(.bottom, 8)
                 // The galaxy has no footer, so the import or deletion note sits above it instead.
                 if let importNote {
                     Text(importNote).font(.footnote).foregroundStyle(theme.inkSecondary)
@@ -85,6 +92,7 @@ struct ShelfPanel: View {
             } else {
                 ScrollView {
                     VStack(spacing: 0) {
+                        strip
                         crate
                         caption
                         resultsList
@@ -102,6 +110,13 @@ struct ShelfPanel: View {
         }
         .foregroundStyle(theme.ink)
         .onChange(of: query, initial: true) { runSearch() }
+        // A hand-off that has landed leaves nothing in flight to hide: the next one names its own.
+        .onChange(of: hidesFront) { _, flying in
+            if !flying {
+                discPicked = nil
+                galaxyPicked = nil
+            }
+        }
         .onChange(of: filter) { runSearch() }
         .onChange(of: library.albums) { runSearch() }
         // Keyed by the phrase and by Search: a new phrase cancels the old search. Online search runs on Search only,
@@ -322,6 +337,79 @@ struct ShelfPanel: View {
         pick(album, nil, rect)
     }
 
+    // MARK: Playlists
+
+    /// The Playlists strip, over the crate or the galaxy; hidden while searching, when matching playlists are listed
+    /// with the results instead.
+    @ViewBuilder
+    private var strip: some View {
+        if let desk, query.isEmpty {
+            PlaylistStrip(
+                desk: desk, theme: theme, hidden: hidesFront ? discPicked : nil, holdsInDialog: showsGalaxy
+            ) { card, frame in
+                playPlaylist(card, from: frame)
+            }
+        }
+    }
+
+    /// A playlist with songs flies its disc to the deck, from `frame`; an empty one opens its sheet instead, never the
+    /// hand-off. Not while a hand-off runs: the hidden disc must stay the one in flight.
+    private func playPlaylist(_ card: PlaylistCard, from frame: CGRect?) {
+        guard card.songCount > 0 else {
+            router.open(.open(card.id))
+            return
+        }
+        guard !hidesFront else { return }
+        discPicked = card.id
+        pick(card.albumCard, nil, frame)
+    }
+
+    /// The playlists whose names match the query as the shelf's search does: from the start of a word, case and
+    /// accents aside.
+    private var matchingPlaylists: [PlaylistCard] {
+        let phrase = query.trimmingCharacters(in: .whitespaces)
+        guard let desk, !phrase.isEmpty, filter == .all || filter == .albums else { return [] }
+        return desk.playlists.filter { card in
+            let name = card.name
+            return name.indices.contains { index in
+                (index == name.startIndex || name[name.index(before: index)].isWhitespace)
+                    && name[index...].range(
+                        of: phrase, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) != nil
+            }
+        }
+    }
+
+    private func playlistResult(_ card: PlaylistCard) -> some View {
+        Button {
+            playPlaylist(card, from: nil)
+        } label: {
+            HStack(spacing: 10) {
+                PressingDisc(look: card.look, size: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(highlighted(card.name)).font(.subheadline).lineLimit(1)
+                    Text("Playlist · \(card.countText)").font(.caption).foregroundStyle(theme.inkSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+            }
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) { Rectangle().fill(theme.hairline.opacity(0.6)).frame(height: 0.5) }
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") {
+                playback.playNext(card.albumCard)
+            }
+            .disabled(card.songCount == 0)
+            Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(card.albumCard) }
+                .disabled(card.songCount == 0)
+            Button("Open Playlist", systemImage: "music.note.list") { router.open(.open(card.id)) }
+        }
+        .accessibilityLabel(card.accessibilityLabel)
+        .accessibilityIdentifier("result-playlist-\(card.name)")
+    }
+
     // MARK: The crate
 
     private var crate: some View {
@@ -435,6 +523,11 @@ struct ShelfPanel: View {
     private var resultsList: some View {
         if !query.isEmpty {
             LazyVStack(alignment: .leading, spacing: 0) {
+                let playlists = matchingPlaylists
+                if !playlists.isEmpty {
+                    header("Playlists")
+                    ForEach(playlists) { card in playlistResult(card) }
+                }
                 if !results.albums.isEmpty, filter != .songs {
                     header("Albums")
                     ForEach(results.albums) { album in
@@ -467,7 +560,11 @@ struct ShelfPanel: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
-                            if let album = albumOf(track) { upNextMenu(album, from: track.id) }
+                            if let album = albumOf(track) {
+                                upNextMenu(album, from: track)
+                            } else if let desk {
+                                SongPlaylistItems(desk: desk, song: track)
+                            }
                         }
                         .accessibilityIdentifier("result-track-\(track.title)")
                     }
@@ -478,7 +575,7 @@ struct ShelfPanel: View {
                         onlineRow(row)
                     }
                 }
-                if results.albums.isEmpty, results.tracks.isEmpty, online.isEmpty {
+                if results.albums.isEmpty, results.tracks.isEmpty, online.isEmpty, playlists.isEmpty {
                     Text("Nothing on your shelf matches. Try Get Music to look online.")
                         .font(.footnote).foregroundStyle(theme.inkSecondary).padding(.vertical, 12)
                 }
@@ -573,16 +670,25 @@ struct ShelfPanel: View {
         library.albums.first { $0.title == track.album && library.tracks(of: $0.id).contains { $0.id == track.id } }
     }
 
-    /// A sleeve's or a result's menu: for an album, or for its song `track` when a song row was held.
+    /// A sleeve's or a result's menu: for an album, or for its song `track` when a song row was held. Up Next and
+    /// Delete act on the album (from the song); the playlist items act on what was held: the album's songs, or the song
+    /// alone.
     @ViewBuilder
-    private func upNextMenu(_ album: AlbumCard, from track: TrackRow.ID? = nil) -> some View {
+    private func upNextMenu(_ album: AlbumCard, from track: TrackRow? = nil) -> some View {
         Button("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") {
-            playback.playNext(album, startingAt: track)
+            playback.playNext(album, startingAt: track?.id)
         }
-        Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(album, startingAt: track) }
+        Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(album, startingAt: track?.id) }
+        if let desk {
+            if let track {
+                SongPlaylistItems(desk: desk, song: track)
+            } else {
+                AlbumPlaylistItem(desk: desk, album: album)
+            }
+        }
         Divider()
         Button(track == nil ? "Delete Album…" : "Delete Song…", systemImage: "trash", role: .destructive) {
-            askToDelete(album, song: track)
+            askToDelete(album, song: track?.id)
         }
     }
 
