@@ -170,7 +170,11 @@ private func storedRows(_ library: Library, _ playlistID: String) async throws -
     let box = try PlaylistSandbox()
     let library = try box.open()
 
-    for bad in ["", "   ", "\n\t ", String(repeating: "x", count: 61), "  " + String(repeating: "é", count: 61) + " "] {
+    // Invisible characters alone (zero-width space, byte-order mark, joiner) would make a blank-looking name.
+    let invisible = ["\u{200B}", "\u{FEFF}\u{200B}", " \u{200D} "]
+    for bad in ["", "   ", "\n\t ", String(repeating: "x", count: 61), "  " + String(repeating: "é", count: 61) + " "]
+        + invisible
+    {
         await #expect(throws: PlaylistError.invalidName) {
             _ = try await library.createPlaylist(name: bad, colourID: "jade")
         }

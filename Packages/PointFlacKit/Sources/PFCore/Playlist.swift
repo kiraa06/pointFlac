@@ -35,10 +35,14 @@ public struct Playlist: Sendable, Hashable, Identifiable {
     }
 
     /// The name a playlist is stored under: `name` with surrounding spaces and newlines trimmed, when that leaves 1 to
-    /// `maxNameLength` characters; otherwise nil. Duplicate names are allowed.
+    /// `maxNameLength` characters, at least one of them visible (not a zero-width or other ignorable character);
+    /// otherwise nil. Duplicate names are allowed.
     public static func validName(_ name: String) -> String? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (1...maxNameLength).contains(trimmed.count) ? trimmed : nil
+        let visible = trimmed.unicodeScalars.contains {
+            !$0.properties.isDefaultIgnorableCodePoint && !CharacterSet.whitespacesAndNewlines.contains($0)
+        }
+        return visible && (1...maxNameLength).contains(trimmed.count) ? trimmed : nil
     }
 }
 
