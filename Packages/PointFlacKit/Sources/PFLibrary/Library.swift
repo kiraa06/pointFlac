@@ -247,6 +247,65 @@ public final class Library: Sendable {
         (try? await run(.never) { try $0.listenStats() }) ?? [:]
     }
 
+    // MARK: Playlists
+    //
+    // Favourites and the user's named playlists (spec "Playlists as custom pressings" §5). They run on the library's
+    // queue like everything else, and none publishes a catalog: a playlist changes no track. The app keeps its own copy,
+    // read again with `playlists()` after each change. A change the rules refuse throws `PlaylistError`; a database
+    // failure throws `LibraryDatabaseError`. None touches a file or the catalog.
+
+    /// Every playlist: Favourites first, then the others in the order they were made (ties by ID). Each carries every
+    /// track ID it stores, in order, including songs not in the catalog now (a file gone for now): the app filters them
+    /// to the catalog. Should the database fail, the failure is logged and the result is empty.
+    public func playlists() async -> [Playlist] {
+        do {
+            return try await run(.never) { try $0.playlists() }
+        } catch {
+            Self.log(error, during: "playlists")
+            return []
+        }
+    }
+
+    /// Makes a playlist with no songs. `name` is trimmed and must then be 1 to 60 characters (`invalidName`); duplicate
+    /// names are allowed. `colourID` is the pressing colour's ID, stored as given; it must not be empty
+    /// (`invalidColour`). The new playlist's ID is a lower-case UUID.
+    public func createPlaylist(name: String, colourID: String) async throws -> Playlist {
+        try await run(.never) { try $0.createPlaylist(name: name, colourID: colourID) }
+    }
+
+    /// Renames a playlist, under `createPlaylist`'s rule for names. Favourites can't be renamed (`favouritesIsFixed`).
+    public func renamePlaylist(id: String, name: String) async throws {
+        try await run(.never) { try $0.renamePlaylist(id: id, name: name) }
+    }
+
+    /// Changes a playlist's pressing colour. Favourites' too: Ruby is only its default.
+    public func setPlaylistColour(id: String, colourID: String) async throws {
+        try await run(.never) { try $0.setPlaylistColour(id: id, colourID: colourID) }
+    }
+
+    /// Deletes a playlist, but never its songs' tracks or files. Favourites can't be deleted (`favouritesIsFixed`).
+    public func deletePlaylist(id: String) async throws {
+        try await run(.never) { try $0.deletePlaylist(id: id) }
+    }
+
+    /// Appends songs to the end of a playlist, in the order given, each once: repeats in `ids`, and songs the playlist
+    /// already holds, are skipped. Returns how many were added. An ID not in the catalog is stored all the same.
+    @discardableResult
+    public func addTracks(_ ids: [String], to playlistID: String) async throws -> Int {
+        try await run(.never) { try $0.addTracks(ids, to: playlistID) }
+    }
+
+    /// Takes songs out of a playlist; the rest keep their order. IDs the playlist does not hold are ignored.
+    public func removeTracks(_ ids: [String], from playlistID: String) async throws {
+        try await run(.never) { try $0.removeTracks(ids, from: playlistID) }
+    }
+
+    /// Puts a playlist's songs in the order of `trackIDs`, which must be exactly the songs it stores (as
+    /// `playlists()` lists them, unfiltered), each once. Anything else throws `notFound` and changes nothing.
+    public func reorderPlaylist(id: String, trackIDs: [String]) async throws {
+        try await run(.never) { try $0.reorderPlaylist(id: id, trackIDs: trackIDs) }
+    }
+
     /// The stored cover for `artworkID` (a JPEG at most 600 px on its long side), or nil. Safe from any thread; held
     /// in a byte-bounded memory cache. A cover whose file has gone is regenerated from its track in the background,
     /// so a later call finds it again.

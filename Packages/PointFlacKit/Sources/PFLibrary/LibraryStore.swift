@@ -160,6 +160,26 @@ final class LibraryStore {
         // v5: listen history, keyed by track ID (the file's content identity). Not tied to `tracks` by a foreign key
         // on purpose: the rows survive a track's removal, are harmless, and come back if the file returns.
         "CREATE TABLE listens(track_id TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at REAL NOT NULL);",
+        // v6: playlists, with Favourites seeded under its fixed ID (`Playlist.favouritesID`), Ruby by default. Like
+        // `listens`, `track_id` is a soft reference with no foreign key: a song whose file is gone for now stays in its
+        // playlists, and is back when the file returns. Only a song the user deletes (`remove(trackIDs:trashing:)`)
+        // is taken out of them.
+        """
+        CREATE TABLE playlists(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            colour TEXT NOT NULL,
+            created_at REAL NOT NULL);
+        CREATE TABLE playlist_tracks(
+            playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            track_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            added_at REAL NOT NULL,
+            PRIMARY KEY (playlist_id, track_id));
+        INSERT INTO playlists(id, name, kind, colour, created_at)
+            VALUES ('favourites', 'Favourites', 'favourites', 'ruby', (julianday('now') - 2440587.5) * 86400.0);
+        """,
     ]
 
     /// Probed files per transaction: each batch is committed and published, so a scan killed part-way keeps what it
@@ -183,6 +203,8 @@ final class LibraryStore {
     /// For tests: thrown once inside the next removal's transaction, after its files are deleted, standing in for a
     /// database failure.
     var removalFault: (any Error)?
+    /// What playlist writes take as now. A stand-in for tests.
+    var clock: () -> Date = { Date() }
 
     init(databaseURL: URL, libraryFolder: URL, artworkFolder: URL, maxFileBytes: Int64) throws {
         database = try SQLiteDatabase(url: databaseURL)
@@ -882,6 +904,8 @@ final class LibraryStore {
     ///   file is remembered in `removed` with the size and date the library last read, so a rescan skips it until it
     ///   changes.
     ///
+    /// Every track that leaves the catalog also leaves every playlist, in the same transaction as its row.
+    ///
     /// The moves to Recently Deleted come first, outside any transaction: a file provider may take its time (up to
     /// `trashing.timeout`), and the library's write lock must not wait on it. The library's queue runs one operation
     /// at a time, so the rows read before the moves are still the rows when the transaction writes what became of
@@ -906,6 +930,8 @@ final class LibraryStore {
         var removal = LibraryRemoval(deletedFiles: 0, removedFromLibrary: 0)
         var emptied: Set<URL> = []
         var kept = 0
+        // The tracks that left the catalog: a track whose file could not be deleted stays, in its playlists too.
+        var left: Set<String> = []
         try database.transaction {
             for row in rows {
                 if row.folder == Self.libraryFolderID {
@@ -933,6 +959,14 @@ final class LibraryStore {
                     removal.removedFromLibrary += 1
                     if moved[row.id] == false { removal.trashFailures += 1 }
                 }
+                left.insert(row.id)
+            }
+            // A song the user deleted leaves every playlist, with its row. (A scan that finds a file gone leaves the
+            // playlists alone, so a song whose file is only missing for now comes back into them.)
+            if !left.isEmpty {
+                try database.query(
+                    "DELETE FROM playlist_tracks WHERE track_id IN (SELECT value FROM json_each(?))",
+                    [.text(Self.jsonArray(left))])
             }
             if let fault = removalFault {
                 removalFault = nil
@@ -1326,6 +1360,136 @@ final class LibraryStore {
     private static func listenStat(_ row: [SQLValue]?) -> ListenStat {
         ListenStat(
             count: Int(row?[0].int ?? 0), lastAt: row?[1].double.map { Date(timeIntervalSince1970: $0) })
+    }
+
+    // MARK: Playlists
+
+    /// Every playlist: Favourites first, then the others by `created_at`, ties by ID. Each carries every track ID it
+    /// stores, in position order, whether or not the track is in the catalog now.
+    func playlists() throws -> [Playlist] {
+        var songs: [String: [String]] = [:]
+        for row in try database.query(
+            "SELECT playlist_id, track_id FROM playlist_tracks ORDER BY playlist_id, position")
+        {
+            if let playlist = row[0].string, let track = row[1].string { songs[playlist, default: []].append(track) }
+        }
+        return try database.query(
+            "SELECT id, name, kind, colour, created_at FROM playlists ORDER BY id = ? DESC, created_at, id",
+            [.text(Playlist.favouritesID)]
+        ).compactMap { row in
+            guard let id = row[0].string, let name = row[1].string, let colour = row[3].string,
+                let created = row[4].double
+            else { return nil }
+            return Playlist(
+                id: id, name: name, kind: row[2].string.flatMap(Playlist.Kind.init(rawValue:)) ?? .custom,
+                colourID: colour, createdAt: Date(timeIntervalSince1970: created), trackIDs: songs[id] ?? [])
+        }
+    }
+
+    /// Makes a playlist named `name` (trimmed) in `colourID`, with a new lower-case UUID and no songs.
+    func createPlaylist(name: String, colourID: String) throws -> Playlist {
+        guard let name = Playlist.validName(name) else { throw PlaylistError.invalidName }
+        guard !colourID.isEmpty else { throw PlaylistError.invalidColour }
+        let created = clock().timeIntervalSince1970
+        let playlist = Playlist(
+            id: UUID().uuidString.lowercased(), name: name, kind: .custom, colourID: colourID,
+            createdAt: Date(timeIntervalSince1970: created))
+        try database.query(
+            "INSERT INTO playlists(id, name, kind, colour, created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                .text(playlist.id), .text(name), .text(Playlist.Kind.custom.rawValue), .text(colourID),
+                .real(created),
+            ])
+        return playlist
+    }
+
+    /// Renames a playlist other than Favourites to `name` (trimmed).
+    func renamePlaylist(id: String, name: String) throws {
+        guard id != Playlist.favouritesID else { throw PlaylistError.favouritesIsFixed }
+        try requirePlaylist(id)
+        guard let name = Playlist.validName(name) else { throw PlaylistError.invalidName }
+        try database.query("UPDATE playlists SET name = ? WHERE id = ?", [.text(name), .text(id)])
+    }
+
+    /// Gives a playlist, Favourites included, the pressing colour `colourID`.
+    func setPlaylistColour(id: String, colourID: String) throws {
+        try requirePlaylist(id)
+        guard !colourID.isEmpty else { throw PlaylistError.invalidColour }
+        try database.query("UPDATE playlists SET colour = ? WHERE id = ?", [.text(colourID), .text(id)])
+    }
+
+    /// Deletes a playlist other than Favourites, and its songs with it (the foreign key cascades). Never the tracks.
+    func deletePlaylist(id: String) throws {
+        guard id != Playlist.favouritesID else { throw PlaylistError.favouritesIsFixed }
+        try requirePlaylist(id)
+        try database.query("DELETE FROM playlists WHERE id = ?", [.text(id)])
+    }
+
+    /// Appends `ids` to the end of a playlist, in order, skipping repeats and songs it already holds, and returns how
+    /// many it added. An ID not in the catalog is stored all the same.
+    func addTracks(_ ids: [String], to playlistID: String) throws -> Int {
+        try database.transaction {
+            try requirePlaylist(playlistID)
+            var present = Set(try storedTrackIDs(of: playlistID))
+            var position =
+                try database.query(
+                    "SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_tracks WHERE playlist_id = ?",
+                    [.text(playlistID)]
+                ).first?.first?.int ?? 0
+            let added = SQLValue.real(clock().timeIntervalSince1970)
+            var count = 0
+            for id in ids where present.insert(id).inserted {
+                try database.query(
+                    "INSERT INTO playlist_tracks(playlist_id, track_id, position, added_at) VALUES (?, ?, ?, ?)",
+                    [.text(playlistID), .text(id), .integer(position), added])
+                position += 1
+                count += 1
+            }
+            return count
+        }
+    }
+
+    /// Takes `ids` out of a playlist. IDs it does not hold are ignored; the others keep their order.
+    func removeTracks(_ ids: [String], from playlistID: String) throws {
+        try database.transaction {
+            try requirePlaylist(playlistID)
+            for id in Set(ids) {
+                try database.query(
+                    "DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?",
+                    [.text(playlistID), .text(id)])
+            }
+        }
+    }
+
+    /// Puts a playlist's songs in the order of `trackIDs`, which must be exactly its songs, each once; otherwise it
+    /// throws `PlaylistError.notFound` and changes nothing.
+    func reorderPlaylist(id: String, trackIDs: [String]) throws {
+        try database.transaction {
+            try requirePlaylist(id)
+            let current = try storedTrackIDs(of: id)
+            guard trackIDs.count == current.count, Set(trackIDs) == Set(current) else {
+                throw PlaylistError.notFound
+            }
+            for (position, track) in trackIDs.enumerated() {
+                try database.query(
+                    "UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?",
+                    [.integer(Int64(position)), .text(id), .text(track)])
+            }
+        }
+    }
+
+    /// Throws `PlaylistError.notFound` unless a playlist has the ID `id`.
+    private func requirePlaylist(_ id: String) throws {
+        guard try !database.query("SELECT 1 FROM playlists WHERE id = ?", [.text(id)]).isEmpty else {
+            throw PlaylistError.notFound
+        }
+    }
+
+    /// The track IDs a playlist stores, in position order.
+    private func storedTrackIDs(of playlistID: String) throws -> [String] {
+        try database.query(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position", [.text(playlistID)]
+        ).compactMap { $0[0].string }
     }
 
     // MARK: Reading

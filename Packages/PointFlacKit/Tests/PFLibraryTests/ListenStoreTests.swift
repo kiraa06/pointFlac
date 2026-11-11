@@ -81,7 +81,7 @@ private func at(_ seconds: Double) -> Date { Date(timeIntervalSince1970: seconds
         databaseURL: box.database, libraryFolder: box.libraryFolder, artworkFolder: box.artwork, maxFileBytes: 1 << 30)
 
     #expect(store.database.userVersion == LibraryStore.migrations.count)
-    #expect(LibraryStore.migrations.count == 5)
+    #expect(LibraryStore.migrations.count == 6)
     #expect(try store.database.query("SELECT id FROM tracks").count == 1)
     #expect(try store.listenStats().isEmpty)
     #expect(try store.recordListen(trackID: "kept", at: at(5)) == ListenStat(count: 1, lastAt: at(5)))
