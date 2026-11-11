@@ -65,7 +65,9 @@ struct DeckScreen: View {
                 "\(ClockFormat.clock(playback.player.position.seconds))  33⅓  \(format)",
             ]
         }
-        return ["\(album.title.uppercased())·\(album.artist.uppercased())", "CUE \(sideLetter ?? "A")1  33⅓"]
+        // Idle, a playlist reads as its pressing does: `FAVOURITES·24 SONGS`.
+        let name = album.pressing?.displayText ?? "\(album.title.uppercased())·\(album.artist.uppercased())"
+        return [name, "CUE \(sideLetter ?? "A")1  33⅓"]
     }
 }
 
