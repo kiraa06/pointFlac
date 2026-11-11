@@ -5,16 +5,29 @@ import SwiftUI
 /// wash, the lamp's streaks glowing through it and a bright rim; or, for Onyx, the deck's opaque black vinyl.
 enum PressingVinyl: Equatable {
     case black
-    case translucent(PressingRGB)
+    /// `lift` (0–1) is how much of a lighter body lies under a light colour on the deck: see `PressingColour.lift`.
+    case translucent(PressingRGB, lift: Double)
 
     /// The translucent body, drawn under the grooves. `free` is a disc lying on its own (the shelf), which gets an
-    /// opaque deep base so it reads the same on any background; on the deck the platter shows through instead.
+    /// opaque deep base so it reads the same on any background; on the deck the platter shows through instead, except
+    /// under a light colour, which `lift` keeps clear of the dark platter.
     static func body(
         _ context: inout GraphicsContext, center c: CGPoint, radius r: CGFloat, label: CGFloat, tone: PressingRGB,
-        free: Bool = false
+        lift: Double = 0, free: Bool = false
     ) {
         let disc = PressingPaint.circle(c, r)
         let line = max(0.5, r / 150)
+        if !free, lift > 0 {
+            // A light colour pressed denser, so a dark platter can't grey it toward olive or caramel: a body of its
+            // own deep shade, most of the way opaque.
+            context.fill(
+                disc,
+                with: .radialGradient(
+                    Gradient(colors: [
+                        Color(tone.mixed(with: .black, 0.42), opacity: lift),
+                        Color(tone.mixed(with: .black, 0.26), opacity: lift),
+                    ]), center: c, startRadius: label, endRadius: r))
+        }
         if free {
             context.fill(
                 disc,
@@ -32,7 +45,7 @@ enum PressingVinyl: Equatable {
                     .init(color: Color(tone, opacity: free ? 0.8 : 0.76), location: 0.94),
                     .init(color: Color(tone.mixed(with: .white, 0.12), opacity: 0.9), location: 1),
                 ]), center: c, startRadius: label, endRadius: r))
-        context.fill(disc, with: .color(.black.opacity(0.08)))
+        context.fill(disc, with: .color(.black.opacity(0.08 * (1 - 0.6 * lift))))
         // Light passing through the vinyl: the colour glows brighter inside the lamp's two wedges.
         var glow = context
         glow.blendMode = .screen

@@ -46,11 +46,12 @@ struct RecordFace: Equatable {
     }
 
     /// A playlist's pressing (spec §3): translucent vinyl in its pressing colour, whatever the record style, with
-    /// the label made from its covers. Its ID is the playlist's card's, `playlist:<id>`.
+    /// the label made from its covers. Its ID is the playlist's card's, `playlist:<id>`, whether the look carries the
+    /// playlist's own ID or the card's.
     init(pressing look: PressingLook, side: String, bands: [CGFloat]) {
         placeholder = false
         pressing = look
-        albumID = "playlist:\(look.id)"
+        albumID = PressingID.card(look.id)
         artwork = nil
         title = look.title
         artist = ""
@@ -114,7 +115,7 @@ struct RecordView: View {
                 let ink = PressingInk(colour: look.colour, monochrome: mono)
                 RecordGrooves(
                     face: face, diameter: diameter, tint: look.colour.isBlackVinyl ? nil : ink.vinyl,
-                    pressing: look.colour.isBlackVinyl ? .black : .translucent(ink.vinylRGB)
+                    pressing: look.colour.isBlackVinyl ? .black : .translucent(ink.vinylRGB, lift: look.colour.lift)
                 )
                 .equatable()
                 PressingPrint(look: look, side: face.side, diameter: diameter, mono: mono).equatable()
@@ -207,8 +208,8 @@ private struct RecordGrooves: View, Equatable {
         let outer = r * VinylGeometry.outerGrooveToRecord
         let picture = face.style == .picture
         // The vinyl.
-        if case .translucent(let tone) = pressing {
-            PressingVinyl.body(&context, center: c, radius: r, label: label, tone: tone)
+        if case .translucent(let tone, let lift) = pressing {
+            PressingVinyl.body(&context, center: c, radius: r, label: label, tone: tone, lift: lift)
         } else if let tint {
             // Translucent: the platter shows faintly through, denser toward the rim where light crosses more vinyl.
             context.fill(
@@ -243,8 +244,9 @@ private struct RecordGrooves: View, Equatable {
             }
             radius += pitch * random.range(0.85, 1.15)
         }
-        // A pressing's tracks each sit at their own level: a band a shade lighter or darker, track by track.
-        if pressing != nil {
+        // A translucent pressing's tracks each sit at their own level: a band a shade lighter or darker, track by
+        // track, as light comes through more or less vinyl. Onyx is black vinyl and stays as calm as the deck's own.
+        if case .translucent = pressing {
             for i in 0..<(edges.count - 1) {
                 let band = circle(edges[i + 1] - gap * 0.6).subtracting(circle(edges[i] + gap * 0.6))
                 let level = levels[i] - 1.03
@@ -512,25 +514,14 @@ enum RecordPrint {
         color: Color, start: Double, smallCaps: Bool = false, monospaced: Bool = false, tracking: CGFloat = 0.16,
         baseline: Bool = false
     ) {
-        let chars = Array(text)
         func glyphs(_ size: CGFloat) -> [(GraphicsContext.ResolvedText, CGFloat)] {
-            var initial = true
-            return chars.map { ch in
-                let big = !smallCaps || initial || !ch.isLetter
-                initial = !(ch.isLetter || ch.isNumber)
-                let s = big ? size : size * 0.8
-                let font: Font =
-                    monospaced
-                    ? .system(size: s, weight: .medium, design: .monospaced)
-                    : .system(size: s, weight: .semibold, design: .default)
-                let resolved = context.resolve(Text(String(ch)).font(font).foregroundStyle(color))
-                let width = resolved.measure(in: CGSize(width: 200, height: 200)).width
-                return (resolved, width + size * tracking)
-            }
+            Self.laid(
+                context, text, size: size, color: color, smallCaps: smallCaps, monospaced: monospaced,
+                tracking: tracking)
         }
         var size = size
         var laid = glyphs(size)
-        let room = 2 * .pi * radius * 0.94
+        let room = room(radius: radius)
         let total = laid.reduce(0) { $0 + $1.1 }
         if total > room {
             size *= room / total
@@ -552,6 +543,38 @@ enum RecordPrint {
                 g.draw(glyph, at: CGPoint(x: 0, y: -radius), anchor: .center)
             }
             angle += Double(width / radius)
+        }
+    }
+
+    /// How long `text` runs at `size` when `arc` lays it, before any shrinking to fit.
+    static func length(
+        _ context: GraphicsContext, _ text: String, size: CGFloat, smallCaps: Bool = false, monospaced: Bool = false,
+        tracking: CGFloat = 0.16
+    ) -> CGFloat {
+        laid(context, text, size: size, color: .black, smallCaps: smallCaps, monospaced: monospaced, tracking: tracking)
+            .reduce(0) { $0 + $1.1 }
+    }
+
+    /// The room `arc` gives text round a circle of `radius`.
+    static func room(radius: CGFloat) -> CGFloat { 2 * .pi * radius * 0.94 }
+
+    /// Each glyph of `text`, resolved, with the advance it takes on the arc.
+    private static func laid(
+        _ context: GraphicsContext, _ text: String, size: CGFloat, color: Color, smallCaps: Bool, monospaced: Bool,
+        tracking: CGFloat
+    ) -> [(GraphicsContext.ResolvedText, CGFloat)] {
+        var initial = true
+        return Array(text).map { ch in
+            let big = !smallCaps || initial || !ch.isLetter
+            initial = !(ch.isLetter || ch.isNumber)
+            let s = big ? size : size * 0.8
+            let font: Font =
+                monospaced
+                ? .system(size: s, weight: .medium, design: .monospaced)
+                : .system(size: s, weight: .semibold, design: .default)
+            let resolved = context.resolve(Text(String(ch)).font(font).foregroundStyle(color))
+            let width = resolved.measure(in: CGSize(width: 200, height: 200)).width
+            return (resolved, width + size * tracking)
         }
     }
 }

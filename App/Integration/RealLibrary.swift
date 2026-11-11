@@ -314,11 +314,7 @@ final class RealLibrary: LibraryBrowsing {
     /// A playlist as the app shows it: its playable songs in the catalog now, and the pressing they make.
     private func card(for playlist: Playlist) -> PlaylistCard {
         let songs = snapshot.tracks(ids: playlist.trackIDs).filter(\.isSupported)
-        var covers: [String] = []
-        for song in songs where !covers.contains(song.albumID) {
-            covers.append(song.albumID)
-            if covers.count == PressingLook.maxCovers { break }
-        }
+        let covers = PressingCovers.distinct(songs.map(\.albumID))
         let favourites = playlist.kind == .favourites
         let colour =
             PressingColour(rawValue: playlist.colourID) ?? (favourites ? .favouritesDefault : .smoke)

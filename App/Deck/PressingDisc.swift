@@ -201,8 +201,10 @@ private struct PressingMosaicArt: View, Equatable {
                 ArtworkView(albumID: tiles[0], artwork: nil, pixels: pixels)
                     .frame(width: side, height: side)
                     .clipped()
+                    .id(tiles[0])
             } else {
-                ForEach(Array(tiles.enumerated()), id: \.offset) { index, albumID in
+                ForEach(PressingSlot.slots(tiles), id: \.id) { slot in
+                    let (index, albumID) = (slot.index, slot.albumID)
                     ArtworkView(albumID: albumID, artwork: nil, pixels: pixels)
                         .frame(width: cell, height: cell)
                         .clipped()

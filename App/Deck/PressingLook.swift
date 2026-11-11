@@ -12,36 +12,23 @@ struct PressingLook: Hashable, Sendable {
     let coverAlbumIDs: [String]
     let songCount: Int
     let isFavourites: Bool
-    /// The playlist's ID: `favourites`, or a lower-case UUID.
+    /// The playlist's ID: `favourites`, or a lower-case UUID. A card's `playlist:<id>` is taken as well.
     let id: String
 
-    /// The most covers a label shows.
-    static let maxCovers = 6
+    /// The playlist's card ID, `playlist:<id>`, whichever form `id` carries.
+    var cardID: String { PressingID.card(id) }
 
-    /// The covers the label draws: the first six.
-    var covers: [String] { Array(coverAlbumIDs.prefix(Self.maxCovers)) }
+    /// The covers the label draws: each album once, in playlist order, at most six.
+    var covers: [String] { PressingCovers.distinct(coverAlbumIDs) }
 
     /// "NO SONGS YET", "1 SONG", "24 SONGS" (spec §8.5).
-    var countText: String {
-        switch songCount {
-        case ...0: "NO SONGS YET"
-        case 1: "1 SONG"
-        default: "\(songCount) SONGS"
-        }
-    }
+    var countText: String { PressingRim.count(songCount) }
 
-    /// The label's curved rim text: `FAVOURITES · 24 SONGS · SIDE A · 33⅓ RPM`, or `DEMOS · NO SONGS YET · SIDE A ·
-    /// 33⅓ RPM` for an empty playlist.
-    func rimText(side: String) -> String {
-        "\(title.uppercased()) · \(countText) · SIDE \(side) · 33⅓ RPM"
-    }
+    /// The label's curved rim text: `FAVOURITES · 24 SONGS · SIDE A · 33⅓ RPM`.
+    func rimText(side: String) -> String { PressingRim.text(title: title, songs: songCount, side: side) }
 
     /// The matrix etched in the dead wax: `PFL-FAV-A1`, or `PFL-MIX-<first 4 of the ID>-A1`.
-    func matrix(side: String) -> String {
-        if isFavourites { return "PFL-FAV-\(side)1" }
-        let code = id.filter { $0.isLetter || $0.isNumber }.prefix(4).uppercased()
-        return "PFL-MIX-\(code.isEmpty ? "0000" : code)-\(side)1"
-    }
+    func matrix(side: String) -> String { PressingID.matrix(id: id, isFavourites: isFavourites, side: side) }
 
     /// The deck display's idle line: `FAVOURITES·24 SONGS`.
     var displayText: String { "\(title.uppercased())·\(countText)" }
@@ -124,4 +111,15 @@ struct PressingRGB: Equatable {
 extension PressingColour {
     /// Onyx is black vinyl: pressed and lit exactly as the deck's own black records are.
     var isBlackVinyl: Bool { self == .onyx }
+
+    /// How much lighter body the light colours get on the deck, so Amber and Citrine read as the same bright colour
+    /// as their shelf discs instead of turning olive or caramel over a dark platter, and Smoke reads as silver. The
+    /// deep colours (Ruby, Jade, Ocean, Violet) need none: the platter only deepens them.
+    var lift: Double {
+        switch self {
+        case .amber, .citrine: 0.85
+        case .smoke: 0.5
+        default: 0
+        }
+    }
 }
