@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import Observation
 import PFAudio
 import PFCore
@@ -68,6 +69,16 @@ final class RealLibrary: LibraryBrowsing {
     /// Every track's listens, keyed by track ID: loaded once by `start()`, then kept up to date by `recordListen`, so
     /// the albums' counts never wait for a catalog.
     @ObservationIgnored private var listenStats: [String: ListenStat] = [:]
+    /// Favourites and the named playlists, as the shelf shows them: each filtered to the catalog's playable songs.
+    private(set) var playlists: [PlaylistCard] = []
+    /// The playlists as the library stores them, every track ID included (a song whose file is gone for now too): the
+    /// truth `playlists` is filtered from, and what a reorder must hand back whole.
+    @ObservationIgnored private var storedPlaylists: [Playlist] = []
+    /// Favourites' stored track IDs, for the heart's lookup. Observed, so the heart follows.
+    private var favouriteIDs: Set<String> = []
+    /// Playlist writes still on their way to the library. A read that lands meanwhile may predate one of them, so it
+    /// is not shown: the list keeps the edits made here until every write is in.
+    @ObservationIgnored private var playlistWrites = 0
     /// The folder picked for downloads, as last resolved, or nil: deleting a song whose file is inside it moves the
     /// file to Recently Deleted. Set by the app model once the folder's store exists; read at each plan and removal,
     /// so a folder chosen, forgotten or found unavailable since applies at once.
@@ -90,6 +101,7 @@ final class RealLibrary: LibraryBrowsing {
         watcher = Task { [weak self] in
             let stored = await library.listenStats()
             self?.adopt(stored)
+            await self?.refreshPlaylists()
             for await catalog in library.changes() {
                 let snapshot = await Task.detached(priority: .userInitiated) { LibrarySnapshot(catalog) }.value
                 guard let self else { return }
@@ -123,6 +135,8 @@ final class RealLibrary: LibraryBrowsing {
         }
         self.covers.replace(with: covers)
         rebuildCards()
+        // A song whose file went (or came back) leaves (or rejoins) its playlists' lists.
+        rebuildPlaylists()
     }
 
     /// Builds every card from the snapshot and the listens.
@@ -179,7 +193,14 @@ final class RealLibrary: LibraryBrowsing {
         return (order.ids.compactMap { cards[$0] }, order.fellBack)
     }
 
+    /// An album's playable tracks; or a playlist's (`playlist:<id>`), in its order, laid out in sides of their own.
     func tracks(of album: AlbumCard.ID) -> [TrackRow] {
+        if let id = PlaylistCard.playlistID(fromCard: album) {
+            guard let playlist = playlists.first(where: { $0.id == id }) else { return [] }
+            let songs = snapshot.tracks(ids: playlist.songIDs)
+            let layout = SideLayout(durations: songs.map(\.durationSeconds))
+            return songs.enumerated().map { index, track in Self.row(track, side: layout.code(ofTrack: index)) }
+        }
         let playable = snapshot.tracks(of: album).filter(\.isSupported)
         let layout = SideLayout(durations: playable.map(\.durationSeconds))
         return playable.enumerated().map { index, track in
@@ -258,8 +279,155 @@ final class RealLibrary: LibraryBrowsing {
         // A failure is logged by the library; either way the shelf then shows what the library holds.
         let removal = try? await library.remove(trackIDs: tracks, trashing: trashing)
         await sync()
+        // The library took the deleted songs out of every playlist in the same write.
+        await refreshPlaylists()
         return RemovalOutcome(trashFailures: removal?.trashFailures ?? 0)
     }
+
+    // MARK: Playlists
+
+    /// Reads the playlists again. A database failure reads as none (Favourites always exists): the list then stays
+    /// as it was, so the shelf never shows Favourites gone.
+    func refreshPlaylists() async {
+        let fresh = await library.playlists()
+        guard playlistWrites == 0 else { return }
+        if !fresh.isEmpty { storedPlaylists = fresh }
+        rebuildPlaylists()
+    }
+
+    /// Builds every playlist's card from the stored playlists and the catalog.
+    private func rebuildPlaylists() {
+        var stored = storedPlaylists
+        // Before the first read (or after a failed one): Favourites, empty, so the strip always has it.
+        if !stored.contains(where: { $0.kind == .favourites }) {
+            stored.insert(
+                Playlist(
+                    id: Playlist.favouritesID, name: "Favourites", kind: .favourites,
+                    colourID: PressingColour.favouritesDefault.rawValue, createdAt: .distantPast), at: 0)
+        }
+        let favourites = Set(stored.first { $0.kind == .favourites }?.trackIDs ?? [])
+        if favourites != favouriteIDs { favouriteIDs = favourites }
+        let built = stored.map(card(for:))
+        if built != playlists { playlists = built }
+    }
+
+    /// A playlist as the app shows it: its playable songs in the catalog now, and the pressing they make.
+    private func card(for playlist: Playlist) -> PlaylistCard {
+        let songs = snapshot.tracks(ids: playlist.trackIDs).filter(\.isSupported)
+        var covers: [String] = []
+        for song in songs where !covers.contains(song.albumID) {
+            covers.append(song.albumID)
+            if covers.count == PressingLook.maxCovers { break }
+        }
+        let favourites = playlist.kind == .favourites
+        let colour =
+            PressingColour(rawValue: playlist.colourID) ?? (favourites ? .favouritesDefault : .smoke)
+        let look = PressingLook(
+            title: playlist.name, colour: colour, coverAlbumIDs: covers, songCount: songs.count,
+            isFavourites: favourites, id: playlist.id)
+        let best = songs.map(\.format).max {
+            ($0.bitsPerSample, $0.sampleRate) < ($1.bitsPerSample, $1.sampleRate)
+        }
+        let album = AlbumCard(
+            id: PlaylistCard.cardID(playlist.id), title: playlist.name, artist: "Playlist", year: nil, artwork: nil,
+            trackCount: songs.count, bestFormat: best.map(LibraryAlbum.formatLabel) ?? "", addedAt: playlist.createdAt,
+            listens: 0, lastListened: nil, bestBits: best?.bitsPerSample ?? 0, bestRate: best?.sampleRate ?? 0,
+            pressing: look)
+        return PlaylistCard(
+            id: playlist.id, name: playlist.name, isFavourites: favourites, colour: colour,
+            songIDs: songs.map(\.id), look: look, albumCard: album)
+    }
+
+    /// Applies `change` to the stored playlist `id` here and now, so the UI follows at once; `write` then makes the
+    /// change in the library.
+    private func changeLocally(_ id: String, _ change: (inout Playlist) -> Void) {
+        guard let index = storedPlaylists.firstIndex(where: { $0.id == id }) else { return }
+        change(&storedPlaylists[index])
+        rebuildPlaylists()
+    }
+
+    /// Makes a playlist change in the library, then reads the playlists back: the library's word is final, a refusal
+    /// included.
+    private func write(_ change: @escaping @Sendable (Library) async throws -> Void) async {
+        playlistWrites += 1
+        do {
+            try await change(library)
+        } catch {
+            Self.playlistLog.error("Playlist change refused: \(String(describing: error), privacy: .public)")
+        }
+        playlistWrites -= 1
+        await refreshPlaylists()
+    }
+
+    func createPlaylist(name: String, colour: PressingColour) async -> PlaylistCard? {
+        playlistWrites += 1
+        let made = try? await library.createPlaylist(name: name, colourID: colour.rawValue)
+        playlistWrites -= 1
+        if let made, !storedPlaylists.contains(where: { $0.id == made.id }) { storedPlaylists.append(made) }
+        rebuildPlaylists()
+        await refreshPlaylists()
+        return made.flatMap { made in playlists.first { $0.id == made.id } }
+    }
+
+    func renamePlaylist(_ id: PlaylistCard.ID, to name: String) async {
+        guard let valid = Playlist.validName(name) else { return }
+        changeLocally(id) { if $0.kind == .custom { $0.name = valid } }
+        await write { try await $0.renamePlaylist(id: id, name: valid) }
+    }
+
+    func setPlaylistColour(_ id: PlaylistCard.ID, to colour: PressingColour) async {
+        changeLocally(id) { $0.colourID = colour.rawValue }
+        await write { try await $0.setPlaylistColour(id: id, colourID: colour.rawValue) }
+    }
+
+    func deletePlaylist(_ id: PlaylistCard.ID) async {
+        guard id != Playlist.favouritesID else { return }
+        storedPlaylists.removeAll { $0.id == id }
+        rebuildPlaylists()
+        await write { try await $0.deletePlaylist(id: id) }
+    }
+
+    @discardableResult
+    func add(_ trackIDs: [TrackRow.ID], to playlist: PlaylistCard.ID) async -> Int {
+        var added = 0
+        changeLocally(playlist) { stored in
+            for id in trackIDs where !stored.trackIDs.contains(id) {
+                stored.trackIDs.append(id)
+                added += 1
+            }
+        }
+        await write { try await $0.addTracks(trackIDs, to: playlist) }
+        return added
+    }
+
+    func remove(_ trackIDs: [TrackRow.ID], from playlist: PlaylistCard.ID) async {
+        let gone = Set(trackIDs)
+        changeLocally(playlist) { $0.trackIDs.removeAll { gone.contains($0) } }
+        await write { try await $0.removeTracks(trackIDs, from: playlist) }
+    }
+
+    /// `songIDs` orders the songs the list shows; songs it leaves out (gone for now) keep their places among them.
+    func reorder(_ playlist: PlaylistCard.ID, songIDs: [TrackRow.ID]) async {
+        guard let stored = storedPlaylists.first(where: { $0.id == playlist }) else { return }
+        let shown = Set(songIDs)
+        guard shown.isSubset(of: Set(stored.trackIDs)), shown.count == songIDs.count else { return }
+        var next = songIDs.makeIterator()
+        let order = stored.trackIDs.map { shown.contains($0) ? (next.next() ?? $0) : $0 }
+        changeLocally(playlist) { $0.trackIDs = order }
+        await write { try await $0.reorderPlaylist(id: playlist, trackIDs: order) }
+    }
+
+    func isFavourite(_ trackID: TrackRow.ID) -> Bool { favouriteIDs.contains(trackID) }
+
+    func toggleFavourite(_ trackID: TrackRow.ID) async {
+        if isFavourite(trackID) {
+            await remove([trackID], from: Playlist.favouritesID)
+        } else {
+            await add([trackID], to: Playlist.favouritesID)
+        }
+    }
+
+    private static let playlistLog = Logger(subsystem: "io.github.kiraa06.pointflac", category: "playlists")
 
     /// The track's record code, from its album's side layout.
     private func side(of track: LibraryTrack) -> String? {
@@ -311,7 +479,7 @@ final class RealLibrary: LibraryBrowsing {
             artist: track.displayArtist.isEmpty ? "Unknown artist" : track.displayArtist,
             album: track.album.isEmpty ? AlbumGrouping.unknownAlbum : track.album,
             durationSeconds: track.durationSeconds,
-            format: track.formatLabel + (track.isCloudPending ? " · iCloud" : ""), side: side)
+            format: track.formatLabel + (track.isCloudPending ? " · iCloud" : ""), side: side, albumID: track.albumID)
     }
 }
 
