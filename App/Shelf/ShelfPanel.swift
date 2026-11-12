@@ -307,7 +307,8 @@ struct ShelfPanel: View {
             hidden: hidesFront ? galaxyPicked : nil,
             pick: { album, rect in pickFromGalaxy(album, rect) },
             playNext: { playback.playNext($0, startingAt: nil) },
-            addToUpNext: { playback.addToUpNext($0, startingAt: nil) }
+            addToUpNext: { playback.addToUpNext($0, startingAt: nil) },
+            addToPlaylist: desk.map { desk in { album in router.addAlbum(album, from: desk) } }
         ) { album, rect in
             // A hold offers the crate's actions, and Play first: the galaxy has no front sleeve to tap twice.
             Button("Play") { pickFromGalaxy(album, rect) }

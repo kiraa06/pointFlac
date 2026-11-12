@@ -38,11 +38,18 @@ struct AlbumPlaylistItem: View {
     @Environment(\.playlistRouter) private var router
 
     var body: some View {
-        Button("Add to Playlist…", systemImage: "text.badge.plus") {
-            let songs = desk.songs(ofAlbum: album.id)
-            guard !songs.isEmpty else { return }
-            router.open(.add(PlaylistAddRequest(album: album, songs: songs)))
-        }
+        Button("Add to Playlist…", systemImage: "text.badge.plus") { router.addAlbum(album, from: desk) }
+    }
+}
+
+extension PlaylistRouter {
+    /// An album's "Add to Playlist…": the Add to Playlist sheet for its songs, in its order; nothing for an album with
+    /// none pointFlac can play. The crate's menus and the galaxy's VoiceOver action both ask for it here.
+    @MainActor
+    func addAlbum(_ album: AlbumCard, from desk: PlaylistDesk) {
+        let songs = desk.songs(ofAlbum: album.id)
+        guard !songs.isEmpty else { return }
+        open(.add(PlaylistAddRequest(album: album, songs: songs)))
     }
 }
 
