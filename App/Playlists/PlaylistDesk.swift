@@ -17,6 +17,9 @@ final class PlaylistDesk {
     /// The playlist whose disc is pressing in now, and a count that changes with each press (for its haptic).
     private(set) var pressing: PlaylistCard.ID?
     private(set) var presses = 0
+    /// Counts the sheets gone (`releasePress`), so a playlist made while its sheet was swiped away is not held back
+    /// for a dismissal that has already happened.
+    @ObservationIgnored private var releases = 0
 
     init(library: any LibraryBrowsing, playback: PlaybackController) {
         self.library = library
@@ -55,17 +58,24 @@ final class PlaylistDesk {
 
     /// Makes a playlist, with `songs` in it, and holds its disc back to press in once the sheet closes. A name that
     /// trims to nothing takes the default.
+    ///
+    /// The sheet can go while the library makes the playlist (swiped away mid-await): its `releasePress` has run
+    /// already and found nothing to release, so the disc presses in at once rather than wait, hidden, for a
+    /// dismissal that will never come.
     @discardableResult
     func create(name: String, colour: PressingColour, adding songs: [TrackRow.ID] = []) async -> PlaylistCard? {
         let name = Playlist.validName(name) ?? nextName
+        let sheetsGone = releases
         guard let made = await library.createPlaylist(name: name, colour: colour) else { return nil }
         awaitingPress = made.id
+        if releases != sheetsGone { releasePress() }
         if !songs.isEmpty { await library.add(songs, to: made.id) }
         return playlist(made.id) ?? made
     }
 
     /// The sheet a playlist was made in has gone: its disc presses in now.
     func releasePress() {
+        releases += 1
         guard let id = awaitingPress else { return }
         awaitingPress = nil
         pressing = id
