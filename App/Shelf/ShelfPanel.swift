@@ -61,11 +61,11 @@ struct ShelfPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // The grabber's zone, the whole header above the search field: 44 pt tall and full width, so a finger finds
-            // it. The shelf follows a drag here, and settles when the finger lifts (`ShelfGrabberDrag`).
             Capsule().fill(theme.inkSecondary.opacity(0.4)).frame(width: 38, height: 5)
-                .frame(maxWidth: .infinity, minHeight: 44)
+                .padding(.top, 8).padding(.bottom, 10)
+                .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
+                // The shelf follows a drag here and settles when the finger lifts (`ShelfGrabberDrag`).
                 .modifier(ShelfGrabberDrag())
                 .accessibilityLabel("Close the shelf")
                 .accessibilityAddTraits(.isButton)

@@ -209,8 +209,11 @@ struct PlayerScreen: View {
     }
 
     private func shelf(_ size: CGSize, _ metrics: ShelfMetrics) -> some View {
-        VStack {
+        VStack(spacing: 0) {
             Spacer(minLength: 0)
+            // Just above the panel's edge: with the grabber under it, a 44 pt touch zone.
+            ShelfGrabberReach(actions: closingDrag(metrics))
+                .offset(y: shelfOffset(size, metrics))
             ShelfPanel(
                 library: model.library, finder: model.finder, playback: playback, theme: theme,
                 close: { withAnimation(.spring(duration: 0.45)) { shelfOpen = false } },

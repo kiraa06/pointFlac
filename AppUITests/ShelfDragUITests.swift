@@ -72,6 +72,22 @@ final class ShelfDragUITests: XCTestCase {
         XCTAssertTrue(app.buttons["shelfButton"].isHittable)
     }
 
+    /// The grabber's touch zone is 44 pt tall without the header growing: it reaches above the panel's top edge, so a
+    /// pull that starts just above the shelf takes it rather than the deck under it.
+    @MainActor
+    func testPullFromJustAboveTheShelfTakesTheGrabber() {
+        let app = launch(open: true)
+        XCTAssertTrue(field(app).waitForExistence(timeout: 20))
+        Thread.sleep(forTimeInterval: 0.6)
+        let grabber = app.buttons["Close the shelf"]
+        XCTAssertTrue(grabber.waitForExistence(timeout: 3))
+        // The grabber's top is the panel's top edge: start 12 pt above it.
+        let start = grabber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0)).withOffset(
+            CGVector(dx: 0, dy: -12))
+        drag(from: start, by: Self.long(app))
+        XCTAssertTrue(field(app).waitForNonExistence(timeout: 5), "a pull from just above the shelf left it open")
+    }
+
     // MARK: Helpers
 
     /// Well short of halfway: the shelf's travel is about three quarters of the screen.

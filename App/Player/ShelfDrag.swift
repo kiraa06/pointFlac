@@ -93,6 +93,24 @@ struct ShelfGrabberDrag: ViewModifier {
     }
 }
 
+/// The grabber's reach above the panel's top edge: a clear strip, full width, that drags the shelf as the grabber
+/// does. With the grabber's header (23 pt) under it, the touch zone is 44 pt tall without the header growing, so the
+/// galaxy and the crate keep every point (a taller header leaves a dragged galaxy sleeve less room). A SwiftUI view
+/// takes no touch outside its frame, whatever its content shape, so the reach is a view of its own.
+struct ShelfGrabberReach: View {
+    static let height: CGFloat = 44 - 23
+    let actions: ShelfDragActions
+
+    var body: some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: Self.height)
+            .contentShape(Rectangle())
+            .modifier(ShelfDragArea(minimumDistance: 10, actions: actions))
+            .accessibilityHidden(true)
+    }
+}
+
 /// Where the Shelf sits in the player: how tall it is, how far down it travels to be out of sight, and how far past
 /// open it may stretch.
 struct ShelfMetrics: Equatable {
