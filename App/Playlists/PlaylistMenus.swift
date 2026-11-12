@@ -3,8 +3,8 @@ import PFDesign
 import SwiftUI
 
 /// A song's playlist items, for a long-press menu (spec §4): Add to Favourites (or Remove from Favourites), Add to
-/// Playlist…, and, in the tracklist of a playlist on the deck, Remove from This Playlist. They act on the song itself,
-/// whatever record it was found on.
+/// Playlist…, and, in the tracklist of a playlist on the deck, Remove from This Playlist (but not for Favourites, where
+/// Remove from Favourites says it already). They act on the song itself, whatever record it was found on.
 struct SongPlaylistItems: View {
     let desk: PlaylistDesk
     let song: TrackRow
@@ -23,7 +23,7 @@ struct SongPlaylistItems: View {
         Button("Add to Playlist…", systemImage: "text.badge.plus") {
             router.open(.add(PlaylistAddRequest(song: song)))
         }
-        if let playlist, desk.playlist(playlist)?.songIDs.contains(song.id) == true {
+        if let playlist, playlist != Playlist.favouritesID, desk.playlist(playlist)?.songIDs.contains(song.id) == true {
             Button("Remove from This Playlist", systemImage: "minus.circle", role: .destructive) {
                 desk.remove([song.id], from: playlist)
             }
