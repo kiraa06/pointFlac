@@ -10,9 +10,9 @@ import Foundation
 /// cancellation saw their own timers fire first and failed (`.offline`, a move that should have timed out, …).
 ///
 /// Jobs here run on an operation queue at most half the CPU count wide (at least 2), so the heavy suites get CPU and
-/// the pool stays free for everyone else. They run at utility QoS: below the pool's default, so a test waiting on a
-/// timer is never queued behind them, and level with the library's own queue, whose coordinated moves the trash tests
-/// time. Use `onComputeQueue(_:)`, or a suite trait built on it.
+/// the pool stays free for everyone else. They run at the default QoS, as they did on the pool: several of them play
+/// the real-time render thread (a chain swap counts a render call that stalls), so a lower one would let the scheduler
+/// preempt them into failures of their own. Use `onComputeQueue(_:)`, or a suite trait built on it.
 public final class ComputeQueue: TaskExecutor {
     public static let shared = ComputeQueue()
 
@@ -28,7 +28,7 @@ public final class ComputeQueue: TaskExecutor {
         let queue = OperationQueue()
         queue.name = "io.github.kiraa06.pointflac.tests.compute"
         queue.maxConcurrentOperationCount = Self.width
-        queue.qualityOfService = .utility
+        queue.qualityOfService = .default
         self.queue = queue
     }
 
