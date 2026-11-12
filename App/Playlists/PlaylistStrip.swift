@@ -150,6 +150,17 @@ private struct PlaylistStripItem: View {
         .accessibilityHint(empty ? "Opens the playlist" : "Plays on the deck")
         .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("playlistDisc-\(card.id)")
+        // The hold's items, for VoiceOver, whichever way the hold shows them.
+        .accessibilityActions {
+            if !empty {
+                Button("Play Next") { desk.playback.playNext(card.albumCard) }
+                Button("Add to Up Next") { desk.playback.addToUpNext(card.albumCard) }
+            }
+            Button("Open Playlist") { router.open(.open(card.id)) }
+            if !card.isFavourites {
+                Button("Delete Playlist…", action: delete)
+            }
+        }
         .onAppear {
             if desk.awaitingPress == card.id { hide() }
         }

@@ -249,6 +249,33 @@ final class PlaylistUITests: XCTestCase {
         wait(for: app.staticTexts["nowPlayingTitle"], "label == 'Fold'", timeout: 8)
     }
 
+    /// A name typed in the playlist sheet is kept when the sheet is closed with Done while the field still has the
+    /// keyboard.
+    @MainActor
+    func testRenameTypedInThePlaylistSheetIsKeptOnDone() {
+        let app = launch()
+        openShelf(app)
+        let new = app.buttons["newPlaylistButton"]
+        XCTAssertTrue(new.waitForExistence(timeout: 5))
+        new.tap()
+        let create = app.buttons["createPlaylist"]
+        XCTAssertTrue(create.waitForExistence(timeout: 3))
+        create.tap()
+        let made = playlistDisc(named: "New Playlist", in: app)
+        XCTAssertTrue(made.waitForExistence(timeout: 5))
+        wait(for: made, "isHittable == true")
+        // Empty, so a tap opens its sheet.
+        made.tap()
+        let field = app.textFields["playlistName"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        replaceText(in: field, with: "Road Trip")
+        app.buttons["closePlaylist"].tap()
+        wait(for: app.descendants(matching: .any)["playlistSheet"], "exists == false")
+        let renamed = playlistDisc(named: "Road Trip", in: app)
+        XCTAssertTrue(renamed.waitForExistence(timeout: 3))
+        XCTAssertEqual(renamed.label, "Road Trip, playlist, 0 songs")
+    }
+
     // MARK: Helpers
 
     /// Drags the shelf's grabber down, which closes it.

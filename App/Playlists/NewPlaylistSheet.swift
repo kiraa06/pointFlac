@@ -127,6 +127,7 @@ struct NewPlaylistForm: View {
         VStack(spacing: 0) {
             RecordView(face: RecordFace(pressing: draft, side: "A", bands: []), diameter: 180)
                 .shadow(color: .black.opacity(theme.isDark ? 0.45 : 0.2), radius: 14, y: 8)
+                .accessibilityHidden(true)
                 .padding(.top, 6)
                 .padding(.bottom, 22)
                 .animation(.easeInOut(duration: 0.25), value: colour)

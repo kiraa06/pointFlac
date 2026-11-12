@@ -66,7 +66,7 @@ struct FavouriteButton: View {
         } label: {
             Image(systemName: on ? "heart.fill" : "heart")
                 .foregroundStyle(on ? heartColour : theme.inkSecondary)
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
                 .symbolEffect(.bounce, options: .nonRepeating, value: reduceMotion ? 0 : taps)
                 .frame(width: 44, height: 44)
         }

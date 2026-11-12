@@ -114,7 +114,21 @@ struct PlaylistSheet: View {
             bar(songs: songs)
         }
         .onAppear { name = card.name }
+        // Closed (Done, a swipe) while the name still has the keyboard: the name typed is kept all the same.
+        .onDisappear { commitName(card) }
         .onChange(of: card.name) { _, now in name = now }
+    }
+
+    /// A name typed becomes the playlist's; one the library would refuse (nothing left once trimmed) goes back.
+    /// Favourites keeps its name.
+    private func commitName(_ card: PlaylistCard) {
+        // Not for Favourites, nor for a playlist just deleted from this sheet.
+        guard !card.isFavourites, desk.playlist(card.id) != nil else { return }
+        if Playlist.validName(name) == nil {
+            name = card.name
+        } else if name != card.name {
+            desk.rename(card.id, to: name)
+        }
     }
 
     /// Edit at the top left (it turns on drag-to-reorder), Done at the top right, floating over the pressing.
@@ -172,14 +186,8 @@ struct PlaylistSheet: View {
                     .accessibilityAddTraits(.isHeader)
                     .accessibilityIdentifier("playlistName")
             } else {
-                PlaylistNameField(name: $name, theme: theme) {
-                    if Playlist.validName(name) == nil {
-                        name = card.name
-                    } else if name != card.name {
-                        desk.rename(card.id, to: name)
-                    }
-                }
-                .padding(.horizontal, 16)
+                PlaylistNameField(name: $name, theme: theme) { commitName(card) }
+                    .padding(.horizontal, 16)
             }
             PressingSwatches(
                 selection: Binding(get: { card.colour }, set: { desk.recolour(card.id, to: $0) }), theme: theme
