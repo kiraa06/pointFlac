@@ -12,8 +12,6 @@ struct CoverStage: View {
     let theme: Theme
     let discSpace: Namespace.ID
     @AppStorage(DeckPreferences.recordStyleKey) private var recordStyle = RecordStyle.standard.rawValue
-    /// For the song the cover shows: the one playing, or the one the needle would drop on.
-    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     var body: some View {
         GeometryReader { proxy in
@@ -75,11 +73,12 @@ struct CoverStage: View {
         }
     }
 
-    /// The cover of the song playing (or, needle up, of the one that would play), cross-fading as the songs change; the
-    /// pressing's own square of covers before any song is known.
+    /// The cover of the song playing (or, needle up, of the one that would play: the deck's `cuedSong`, which the
+    /// player's wash follows too), cross-fading as the songs change; the pressing's own square of covers before any song
+    /// is known.
     @ViewBuilder
     private func songCover(_ look: PressingLook, side: CGFloat) -> some View {
-        let song = desk?.cuedSong ?? playback.currentTrack
+        let song = playback.cuedSong
         ZStack {
             if let albumID = song?.albumID {
                 ArtworkView(albumID: albumID, artwork: nil, pixels: 900)

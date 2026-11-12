@@ -44,9 +44,10 @@ struct PlayerScreen: View {
     private var playback: PlaybackController { model.playback }
     private var theme: Theme { .look(stage: stage, dark: scheme == .dark, monochrome: monochrome) }
     /// What tints the glass: the record's colours, in greys under Monochrome (the sleeve and art keep theirs). A
-    /// playlist lights the deck in its pressing colour; on the cover, the wash follows the song's own album.
+    /// playlist lights the deck in its pressing colour; on the cover, the wash follows the album of the song the cover
+    /// shows (`cuedSong`: the one playing or, needle up, the one that would play).
     private var palette: ArtPalette {
-        if stage == .cover, playback.album?.pressing != nil, let album = playback.currentTrack?.albumID {
+        if stage == .cover, playback.album?.pressing != nil, let album = playback.cuedSong?.albumID {
             return ArtPalette(seed: album).tint(for: theme)
         }
         return ArtPalette.record(playback.record).tint(for: theme)

@@ -127,6 +127,15 @@ final class PlaybackController {
 
     var currentTrack: TrackRow? { trackIndex.map { tracks[$0] } }
 
+    /// The song on the deck: the one playing, or the one that would play with the needle up (the first of the cued
+    /// side). Nil only with the deck empty. The heart acts on it, and the cover shows it and takes its wash from it.
+    var cuedSong: TrackRow? {
+        if let track = currentTrack { return track }
+        let sides = layout.sides
+        let first = sides.indices.contains(cuedSide) ? sides[cuedSide].tracks.lowerBound : 0
+        return tracks.indices.contains(first) ? tracks[first] : tracks.first
+    }
+
     /// The record on the platter as the deck shows it: for a playlist, its card with the playlist's name and colour as
     /// they are now (a rename or a new colour shows at once), keeping the song count and covers it was cued with, since
     /// its songs stay as cued until it is put on again. An album's card as it is: only a playlist reads the

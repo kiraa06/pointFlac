@@ -35,14 +35,9 @@ final class PlaylistDesk {
         Task { await library.toggleFavourite(trackID) }
     }
 
-    /// The song the heart acts on (spec §8.7): the one playing, or the one that would play with the needle up (the
-    /// first of the cued side). Nil only with the deck empty.
-    var cuedSong: TrackRow? {
-        if let track = playback.currentTrack { return track }
-        let sides = playback.layout.sides
-        let first = sides.indices.contains(playback.cuedSide) ? sides[playback.cuedSide].tracks.lowerBound : 0
-        return playback.tracks.indices.contains(first) ? playback.tracks[first] : playback.tracks.first
-    }
+    /// The song the heart acts on (spec §8.7): the deck's `cuedSong`, the one playing or, with the needle up, the one
+    /// that would play. Nil only with the deck empty.
+    var cuedSong: TrackRow? { playback.cuedSong }
 
     // MARK: Making and editing
 
