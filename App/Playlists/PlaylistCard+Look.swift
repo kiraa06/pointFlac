@@ -4,15 +4,13 @@ import SwiftUI
 import UIKit
 
 extension PlaylistCard {
-    /// What a playlist's card ID starts with: `playlist:favourites`.
-    static let cardPrefix = "playlist:"
-
-    /// The card ID the player knows playlist `id` by.
-    static func cardID(_ id: String) -> String { cardPrefix + id }
+    /// The card ID the player knows playlist `id` by: `playlist:favourites` (`PressingID`, the one source of the
+    /// prefix).
+    static func cardID(_ id: String) -> String { PressingID.card(id) }
 
     /// The playlist behind card ID `cardID`, or nil when it is an album's.
     static func playlistID(fromCard cardID: String) -> String? {
-        cardID.hasPrefix(cardPrefix) ? String(cardID.dropFirst(cardPrefix.count)) : nil
+        cardID.hasPrefix(PressingID.prefix) ? PressingID.bare(cardID) : nil
     }
 
     /// "0 songs", "1 song", "24 songs".
@@ -34,13 +32,13 @@ extension PlaylistCard {
 
 extension AlbumCard {
     /// The playlist this card plays, or nil for an album.
-    var playlistID: String? { pressing?.id ?? PlaylistCard.playlistID(fromCard: id) }
+    var playlistID: String? { pressing.map { PressingID.bare($0.id) } ?? PlaylistCard.playlistID(fromCard: id) }
 
     /// A playlist's card as it was put on the deck, with the playlist's name and colour as they are now: a rename or a
     /// new colour shows on the deck at once, while the songs it was cued with (and so its label's covers and count)
     /// stay until it is cued again. An album's card, or a playlist since deleted, is returned as it is.
     func restyled(from playlists: [PlaylistCard]) -> AlbumCard {
-        guard let look = pressing, let live = playlists.first(where: { $0.id == look.id }),
+        guard let look = pressing, let live = playlists.first(where: { $0.id == PressingID.bare(look.id) }),
             live.name != look.title || live.colour != look.colour
         else { return self }
         let fresh = PressingLook(

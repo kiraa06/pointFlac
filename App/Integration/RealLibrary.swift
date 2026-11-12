@@ -343,26 +343,32 @@ final class RealLibrary: LibraryBrowsing {
     }
 
     /// Makes a playlist change in the library, then reads the playlists back: the library's word is final, a refusal
-    /// included.
-    private func write(_ change: @escaping @Sendable (Library) async throws -> Void) async {
+    /// included. Returns what the library returned, or nil when it refused (the refusal is logged).
+    @discardableResult
+    private func write<Result: Sendable>(_ change: @Sendable (Library) async throws -> Result) async -> Result? {
         playlistWrites += 1
+        let result: Result?
         do {
-            try await change(library)
+            result = try await change(library)
         } catch {
             Self.playlistLog.error("Playlist change refused: \(String(describing: error), privacy: .public)")
+            result = nil
         }
         playlistWrites -= 1
         await refreshPlaylists()
+        return result
     }
 
     func createPlaylist(name: String, colour: PressingColour) async -> PlaylistCard? {
-        playlistWrites += 1
-        let made = try? await library.createPlaylist(name: name, colourID: colour.rawValue)
-        playlistWrites -= 1
-        if let made, !storedPlaylists.contains(where: { $0.id == made.id }) { storedPlaylists.append(made) }
-        rebuildPlaylists()
-        await refreshPlaylists()
-        return made.flatMap { made in playlists.first { $0.id == made.id } }
+        guard let made = await write({ try await $0.createPlaylist(name: name, colourID: colour.rawValue) }) else {
+            return nil
+        }
+        // Made, even should the read back have failed: show it.
+        if !storedPlaylists.contains(where: { $0.id == made.id }) {
+            storedPlaylists.append(made)
+            rebuildPlaylists()
+        }
+        return playlists.first { $0.id == made.id }
     }
 
     func renamePlaylist(_ id: PlaylistCard.ID, to name: String) async {
@@ -383,17 +389,13 @@ final class RealLibrary: LibraryBrowsing {
         await write { try await $0.deletePlaylist(id: id) }
     }
 
+    /// Returns how many the library added: none when it refused, whatever the list showed meanwhile.
     @discardableResult
     func add(_ trackIDs: [TrackRow.ID], to playlist: PlaylistCard.ID) async -> Int {
-        var added = 0
         changeLocally(playlist) { stored in
-            for id in trackIDs where !stored.trackIDs.contains(id) {
-                stored.trackIDs.append(id)
-                added += 1
-            }
+            for id in trackIDs where !stored.trackIDs.contains(id) { stored.trackIDs.append(id) }
         }
-        await write { try await $0.addTracks(trackIDs, to: playlist) }
-        return added
+        return await write { try await $0.addTracks(trackIDs, to: playlist) } ?? 0
     }
 
     func remove(_ trackIDs: [TrackRow.ID], from playlist: PlaylistCard.ID) async {
@@ -404,11 +406,9 @@ final class RealLibrary: LibraryBrowsing {
 
     /// `songIDs` orders the songs the list shows; songs it leaves out (gone for now) keep their places among them.
     func reorder(_ playlist: PlaylistCard.ID, songIDs: [TrackRow.ID]) async {
-        guard let stored = storedPlaylists.first(where: { $0.id == playlist }) else { return }
-        let shown = Set(songIDs)
-        guard shown.isSubset(of: Set(stored.trackIDs)), shown.count == songIDs.count else { return }
-        var next = songIDs.makeIterator()
-        let order = stored.trackIDs.map { shown.contains($0) ? (next.next() ?? $0) : $0 }
+        guard let stored = storedPlaylists.first(where: { $0.id == playlist }),
+            let order = PlaylistOrder.reordered(stored: stored.trackIDs, shown: songIDs)
+        else { return }
         changeLocally(playlist) { $0.trackIDs = order }
         await write { try await $0.reorderPlaylist(id: playlist, trackIDs: order) }
     }

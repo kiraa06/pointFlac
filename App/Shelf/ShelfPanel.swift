@@ -364,52 +364,6 @@ struct ShelfPanel: View {
         pick(card.albumCard, nil, frame)
     }
 
-    /// The playlists whose names match the query as the shelf's search does: from the start of a word, case and
-    /// accents aside.
-    private var matchingPlaylists: [PlaylistCard] {
-        let phrase = query.trimmingCharacters(in: .whitespaces)
-        guard let desk, !phrase.isEmpty, filter == .all || filter == .albums else { return [] }
-        return desk.playlists.filter { card in
-            let name = card.name
-            return name.indices.contains { index in
-                (index == name.startIndex || name[name.index(before: index)].isWhitespace)
-                    && name[index...].range(
-                        of: phrase, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) != nil
-            }
-        }
-    }
-
-    private func playlistResult(_ card: PlaylistCard) -> some View {
-        Button {
-            playPlaylist(card, from: nil)
-        } label: {
-            HStack(spacing: 10) {
-                PressingDisc(look: card.look, size: 38)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(highlighted(card.name)).font(.subheadline).lineLimit(1)
-                    Text("Playlist · \(card.countText)").font(.caption).foregroundStyle(theme.inkSecondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 4)
-            }
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
-            .overlay(alignment: .bottom) { Rectangle().fill(theme.hairline.opacity(0.6)).frame(height: 0.5) }
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") {
-                playback.playNext(card.albumCard)
-            }
-            .disabled(card.songCount == 0)
-            Button("Add to Up Next", systemImage: "text.append") { playback.addToUpNext(card.albumCard) }
-                .disabled(card.songCount == 0)
-            Button("Open Playlist", systemImage: "music.note.list") { router.open(.open(card.id)) }
-        }
-        .accessibilityLabel(card.accessibilityLabel)
-        .accessibilityIdentifier("result-playlist-\(card.name)")
-    }
-
     // MARK: The crate
 
     private var crate: some View {
@@ -523,10 +477,16 @@ struct ShelfPanel: View {
     private var resultsList: some View {
         if !query.isEmpty {
             LazyVStack(alignment: .leading, spacing: 0) {
-                let playlists = matchingPlaylists
-                if !playlists.isEmpty {
+                // Playlists match by name; the album and song chips are about records, so only All and Albums list
+                // them.
+                let playlists = filter == .all || filter == .albums ? desk?.playlists(matching: query) ?? [] : []
+                if let desk, !playlists.isEmpty {
                     header("Playlists")
-                    ForEach(playlists) { card in playlistResult(card) }
+                    ForEach(playlists) { card in
+                        PlaylistResultRow(
+                            card: card, desk: desk, theme: theme, title: highlighted(card.name),
+                            play: { playPlaylist(card, from: nil) })
+                    }
                 }
                 if !results.albums.isEmpty, filter != .songs {
                     header("Albums")
