@@ -379,8 +379,9 @@ private final class Flag: Sendable {
     var value: Bool? { state.withLock { $0 } }
 }
 
-/// Holds a coordinated write of a file on a thread of its own until released (three seconds at most), as a file
-/// provider that has not granted access yet would.
+/// Holds a coordinated write of a file on a thread of its own until released (thirty seconds at most), as a file
+/// provider that has not granted access yet would. The tests release it only once the removal has returned: a hold
+/// that ran out by itself could end before the removal's timeout came round on a loaded machine.
 private final class CoordinationHolder: Sendable {
     let file: URL
     private let held = Mutex(false)
@@ -395,8 +396,8 @@ private final class CoordinationHolder: Sendable {
             var error: NSError?
             NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: file, options: [], error: &error) { _ in
                 held.withLock { $0 = true }
-                // Let go after three seconds at most, so code that never gives up fails the test rather than hangs it.
-                _ = released.wait(timeout: .now() + 3)
+                // Let go after thirty seconds at most, so code that never gives up fails the test rather than hangs it.
+                _ = released.wait(timeout: .now() + 30)
             }
             finished.withLock { $0 = true }
         }
