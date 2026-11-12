@@ -7,7 +7,12 @@ import Testing
 /// Kiran lost every download when the app was deleted, so a download can go to a folder he picked in Files instead.
 /// `DownloadDestination` is the copy into that folder: a plain temporary directory stands in for it here, since the
 /// type knows nothing of bookmarks or security scope.
-@Suite("DownloadDestination")
+///
+/// Serialized, as the app is: it saves one download at a time on `DownloadFolderStore`'s own queue. Each save blocks
+/// its thread until the coordinated write is granted, and the grant comes on another thread. Run in parallel, the
+/// suite's twenty saves filled the simulator's cooperative pool, so no grant could run and every save waited out its
+/// 120 s timeout.
+@Suite("DownloadDestination", .serialized)
 struct DownloadDestinationTests {
     /// A validated download waiting in staging, as `Admission` leaves it: a real FLAC under its sanitised name.
     static func staged(_ folder: TempFolder, fixture: String = "s16-44100", name: String = "01 Fold.flac") throws
