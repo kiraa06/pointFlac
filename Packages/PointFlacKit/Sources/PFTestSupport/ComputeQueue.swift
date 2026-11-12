@@ -10,9 +10,10 @@ import Foundation
 /// cancellation saw their own timers fire first and failed (`.offline`, a move that should have timed out, …).
 ///
 /// Jobs here run on an operation queue at most half the CPU count wide (at least 2), so the heavy suites get CPU and
-/// the pool stays free for everyone else. They run at the default QoS, as they did on the pool: several of them play
-/// the real-time render thread (a chain swap counts a render call that stalls), so a lower one would let the scheduler
-/// preempt them into failures of their own. Use `onComputeQueue(_:)`, or a suite trait built on it.
+/// the pool stays free for everyone else. They run at user-initiated QoS, one step above the pool: several of them play
+/// the real-time render thread, and the sound chain counts a render call held up for 200 ms as stalled, so at the
+/// pool's QoS or below, the scheduler could preempt them that long on a loaded simulator and fail them for nothing.
+/// The pool keeps the other half of the CPUs. Use `onComputeQueue(_:)`, or a suite trait built on it.
 public final class ComputeQueue: TaskExecutor {
     public static let shared = ComputeQueue()
 
@@ -28,7 +29,7 @@ public final class ComputeQueue: TaskExecutor {
         let queue = OperationQueue()
         queue.name = "io.github.kiraa06.pointflac.tests.compute"
         queue.maxConcurrentOperationCount = Self.width
-        queue.qualityOfService = .default
+        queue.qualityOfService = .userInitiated
         self.queue = queue
     }
 
