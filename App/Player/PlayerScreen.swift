@@ -27,12 +27,26 @@ struct PlayerScreen: View {
     /// The stage's frame in the player's space: the hole in the tap-catcher that folds the deck's tracklist back.
     @State private var stageFrame: CGRect = .zero
     @State private var handoff = HandoffDirector()
+    /// The playlists, for the strip, the heart, the menus and their sheets.
+    @State private var desk: PlaylistDesk
     @Namespace private var discSpace
+
+    init(model: AppModel, tab: Binding<AppTab>) {
+        self.model = model
+        _tab = tab
+        _desk = State(initialValue: PlaylistDesk(library: model.library, playback: model.playback))
+    }
 
     private var playback: PlaybackController { model.playback }
     private var theme: Theme { .look(stage: stage, dark: scheme == .dark, monochrome: monochrome) }
-    /// What tints the glass: the record's colours, in greys under Monochrome (the sleeve and art keep theirs).
-    private var palette: ArtPalette { ArtPalette(seed: playback.album?.id ?? "pointflac").tint(for: theme) }
+    /// What tints the glass: the record's colours, in greys under Monochrome (the sleeve and art keep theirs). A
+    /// playlist lights the deck in its pressing colour; on the cover, the wash follows the song's own album.
+    private var palette: ArtPalette {
+        if stage == .cover, playback.album?.pressing != nil, let album = playback.currentTrack?.albumID {
+            return ArtPalette(seed: album).tint(for: theme)
+        }
+        return ArtPalette.record(playback.record).tint(for: theme)
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -71,7 +85,9 @@ struct PlayerScreen: View {
                 }
             }
             .coordinateSpace(.named(PlayerSpace.name))
+            .playlistSheets(desk) { album, track in playFromSheet(album, track: track) }
         }
+        .environment(desk)
         .onAppear {
             #if DEBUG
                 // `-PFOpenShelf`: opens on the shelf, for screenshots.
@@ -82,6 +98,8 @@ struct PlayerScreen: View {
                 {
                     stage = start
                 }
+                // `-PFDemoPlaylists`, `-PFPlayPlaylist`: the demo playlists, and one on the deck.
+                Task { await desk.prepareForLaunch() }
             #endif
         }
         .fileImporter(
@@ -246,6 +264,13 @@ struct PlayerScreen: View {
     private func finishHandoff() {
         handoff.finishNow()
         shelfOpen = false
+    }
+
+    /// Play in a playlist's sheet: the sheet and the shelf close, and the record settles onto the platter (the deck's
+    /// short arrival), as a record pulled from Up Next does.
+    private func playFromSheet(_ album: AlbumCard, track: TrackRow.ID?) {
+        withAnimation(.spring(duration: 0.45)) { shelfOpen = false }
+        Task { await playback.load(album, startingAt: track) }
     }
 }
 

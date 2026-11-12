@@ -1,6 +1,7 @@
 import Foundation
 import PFAudio
 import PFCore
+import PFDesign
 
 // Contracts 2 and 3 of the overnight build (owned by stream D). The UI codes only against these protocols, never
 // against the library's or the downloaders' concrete types, so each side can change without the other noticing. The
@@ -26,6 +27,9 @@ struct AlbumCard: Identifiable, Hashable {
     /// Bit depth and sample rate (Hz) of the best format, for the Hi-res first sort.
     let bestBits: Int
     let bestRate: Int
+    /// A playlist's custom pressing, when the card is a playlist's (`playlist:<id>`, spec "Playlists as custom
+    /// pressings" §5); nil for an album. The deck, the hand-off and the cover draw it in place of the album's record.
+    var pressing: PressingLook? = nil
 }
 
 /// A song as search and the shelf list it.
@@ -39,6 +43,27 @@ struct TrackRow: Identifiable, Hashable {
     let format: String
     /// The record code, e.g. "A2", when the library has laid the album out.
     let side: String?
+    /// The song's own album: a playlist's songs come from many, and each shows its own cover.
+    var albumID: String? = nil
+}
+
+/// A playlist as the app shows it: Favourites, or one the user named (spec "Playlists as custom pressings").
+struct PlaylistCard: Identifiable, Hashable {
+    /// The playlist's own ID: `favourites`, or a lower-case UUID. Its card's is `playlist:<id>`.
+    let id: String
+    let name: String
+    let isFavourites: Bool
+    let colour: PressingColour
+    /// Its songs in the catalog now that pointFlac can play, in the playlist's order. A song whose file is gone for
+    /// now is left out until it returns; the library keeps it.
+    let songIDs: [TrackRow.ID]
+    /// How its pressing is drawn.
+    let look: PressingLook
+    /// The playlist as the player takes it: a card with the ID `playlist:<id>` and `pressing` set, so the hand-off, the
+    /// deck, the sides and Up Next play it as they play an album.
+    let albumCard: AlbumCard
+
+    var songCount: Int { songIDs.count }
 }
 
 struct SearchResults {
@@ -80,6 +105,30 @@ enum SearchFilter: CaseIterable {
     /// them, saying what the plan could not promise: files that would not move to Recently Deleted.
     @discardableResult
     func remove(tracks: [TrackRow.ID]) async -> RemovalOutcome
+
+    // Playlists (spec "Playlists as custom pressings" §5). The list follows every change at once, and the catalog: a
+    // song whose file is gone leaves its playlists' lists until it returns. A change the library refuses (a name it
+    // won't take, Favourites renamed or deleted) leaves the list as the library has it.
+
+    /// Favourites first, then the others in the order they were made. Never without Favourites.
+    var playlists: [PlaylistCard] { get }
+    /// Makes an empty playlist; nil if the library refused it.
+    func createPlaylist(name: String, colour: PressingColour) async -> PlaylistCard?
+    func renamePlaylist(_ id: PlaylistCard.ID, to name: String) async
+    func setPlaylistColour(_ id: PlaylistCard.ID, to colour: PressingColour) async
+    /// Deletes a playlist, never its songs. Favourites can't be deleted.
+    func deletePlaylist(_ id: PlaylistCard.ID) async
+    /// Appends songs, each once: those it holds already are skipped. Returns how many were added.
+    @discardableResult
+    func add(_ trackIDs: [TrackRow.ID], to playlist: PlaylistCard.ID) async -> Int
+    /// Takes songs out of a playlist. The songs stay in the library.
+    func remove(_ trackIDs: [TrackRow.ID], from playlist: PlaylistCard.ID) async
+    /// Puts a playlist's songs (as `songIDs` lists them) in this order.
+    func reorder(_ playlist: PlaylistCard.ID, songIDs: [TrackRow.ID]) async
+    /// Whether the song is in Favourites: a lookup, cheap enough for a view's body.
+    func isFavourite(_ trackID: TrackRow.ID) -> Bool
+    /// Adds the song to Favourites, or takes it out.
+    func toggleFavourite(_ trackID: TrackRow.ID) async
 }
 
 /// What deleting an album or a song would do, worked out before the user confirms. The plan names the tracks it

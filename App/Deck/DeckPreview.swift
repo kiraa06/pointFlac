@@ -40,7 +40,7 @@ struct DeckPreview: View, Equatable {
 
     private var face: RecordFace {
         guard let album else { return RecordFace(placeholderStyle: recordStyle) }
-        return RecordFace(album: album, side: "A", bands: [0.86, 0.73, 0.6, 0.48], style: recordStyle)
+        return .face(for: album, side: "A", bands: [0.86, 0.73, 0.6, 0.48], style: recordStyle)
     }
 }
 
@@ -83,6 +83,7 @@ private struct DeckStill: View, Equatable {
 
     private var lines: [String] {
         if face.placeholder { return ["SIDE \(face.side)  33⅓ RPM  STEREO", "0:42  33⅓  96K/24"] }
+        if let look = face.pressing { return [look.displayText, "0:42  33⅓  96K/24"] }
         return ["A1 \(face.title.uppercased())·\(face.artist.uppercased())", "0:42  33⅓  96K/24"]
     }
 }

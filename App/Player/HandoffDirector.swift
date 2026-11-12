@@ -64,7 +64,7 @@ final class HandoffDirector {
         self.track = track
         self.playback = playback
         self.closeShelf = closeShelf
-        palette = ArtPalette(seed: album.id)
+        palette = ArtPalette.record(album)
         source = rect
         self.sinkDistance = sinkDistance
         let cue = playback.cueSide(of: album, startingAt: track)
@@ -158,6 +158,9 @@ final class HandoffDirector {
 /// The record is drawn exactly as the deck draws it (same size, style, track gaps and light) and scaled down to the
 /// sleeve at the start, so at the landing the deck's record replaces it pixel for pixel. The sleeve is the shelf's own
 /// `Sleeve`, standing in for the front sleeve (which the shelf hides meanwhile) and sinking with the shelf.
+///
+/// A playlist has no sleeve: its pressing flies itself, from its disc in the shelf's strip (which hides meanwhile).
+/// It lifts off the shelf a little, then arcs to the spindle, growing to the platter's size.
 struct HandoffOverlay: View {
     let director: HandoffDirector
     let palette: ArtPalette
@@ -175,8 +178,10 @@ struct HandoffOverlay: View {
             let arc = timeline.progress(.arc, at: t)
             let sink = timeline.progress(.sink, at: t)
             let lin = min(max(arc, 0), 1)
-            // The record leaves the sleeve upward, then arcs to the spindle: y leads x, so it rises before it swings.
-            let startCenter = CGPoint(x: src.midX, y: src.midY - size * 0.65 * slide)
+            let disc = director.album?.pressing != nil
+            // The record leaves the sleeve upward, then arcs to the spindle: y leads x, so it rises before it swings. A
+            // disc has no sleeve to leave: it rises only a touch, off the shelf.
+            let startCenter = CGPoint(x: src.midX, y: src.midY - size * (disc ? 0.08 * lift : 0.65 * slide))
             let dx = dst.midX - startCenter.x
             let dy = dst.midY - startCenter.y
             let px = arc - 0.08 * sin(.pi * lin)
@@ -185,13 +190,14 @@ struct HandoffOverlay: View {
             // Sleeve-sized at the start, the platter's size on landing; a slight swell as it leaves the sleeve, gone by
             // the time it lands.
             let fit = size / max(dst.width, 1)
-            let scale = (fit + (1 - fit) * arc) * (1 + 0.02 * slide * (1 - lin))
+            let swell = disc ? 0.1 * lift : 0.02 * slide
+            let scale = (fit + (1 - fit) * arc) * (1 + swell * (1 - lin))
             ZStack {
                 Color.black.opacity(0.001)
                 if !director.landed, let album = director.album {
                     RecordView(
-                        face: RecordFace(
-                            album: album, side: director.incomingSide, bands: director.incomingBands,
+                        face: .face(
+                            for: album, side: director.incomingSide, bands: director.incomingBands,
                             style: RecordStyle(rawValue: recordStyle) ?? .standard),
                         diameter: dst.width, angle: HandoffDirector.landingAngle * arc
                     )
@@ -201,7 +207,7 @@ struct HandoffOverlay: View {
                     .scaleEffect(scale)
                     .position(center)
                 }
-                if let album = director.album, sink < 1 {
+                if let album = director.album, album.pressing == nil, sink < 1 {
                     // The sink rides the shelf's own animation (same state, same transaction), not this clock, so
                     // the sleeve and the shelf it stands in for move as one.
                     Sleeve(album: album)
