@@ -9,7 +9,7 @@ import Testing
 /// True peaks are measured either by `truePeakDb`, an offline 16× reconstruction that shares no code or filter with
 /// the limiter's detector, or, for steady tones, exactly: once settled, the output is the input times one gain, so its
 /// true peak is that gain times the tone's amplitude. Either way the limiter is never marked by its own measure.
-@Suite("True-peak limiter")
+@Suite("True-peak limiter", .computeHeavy)
 struct TruePeakLimiterTests {
     static let rate = 48_000.0
     static let channels = 2

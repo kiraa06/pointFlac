@@ -13,7 +13,7 @@ import Testing
 ///
 /// Tests that check chains are freed hold weak references to their own chains, so chains other suites make in
 /// parallel can't affect them.
-@Suite("Sound chain")
+@Suite("Sound chain", .computeHeavy)
 struct SoundChainTests {
     static let rate = 48_000.0
 

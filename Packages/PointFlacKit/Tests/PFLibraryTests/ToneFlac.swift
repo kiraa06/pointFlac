@@ -93,12 +93,20 @@ enum ToneFlac {
         return crc
     }
 
+    /// FLAC's frame CRC-16 (polynomial 0x8005), a table lookup per byte. Bit by bit it was most of the time the
+    /// loudness suites spent writing their files, about a megabyte each in a debug build, and that ran on the
+    /// cooperative pool before any test reached its first await.
     private static func crc16(_ bytes: [UInt8]) -> UInt16 {
         var crc: UInt16 = 0
         for byte in bytes {
-            crc ^= UInt16(byte) << 8
-            for _ in 0..<8 { crc = crc & 0x8000 != 0 ? crc << 1 ^ 0x8005 : crc << 1 }
+            crc = crc << 8 ^ crc16Table[Int(UInt8(truncatingIfNeeded: crc >> 8) ^ byte)]
         }
+        return crc
+    }
+
+    private static let crc16Table: [UInt16] = (0..<256).map { index in
+        var crc = UInt16(index) << 8
+        for _ in 0..<8 { crc = crc & 0x8000 != 0 ? crc << 1 ^ 0x8005 : crc << 1 }
         return crc
     }
 }
