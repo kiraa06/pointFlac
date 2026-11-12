@@ -70,7 +70,8 @@ struct ShelfPanel: View {
                 .padding(.top, 8).padding(.bottom, 10)
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 10).onEnded { if $0.translation.height > 40 { close() } })
+                // The shelf follows a drag here and settles when the finger lifts (`ShelfGrabberDrag`).
+                .modifier(ShelfGrabberDrag())
                 .accessibilityLabel("Close the shelf")
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction { close() }

@@ -20,6 +20,10 @@ struct PlayerScreen: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shelfOpen = false
+    /// A finger moving the shelf (`ShelfDrag`): the panel follows it, and settles only when it lifts.
+    @State private var shelfDrag: ShelfDrag?
+    /// The shelf is settling closed after a drag: it stays on screen until it is out of sight.
+    @State private var shelfSettling = false
     @State private var upNextOpen = false
     @State private var importing = false
     /// The deck's display unfolded into the tracklist (plan 9 §3).
@@ -51,6 +55,7 @@ struct PlayerScreen: View {
     var body: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
+            let metrics = ShelfMetrics(proxy)
             ZStack(alignment: .top) {
                 background(width: width)
                 VStack(spacing: 0) {
@@ -69,12 +74,12 @@ struct PlayerScreen: View {
                 }
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
-                .gesture(swipeUp)
+                .modifier(ShelfDragArea(minimumDistance: 30, actions: openingDrag(metrics)))
                 if deckTracklistOpen {
                     foldCatcher
                 }
-                if shelfOpen || handoff.isRunning {
-                    shelf(proxy.size)
+                if shelfOpen || shelfDrag != nil || shelfSettling || handoff.isRunning {
+                    shelf(proxy.size, metrics)
                 }
                 if handoff.isRunning {
                     // Above the shelf (zIndex 2): the sleeve lifts and the record leaves it in plain sight.
@@ -92,6 +97,13 @@ struct PlayerScreen: View {
             #if DEBUG
                 // `-PFOpenShelf`: opens on the shelf, for screenshots.
                 if ProcessInfo.processInfo.arguments.contains("-PFOpenShelf") { shelfOpen = true }
+                // `-PFShelfHold <points>`: holds the open shelf that far down, as a finger would mid-drag, for
+                // screenshots.
+                if UserDefaults.standard.object(forKey: "PFShelfHold") != nil {
+                    shelfOpen = true
+                    shelfDrag = ShelfDrag(
+                        startsOpen: true, translation: CGFloat(UserDefaults.standard.double(forKey: "PFShelfHold")))
+                }
                 // `-PFStage deck|cover`: starts on that stage. Not `-playerView`, which would pin the setting: the
                 // argument domain outranks what the switch writes.
                 if let value = UserDefaults.standard.string(forKey: "PFStage"), let start = PlayerStage(rawValue: value)
@@ -214,9 +226,12 @@ struct PlayerScreen: View {
         .accessibilityHint("Opens the shelf to browse and search your records")
     }
 
-    private func shelf(_ size: CGSize) -> some View {
-        VStack {
+    private func shelf(_ size: CGSize, _ metrics: ShelfMetrics) -> some View {
+        VStack(spacing: 0) {
             Spacer(minLength: 0)
+            // Just above the panel's edge: with the grabber under it, a 44 pt touch zone.
+            ShelfGrabberReach(actions: closingDrag(metrics))
+                .offset(y: shelfOffset(size, metrics))
             ShelfPanel(
                 library: model.library, finder: model.finder, playback: playback, theme: theme,
                 close: { withAnimation(.spring(duration: 0.45)) { shelfOpen = false } },
@@ -226,23 +241,85 @@ struct PlayerScreen: View {
                     startHandoff(album, track: track, from: frontRect, sinkDistance: size.height)
                 }
             )
-            .frame(height: size.height * 0.74)
-            .offset(y: handoff.isRunning ? handoff.shelfOffset(size.height) : 0)
+            .environment(\.shelfGrabberDrag, closingDrag(metrics))
+            .frame(height: metrics.height)
+            .offset(y: shelfOffset(size, metrics))
         }
         .transition(.move(edge: .bottom))
         .zIndex(2)
     }
 
-    private var swipeUp: some Gesture {
-        DragGesture(minimumDistance: 30).onEnded { value in
-            if value.translation.height < -60, abs(value.translation.width) < 80, !shelfOpen {
-                openShelf()
-            }
-        }
+    /// Where the shelf sits, down from open: sunk away by the hand-off, under a finger, settling closed after a drag,
+    /// or open (the button and the close action move it by its transition).
+    private func shelfOffset(_ size: CGSize, _ metrics: ShelfMetrics) -> CGFloat {
+        if handoff.isRunning { return handoff.shelfOffset(size.height) }
+        if let shelfDrag { return metrics.offset(shelfDrag) }
+        return shelfSettling && !shelfOpen ? metrics.travel : 0
     }
 
     private func openShelf() {
-        withAnimation(.spring(duration: 0.45, bounce: 0.12)) { shelfOpen = true }
+        withAnimation(.spring(duration: 0.45, bounce: 0.12)) {
+            shelfOpen = true
+            shelfSettling = false
+        }
+    }
+
+    // MARK: Dragging the shelf
+
+    /// Up anywhere on the player while the shelf is closed: it rises from the bottom edge under the finger. The deck's
+    /// own drags (the record, the tonearm) and the controls' are the children's, and win.
+    private func openingDrag(_ metrics: ShelfMetrics) -> ShelfDragActions {
+        ShelfDragActions(
+            accepts: { move in move.height < 0 && !shelfOpen && shelfDrag == nil && !handoff.isRunning },
+            changed: { moveShelf($0) },
+            ended: { settleShelf(velocity: $0, metrics) })
+    }
+
+    /// The grabber, either way: down it lowers the shelf under the finger, up it stretches.
+    private func closingDrag(_ metrics: ShelfMetrics) -> ShelfDragActions {
+        ShelfDragActions(
+            accepts: { _ in shelfOpen && shelfDrag == nil && !handoff.isRunning },
+            changed: { moveShelf($0) },
+            ended: { settleShelf(velocity: $0, metrics) })
+    }
+
+    /// The finger moved: the panel goes with it, at once.
+    private func moveShelf(_ translation: CGFloat) {
+        if shelfDrag == nil {
+            shelfDrag = ShelfDrag(startsOpen: shelfOpen, translation: translation)
+        } else {
+            shelfDrag?.translation = translation
+        }
+    }
+
+    /// The finger lifted: the shelf settles open or closed (`ShelfTravel`), from where the finger left it and at the
+    /// finger's speed. Under Reduce Motion, a short ease instead of a spring. Settling closed, it stays on screen until
+    /// it is out of sight.
+    private func settleShelf(velocity: CGFloat, _ metrics: ShelfMetrics) {
+        guard let shelfDrag else { return }
+        let offset = metrics.offset(shelfDrag)
+        let open = ShelfTravel.settlesOpen(offset: offset, velocity: velocity, travel: metrics.travel)
+        let target = open ? 0 : metrics.travel
+        if !open, abs(offset - target) < 0.5 {
+            // Already out of sight: there is nothing to animate, so no completion would come to clear the settle.
+            self.shelfDrag = nil
+            shelfOpen = false
+            shelfSettling = false
+            return
+        }
+        let animation: Animation =
+            reduceMotion
+            ? .easeOut(duration: 0.22)
+            : .interpolatingSpring(
+                Spring(duration: 0.45, bounce: open ? 0.12 : 0),
+                initialVelocity: ShelfTravel.springVelocity(offset: offset, target: target, velocity: velocity))
+        withAnimation(animation, completionCriteria: .removed) {
+            self.shelfDrag = nil
+            shelfOpen = open
+            shelfSettling = !open
+        } completion: {
+            if !shelfOpen, self.shelfDrag == nil { shelfSettling = false }
+        }
     }
 
     // MARK: The hand-off
