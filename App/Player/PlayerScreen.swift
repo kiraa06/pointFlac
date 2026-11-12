@@ -75,7 +75,10 @@ struct PlayerScreen: View {
                 }
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
-                .modifier(ShelfDragArea(minimumDistance: 30, actions: openingDrag(metrics)))
+                // Not while the deck's tracklist is unfolded: the stage is all its scrolling list then, and a drag
+                // up on it is the list's (off the stage, the fold catcher takes every touch).
+                .modifier(
+                    ShelfDragArea(minimumDistance: 30, enabled: !deckTracklistOpen, actions: openingDrag(metrics)))
                 if deckTracklistOpen {
                     foldCatcher
                 }
@@ -268,7 +271,8 @@ struct PlayerScreen: View {
     // MARK: Dragging the shelf
 
     /// Up anywhere on the player while the shelf is closed: it rises from the bottom edge under the finger. The deck's
-    /// own drags (the record, the tonearm) and the controls' are the children's, and win.
+    /// own drags (the record, the tonearm) and the controls' are the children's, and win; the deck's unfolded
+    /// tracklist turns the area off.
     private func openingDrag(_ metrics: ShelfMetrics) -> ShelfDragActions {
         ShelfDragActions(
             accepts: { move in move.height < 0 && !shelfOpen && shelfDrag == nil && !handoff.isRunning },

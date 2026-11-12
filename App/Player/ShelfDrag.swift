@@ -34,8 +34,12 @@ extension EnvironmentValues {
 ///
 /// Every way the drag can stop ends it: the finger lifting (`onEnded`) or the system cancelling the touch, which
 /// `onEnded` never reports but a `@GestureState` reset does (reported at rest; after a lift it repeats harmlessly).
+///
+/// Turned off (`enabled` false), the area takes no touch at all, not even to ignore it, so a scroll view in it scrolls
+/// as if it were not there: refusing in `accepts` would still leave the drag tracking the finger beside the scroll.
 struct ShelfDragArea: ViewModifier {
     let minimumDistance: CGFloat
+    var enabled = true
     let actions: ShelfDragActions
     @GestureState private var touching = false
     @State private var phase = Phase.waiting
@@ -54,7 +58,8 @@ struct ShelfDragArea: ViewModifier {
                 DragGesture(minimumDistance: minimumDistance, coordinateSpace: .global)
                     .updating($touching) { _, state, _ in state = true }
                     .onChanged { changed($0) }
-                    .onEnded { end(velocity: $0.velocity.height) }
+                    .onEnded { end(velocity: $0.velocity.height) },
+                including: enabled ? .all : .subviews
             )
             .onChange(of: touching) { _, touching in
                 if !touching { end(velocity: 0) }

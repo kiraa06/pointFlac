@@ -88,6 +88,35 @@ final class ShelfDragUITests: XCTestCase {
         XCTAssertTrue(field(app).waitForNonExistence(timeout: 5), "a pull from just above the shelf left it open")
     }
 
+    /// The deck's unfolded tracklist takes the stage: a drag up on it is the list's, never the shelf's, whether it is
+    /// long and slow (which would carry the shelf open) or a quick flick. Night Drive's five songs fit the panel at the
+    /// default text size, so here the list has nowhere to scroll and the drag reaches nothing else.
+    @MainActor
+    func testDragUpOnTheDeckTracklistLeavesTheShelfClosed() {
+        let app = launchOnTheDeckTracklist()
+        let list = app.descendants(matching: .any)["deckTracklist"]
+        dragUp(on: list, in: app)
+        XCTAssertTrue(list.exists)
+        XCTAssertTrue(app.buttons["shelfButton"].isHittable)
+    }
+
+    /// At a large text size the same songs run past the panel's edge: a drag up scrolls them, and still leaves the
+    /// shelf alone.
+    @MainActor
+    func testDragUpOnALongDeckTracklistScrollsItAndLeavesTheShelfClosed() {
+        let app = launchOnTheDeckTracklist([
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityL",
+        ])
+        let list = app.descendants(matching: .any)["deckTracklist"]
+        let first = app.descendants(matching: .any)["deckTrack-0"]
+        XCTAssertTrue(first.waitForExistence(timeout: 3))
+        let top = first.frame.minY
+        dragUp(on: list, in: app)
+        // The songs went up instead.
+        XCTAssertLessThan(first.frame.minY, top - 20, "the deck's tracklist did not scroll")
+        XCTAssertTrue(app.buttons["shelfButton"].isHittable)
+    }
+
     // MARK: Helpers
 
     /// Well short of halfway: the shelf's travel is about three quarters of the screen.
@@ -97,6 +126,30 @@ final class ShelfDragUITests: XCTestCase {
     /// Well past halfway.
     @MainActor
     private static func long(_ app: XCUIApplication) -> CGFloat { app.windows.firstMatch.frame.height * 0.5 }
+
+    /// Night Drive playing, with the deck's display unfolded into its tracklist (`-PFTracklist deck`).
+    @MainActor
+    private func launchOnTheDeckTracklist(_ extra: [String] = []) -> XCUIApplication {
+        let app = XCUIApplication.pointFlac(
+            ["-PFPreloadFixtures", "-PFFreshLibrary", "-PFStage", "deck", "-PFDemoPlay", "-PFTracklist", "deck"] + extra
+        )
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any)["deckTracklist"].waitForExistence(timeout: 20))
+        Thread.sleep(forTimeInterval: 0.6)
+        return app
+    }
+
+    /// A long, slow drag up from low on `list`, then a quick flick up: neither may open the shelf.
+    @MainActor
+    private func dragUp(on list: XCUIElement, in app: XCUIApplication) {
+        let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+        drag(from: start, by: -Self.long(app))
+        XCTAssertFalse(field(app).waitForExistence(timeout: 2), "a drag up on the deck's tracklist opened the shelf")
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.short(app))), withVelocity: 1800,
+            thenHoldForDuration: 0)
+        XCTAssertFalse(field(app).waitForExistence(timeout: 2), "a flick up on the deck's tracklist opened the shelf")
+    }
 
     @MainActor
     private func launch(open: Bool = false) -> XCUIApplication {
