@@ -324,9 +324,15 @@ final class RealLibrary: LibraryBrowsing {
         let best = songs.map(\.format).max {
             ($0.bitsPerSample, $0.sampleRate) < ($1.bitsPerSample, $1.sampleRate)
         }
+        // Songs in more than one bit depth or sample rate have no one format to show: "Mixed", not the best of them
+        // (which still sorts the card, as `bestBits` and `bestRate`).
+        let mixed = songs.contains {
+            $0.format.bitsPerSample != best?.bitsPerSample || $0.format.sampleRate != best?.sampleRate
+        }
+        let format = mixed ? "Mixed" : best.map(LibraryAlbum.formatLabel) ?? ""
         let album = AlbumCard(
             id: PlaylistCard.cardID(playlist.id), title: playlist.name, artist: "Playlist", year: nil, artwork: nil,
-            trackCount: songs.count, bestFormat: best.map(LibraryAlbum.formatLabel) ?? "", addedAt: playlist.createdAt,
+            trackCount: songs.count, bestFormat: format, addedAt: playlist.createdAt,
             listens: 0, lastListened: nil, bestBits: best?.bitsPerSample ?? 0, bestRate: best?.sampleRate ?? 0,
             pressing: look)
         return PlaylistCard(
