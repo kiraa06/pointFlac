@@ -450,8 +450,8 @@ struct RecordLight: View, Equatable {
 
     /// Two soft wedges of light at fixed screen angles: one toward the lamp at the top left, brighter, and one
     /// opposite. `spread` widens them; `colour` tints them (light through coloured vinyl). The wedges never turn with
-    /// the record.
-    static func streaks(
+    /// the record. Nonisolated: it is pure, and a pressing's vinyl draws it from a `Canvas` renderer.
+    nonisolated static func streaks(
         center: CGPoint, near: Double, far: Double, spread: Double = 1, colour: Color = .white
     ) -> GraphicsContext.Shading {
         let half = 0.045 * spread
