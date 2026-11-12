@@ -53,7 +53,7 @@ struct DeckTracklist: View {
     private var back: Color { theme.lcdBack }
 
     var body: some View {
-        let list = Tracklist(tracks: playback.tracks, layout: playback.layout)
+        let list = Tracklist(of: playback)
         ZStack {
             RoundedRectangle(cornerRadius: 14, style: .continuous).fill(back)
             VStack(alignment: .leading, spacing: 0) {

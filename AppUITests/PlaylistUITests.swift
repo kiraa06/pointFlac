@@ -287,11 +287,12 @@ final class PlaylistUITests: XCTestCase {
         XCTAssertTrue(title.waitForExistence(timeout: 10))
         wait(for: title, "label == 'Neon Mile'", timeout: 10)
 
-        // Apogee leaves the playlist from the deck's tracklist.
+        // Apogee leaves the playlist from the deck's tracklist. Its row says whose song it is, to VoiceOver too.
         openTracklist(app)
         let apogee = app.buttons["tracklistTrack-1"]
         XCTAssertTrue(apogee.waitForExistence(timeout: 3))
-        XCTAssertTrue(apogee.label.contains("Apogee"), "the row reads \"\(apogee.label)\"")
+        XCTAssertTrue(
+            apogee.label.contains("Apogee, Kessler Quartet · Low Orbit, "), "the row reads \"\(apogee.label)\"")
         apogee.press(forDuration: 1.2)
         let remove = app.buttons["Remove from This Playlist"]
         XCTAssertTrue(remove.waitForExistence(timeout: 3))

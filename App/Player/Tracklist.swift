@@ -11,6 +11,8 @@ struct Tracklist {
         let code: String
         let title: String
         let seconds: Double
+        /// Whose song it is, for a playlist's: "Lumen Arcade · Night Drive". Nil for an album's, all its own.
+        var source: String? = nil
         var id: Int { index }
     }
 
@@ -25,20 +27,29 @@ struct Tracklist {
     let songCount: Int
     let seconds: Double
 
-    init(tracks: [TrackRow], layout: SideLayout) {
+    /// `playlist`: the songs are a playlist's, from many records, and each says whose it is.
+    init(tracks: [TrackRow], layout: SideLayout, playlist: Bool = false) {
         sides = layout.sides.map { side in
             Side(
                 letter: side.letter, seconds: side.duration,
                 songs: side.tracks.compactMap { index in
                     guard tracks.indices.contains(index) else { return nil }
-                    let length = tracks[index].durationSeconds
+                    let track = tracks[index]
+                    let length = track.durationSeconds
                     return Song(
-                        index: index, code: layout.code(ofTrack: index), title: tracks[index].title,
-                        seconds: length.isFinite && length > 0 ? length : 0)
+                        index: index, code: layout.code(ofTrack: index), title: track.title,
+                        seconds: length.isFinite && length > 0 ? length : 0,
+                        source: playlist ? "\(track.artist) · \(track.album)" : nil)
                 })
         }
         songCount = tracks.count
         seconds = layout.sides.reduce(0) { $0 + $1.duration }
+    }
+
+    /// The record on the deck's songs; a playlist's each with whose it is.
+    @MainActor
+    init(of playback: PlaybackController) {
+        self.init(tracks: playback.tracks, layout: playback.layout, playlist: playback.album?.pressing != nil)
     }
 
     /// "5 SONGS · 19:05 · 2 SIDES", as the sleeve's back prints it.
@@ -57,9 +68,10 @@ struct Tracklist {
         "\(Self.count(songCount, "song")), \(Self.spoken(seconds)), \(Self.count(sides.count, "side"))"
     }
 
-    /// A row as VoiceOver reads it: "A1, Ignition, 3 minutes 10 seconds".
+    /// A row as VoiceOver reads it: "A1, Ignition, 3 minutes 10 seconds"; a playlist's song with whose it is, as its
+    /// row shows it: "A1, Ignition, Lumen Arcade · Night Drive, 3 minutes 10 seconds".
     static func label(_ song: Song) -> String {
-        "\(song.code), \(song.title), \(spoken(song.seconds))"
+        [song.code, song.title, song.source, spoken(song.seconds)].compactMap(\.self).joined(separator: ", ")
     }
 
     /// m:ss to the nearest second. A length, not a position: a 3:09.998 song is a 3:10 song, so the sheet and the

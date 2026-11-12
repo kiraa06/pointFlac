@@ -47,7 +47,7 @@ struct TracklistSheet: View {
     private var titleTint: Color { theme.isMonochrome ? theme.ink : tint }
 
     var body: some View {
-        let list = Tracklist(tracks: playback.tracks, layout: playback.layout)
+        let list = Tracklist(of: playback)
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -234,8 +234,8 @@ struct TracklistSheet: View {
                         .foregroundStyle(current ? titleTint : theme.ink)
                         .lineLimit(2)
                     // A playlist's songs come from many records: each says whose it is.
-                    if let artist = playlistArtist(song) {
-                        Text(artist)
+                    if let source = song.source {
+                        Text(source)
                             .font(.footnote)
                             .foregroundStyle(theme.inkSecondary)
                             .lineLimit(1)
@@ -267,13 +267,6 @@ struct TracklistSheet: View {
         .accessibilityLabel(Tracklist.label(song))
         .accessibilityValue(current ? "Playing" : "")
         .accessibilityIdentifier("tracklistTrack-\(song.index)")
-    }
-
-    /// For a playlist on the deck, the song's artist and album; nil for an album, whose songs are all its own.
-    private func playlistArtist(_ song: Tracklist.Song) -> String? {
-        guard playback.album?.pressing != nil, playback.tracks.indices.contains(song.index) else { return nil }
-        let track = playback.tracks[song.index]
-        return "\(track.artist) · \(track.album)"
     }
 
     /// The tint moves to the song at once, the record plays from it, and the sheet drops a beat later.
