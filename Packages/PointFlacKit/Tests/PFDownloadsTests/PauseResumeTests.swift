@@ -115,34 +115,38 @@ struct PauseResumeTests {
         try await waitFor(manager) { _ in provider.active.withLock { $0.now } == 0 }
     }
 
-    @Test("once a job is validating, saving or published it is too late to pause")
-    func tooLateToPause() async throws {
-        let folder = try TempFolder()
-        let saving = Gate()
-        let library = try LibrarySpy(folder: folder.sub("Library"), gate: saving)
-        let provider = ScriptedProvider { track, staging, _, events in
-            events.yield(.finished(try deliverFixture(track, staging)))
+    #if DEBUG
+        /// DEBUG only: it holds a job in validating with `setValidationHook`, which release builds do not have
+        /// (`scripts/test.sh` builds the package tests in release for the SampleRing stress).
+        @Test("once a job is validating, saving or published it is too late to pause")
+        func tooLateToPause() async throws {
+            let folder = try TempFolder()
+            let saving = Gate()
+            let library = try LibrarySpy(folder: folder.sub("Library"), gate: saving)
+            let provider = ScriptedProvider { track, staging, _, events in
+                events.yield(.finished(try deliverFixture(track, staging)))
+            }
+            let manager = makeManager(folder, provider: provider, library: library)
+            let validating = Gate()
+            await manager.setValidationHook { _ in await validating.wait() }
+            let id = await manager.enqueue(fixtureTrack("s16-44100"))
+
+            try await waitFor(manager) { $0.first?.state == .validating }
+            #expect(await manager.pause(id) == false)
+            #expect(await manager.items.first?.state == .validating)
+            await validating.open()
+
+            try await waitFor(manager) { $0.first?.state == .saving }
+            #expect(await manager.pause(id) == false)
+            await saving.open()
+
+            let items = try await waitFor(manager, allFinal)
+            #expect(items.first?.state == .published)
+            #expect(await manager.pause(id) == false)
+            #expect(await manager.resume(id) == false, "only a paused job resumes")
+            #expect(library.names == ["Song.flac"])
         }
-        let manager = makeManager(folder, provider: provider, library: library)
-        let validating = Gate()
-        await manager.setValidationHook { _ in await validating.wait() }
-        let id = await manager.enqueue(fixtureTrack("s16-44100"))
-
-        try await waitFor(manager) { $0.first?.state == .validating }
-        #expect(await manager.pause(id) == false)
-        #expect(await manager.items.first?.state == .validating)
-        await validating.open()
-
-        try await waitFor(manager) { $0.first?.state == .saving }
-        #expect(await manager.pause(id) == false)
-        await saving.open()
-
-        let items = try await waitFor(manager, allFinal)
-        #expect(items.first?.state == .published)
-        #expect(await manager.pause(id) == false)
-        #expect(await manager.resume(id) == false, "only a paused job resumes")
-        #expect(library.names == ["Song.flac"])
-    }
+    #endif
 
     @Test("a paused job stays paused across a relaunch, with its partial file, and does not start by itself")
     func pausedSurvivesARelaunch() async throws {
