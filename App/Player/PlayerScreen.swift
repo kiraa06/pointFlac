@@ -282,6 +282,13 @@ struct PlayerScreen: View {
         let offset = metrics.offset(shelfDrag)
         let open = ShelfTravel.settlesOpen(offset: offset, velocity: velocity, travel: metrics.travel)
         let target = open ? 0 : metrics.travel
+        if !open, abs(offset - target) < 0.5 {
+            // Already out of sight: there is nothing to animate, so no completion would come to clear the settle.
+            self.shelfDrag = nil
+            shelfOpen = false
+            shelfSettling = false
+            return
+        }
         let animation: Animation =
             reduceMotion
             ? .easeOut(duration: 0.22)
