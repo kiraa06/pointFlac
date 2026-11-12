@@ -56,7 +56,7 @@ struct DeckScreen: View {
     }
 
     private var lcdLines: [String] {
-        guard let album = playback.album else { return ["NO RECORD", "—"] }
+        guard let album = playback.record else { return ["NO RECORD", "—"] }
         let format = playback.player.signal.source.map { "\($0.sampleRate / 1000)K/\($0.bitsPerSample)" } ?? ""
         if let index = playback.trackIndex {
             let track = playback.tracks[index]

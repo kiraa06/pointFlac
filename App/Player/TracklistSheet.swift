@@ -30,7 +30,7 @@ struct TracklistSheet: View {
     private var playing: Int? { picked ?? playback.trackIndex }
 
     /// The record's colours (a playlist's pressing colour), in greys under Monochrome (the sleeve keeps its own).
-    private var palette: ArtPalette { ArtPalette.record(playback.album).tint(for: theme) }
+    private var palette: ArtPalette { ArtPalette.record(playback.record).tint(for: theme) }
 
     /// The tint's colour: `line` is the record's hue deep enough for a light page, `base` its bright twin for a dark
     /// one, as the progress wave draws them.
@@ -51,7 +51,7 @@ struct TracklistSheet: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    if let album = playback.album {
+                    if let album = playback.record {
                         header(album)
                             .padding(.horizontal, 12)
                     }

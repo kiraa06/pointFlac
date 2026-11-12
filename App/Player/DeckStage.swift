@@ -46,8 +46,6 @@ struct DeckStage: View {
     @State private var flipClaim: FlipClaim?
     /// The plinth's size, for working out where the arm is when a jump arrives (outside the geometry reader).
     @State private var deckSize: CGSize = .zero
-    /// The playlists, so a playlist on the deck shows its current name and colour.
-    @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     /// The tonearm swinging to a song the tracklist chose (plan 9 §3), instead of snapping to it. On the same side it
     /// swings straight there, over 0.6 s. On the other side the record turns over first while the arm parks at rest,
@@ -437,10 +435,8 @@ struct DeckStage: View {
 
     @ViewBuilder
     private func record(_ layout: DeckLayout, angle: Double) -> some View {
-        if showsRecord, let cued = playback.album {
+        if showsRecord, let album = playback.record {
             let d = layout.recordRadius * 2
-            // A playlist on the deck shows a rename or a new colour at once; its songs stay as they were cued.
-            let album = cued.restyled(from: desk?.playlists ?? [])
             RecordView(
                 face: .face(for: album, side: sideLetter ?? "A", bands: bands(layout), style: recordStyle),
                 diameter: d, angle: angle

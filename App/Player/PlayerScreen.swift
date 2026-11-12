@@ -45,7 +45,7 @@ struct PlayerScreen: View {
         if stage == .cover, playback.album?.pressing != nil, let album = playback.currentTrack?.albumID {
             return ArtPalette(seed: album).tint(for: theme)
         }
-        return ArtPalette.record(playback.album?.restyled(from: desk.playlists)).tint(for: theme)
+        return ArtPalette.record(playback.record).tint(for: theme)
     }
 
     var body: some View {

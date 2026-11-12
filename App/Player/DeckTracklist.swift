@@ -115,7 +115,7 @@ struct DeckTracklist: View {
 
     /// `NIGHT DRIVE   5 TRK 19:05`, a shade dimmer than the rows. Tapping it folds the display back.
     private func header(_ list: Tracklist) -> some View {
-        let album = playback.album
+        let album = playback.record
         return Button(action: fold) {
             HStack(spacing: 12) {
                 Text((album?.title ?? "").uppercased())

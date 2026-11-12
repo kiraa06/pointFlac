@@ -131,11 +131,11 @@ struct SharedControls: View {
     }
 
     private var title: String {
-        playback.currentTrack?.title ?? playback.album?.title ?? ""
+        playback.currentTrack?.title ?? playback.record?.title ?? ""
     }
 
     private var subtitle: String {
-        guard let album = playback.album else { return "" }
+        guard let album = playback.record else { return "" }
         let sides = playback.layout.sides
         let side = sides.indices.contains(playback.currentSide) ? sides[playback.currentSide] : nil
         if let index = playback.trackIndex, let side {
@@ -233,7 +233,7 @@ struct ProgressRow: View {
     private var player: Player { playback.player }
 
     /// The playing record's colours (a playlist's pressing colour): the played part of the bar is drawn in them.
-    private var palette: ArtPalette { ArtPalette.record(playback.album).tint(for: theme) }
+    private var palette: ArtPalette { ArtPalette.record(playback.record).tint(for: theme) }
 
     var body: some View { progress }
 
@@ -487,7 +487,7 @@ struct UpNextSheet: View {
                     }
                     .pickerStyle(.segmented)
                 }
-                if let album = playback.album {
+                if let album = playback.record {
                     Section("On the deck") {
                         AlbumLine(album: album)
                     }
@@ -498,7 +498,8 @@ struct UpNextSheet: View {
                             .foregroundStyle(.secondary)
                     }
                     ForEach(playback.upNext) { entry in
-                        AlbumLine(album: entry.album)
+                        // A playlist as it will play: its songs as they are now.
+                        AlbumLine(album: playback.live(entry.album))
                             .swipeActions {
                                 Button("Remove", role: .destructive) { playback.removeUpNext(entry) }
                                     .monoDestructive()

@@ -27,9 +27,6 @@ final class PlaylistDesk {
 
     func playlist(_ id: PlaylistCard.ID) -> PlaylistCard? { library.playlists.first { $0.id == id } }
 
-    /// The playlist on the deck, if the record there is one.
-    var playlistOnDeck: PlaylistCard.ID? { playback.album?.playlistID }
-
     // MARK: Favourites
 
     func isFavourite(_ trackID: TrackRow.ID) -> Bool { library.isFavourite(trackID) }

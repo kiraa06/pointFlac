@@ -12,6 +12,7 @@ struct CoverStage: View {
     let theme: Theme
     let discSpace: Namespace.ID
     @AppStorage(DeckPreferences.recordStyleKey) private var recordStyle = RecordStyle.standard.rawValue
+    /// For the song the cover shows: the one playing, or the one the needle would drop on.
     @Environment(PlaylistDesk.self) private var desk: PlaylistDesk?
 
     var body: some View {
@@ -20,8 +21,7 @@ struct CoverStage: View {
             // A playlist's caption takes a line under the cover, so the cover gives up a little height for it.
             let side = min(proxy.size.width * 0.74, proxy.size.height * (playlist ? 0.8 : 0.9))
             ZStack {
-                if let cued = playback.album {
-                    let album = cued.restyled(from: desk?.playlists ?? [])
+                if let album = playback.record {
                     VStack(spacing: 14) {
                         ZStack {
                             // The record peeks out of the sleeve's right edge, further while it plays: the same record
@@ -79,7 +79,7 @@ struct CoverStage: View {
     /// pressing's own square of covers before any song is known.
     @ViewBuilder
     private func songCover(_ look: PressingLook, side: CGFloat) -> some View {
-        let song = cuedSong
+        let song = desk?.cuedSong ?? playback.currentTrack
         ZStack {
             if let albumID = song?.albumID {
                 ArtworkView(albumID: albumID, artwork: nil, pixels: 900)
@@ -117,14 +117,6 @@ struct CoverStage: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Playlist \(look.title), \(PlaylistCard.songs(look.songCount))")
         .accessibilityIdentifier("coverCaption")
-    }
-
-    /// The song playing, or the first of the cued side with the needle up.
-    private var cuedSong: TrackRow? {
-        if let track = playback.currentTrack { return track }
-        let sides = playback.layout.sides
-        let first = sides.indices.contains(playback.currentSide) ? sides[playback.currentSide].tracks.lowerBound : 0
-        return playback.tracks.indices.contains(first) ? playback.tracks[first] : nil
     }
 
     private var sideLetter: String {

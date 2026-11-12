@@ -200,7 +200,66 @@ final class PlaylistUITests: XCTestCase {
         XCTAssertFalse(app.descendants(matching: .any)["deckRecord"].exists)
     }
 
+    /// A playlist waiting in Up Next that has been emptied since is passed over: Up Next carries on with the record
+    /// after it.
+    @MainActor
+    func testEmptiedPlaylistInUpNextIsSkipped() {
+        let app = launch(demoPlay: true)
+        let heart = app.buttons["favouriteButton"]
+        XCTAssertTrue(heart.waitForExistence(timeout: 8))
+        wait(for: heart, "value == 'Ignition'", timeout: 8)
+        heart.tap()
+        wait(for: heart, "label == 'Remove from Favourites'")
+
+        // Up Next: Favourites (Ignition), then Paper Moons.
+        openShelf(app)
+        let favourites = app.buttons["playlistDisc-favourites"]
+        wait(for: favourites, "label == 'Favourites, playlist, 1 song'")
+        favourites.press(forDuration: 1.2)
+        let queue = app.buttons["Add to Up Next"]
+        XCTAssertTrue(queue.waitForExistence(timeout: 3))
+        queue.tap()
+        holdAlbumResult("paper moons", title: "Paper Moons", in: app)
+        XCTAssertTrue(queue.waitForExistence(timeout: 3))
+        queue.tap()
+        clearSearch(app)
+
+        // Favourites is emptied while it waits.
+        holdSongResult("ignition", title: "Ignition", in: app)
+        let unheart = app.buttons.matching(
+            NSPredicate(format: "label == 'Remove from Favourites' AND identifier != 'favouriteButton'")
+        ).firstMatch
+        XCTAssertTrue(unheart.waitForExistence(timeout: 3))
+        unheart.tap()
+        clearSearch(app)
+        wait(for: favourites, "label == 'Favourites, playlist, 0 songs'")
+        closeShelf(app)
+
+        // From the record's last song, Next goes past the empty Favourites to Paper Moons.
+        let tracklist = app.buttons["tracklistButton"]
+        XCTAssertTrue(tracklist.waitForExistence(timeout: 3))
+        tracklist.tap()
+        let last = app.buttons["tracklistTrack-4"]
+        XCTAssertTrue(last.waitForExistence(timeout: 3))
+        last.tap()
+        wait(for: app.staticTexts["nowPlayingTitle"], "label == 'Last Exit'")
+        app.buttons["nextButton"].tap()
+        let record = app.descendants(matching: .any)["deckRecord"]
+        wait(for: record, "label == 'Record, Paper Moons'", timeout: 8)
+        wait(for: app.staticTexts["nowPlayingTitle"], "label == 'Fold'", timeout: 8)
+    }
+
     // MARK: Helpers
+
+    /// Drags the shelf's grabber down, which closes it.
+    @MainActor
+    private func closeShelf(_ app: XCUIApplication) {
+        let grabber = app.descendants(matching: .any)["Close the shelf"].firstMatch
+        XCTAssertTrue(grabber.waitForExistence(timeout: 3))
+        let start = grabber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 300)))
+        wait(for: app.textFields["shelfSearch"], "exists == false")
+    }
 
     @MainActor
     private func launch(demoPlay: Bool = false) -> XCUIApplication {
