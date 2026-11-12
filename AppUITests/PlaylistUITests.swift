@@ -329,6 +329,41 @@ final class PlaylistUITests: XCTestCase {
         XCTAssertFalse(app.buttons["tracklistTrack-2"].exists)
     }
 
+    /// Over the galaxy a disc's hold asks in a dialog, not a context menu (the delete half of
+    /// `testFavouritesCannotBeDeleted`). Delete Playlist… there leads on to the delete confirmation, which deletes the
+    /// playlist; Favourites' dialog offers no Delete.
+    @MainActor
+    func testGalaxyStripDeletesAPlaylistButNeverFavourites() {
+        let app = launch(shelfMode: "galaxy")
+        openShelf(app)
+        XCTAssertTrue(app.descendants(matching: .any)["shelfGalaxy"].waitForExistence(timeout: 5))
+        let new = app.buttons["newPlaylistButton"]
+        XCTAssertTrue(new.waitForExistence(timeout: 5))
+        new.tap()
+        let create = app.buttons["createPlaylist"]
+        XCTAssertTrue(create.waitForExistence(timeout: 3))
+        create.tap()
+        let made = playlistDisc(named: "New Playlist", in: app)
+        XCTAssertTrue(made.waitForExistence(timeout: 5))
+        wait(for: made, "isHittable == true")
+
+        made.press(forDuration: 1.2)
+        // A dialog's button can be listed twice (the popover's button inside its own): the first will do.
+        let delete = app.buttons["Delete Playlist…"].firstMatch
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        let confirm = app.buttons["Delete Playlist"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3), "no delete confirmation followed the hold's dialog")
+        confirm.tap()
+        wait(for: made, "exists == false")
+
+        let favourites = app.buttons["playlistDisc-favourites"]
+        XCTAssertTrue(favourites.exists)
+        favourites.press(forDuration: 1.2)
+        XCTAssertTrue(app.buttons["Open Playlist"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["Delete Playlist…"].exists)
+    }
+
     // MARK: Helpers
 
     /// Opens the tracklist sheet from the song line under the title.
