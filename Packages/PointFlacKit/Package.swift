@@ -56,7 +56,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PFLoudnessTests",
-            dependencies: ["PFLoudness"],
+            dependencies: ["PFLoudness", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(

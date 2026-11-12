@@ -285,34 +285,39 @@ struct DownloadDestinationTests {
     }
 
     @Test("a file provider that holds the name too long fails this download only, and writes nothing")
-    func coordinationTimesOut() throws {
+    func coordinationTimesOut() async throws {
         let folder = try TempFolder()
         let root = try Self.picked(folder)
         let album = root.appending(path: "Ada Vale/Paper Moons")
         try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
         let target = album.appending(path: "01 Fold.flac")
         let staged = try Self.staged(folder)
-        // Another writer holds the name, as a provider busy with it would.
-        let holding = DispatchSemaphore(value: 0)
-        let released = DispatchSemaphore(value: 0)
+        // Another writer holds the name, as a provider busy with it would, on a thread of its own until the save has
+        // given up: a fixed hold could end first on a loaded machine, and the save would then succeed. (Thirty seconds
+        // at most, so a save that never gives up fails the test rather than hangs it.) The test awaits the gates
+        // rather than blocking on semaphores, so its cooperative-pool thread is free meanwhile.
+        let holding = Gate()
+        let released = Gate()
+        let letGo = DispatchSemaphore(value: 0)
         let holder = Thread {
             NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: target, options: [], error: nil) { _ in
-                holding.signal()
-                Thread.sleep(forTimeInterval: 1.5)
+                Task { await holding.open() }
+                _ = letGo.wait(timeout: .now() + 30)
             }
-            released.signal()
+            Task { await released.open() }
         }
         holder.start()
-        holding.wait()
+        await holding.wait()
 
         let failure = Self.failure {
             _ = try DownloadDestination(coordinationTimeout: .milliseconds(200)).save(
                 staged, track: Self.track(), into: root)
         }
+        letGo.signal()
 
         #expect(failure?.folderUnreachable == false)
         #expect(!FileManager.default.fileExists(atPath: target.path))
-        released.wait()
+        await released.wait()
         #expect(!FileManager.default.fileExists(atPath: target.path))
     }
 

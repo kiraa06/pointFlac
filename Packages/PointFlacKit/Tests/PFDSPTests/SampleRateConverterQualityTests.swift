@@ -161,7 +161,7 @@ private let rates = [192_000, 96_000, 88_200, 44_100]
 
 private func fmt(_ x: Double) -> String { String(format: "%.6f", x) }
 
-@Test(arguments: rates)
+@Test(.computeHeavy, arguments: rates)
 func passbandRippleWithinTenthOfADecibel(rate: Int) async throws {
     let m = try await Sweeps.shared.get(rate)
     let worst = m.passband.max { abs($0.gainDB) < abs($1.gainDB) }!
@@ -170,7 +170,7 @@ func passbandRippleWithinTenthOfADecibel(rate: Int) async throws {
     #expect(abs(worst.gainDB) < 0.1, "\(rate): \(worst.gainDB) dB at \(worst.freq) Hz")
 }
 
-@Test(arguments: rates)
+@Test(.computeHeavy, arguments: rates)
 func stopbandBelowMinus100dB(rate: Int) async throws {
     let m = try await Sweeps.shared.get(rate)
     guard !m.stopband.isEmpty else { return }  // no source content above 24.5 kHz
@@ -180,7 +180,7 @@ func stopbandBelowMinus100dB(rate: Int) async throws {
     #expect(worst.levelDB < -100, "\(rate): \(worst.levelDB) dB from \(worst.freq) Hz")
 }
 
-@Test(arguments: rates)
+@Test(.computeHeavy, arguments: rates)
 func delayIsConstantWithinOneSample(rate: Int) async throws {
     let m = try await Sweeps.shared.get(rate)
     let band = m.delays.filter { $0.freq <= 18_000 }.map(\.samples)
@@ -194,7 +194,7 @@ func delayIsConstantWithinOneSample(rate: Int) async throws {
 
 /// Control: the fit recovers a known gain and delay, so a flat 0 dB / 0-sample result above is a measurement of
 /// the converter and not an artefact of the fit.
-@Test func fitRecoversKnownGainAndDelay() {
+@Test(.computeHeavy) func fitRecoversKnownGainAndDelay() {
     let f = 15_000.0
     let delay = 3.25
     let y = (0..<48_000).map { Float(0.45 * sin(2 * Double.pi * f * (Double($0) - delay) / Double(outRate))) }

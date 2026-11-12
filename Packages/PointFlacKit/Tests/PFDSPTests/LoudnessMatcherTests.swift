@@ -10,7 +10,7 @@ import Testing
 /// Loudness is read with BS.1770-4's own 48 kHz K-weighting coefficients (its tables 1 and 2), in a filter written
 /// here, so the measure shares nothing with `LoudnessMatcher`'s design. Clicks are the largest sample step against the
 /// tone's own slope, as in `SoundChainTests`.
-@Suite("Level-matched A/B")
+@Suite("Level-matched A/B", .computeHeavy)
 struct LoudnessMatcherTests {
     static let rate = SoundChainTests.rate
 

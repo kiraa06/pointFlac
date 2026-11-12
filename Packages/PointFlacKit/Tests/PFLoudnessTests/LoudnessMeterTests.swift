@@ -4,7 +4,7 @@ import Testing
 @testable import PFLoudness
 
 /// EBU Tech 3341 reference signals, generated here rather than bundled.
-@Suite("LoudnessMeter")
+@Suite("LoudnessMeter", .computeHeavy)
 struct LoudnessMeterTests {
     /// Interleaved stereo sine, the same signal on both channels.
     static func stereoSine(
