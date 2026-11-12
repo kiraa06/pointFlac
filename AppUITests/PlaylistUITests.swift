@@ -276,7 +276,69 @@ final class PlaylistUITests: XCTestCase {
         XCTAssertEqual(renamed.label, "Road Trip, playlist, 0 songs")
     }
 
+    /// The record on the deck plays the songs it was cued with; an edit applies the next time the playlist is cued. A
+    /// song taken out of the playlist on the deck, from the deck's own tracklist, stays listed there and Next still
+    /// plays it; the playlist cued again from the strip has one song fewer.
+    @MainActor
+    func testEditingThePlaylistOnTheDeckChangesNothingThatPlays() {
+        // Late Night Drives: Neon Mile, Apogee, Fold.
+        let app = launch(["-PFDemoPlaylists", "-PFPlayPlaylist", "Late Night Drives"])
+        let title = app.staticTexts["nowPlayingTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        wait(for: title, "label == 'Neon Mile'", timeout: 10)
+
+        // Apogee leaves the playlist from the deck's tracklist.
+        openTracklist(app)
+        let apogee = app.buttons["tracklistTrack-1"]
+        XCTAssertTrue(apogee.waitForExistence(timeout: 3))
+        XCTAssertTrue(apogee.label.contains("Apogee"), "the row reads \"\(apogee.label)\"")
+        apogee.press(forDuration: 1.2)
+        let remove = app.buttons["Remove from This Playlist"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 3))
+        remove.tap()
+        wait(for: remove, "exists == false")
+        // Neon Mile again from its start, which closes the sheet.
+        app.buttons["tracklistTrack-0"].tap()
+        wait(for: app.descendants(matching: .any)["tracklistSheet"], "exists == false")
+
+        // The playlist has lost it...
+        openShelf(app)
+        wait(for: playlistDisc(named: "Late Night Drives", in: app), "label == 'Late Night Drives, playlist, 2 songs'")
+        closeShelf(app)
+
+        // ...but the record on the deck still lists it, and Next plays it.
+        openTracklist(app)
+        wait(for: app.buttons["tracklistTrack-1"], "label CONTAINS 'Apogee'")
+        wait(for: app.buttons["tracklistTrack-2"], "label CONTAINS 'Fold'")
+        app.buttons["tracklistTrack-0"].tap()
+        wait(for: app.descendants(matching: .any)["tracklistSheet"], "exists == false")
+        wait(for: title, "label == 'Neon Mile'")
+        app.buttons["nextButton"].tap()
+        wait(for: title, "label == 'Apogee'", timeout: 8)
+        wait(for: app.buttons["playButton"], "label == 'Pause'", timeout: 8)
+
+        // Cued again from the strip, the playlist plays as it is now: two songs, Apogee gone.
+        openShelf(app)
+        let disc = playlistDisc(named: "Late Night Drives", in: app)
+        XCTAssertTrue(disc.waitForExistence(timeout: 3))
+        disc.tap()
+        wait(for: app.textFields["shelfSearch"], "exists == false", timeout: 8)
+        wait(for: title, "label == 'Neon Mile'", timeout: 8)
+        openTracklist(app)
+        wait(for: app.buttons["tracklistTrack-1"], "label CONTAINS 'Fold'")
+        XCTAssertFalse(app.buttons["tracklistTrack-2"].exists)
+    }
+
     // MARK: Helpers
+
+    /// Opens the tracklist sheet from the song line under the title.
+    @MainActor
+    private func openTracklist(_ app: XCUIApplication) {
+        let button = app.buttons["tracklistButton"]
+        XCTAssertTrue(button.waitForExistence(timeout: 3))
+        button.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["tracklistSheet"].waitForExistence(timeout: 3))
+    }
 
     /// Drags the shelf's grabber down, which closes it.
     @MainActor
@@ -288,11 +350,13 @@ final class PlaylistUITests: XCTestCase {
         wait(for: app.textFields["shelfSearch"], "exists == false")
     }
 
+    /// `shelfMode` pins the shelf's mode for the launch; `extra` comes last.
     @MainActor
-    private func launch(demoPlay: Bool = false) -> XCUIApplication {
+    private func launch(demoPlay: Bool = false, shelfMode: String = "crate", _ extra: [String] = []) -> XCUIApplication
+    {
         let app = XCUIApplication.pointFlac(
-            ["-PFPreloadFixtures", "-PFFreshLibrary", "-PFStage", "deck", "-shelfMode", "crate"]
-                + (demoPlay ? ["-PFDemoPlay"] : []))
+            ["-PFPreloadFixtures", "-PFFreshLibrary", "-PFStage", "deck", "-shelfMode", shelfMode]
+                + (demoPlay ? ["-PFDemoPlay"] : []) + extra)
         app.launch()
         return app
     }
