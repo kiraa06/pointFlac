@@ -56,7 +56,7 @@ struct DeckScreen: View {
     }
 
     private var lcdLines: [String] {
-        guard let album = playback.album else { return ["NO RECORD", "—"] }
+        guard let album = playback.record else { return ["NO RECORD", "—"] }
         let format = playback.player.signal.source.map { "\($0.sampleRate / 1000)K/\($0.bitsPerSample)" } ?? ""
         if let index = playback.trackIndex {
             let track = playback.tracks[index]
@@ -65,7 +65,9 @@ struct DeckScreen: View {
                 "\(ClockFormat.clock(playback.player.position.seconds))  33⅓  \(format)",
             ]
         }
-        return ["\(album.title.uppercased())·\(album.artist.uppercased())", "CUE \(sideLetter ?? "A")1  33⅓"]
+        // Idle, a playlist reads as its pressing does: `FAVOURITES·24 SONGS`.
+        let name = album.pressing?.displayText ?? "\(album.title.uppercased())·\(album.artist.uppercased())"
+        return [name, "CUE \(sideLetter ?? "A")1  33⅓"]
     }
 }
 

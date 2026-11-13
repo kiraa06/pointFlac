@@ -38,6 +38,9 @@ struct RootView: View {
                 SettingsView(model: model)
             }
         }
+        #if DEBUG
+            .overlay { if PressingGalleryView.isRequested { PressingGalleryView(model: model) } }
+        #endif
         .preferredColorScheme(appearance.colorScheme)
         // Monochrome: system controls (tab bar, toggles, buttons, links) take the ink grey, and views that draw a
         // colour of their own read the flag. The look switches live, over a short fade.

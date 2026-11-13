@@ -84,15 +84,16 @@ final class ShelfGalaxyUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 1.5)
         let before = centre.frame
         let start = centre.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        // Sideways: with the Playlists strip above it (Plan 11), the galaxy is too short for a long drag down.
         start.press(
-            forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 110)), withVelocity: 150,
+            forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 110, dy: 0)), withVelocity: 150,
             thenHoldForDuration: 0.3)
-        let moved = NSPredicate { _, _ in centre.frame.midY > before.midY + 70 }
+        let moved = NSPredicate { _, _ in centre.frame.midX > before.midX + 70 }
         expectation(for: moved, evaluatedWith: nil)
         waitForExpectations(timeout: 4)
         // Still there a moment later: no spring home.
         Thread.sleep(forTimeInterval: 2)
-        XCTAssertGreaterThan(centre.frame.midY, before.midY + 70)
+        XCTAssertGreaterThan(centre.frame.midX, before.midX + 70)
     }
 
     // MARK: Helpers

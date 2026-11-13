@@ -435,10 +435,10 @@ struct DeckStage: View {
 
     @ViewBuilder
     private func record(_ layout: DeckLayout, angle: Double) -> some View {
-        if showsRecord, let album = playback.album {
+        if showsRecord, let album = playback.record {
             let d = layout.recordRadius * 2
             RecordView(
-                face: RecordFace(album: album, side: sideLetter ?? "A", bands: bands(layout), style: recordStyle),
+                face: .face(for: album, side: sideLetter ?? "A", bands: bands(layout), style: recordStyle),
                 diameter: d, angle: angle
             )
             .rotation3DEffect(.degrees(flip), axis: (x: 0, y: 1, z: 0), perspective: 0.4)

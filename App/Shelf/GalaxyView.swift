@@ -23,6 +23,8 @@ struct GalaxyView<HoldActions: View>: View {
     let pick: (AlbumCard, CGRect) -> Void
     let playNext: (AlbumCard) -> Void
     let addToUpNext: (AlbumCard) -> Void
+    /// The crate menu's Add to Playlist…, for VoiceOver's actions; nil offers none.
+    var addToPlaylist: ((AlbumCard) -> Void)? = nil
     /// The held sleeve's menu, for its album and its frame in the player's space (Play hands off from there).
     @ViewBuilder let holdActions: (AlbumCard, CGRect) -> HoldActions
 
@@ -189,23 +191,32 @@ struct GalaxyView<HoldActions: View>: View {
         let rects = model.albums.indices.map { model.restingRect(rank: $0) }
         return ZStack(alignment: .topLeading) {
             ForEach(Array(model.albums.enumerated()), id: \.element.id) { rank, album in
-                let rect = rects[rank]
-                Color.clear
-                    .frame(width: max(rect.width, 1), height: max(rect.height, 1))
-                    .position(x: rect.midX, y: rect.midY)
-                    .accessibilityElement()
-                    .accessibilityLabel("\(album.title), \(album.artist)")
-                    .accessibilityValue(Self.value(of: album, sort: sort))
-                    .accessibilityHint("Puts the record on the deck")
-                    .accessibilityAddTraits(.isButton)
-                    .accessibilityIdentifier("galaxy-\(rank)")
-                    .accessibilityAction { pick(album, model.playerRect(model.restingRect(rank: rank))) }
-                    .accessibilityAction(named: "Play Next") { playNext(album) }
-                    .accessibilityAction(named: "Add to Up Next") { addToUpNext(album) }
+                element(album, rank: rank, at: rects[rank])
             }
         }
         .frame(width: model.size.width, height: model.size.height)
         .id(revision)
+    }
+
+    /// The sleeve at `rank` for VoiceOver: a tap plays it, and its actions are the hold's.
+    private func element(_ album: AlbumCard, rank: Int, at rect: CGRect) -> some View {
+        Color.clear
+            .frame(width: max(rect.width, 1), height: max(rect.height, 1))
+            .position(x: rect.midX, y: rect.midY)
+            .accessibilityElement()
+            .accessibilityLabel("\(album.title), \(album.artist)")
+            .accessibilityValue(Self.value(of: album, sort: sort))
+            .accessibilityHint("Puts the record on the deck")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityIdentifier("galaxy-\(rank)")
+            .accessibilityAction { pick(album, model.playerRect(model.restingRect(rank: rank))) }
+            .accessibilityAction(named: "Play Next") { playNext(album) }
+            .accessibilityAction(named: "Add to Up Next") { addToUpNext(album) }
+            .accessibilityActions {
+                if let addToPlaylist {
+                    Button("Add to Playlist…") { addToPlaylist(album) }
+                }
+            }
     }
 
     /// What the sort orders by, for VoiceOver: plays for Most played, else that sort's own attribute.

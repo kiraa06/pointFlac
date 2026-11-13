@@ -127,6 +127,31 @@ final class PlaybackController {
 
     var currentTrack: TrackRow? { trackIndex.map { tracks[$0] } }
 
+    /// The song on the deck: the one playing, or the one that would play with the needle up (the first of the cued
+    /// side). Nil only with the deck empty. The heart acts on it, and the cover shows it and takes its wash from it.
+    var cuedSong: TrackRow? {
+        if let track = currentTrack { return track }
+        let sides = layout.sides
+        let first = sides.indices.contains(cuedSide) ? sides[cuedSide].tracks.lowerBound : 0
+        return tracks.indices.contains(first) ? tracks[first] : tracks.first
+    }
+
+    /// The record on the platter as the deck shows it: for a playlist, its card with the playlist's name and colour as
+    /// they are now (a rename or a new colour shows at once), keeping the song count and covers it was cued with, since
+    /// its songs stay as cued until it is put on again. An album's card as it is: only a playlist reads the
+    /// playlists, so nothing redraws for an album when one changes.
+    var record: AlbumCard? {
+        guard let album, album.pressing != nil else { return album }
+        return album.restyled(from: library.playlists)
+    }
+
+    /// A card as it would be cued now: a playlist's live card (its songs, covers and count as they are), or the card
+    /// itself for an album or a playlist since deleted. Up Next keeps the card it was given; this is what it plays.
+    func live(_ card: AlbumCard) -> AlbumCard {
+        guard card.pressing != nil else { return card }
+        return library.playlists.first { $0.albumCard.id == card.id }?.albumCard ?? card
+    }
+
     /// The side under the needle: the playing track's, or the cued one.
     var currentSide: Int { trackIndex.flatMap { layout.side(ofTrack: $0) } ?? cuedSide }
 
@@ -161,9 +186,10 @@ final class PlaybackController {
         return (letter, SideTimeline(durations: layout.durations(onSide: side)))
     }
 
-    /// Puts `album` on the platter without dropping the needle: the hand-off's landing.
+    /// Puts `album` on the platter without dropping the needle: the hand-off's landing. A playlist goes on as it is now,
+    /// its card and its songs read together, whatever card was kept for it (in Up Next, say).
     func cue(_ album: AlbumCard, startingAt trackID: TrackRow.ID? = nil) {
-        self.album = album
+        self.album = live(album)
         tracks = library.tracks(of: album.id)
         layout = SideLayout(durations: tracks.map(\.durationSeconds))
         let start = trackID.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
@@ -509,10 +535,12 @@ final class PlaybackController {
     /// pipeline can overlap the boundary. It stays in Up Next until its first track starts.
     private func appendNextRecordIfDue() {
         let sound = player.sound
-        guard !sound.pure, sound.crossfade.mode != .off, repeatMode == .off, isPlaying, let entry = upNext.first,
+        guard !sound.pure, sound.crossfade.mode != .off, repeatMode == .off, isPlaying, !upNext.isEmpty,
             let index = player.currentIndex, index == player.queue.count - 1, let last = albumSegments.last,
             index >= last.start, index < last.end, trackIndex != nil
         else { return }
+        dropEmptyPlaylists()
+        guard let entry = upNext.first else { return }
         let tracks = library.tracks(of: entry.album.id)
         let first = entry.startTrack.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
         guard tracks.indices.contains(first) else { return }
@@ -521,17 +549,27 @@ final class PlaybackController {
         guard items.count == ids.count else { return }
         albumSegments.append(
             AlbumSegment(
-                album: entry.album, tracks: tracks, start: player.queue.count, firstTrack: first, entry: entry.id))
+                album: live(entry.album), tracks: tracks, start: player.queue.count, firstTrack: first,
+                entry: entry.id))
         player.append(items)
     }
 
     private func pullNextNow() async {
+        dropEmptyPlaylists()
         guard !upNext.isEmpty else { return }
         let entry = upNext.removeFirst()
         autoLoads += 1
         cue(entry.album, startingAt: entry.startTrack)
         let start = entry.startTrack.flatMap { id in tracks.firstIndex { $0.id == id } } ?? 0
         await playNow(fromTrack: start, at: 0)
+    }
+
+    /// Playlists at the head of Up Next that have no songs now (emptied, or deleted, since they were queued) are
+    /// passed over when their turn comes, so Up Next carries on with the record after them.
+    private func dropEmptyPlaylists() {
+        while let entry = upNext.first, entry.album.pressing != nil, library.tracks(of: entry.album.id).isEmpty {
+            upNext.removeFirst()
+        }
     }
 }
 
