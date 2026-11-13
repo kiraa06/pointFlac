@@ -240,8 +240,8 @@ final class PlayerUITests: XCTestCase {
         waitForExpectations(timeout: 10)
     }
 
-    /// A finished download can be swiped off the list, and the footer says its song stays in the library. Clear
-    /// shows only while there is something to clear.
+    /// A finished download can be swiped off the list, and the footer says its song stays in the library. The
+    /// toolbar's menu (Clear Finished, here) shows only while there is something in it.
     @MainActor
     func testFinishedDownloadCanBeRemoved() {
         let app = launch()
@@ -259,7 +259,7 @@ final class PlayerUITests: XCTestCase {
         expectation(for: NSPredicate(format: "label CONTAINS 'Done'"), evaluatedWith: row)
         waitForExpectations(timeout: 12)
         XCTAssertTrue(app.staticTexts["Removing a finished download keeps the song in your library."].exists)
-        XCTAssertTrue(app.buttons["clearDownloads"].exists)
+        XCTAssertTrue(app.buttons["downloadsMenu"].exists)
 
         row.swipeLeft()
         // A long swipe runs the only action at once; a short one shows its button.
@@ -267,7 +267,7 @@ final class PlayerUITests: XCTestCase {
         if remove.waitForExistence(timeout: 2) { remove.tap() }
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
         waitForExpectations(timeout: 3)
-        XCTAssertFalse(app.buttons["clearDownloads"].exists)
+        XCTAssertFalse(app.buttons["downloadsMenu"].exists)
     }
 
     /// Kiran's request: an album can be deleted from the shelf. The fixtures were imported into the app's own library

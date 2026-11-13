@@ -65,6 +65,8 @@ enum SearchFilter: CaseIterable {
     func recordListen(trackID: TrackRow.ID, at date: Date) async
     /// An album's tracks, in album order.
     func tracks(of album: AlbumCard.ID) -> [TrackRow]
+    /// Whether the library still has `track`: a lookup, cheap enough for a view's body.
+    func hasTrack(_ track: TrackRow.ID) -> Bool
     /// Synchronous, because local results must be on screen within the frame of the keystroke (spec §8).
     func search(_ query: String, filter: SearchFilter) -> SearchResults
     /// What the player needs to play these tracks, in the order given.
@@ -75,8 +77,9 @@ enum SearchFilter: CaseIterable {
     /// before the user confirms.
     func removalPlan(album: AlbumCard.ID?, tracks: [TrackRow.ID]) -> RemovalPlan
     /// Removes `tracks` (a plan's) as `removalPlan` described, and returns once the shelf shows the library without
-    /// them.
-    func remove(tracks: [TrackRow.ID]) async
+    /// them, saying what the plan could not promise: files that would not move to Recently Deleted.
+    @discardableResult
+    func remove(tracks: [TrackRow.ID]) async -> RemovalOutcome
 }
 
 /// What deleting an album or a song would do, worked out before the user confirms. The plan names the tracks it
@@ -89,10 +92,31 @@ struct RemovalPlan: Equatable {
     var deletes = 0
     /// Songs only removed from pointFlac: files in folders added in place, which stay where they are.
     var removes = 0
+    /// Songs whose file moves to Recently Deleted in Files, where it can be restored for 30 days: those in the folder
+    /// picked for downloads (Settings → Downloads).
+    var trashes = 0
     /// How many of `deletes` pointFlac can't play.
     var unplayableDeletes = 0
     /// How many of `removes` pointFlac can't play.
     var unplayableRemoves = 0
+    /// How many of `trashes` pointFlac can't play.
+    var unplayableTrashes = 0
+}
+
+/// What a removal did that its plan could not promise.
+struct RemovalOutcome: Equatable {
+    /// Songs whose file should have moved to Recently Deleted but would not (a provider without a trash, an error).
+    /// They left pointFlac all the same, and their file stays in its folder.
+    var trashFailures = 0
+
+    /// The line the UI shows when files could not move to Recently Deleted; nil when every one did.
+    var note: String? {
+        switch trashFailures {
+        case 0: nil
+        case 1: "Couldn't move the file to Recently Deleted. It stays in its folder."
+        default: "Couldn't move \(trashFailures) files to Recently Deleted. They stay in their folder."
+        }
+    }
 }
 
 /// Finding and downloading music from the online providers.
@@ -104,6 +128,16 @@ struct RemovalPlan: Equatable {
     var downloads: [DownloadRow] { get }
     /// Stops a queued or running download; its partial file is discarded.
     func cancelDownload(_ id: DownloadRow.ID)
+    /// Stops a queued, waiting or running download and keeps its partial file, for `resumeDownload`.
+    func pauseDownload(_ id: DownloadRow.ID)
+    /// Queues a paused download again; it continues from its partial file.
+    func resumeDownload(_ id: DownloadRow.ID)
+    /// Pauses every download that can be paused.
+    func pauseAllDownloads()
+    /// Resumes every paused download.
+    func resumeAllDownloads()
+    /// Cancels every download still under way or paused. Songs already downloaded stay in the library.
+    func cancelAllDownloads()
     /// Starts a failed or cancelled download again.
     func retryDownload(_ id: DownloadRow.ID)
     /// Takes a finished, failed or cancelled row off the list. A finished download's song stays in the library.
@@ -122,6 +156,11 @@ struct RemovalPlan: Equatable {
 /// no-ops, so the mock and any other finder written to the original shape still conform.
 extension MusicFinding {
     func cancelDownload(_ id: DownloadRow.ID) {}
+    func pauseDownload(_ id: DownloadRow.ID) {}
+    func resumeDownload(_ id: DownloadRow.ID) {}
+    func pauseAllDownloads() {}
+    func resumeAllDownloads() {}
+    func cancelAllDownloads() {}
     func retryDownload(_ id: DownloadRow.ID) {}
     func removeDownload(_ id: DownloadRow.ID) {}
     func clearDownloads(finished: Bool, failed: Bool) {}
@@ -161,13 +200,40 @@ struct RemoteResultRow: Identifiable, Hashable, Sendable {
 struct DownloadRow: Identifiable, Hashable {
     let id: String
     let title: String
-    /// One of spec §4.7's states, as words: "Queued", "Downloading", "Validating", "Saving", "Done", "Failed: …".
+    /// One of spec §4.7's states, as words: "Queued", "Downloading", "Validating", "Saving", "Done", "Failed: …",
+    /// "Paused" or "Paused · 42%".
     let state: String
-    /// 0...1 while transferring; nil when indeterminate or finished.
+    /// 0...1 while transferring; nil when indeterminate, paused or finished.
     let progress: Double?
     /// Shown in place of a finished download's "Done" when it was saved somewhere other than asked: "Saved in
     /// pointFlac (folder unavailable)".
     var note: String? = nil
+    /// The library track a finished download became, so its row can delete the song; nil until then, or when the
+    /// library could not say.
+    var trackID: TrackRow.ID? = nil
+
+    /// Where the download is, for the controls its row offers. Read from the state's words, which both finders share.
+    enum Phase: Equatable {
+        /// Queued, waiting at its source or downloading: it can be paused or cancelled.
+        case transferring
+        case paused
+        /// Validating or saving: moments from the library, too late to pause.
+        case finishing
+        /// Published: the song is in the library.
+        case done
+        /// Failed or cancelled: it can be retried or removed.
+        case stopped
+    }
+
+    var phase: Phase {
+        if state.hasPrefix("Done") { return .done }
+        if state.hasPrefix("Failed") || state.hasPrefix("Cancelled") { return .stopped }
+        if state.hasPrefix("Paused") { return .paused }
+        if state.hasPrefix("Queued") || state.hasPrefix("Waiting") || state.hasPrefix("Downloading") {
+            return .transferring
+        }
+        return .finishing
+    }
 }
 
 /// A typeahead suggestion (contract 3).

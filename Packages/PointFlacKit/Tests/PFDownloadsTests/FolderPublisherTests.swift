@@ -31,6 +31,7 @@ struct FolderPublisherTests {
         let admitThrows = Mutex(false)
         let catalogHas = Mutex(true)
         let importFails = Mutex(false)
+        let importedID = Mutex<String?>("app-track")
         let saveGate = Mutex<Gate?>(nil)
 
         func log(_ event: String) { events.withLock { $0.append(event) } }
@@ -73,6 +74,7 @@ struct FolderPublisherTests {
                 importIntoApp: { _ in
                     self.log("import")
                     if self.importFails.withLock({ $0 }) { throw CocoaError(.fileWriteOutOfSpace) }
+                    return self.importedID.withLock { $0 }
                 },
                 deleteStaged: { _ in self.log("deleteStaged") })
         }
@@ -81,7 +83,7 @@ struct FolderPublisherTests {
     @Test("saved to the folder: the staged file goes only after the catalog has the song, then the scope closes")
     func success() async throws {
         let world = World()
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == nil)
         #expect(world.log == ["open", "reads", "save Ada Vale", "admit", "catalog", "deleteStaged", "close"])
         #expect(world.marked.withLock { $0 }.isEmpty)
@@ -99,7 +101,7 @@ struct FolderPublisherTests {
         case .threw: world.admitThrows.withLock { $0 = true }
         case .missingFromCatalog: world.catalogHas.withLock { $0 = false }
         }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
 
         #expect(note == FolderPublisher.notAdmittedNote)
         let log = world.log
@@ -127,7 +129,7 @@ struct FolderPublisherTests {
     func libraryAddsTheFolderFirst() async throws {
         let world = World()
         world.reads.withLock { $0 = [false, true] }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == nil)
         #expect(world.log.prefix(4) == ["open", "reads", "add", "reads"])
         #expect(world.log.contains("deleteStaged"))
@@ -138,7 +140,7 @@ struct FolderPublisherTests {
         let world = World()
         world.reads.withLock { $0 = [false] }
         world.addFails.withLock { $0 = true }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == FolderPublisher.notReadNote)
         #expect(!world.log.contains { $0.hasPrefix("save") })
         #expect(world.log.suffix(2) == ["import", "deleteStaged"])
@@ -149,7 +151,7 @@ struct FolderPublisherTests {
     func alreadyUnavailable() async throws {
         let world = World()
         world.target.withLock { $0 = .unavailable }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == FolderPublisher.unavailableNote)
         #expect(world.log == ["import", "deleteStaged"])
     }
@@ -158,7 +160,7 @@ struct FolderPublisherTests {
     func inTheApp() async throws {
         let world = World()
         world.target.withLock { $0 = .app }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == nil)
         #expect(world.log == ["import", "deleteStaged"])
     }
@@ -167,7 +169,7 @@ struct FolderPublisherTests {
     func fileOnlyFailureDoesNotMark() async throws {
         let world = World()
         world.saveFault.withLock { $0 = .fileOnly("a file is in the way of its folder") }
-        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
         #expect(note == "Saved in pointFlac (a file is in the way of its folder)")
         #expect(world.marked.withLock { $0 }.isEmpty)
         #expect(world.log.suffix(2) == ["import", "deleteStaged"])
@@ -180,7 +182,7 @@ struct FolderPublisherTests {
             let failure = DownloadDestination.Failure.unreachable("there's no space left")
             if fault == "open" { world.openFault.withLock { $0 = failure } }
             if fault == "save" { world.saveFault.withLock { $0 = failure } }
-            let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+            let note = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track).note
             #expect(note == FolderPublisher.unavailableNote)
             #expect(world.marked.withLock { $0 } == [Self.choice])
             #expect(world.log.suffix(2) == ["import", "deleteStaged"])
@@ -197,6 +199,33 @@ struct FolderPublisherTests {
         }
         #expect(!world.log.contains("deleteStaged"))
         #expect(world.marked.withLock { $0 } == [Self.choice])
+    }
+
+    @Test("saved to the folder, the publication names the track the library admitted there")
+    func folderPathReportsTheAdmittedTrack() async throws {
+        let world = World()
+        let published = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        #expect(published == Publication(note: nil, trackID: "track-1"))
+    }
+
+    @Test("imported into the app (chosen, known unavailable, or as a fallback), it names the import's track")
+    func appPathReportsTheImportedTrack() async throws {
+        for setup in ["app", "unavailable", "fallback"] {
+            let world = World()
+            switch setup {
+            case "app": world.target.withLock { $0 = .app }
+            case "unavailable": world.target.withLock { $0 = .unavailable }
+            default: world.saveFault.withLock { $0 = .fileOnly("a file is in the way of its folder") }
+            }
+            let published = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+            #expect(published.trackID == "app-track", "\(setup)")
+        }
+        // An import that kept the file but could not name its track still finishes the download.
+        let world = World()
+        world.target.withLock { $0 = .app }
+        world.importedID.withLock { $0 = nil }
+        let published = try await FolderPublisher(steps: world.steps).publish(Self.staged, track: Self.track)
+        #expect(published == Publication(note: nil, trackID: nil))
     }
 
     @Test("downloads go into the folder one at a time, so one can never adopt a copy another may take back")

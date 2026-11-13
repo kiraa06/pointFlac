@@ -437,3 +437,22 @@ private func tags(
     #expect(library.current.tracks.isEmpty)
     #expect(try FileManager.default.contentsOfDirectory(atPath: temp.artwork.path).isEmpty)
 }
+
+/// A download imported into the app that the library already has (same name, same size) is not copied again; the
+/// import names the track it already had, so the Downloads list can delete that song.
+@Test func aDuplicateImportNamesTheTrackAlreadyThere() async throws {
+    let temp = try TemporaryLibraryRoot()
+    let library = try temp.open()
+    let first = try temp.picked("s16-44100", as: "Fold.flac", tags: tags(title: "Fold", artist: "Ada", album: "Moons"))
+    let added = await library.importFiles([first])
+    let id = try #require(added.added.first)
+    #expect(added.existing.isEmpty)
+
+    let again = try temp.picked("s16-44100", as: "Fold.flac", tags: tags(title: "Fold", artist: "Ada", album: "Moons"))
+    let duplicate = await library.importFiles([again])
+
+    #expect(duplicate.added.isEmpty)
+    #expect(duplicate.duplicates == 1)
+    #expect(duplicate.existing == [id])
+    #expect(library.current.tracks.count == 1)
+}

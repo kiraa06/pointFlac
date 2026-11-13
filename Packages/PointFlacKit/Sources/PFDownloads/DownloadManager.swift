@@ -6,6 +6,10 @@ import os
 /// The manager is the only path from the network into the library. It never trusts a provider: each finished file is
 /// checked by `Admission` (location, file type, size, FLAC admission rule) before `publish` sees it. Failures keep
 /// enough state to retry, and cancelling only ever deletes the job's own staging folder, never published music.
+///
+/// Pausing stops a job's transfer and keeps its staging folder, partial file included; resuming queues it again into
+/// that same folder, where the provider continues from the partial file. A paused job waits for the user, across
+/// launches too, and frees its slot for the next queued job.
 public actor DownloadManager {
     public struct Configuration: Sendable {
         /// A private folder for in-progress files, e.g. `Library/Caches/Downloads`. Each job gets a subfolder.
@@ -56,9 +60,9 @@ public actor DownloadManager {
     /// Hands a validated file to the library. It may move or copy the file; it must throw if it did not keep it.
     public typealias Publish = @Sendable (URL) async throws -> Void
     /// `Publish`, told which track the file is, so it can file the song by artist and album in a folder the user
-    /// picked. It returns a short line for the Downloads list when the song went somewhere other than asked (the
-    /// folder could not be reached, so it was saved in the app), or `nil`; the line is kept as the job's `note`.
-    public typealias PublishTrack = @Sendable (URL, RemoteTrack) async throws -> String?
+    /// picked. It returns what became of the file (`Publication`): kept on the job as its `note` and
+    /// `publishedTrackID`.
+    public typealias PublishTrack = @Sendable (URL, RemoteTrack) async throws -> Publication
 
     private let configuration: Configuration
     private let providers: [String: any DownloadProvider]
@@ -72,12 +76,19 @@ public actor DownloadManager {
     private var restored = false
     /// Why the manager itself stopped a job (e.g. it outgrew the size limit), as opposed to a user cancel.
     private var abortReasons: [String: String] = [:]
+    /// Jobs whose transfer was stopped by `pause` and has not ended yet: their task keeps the staging folder, even if
+    /// the job was resumed meanwhile (the next transfer continues from it). `cancel` takes a job out again.
+    private var pausing: Set<String> = []
+    #if DEBUG
+        /// For tests: awaited as a job starts validating, so a test can act while it is there. Debug builds only.
+        private var validationHook: (@Sendable (String) async -> Void)?
+    #endif
     private var lastGrowthCheck: [String: ContinuousClock.Instant] = [:]
 
     public init(providers: [any DownloadProvider], configuration: Configuration, publish: @escaping Publish) {
         self.init(providers: providers, configuration: configuration) { file, _ in
             try await publish(file)
-            return nil
+            return Publication()
         }
     }
 
@@ -124,6 +135,8 @@ public actor DownloadManager {
                 // library probably has it. Downloading again could duplicate it, so the user decides.
                 item.state = .failed("the app closed while saving; check the library before retrying")
                 item.stagedFileName = nil
+            } else if case .paused = item.state {
+                // Paused by the user: it stays paused, its partial file kept, until they resume it.
             } else if !item.state.isFinal {
                 // A job interrupted mid-flight starts again from the queue; a provider resumes from the staged
                 // part file and a validated file is re-checked, never trusted from the last run.
@@ -136,8 +149,9 @@ public actor DownloadManager {
         pump()
     }
 
-    /// Deletes staging folders no live job can use: those of unknown, published or cancelled jobs. Only
-    /// UUID-named folders are touched, so a misconfigured staging root never loses anything else.
+    /// Deletes staging folders no live job can use: those of unknown, published or cancelled jobs. A paused job's is
+    /// kept for its resume. Only UUID-named folders are touched, so a misconfigured staging root never loses anything
+    /// else.
     private func removeOrphanedStaging() {
         let keep = Set(queue.filter { $0.state != .published && $0.state != .cancelled }.map(\.id))
         let names = (try? FileManager.default.contentsOfDirectory(atPath: configuration.stagingRoot.path)) ?? []
@@ -146,13 +160,18 @@ public actor DownloadManager {
         }
     }
 
-    /// Queues `track`, or returns the job already downloading it.
+    /// Queues `track`, or returns the job already downloading it. A paused job for it is resumed: asking for the song
+    /// again is asking for it to come.
     @discardableResult
     public func enqueue(_ track: RemoteTrack) -> String {
         // Only a job still in flight absorbs a repeat request; after it ends the user may want the file again.
         if let existing = queue.first(where: {
             $0.track.id == track.id && $0.track.provider == track.provider && !$0.state.isFinal
         }) {
+            if release(existing.id) {
+                changed(persist: true)
+                pump()
+            }
             return existing.id
         }
         let item = DownloadItem(id: UUID().uuidString, track: track)
@@ -168,20 +187,97 @@ public actor DownloadManager {
     /// can never remove music the library has taken. Returns whether the job was cancelled.
     @discardableResult
     public func cancel(_ id: String) -> Bool {
+        guard stop(id) else { return false }
+        changed(persist: true)
+        return true
+    }
+
+    /// Cancels every job not yet final that `cancel` takes (not one already saving), and returns how many it cancelled.
+    /// Each loses only its own staging folder, as with `cancel`.
+    @discardableResult
+    public func cancelAll() -> Int {
+        let count = queue.filter { !$0.state.isFinal }.map(\.id).count(where: stop)
+        if count > 0 { changed(persist: true) }
+        return count
+    }
+
+    /// `cancel` without saving the queue.
+    private func stop(_ id: String) -> Bool {
         guard let index = index(of: id) else { return false }
         switch queue[index].state {
         case .saving, .published, .cancelled: return false
-        case .queued, .downloading, .waiting, .validating, .failed: break
+        case .queued, .downloading, .waiting, .validating, .failed, .paused: break
         }
         queue[index].state = .cancelled
         queue[index].stagedFileName = nil
+        // A transfer paused moments ago and still stopping must not keep the folder now.
+        pausing.remove(id)
         if let task = running[id] {
             // The job's task removes the staging folder once the provider has stopped writing into it.
             task.cancel()
         } else {
             removeStaging(id)
         }
+        return true
+    }
+
+    /// Pauses a job that is queued, waiting at its source or downloading: its transfer stops, and its staging folder
+    /// and partial file stay for `resume`. Returns false once the job is validating, saving or done: too late to pause.
+    @discardableResult
+    public func pause(_ id: String) -> Bool {
+        guard hold(id) else { return false }
         changed(persist: true)
+        return true
+    }
+
+    /// Pauses every job `pause` takes, and returns how many it paused.
+    @discardableResult
+    public func pauseAll() -> Int {
+        let count = queue.map(\.id).count(where: hold)
+        if count > 0 { changed(persist: true) }
+        return count
+    }
+
+    /// `pause` without saving the queue.
+    private func hold(_ id: String) -> Bool {
+        guard let index = index(of: id), queue[index].state.isPausable else { return false }
+        queue[index].state = .paused(progress: currentProgress(id))
+        if let task = running[id] {
+            // The task keeps the staging folder when it stops (`execute`), and its slot frees as it ends.
+            pausing.insert(id)
+            task.cancel()
+        }
+        Self.log.info("download \(id.prefix(8), privacy: .public) → paused")
+        return true
+    }
+
+    /// Queues a paused job again, behind the limits like any queued job. It downloads into the same staging folder,
+    /// so the provider continues from the partial file. Returns false for a job that is not paused.
+    @discardableResult
+    public func resume(_ id: String) -> Bool {
+        guard release(id) else { return false }
+        changed(persist: true)
+        pump()
+        return true
+    }
+
+    /// Resumes every paused job, oldest first, and returns how many it resumed.
+    @discardableResult
+    public func resumeAll() -> Int {
+        let count = queue.map(\.id).count(where: release)
+        if count > 0 {
+            changed(persist: true)
+            pump()
+        }
+        return count
+    }
+
+    /// `resume` without saving the queue or starting anything.
+    private func release(_ id: String) -> Bool {
+        guard let index = index(of: id), case .paused = queue[index].state else { return false }
+        queue[index].state = .queued
+        // A fresh set of attempts, as after `retry`: the pause was the user's, not a failure.
+        queue[index].attempts = 0
         return true
     }
 
@@ -244,10 +340,12 @@ public actor DownloadManager {
             running[id] = nil
             abortReasons[id] = nil
             lastGrowthCheck[id] = nil
+            pausing.remove(id)
             pump()
         }
         guard let item = queue.first(where: { $0.id == id }), item.state == .queued else {
-            // Cancelled between being scheduled and starting: cancel() left the folder to this task.
+            // Cancelled between being scheduled and starting: cancel() left the folder to this task. A job paused
+            // meanwhile keeps it.
             if queue.first(where: { $0.id == id })?.state == .cancelled { removeStaging(id) }
             return
         }
@@ -260,6 +358,9 @@ public actor DownloadManager {
                 // The download already passed validation; the library refused it last time. Check it again
                 // (spec §5.4 step 5) rather than trusting the earlier run, then publish.
                 try setState(id, .validating)
+                #if DEBUG
+                    await validationHook?(id)
+                #endif
                 admitted = try await Self.admit(
                     staging.appending(path: staged), staging: staging, track: item.track,
                     maxBytes: configuration.maxFileBytes)
@@ -275,30 +376,35 @@ public actor DownloadManager {
                 let file = try await download(id, track: item.track, from: provider, into: staging)
                 watchdog.cancel()
                 try setState(id, .validating)
+                #if DEBUG
+                    await validationHook?(id)
+                #endif
                 admitted = try await Self.admit(
                     file, staging: staging, track: item.track, maxBytes: configuration.maxFileBytes)
             }
             try setStaged(id, admitted.lastPathComponent)
             // Past this point cancel() refuses, so the library never receives a file from a cancelled job.
             try setState(id, .saving)
-            let note: String?
+            let publication: Publication
             do {
-                note = try await publish(admitted, item.track)
+                publication = try await publish(admitted, item.track)
             } catch {
                 throw DownloadFailure("the library could not save it: \(error.localizedDescription)", retryable: true)
             }
             update(id) {
                 $0.stagedFileName = nil
-                $0.note = note
+                $0.note = publication.note
+                $0.publishedTrackID = publication.trackID
                 $0.state = .published
             }
             removeStaging(id)
         } catch is CancellationError {
             if let reason = abortReasons[id] {
                 fail(id, DownloadFailure(reason))
-            } else {
+            } else if !pausing.contains(id) {
                 removeStaging(id)
             }
+            // Paused: the staging folder and its partial file stay for the resume.
         } catch let failure as DownloadFailure {
             fail(id, failure)
         } catch {
@@ -486,6 +592,8 @@ public actor DownloadManager {
             removeStaging(id)
             return
         }
+        // A transfer stopped by `pause` that ended in an error of its own stays paused, its partial file kept.
+        if pausing.contains(id), abortReasons[id] == nil { return }
         Self.log.error("download failed: \(failure.message, privacy: .public)")
         queue[index].state = .failed(failure.message)
         // A validated file waiting for the library is kept for retry; anything else is discarded unless the
@@ -506,6 +614,13 @@ public actor DownloadManager {
     }
 
     private func unsubscribe(_ token: UUID) { subscribers[token] = nil }
+
+    #if DEBUG
+        /// For tests: `hook` is awaited each time a job starts validating.
+        func setValidationHook(_ hook: (@Sendable (String) async -> Void)?) {
+            validationHook = hook
+        }
+    #endif
 
     // MARK: Files
 
@@ -536,5 +651,19 @@ public actor DownloadManager {
         _ file: URL, staging: URL, track: RemoteTrack, maxBytes: Int64
     ) async throws(DownloadFailure) -> URL {
         try Admission.admit(file, staging: staging, track: track, maxBytes: maxBytes)
+    }
+}
+
+/// What the publish step did with a download, for the Downloads list.
+public struct Publication: Sendable, Equatable {
+    /// A short line for the row when the song went somewhere other than asked ("Saved in pointFlac (folder
+    /// unavailable)"), or nil for a plain "Done".
+    public var note: String?
+    /// The library track the song became, or nil when the library could not say. Lets the row delete the song.
+    public var trackID: String?
+
+    public init(note: String? = nil, trackID: String? = nil) {
+        self.note = note
+        self.trackID = trackID
     }
 }

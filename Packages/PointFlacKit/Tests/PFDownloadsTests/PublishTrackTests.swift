@@ -29,7 +29,7 @@ struct PublishTrackTests {
         let manager = Self.manager(folder) { file, track in
             seen.withLock { $0.append((file.lastPathComponent, track.artist, track.album)) }
             try FileManager.default.removeItem(at: file)
-            return nil
+            return Publication()
         }
         var track = fixtureTrack("s16-44100", fileName: "01 Fold.flac")
         track.artist = "Ada Vale"
@@ -53,7 +53,7 @@ struct PublishTrackTests {
         let stateFile = folder.url.appending(path: "queue.json")
         let manager = Self.manager(folder, stateFile: stateFile) { file, _ in
             try FileManager.default.removeItem(at: file)
-            return "Saved in pointFlac (folder unavailable)"
+            return Publication(note: "Saved in pointFlac (folder unavailable)")
         }
         await manager.restore()
         await manager.enqueue(fixtureTrack("s16-44100"))
@@ -62,7 +62,7 @@ struct PublishTrackTests {
         #expect(items.first?.state == .published)
         #expect(items.first?.note == "Saved in pointFlac (folder unavailable)")
 
-        let relaunched = Self.manager(folder, stateFile: stateFile) { _, _ in nil }
+        let relaunched = Self.manager(folder, stateFile: stateFile) { _, _ in Publication() }
         await relaunched.restore()
         let restored = await relaunched.items
         #expect(restored.first?.state == .published)

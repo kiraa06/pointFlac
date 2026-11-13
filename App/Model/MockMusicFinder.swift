@@ -13,6 +13,10 @@ import PFDownloads
     /// Given a publisher (DEBUG's `-PFDownloadFolder`), a finished demo download is real: a copy of a bundled demo song,
     /// Ada Vale's "Fold" from Paper Moons, goes through the app's own publish step, so a UI test can follow a real file
     /// into the chosen folder and onto the shelf. Without one, nothing is saved, as before.
+    ///
+    /// Demo downloads can be paused, resumed, cancelled and retried like real ones; a resumed one continues from the
+    /// step it reached. `-PFSlowDownloads` (DEBUG) stretches each step, so a UI test or a screenshot can catch a
+    /// download under way.
     @MainActor
     @Observable
     final class MockMusicFinder: MusicFinding {
@@ -20,11 +24,19 @@ import PFDownloads
         private(set) var downloads: [DownloadRow] = []
         @ObservationIgnored private let library: any LibraryBrowsing
         @ObservationIgnored private var transfers: [String: Task<Void, Never>] = [:]
+        /// The progress step each download reached, out of `steps`: where a resume continues.
+        @ObservationIgnored private var reached: [String: Int] = [:]
+        @ObservationIgnored private var rows: [String: RemoteResultRow] = [:]
         @ObservationIgnored private let publisher: DownloadPublisher?
+        /// How long each of the `steps` takes.
+        @ObservationIgnored private let stepTime: Duration
+        private static let steps = 20
 
         init(library: any LibraryBrowsing, publisher: DownloadPublisher? = nil) {
             self.library = library
             self.publisher = publisher
+            let slow = ProcessInfo.processInfo.arguments.contains("-PFSlowDownloads")
+            stepTime = slow ? .milliseconds(1500) : .milliseconds(220)
         }
 
         func search(_ query: String, provider: String) -> AsyncStream<[RemoteResultRow]> {
@@ -76,36 +88,91 @@ import PFDownloads
         }
 
         func download(_ row: RemoteResultRow) {
-            guard transfers[row.id] == nil else { return }
+            guard !downloads.contains(where: { $0.id == row.id }) else { return }
+            rows[row.id] = row
             downloads.insert(DownloadRow(id: row.id, title: row.title, state: "Queued", progress: nil), at: 0)
-            transfers[row.id] = Task { [weak self] in
+            start(row.id)
+        }
+
+        /// Runs the demo transfer of `id` from the step it reached, then validates and saves it.
+        private func start(_ id: String) {
+            transfers[id]?.cancel()
+            let first = reached[id] ?? 0
+            let stepTime = stepTime
+            transfers[id] = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(400))
-                for step in 0...20 {
+                for step in first...Self.steps {
                     guard !Task.isCancelled else { return }
-                    self?.set(row, "Downloading", Double(step) / 20)
-                    try? await Task.sleep(for: .milliseconds(220))
+                    self?.reached[id] = step
+                    self?.set(id, "Downloading", Double(step) / Double(Self.steps))
+                    try? await Task.sleep(for: stepTime)
                 }
-                self?.set(row, "Validating", nil)
+                guard !Task.isCancelled else { return }
+                self?.set(id, "Validating", nil)
                 try? await Task.sleep(for: .milliseconds(500))
-                self?.set(row, "Saving", nil)
+                self?.set(id, "Saving", nil)
                 try? await Task.sleep(for: .milliseconds(300))
-                guard let publisher = self?.publisher else {
-                    self?.set(row, "Done (demo, nothing saved)", nil)
+                guard let self, let row = self.rows[id] else { return }
+                guard let publisher = self.publisher else {
+                    self.set(id, "Done (demo, nothing saved)", nil)
                     return
                 }
                 do {
-                    let note = try await Self.publishDemoSong(for: row, through: publisher)
-                    self?.set(row, "Done", nil, note: note)
+                    let published = try await Self.publishDemoSong(for: row, through: publisher)
+                    self.set(id, "Done", nil, note: published.note, trackID: published.trackID)
                 } catch {
-                    self?.set(row, "Failed: \(error.localizedDescription)", nil)
+                    self.set(id, "Failed: \(error.localizedDescription)", nil)
                 }
             }
+        }
+
+        func pauseDownload(_ id: DownloadRow.ID) {
+            guard let row = downloads.first(where: { $0.id == id }), row.phase == .transferring else { return }
+            transfers[id]?.cancel()
+            transfers[id] = nil
+            let step = reached[id] ?? 0
+            set(id, step == 0 ? "Paused" : "Paused · \(step * 100 / Self.steps)%", nil)
+        }
+
+        func resumeDownload(_ id: DownloadRow.ID) {
+            guard downloads.first(where: { $0.id == id })?.phase == .paused else { return }
+            set(id, "Queued", nil)
+            start(id)
+        }
+
+        func cancelDownload(_ id: DownloadRow.ID) {
+            guard let phase = downloads.first(where: { $0.id == id })?.phase,
+                phase == .transferring || phase == .paused
+            else { return }
+            transfers[id]?.cancel()
+            transfers[id] = nil
+            reached[id] = nil
+            set(id, "Cancelled", nil)
+        }
+
+        func retryDownload(_ id: DownloadRow.ID) {
+            guard downloads.first(where: { $0.id == id })?.phase == .stopped else { return }
+            reached[id] = nil
+            set(id, "Queued", nil)
+            start(id)
+        }
+
+        func pauseAllDownloads() {
+            for row in downloads where row.phase == .transferring { pauseDownload(row.id) }
+        }
+
+        func resumeAllDownloads() {
+            for row in downloads where row.phase == .paused { resumeDownload(row.id) }
+        }
+
+        func cancelAllDownloads() {
+            for row in downloads { cancelDownload(row.id) }
         }
 
         /// Stages a copy of the bundled "Fold" as a provider would leave a validated download, and publishes it with
         /// the demo song's own artist and album, so the folder it is filed in matches the album the shelf shows.
         private static func publishDemoSong(for row: RemoteResultRow, through publisher: DownloadPublisher)
-            async throws -> String?
+            async throws -> Publication
         {
             guard
                 let fixture = Bundle.main.url(
@@ -126,25 +193,26 @@ import PFDownloads
 
         /// Only finished rows go, as with the real manager; the demo's row can then be downloaded again.
         func removeDownload(_ id: DownloadRow.ID) {
-            guard let row = downloads.first(where: { $0.id == id }), Self.isFinal(row.state) else { return }
+            guard let row = downloads.first(where: { $0.id == id }), row.phase == .done || row.phase == .stopped
+            else { return }
             downloads.removeAll { $0.id == id }
             transfers[id] = nil
+            reached[id] = nil
         }
 
         func clearDownloads(finished: Bool, failed: Bool) {
             for row in downloads {
-                let done = row.state.hasPrefix("Done")
-                if (finished && done) || (failed && !done && Self.isFinal(row.state)) { removeDownload(row.id) }
+                if (finished && row.phase == .done) || (failed && row.phase == .stopped) { removeDownload(row.id) }
             }
         }
 
-        private static func isFinal(_ state: String) -> Bool {
-            state.hasPrefix("Done") || state.hasPrefix("Failed") || state.hasPrefix("Cancelled")
-        }
-
-        private func set(_ row: RemoteResultRow, _ state: String, _ progress: Double?, note: String? = nil) {
-            guard let index = downloads.firstIndex(where: { $0.id == row.id }) else { return }
-            downloads[index] = DownloadRow(id: row.id, title: row.title, state: state, progress: progress, note: note)
+        private func set(
+            _ id: String, _ state: String, _ progress: Double?, note: String? = nil, trackID: String? = nil
+        ) {
+            guard let index = downloads.firstIndex(where: { $0.id == id }) else { return }
+            let title = downloads[index].title
+            downloads[index] = DownloadRow(
+                id: id, title: title, state: state, progress: progress, note: note, trackID: trackID)
         }
 
         private func localSuggestions(_ partial: String) -> [Suggestion] {

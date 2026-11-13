@@ -55,7 +55,22 @@ final class DownloadFolderStore: Sendable {
     /// cooperative pool or the main actor.
     private static let queue = DispatchQueue(label: "io.github.kiraa06.pointflac.download-folder", qos: .utility)
 
+    /// The download folder as last resolved: where it is, and its path as `FolderLocation` compares paths, worked out
+    /// once when it resolved, so a delete dialog on the main actor never resolves it again.
+    struct ResolvedFolder: Sendable {
+        let url: URL
+        let comparablePath: String
+
+        init(_ url: URL) {
+            self.url = url
+            comparablePath = FolderLocation.comparablePath(url)
+        }
+    }
+
     private let state: Mutex<Choice?>
+    /// The chosen folder as `open` last resolved it (DEBUG's plain folder from the start), with the choice it belongs
+    /// to.
+    private let resolved = Mutex<(id: UUID, folder: ResolvedFolder)?>(nil)
     /// Where the choice is saved; nil keeps it for this launch only (DEBUG's `-PFDownloadFolder`).
     private let file: URL?
 
@@ -71,11 +86,26 @@ final class DownloadFolderStore: Sendable {
         init(debugPath: String) {
             file = nil
             let url = URL(filePath: debugPath, directoryHint: .isDirectory)
-            state = Mutex(Choice(bookmark: nil, path: url.path, name: url.lastPathComponent))
+            let choice = Choice(bookmark: nil, path: url.path, name: url.lastPathComponent)
+            state = Mutex(choice)
+            resolved.withLock { $0 = (choice.id, ResolvedFolder(url)) }
         }
     #endif
 
     var choice: Choice? { state.withLock { $0 } }
+
+    /// The chosen folder as last resolved this launch (DEBUG's plain folder at once): deleting a song whose file is
+    /// inside it moves the file to Recently Deleted. Read without blocking or touching the file system, so a delete
+    /// dialog can count on it. Nil (its songs then only leave pointFlac, their files staying) when no folder is chosen,
+    /// when it has not been resolved yet, when it is known unavailable (it can't be reached, so neither can a trash),
+    /// or when the folder is itself in a trash, where its files already are.
+    var downloadFolder: ResolvedFolder? {
+        guard let choice, !choice.unavailable else { return nil }
+        guard let folder = resolved.withLock({ $0?.id == choice.id ? $0?.folder : nil }),
+            !FolderLocation.isInTrash(folder.url)
+        else { return nil }
+        return folder
+    }
 
     /// Where the publish step sends the next download.
     var target: DownloadTarget {
@@ -129,6 +159,8 @@ final class DownloadFolderStore: Sendable {
             throw .unreachable("the folder can't be found")
         }
         guard !FolderLocation.isInTrash(url) else { throw .unreachable("the folder is in the trash") }
+        let folder = ResolvedFolder(url)
+        resolved.withLock { $0 = (choice.id, folder) }
         // False when the URL needs no scope; a folder that does need one and refuses fails at the copy instead.
         let scoped = url.startAccessingSecurityScopedResource()
         if stale, let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
@@ -174,8 +206,9 @@ final class DownloadFolderStore: Sendable {
 
 /// Settings' view of where downloads go: "In pointFlac" (the default), the folder the user picked in Files, or that
 /// folder while it can't be reached. Picking a folder adds it to the library as a folder read in place, so the songs
-/// already in it appear on the shelf, and the delete rules for such folders apply to them: deleting removes a song
-/// from pointFlac, never the file.
+/// already in it appear on the shelf. Deleting one of them (on the shelf, or Delete Song in Downloads) moves its file
+/// to Recently Deleted, where it can be restored for 30 days; should that fail, or the folder be unavailable, the song
+/// only leaves pointFlac and the file stays. Songs in any other folder read in place only ever leave pointFlac.
 @MainActor
 @Observable
 final class DownloadFolder {
@@ -290,6 +323,8 @@ final class DownloadFolder {
             try await addToLibrary(url)
             try store.choose(.init(bookmark: bookmark, path: nil, name: name))
             DownloadFolderStore.log.info("download folder chosen")
+            // Resolves the new choice at once, so deleting a song already in it moves the file to Recently Deleted.
+            await recheck()
         } catch LibraryError.overlappingFolder {
             pickError = "pointFlac already reads a folder inside “\(name)”. Choose that folder, or another one."
         } catch {

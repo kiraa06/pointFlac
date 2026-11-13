@@ -30,12 +30,16 @@ final class DownloadFolderUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts.matching(footer).firstMatch.exists)
     }
 
-    /// A download lands at <Artist>/<Album>/ in the chosen folder, the shelf shows its album, and deleting it from
-    /// pointFlac says the file stays, and leaves it there.
+    /// A download lands at <Artist>/<Album>/ in the chosen folder, the shelf shows its album, and deleting the album
+    /// from the shelf says its file moves to Recently Deleted, and moves it out of the folder. The simulator has no
+    /// Recently Deleted (its volumes have no trash), so `-PFTrashFolder` stands in for it.
     @MainActor
     func testDownloadsGoToTheChosenFolder() throws {
         let folder = try makeFolder()
-        let app = XCUIApplication.pointFlac(["-PFMockFinder", "-PFFreshLibrary", "-PFDownloadFolder", folder.path])
+        let bin = try makeFolder()
+        let app = XCUIApplication.pointFlac([
+            "-PFMockFinder", "-PFFreshLibrary", "-PFDownloadFolder", folder.path, "-PFTrashFolder", bin.path,
+        ])
         app.launch()
 
         let link = openDownloadsSetting(app)
@@ -53,14 +57,18 @@ final class DownloadFolderUITests: XCTestCase {
         let delete = app.buttons["Delete Album…"]
         XCTAssertTrue(delete.waitForExistence(timeout: 3))
         delete.tap()
-        // The folder is read in place: the song leaves pointFlac, and its file stays.
-        let remove = app.buttons["Remove"]
-        XCTAssertTrue(remove.waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["Removes 1 song from pointFlac. The file stays in its folder."].exists)
-        remove.tap()
+        // The song is in the download folder: its file goes to Recently Deleted, where it can be restored.
+        let confirm = app.buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            app.staticTexts[
+                "Moves 1 song to Recently Deleted in Files. You can restore it there for 30 days."
+            ].exists)
+        confirm.tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: album)
         waitForExpectations(timeout: 5)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: saved.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: saved.path), "the file is still in the folder")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bin.appending(path: "01 Fold.flac").path))
     }
 
     /// The folder disappears after launch: the download still finishes, in the app, its row says so, and Settings

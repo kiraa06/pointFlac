@@ -7,7 +7,12 @@ import Testing
 /// Kiran lost every download when the app was deleted, so a download can go to a folder he picked in Files instead.
 /// `DownloadDestination` is the copy into that folder: a plain temporary directory stands in for it here, since the
 /// type knows nothing of bookmarks or security scope.
-@Suite("DownloadDestination")
+///
+/// Serialized, as the app is: it saves one download at a time on `DownloadFolderStore`'s own queue. Each save blocks
+/// its thread until the coordinated write is granted, and the grant comes on another thread. Run in parallel, the
+/// suite's twenty saves filled the simulator's cooperative pool, so no grant could run and every save waited out its
+/// 120 s timeout.
+@Suite("DownloadDestination", .serialized)
 struct DownloadDestinationTests {
     /// A validated download waiting in staging, as `Admission` leaves it: a real FLAC under its sanitised name.
     static func staged(_ folder: TempFolder, fixture: String = "s16-44100", name: String = "01 Fold.flac") throws
@@ -285,34 +290,39 @@ struct DownloadDestinationTests {
     }
 
     @Test("a file provider that holds the name too long fails this download only, and writes nothing")
-    func coordinationTimesOut() throws {
+    func coordinationTimesOut() async throws {
         let folder = try TempFolder()
         let root = try Self.picked(folder)
         let album = root.appending(path: "Ada Vale/Paper Moons")
         try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
         let target = album.appending(path: "01 Fold.flac")
         let staged = try Self.staged(folder)
-        // Another writer holds the name, as a provider busy with it would.
-        let holding = DispatchSemaphore(value: 0)
-        let released = DispatchSemaphore(value: 0)
+        // Another writer holds the name, as a provider busy with it would, on a thread of its own until the save has
+        // given up: a fixed hold could end first on a loaded machine, and the save would then succeed. (Thirty seconds
+        // at most, so a save that never gives up fails the test rather than hangs it.) The test awaits the gates
+        // rather than blocking on semaphores, so its cooperative-pool thread is free meanwhile.
+        let holding = Gate()
+        let released = Gate()
+        let letGo = DispatchSemaphore(value: 0)
         let holder = Thread {
             NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: target, options: [], error: nil) { _ in
-                holding.signal()
-                Thread.sleep(forTimeInterval: 1.5)
+                Task { await holding.open() }
+                _ = letGo.wait(timeout: .now() + 30)
             }
-            released.signal()
+            Task { await released.open() }
         }
         holder.start()
-        holding.wait()
+        await holding.wait()
 
         let failure = Self.failure {
             _ = try DownloadDestination(coordinationTimeout: .milliseconds(200)).save(
                 staged, track: Self.track(), into: root)
         }
+        letGo.signal()
 
         #expect(failure?.folderUnreachable == false)
         #expect(!FileManager.default.fileExists(atPath: target.path))
-        released.wait()
+        await released.wait()
         #expect(!FileManager.default.fileExists(atPath: target.path))
     }
 

@@ -22,6 +22,8 @@ import os
 /// - Downloads go through one `DownloadManager`, whose publish step (`DownloadPublisher`) puts the validated file in
 ///   the folder the user picked for downloads, or in the app's library, and then deletes the staged copy, so a
 ///   finished download is moved, not duplicated.
+/// - Every Download and every row or bulk action (pause, resume, cancel, retry, remove) goes to the manager through
+///   one serial channel, in the order tapped: a quick Pause then Resume never reaches it the other way round.
 @MainActor
 @Observable
 final class RealMusicFinder: MusicFinding {
@@ -34,6 +36,8 @@ final class RealMusicFinder: MusicFinding {
     @ObservationIgnored private let archive: ArchiveProvider
     @ObservationIgnored let manager: DownloadManager
     @ObservationIgnored private let observer: DownloadsObserver
+    /// The serial channel to the manager (`Command`), drained in order by one task.
+    @ObservationIgnored private let commands: AsyncStream<Command>.Continuation
     @ObservationIgnored private var smartSearch: SmartSearch
     @ObservationIgnored private var registryEnabled: Bool
     @ObservationIgnored private var artworkEnabled: Bool
@@ -65,6 +69,7 @@ final class RealMusicFinder: MusicFinding {
             smartSearch = Self.makeSmartSearch(library.box, registry: registryEnabled, artwork: artworkEnabled)
             manager = Self.makeManager(providers: [archive, soulseek], publisher: publisher)
             observer = DownloadsObserver(manager: manager)
+            commands = Self.startCommands(for: manager)
         }
     #else
         init(library: RealLibrary, publisher: DownloadPublisher, registryEnabled: Bool, artworkEnabled: Bool) {
@@ -77,6 +82,7 @@ final class RealMusicFinder: MusicFinding {
             smartSearch = Self.makeSmartSearch(library.box, registry: registryEnabled, artwork: artworkEnabled)
             manager = Self.makeManager(providers: [archive], publisher: publisher)
             observer = DownloadsObserver(manager: manager)
+            commands = Self.startCommands(for: manager)
         }
     #endif
 
@@ -102,9 +108,10 @@ final class RealMusicFinder: MusicFinding {
         return observer.items.reversed().compactMap { item in
             let id = Self.rowID(item.track)
             guard seen.insert(id).inserted else { return nil }
+            let published = item.state == .published
             return DownloadRow(
                 id: id, title: item.track.title, state: Self.label(item.state), progress: Self.progress(item.state),
-                note: item.state == .published ? item.note : nil)
+                note: published ? item.note : nil, trackID: published ? item.publishedTrackID : nil)
         }
     }
 
@@ -115,23 +122,24 @@ final class RealMusicFinder: MusicFinding {
         }
         Self.log.info(
             "Download pressed: \(tracks.count, privacy: .public) track(s) (\(row.provider, privacy: .public))")
-        let manager = manager
-        Task {
-            for track in tracks { await manager.enqueue(track) }
-        }
+        commands.yield(.enqueue(tracks))
     }
 
-    func cancelDownload(_ id: DownloadRow.ID) {
-        guard let job = latestJob(for: id) else { return }
-        let manager = manager
-        Task { _ = await manager.cancel(job) }
-    }
+    func cancelDownload(_ id: DownloadRow.ID) { commands.yield(.cancel(row: id)) }
 
-    func retryDownload(_ id: DownloadRow.ID) {
-        guard let job = latestJob(for: id) else { return }
-        let manager = manager
-        Task { _ = await manager.retry(job) }
-    }
+    func retryDownload(_ id: DownloadRow.ID) { commands.yield(.retry(row: id)) }
+
+    /// The manager refuses a job already validating or saving: too late to pause, it is moments from the library.
+    func pauseDownload(_ id: DownloadRow.ID) { commands.yield(.pause(row: id)) }
+
+    func resumeDownload(_ id: DownloadRow.ID) { commands.yield(.resume(row: id)) }
+
+    func pauseAllDownloads() { commands.yield(.pauseAll) }
+
+    func resumeAllDownloads() { commands.yield(.resumeAll) }
+
+    /// Every job still under way or paused; one already saving finishes, so no song the library has taken is lost.
+    func cancelAllDownloads() { commands.yield(.cancelAll) }
 
     /// A row stands for every job of its track, so every finished one goes with it: an older job left behind would
     /// surface as the row again. Jobs still running are the manager's to keep; it refuses to remove them.
@@ -153,7 +161,7 @@ final class RealMusicFinder: MusicFinding {
                     switch state {
                     case .published: finished
                     case .failed, .cancelled: failed
-                    case .queued, .downloading, .waiting, .validating, .saving: false
+                    case .queued, .downloading, .waiting, .validating, .saving, .paused: false
                     }
                 return cleared ? row : nil
             })
@@ -165,15 +173,58 @@ final class RealMusicFinder: MusicFinding {
     private func removeJobs(where include: (DownloadItem) -> Bool) {
         let jobs = observer.items.filter { $0.state.isFinal && include($0) }.map(\.id)
         guard !jobs.isEmpty else { return }
-        let manager = manager
-        Task {
-            for job in jobs { await manager.remove(job) }
-        }
+        commands.yield(.remove(jobs: jobs))
     }
 
-    /// The manager's job behind a Downloads row: the newest for that track, as `downloads` shows.
-    private func latestJob(for rowID: DownloadRow.ID) -> String? {
-        observer.items.last { Self.rowID($0.track) == rowID }?.id
+    /// What the UI asks of the manager. A row's action names the row, and its job is looked up when the command runs,
+    /// so it acts on the job the commands before it left (a Pause right after a Download finds the new job).
+    enum Command: Sendable {
+        case enqueue([RemoteTrack])
+        case pause(row: DownloadRow.ID)
+        case resume(row: DownloadRow.ID)
+        case cancel(row: DownloadRow.ID)
+        case retry(row: DownloadRow.ID)
+        case remove(jobs: [String])
+        case pauseAll
+        case resumeAll
+        case cancelAll
+    }
+
+    /// The channel's one reader: each command runs to its end on the manager before the next starts. It lives as long
+    /// as the finder, which lives as long as the app.
+    private static func startCommands(for manager: DownloadManager) -> AsyncStream<Command>.Continuation {
+        let (stream, continuation) = AsyncStream.makeStream(of: Command.self)
+        Task {
+            for await command in stream { await run(command, on: manager) }
+        }
+        return continuation
+    }
+
+    nonisolated private static func run(_ command: Command, on manager: DownloadManager) async {
+        /// The newest job of a row's track, as `downloads` shows it.
+        func job(_ row: DownloadRow.ID) async -> String? {
+            await manager.items.last { rowID($0.track) == row }?.id
+        }
+        switch command {
+        case .enqueue(let tracks):
+            for track in tracks { await manager.enqueue(track) }
+        case .pause(let row):
+            if let job = await job(row) { await manager.pause(job) }
+        case .resume(let row):
+            if let job = await job(row) { await manager.resume(job) }
+        case .cancel(let row):
+            if let job = await job(row) { await manager.cancel(job) }
+        case .retry(let row):
+            if let job = await job(row) { await manager.retry(job) }
+        case .remove(let jobs):
+            for job in jobs { await manager.remove(job) }
+        case .pauseAll:
+            await manager.pauseAll()
+        case .resumeAll:
+            await manager.resumeAll()
+        case .cancelAll:
+            await manager.cancelAll()
+        }
     }
 
     /// The UI's words for each state (contract 2): "Queued", "Downloading", "Validating", "Saving", "Done", "Failed: …".
@@ -184,22 +235,25 @@ final class RealMusicFinder: MusicFinding {
         case .waiting: "Waiting for peer"
         case .validating: "Validating"
         case .saving: "Saving"
+        // As the manager words it: "Paused", or "Paused · 42%" with the progress so far.
+        case .paused: state.label
         case .published: "Done"
         case .failed(let reason): "Failed: \(reason)"
         case .cancelled: "Cancelled"
         }
     }
 
-    /// Non-nil exactly while the job is under way, so the progress bar and the tab badge track live transfers only.
+    /// Non-nil exactly while the job is under way, so the progress bar and the tab badge track live transfers only. A
+    /// paused job is not under way: its label carries how far it got.
     static func progress(_ state: DownloadState) -> Double? {
         switch state {
         case .downloading(let progress): progress ?? 0
         case .validating, .saving: 1
-        case .queued, .waiting, .published, .failed, .cancelled: nil
+        case .queued, .waiting, .paused, .published, .failed, .cancelled: nil
         }
     }
 
-    static func rowID(_ track: RemoteTrack) -> String { "\(track.provider)|\(track.id)" }
+    nonisolated static func rowID(_ track: RemoteTrack) -> String { "\(track.provider)|\(track.id)" }
 
     // MARK: Suggestions
 

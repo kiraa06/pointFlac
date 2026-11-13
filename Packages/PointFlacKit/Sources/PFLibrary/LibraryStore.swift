@@ -874,41 +874,64 @@ final class LibraryStore {
     ///   then each folder the deletion left empty, up to but never including the library folder. A file already gone
     ///   (deleted in the Files app) only loses its row. A file that cannot be deleted keeps its track, so the library
     ///   never hides a file that still takes space.
+    /// - Inside `trashing`'s folder (the folder picked for downloads) the user asked for the file to go, so it moves to
+    ///   Recently Deleted, from where they can restore it; then its row goes. No `removed` entry is made, so a restored
+    ///   file comes back with the next scan. Only a file (or a link) is ever handed to the trash, never a folder that
+    ///   took its name. Should the move fail or time out, the file stays, and the track is treated as below.
     /// - In a folder added in place the file is the user's, and pointFlac never deletes it. Only the row goes, and the
     ///   file is remembered in `removed` with the size and date the library last read, so a rescan skips it until it
     ///   changes.
     ///
-    /// Covers no track uses any more go too, rows and files, as after a scan. Files are deleted inside the database
-    /// transaction; should it roll back, the rows of files already deleted stay until a scan finds them gone, which
-    /// `Library.remove` runs at once. Only the transaction throws: once it commits, the removal is reported.
-    func remove(trackIDs ids: [String]) throws -> LibraryRemoval {
+    /// The moves to Recently Deleted come first, outside any transaction: a file provider may take its time (up to
+    /// `trashing.timeout`), and the library's write lock must not wait on it. The library's queue runs one operation
+    /// at a time, so the rows read before the moves are still the rows when the transaction writes what became of
+    /// each. The app's own files are deleted inside that transaction, as before. Should it roll back, the rows of files
+    /// already gone stay until a scan finds them gone, which `Library.remove` runs at once. Covers no track uses any
+    /// more go too, rows and files, as after a scan. Only the transaction throws: once it commits, the removal is
+    /// reported.
+    func remove(trackIDs ids: [String], trashing: TrashFolder? = nil) throws -> LibraryRemoval {
+        var rows: [RemovalRow] = []
+        for id in Set(ids).sorted() {
+            guard
+                let row = try database.query(
+                    "SELECT folder_id, rel_path, size, mtime FROM tracks WHERE id = ?", [.text(id)]
+                ).first,
+                let folder = row[0].int, let path = row[1].string, let size = row[2].int,
+                let modified = row[3].double
+            else { continue }
+            rows.append(RemovalRow(id: id, folder: folder, path: path, size: size, modified: modified))
+        }
+        // Track ID → whether its file left the download folder (true) or stays (false).
+        let moved = trashing.map { moveToTrash(rows, $0) } ?? [:]
         var removal = LibraryRemoval(deletedFiles: 0, removedFromLibrary: 0)
         var emptied: Set<URL> = []
         var kept = 0
         try database.transaction {
-            for id in Set(ids).sorted() {
-                guard
-                    let row = try database.query(
-                        "SELECT folder_id, rel_path, size, mtime FROM tracks WHERE id = ?", [.text(id)]
-                    ).first,
-                    let folder = row[0].int, let path = row[1].string, let size = row[2].int,
-                    let modified = row[3].double
-                else { continue }
-                if folder == Self.libraryFolderID {
-                    guard let root = roots[folder], let file = Self.ownFile(path, in: root), Self.deleteOwnFile(file)
+            for row in rows {
+                if row.folder == Self.libraryFolderID {
+                    guard let root = roots[row.folder], let file = Self.ownFile(row.path, in: root),
+                        Self.deleteOwnFile(file)
                     else {
                         kept += 1
                         continue
                     }
-                    try delete(id)
+                    try delete(row.id)
                     removal.deletedFiles += 1
                     emptied.insert(file.deletingLastPathComponent())
+                } else if moved[row.id] == true {
+                    // Restored from Recently Deleted, the file must come back with the next scan.
+                    try database.query(
+                        "DELETE FROM removed WHERE folder_id = ? AND rel_path = ?",
+                        [.integer(row.folder), .text(row.path)])
+                    try delete(row.id)
+                    removal.trashedFiles += 1
                 } else {
                     try database.query(
                         "INSERT OR REPLACE INTO removed(folder_id, rel_path, size, mtime) VALUES (?, ?, ?, ?)",
-                        [.integer(folder), .text(path), .integer(size), .real(modified)])
-                    try delete(id)
+                        [.integer(row.folder), .text(row.path), .integer(row.size), .real(row.modified)])
+                    try delete(row.id)
                     removal.removedFromLibrary += 1
+                    if moved[row.id] == false { removal.trashFailures += 1 }
                 }
             }
             if let fault = removalFault {
@@ -931,7 +954,145 @@ final class LibraryStore {
         if kept > 0 {
             Library.logger.error("Remove: \(kept, privacy: .public) file(s) could not be deleted; their tracks stay")
         }
+        if removal.trashFailures > 0 {
+            Library.logger.error(
+                "Remove: \(removal.trashFailures, privacy: .public) file(s) could not move to Recently Deleted; kept")
+        }
         return removal
+    }
+
+    /// A track to remove, as the database had it.
+    private struct RemovalRow {
+        var id: String
+        var folder: Int64
+        var path: String
+        var size: Int64
+        var modified: Double
+    }
+
+    /// Moves the files of `rows` that lie inside `trashing`'s folder to Recently Deleted, with the folder's security
+    /// scope open around the moves, and says for each such track whether its file left the folder. Tracks elsewhere
+    /// are not in the result.
+    ///
+    /// Once one move times out, the provider is taken to be stalled: the files after it are not tried, and stay, so a
+    /// removal costs one timeout at most, not one per song.
+    private func moveToTrash(_ rows: [RemovalRow], _ trashing: TrashFolder) -> [String: Bool] {
+        let container = Self.comparablePath(trashing.folder)
+        // False when the URL needs no scope.
+        let scoped = trashing.folder.startAccessingSecurityScopedResource()
+        defer {
+            if scoped { trashing.folder.stopAccessingSecurityScopedResource() }
+        }
+        var moved: [String: Bool] = [:]
+        var stalled = false
+        for row in rows where row.folder != Self.libraryFolderID {
+            guard let root = roots[row.folder], let file = Self.trashable(row.path, in: root, under: container)
+            else { continue }
+            guard !stalled else {
+                moved[row.id] = false
+                continue
+            }
+            switch Self.moveToTrash(file, trashing) {
+            case .moved: moved[row.id] = true
+            case .kept: moved[row.id] = false
+            case .timedOut:
+                moved[row.id] = false
+                stalled = true
+            }
+        }
+        if stalled {
+            Library.logger.error("Remove: the file provider did not answer; the rest of the removal kept its files")
+        }
+        return moved
+    }
+
+    /// What became of one file handed to the trash.
+    private enum TrashOutcome {
+        /// It left the folder: moved to Recently Deleted, or already gone.
+        case moved
+        /// It is still there, or can't be told to be gone.
+        case kept
+        /// Kept, because the file's provider did not grant the move in time.
+        case timedOut
+    }
+
+    /// The file at `relativePath` in a folder read in place, when it lies inside the folder whose comparable path is
+    /// `container`; nil otherwise. As with `ownFile`, the last component is left unresolved, so a link is judged by
+    /// where it sits.
+    private static func trashable(_ relativePath: String, in root: URL, under container: String) -> URL? {
+        let file = root.appending(path: relativePath)
+        let name = file.lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..",
+            comparablePath(file.deletingLastPathComponent()).hasPrefix(container)
+        else { return nil }
+        return file
+    }
+
+    /// Moves a file of the download folder to Recently Deleted. Moved when it is gone from the folder afterwards,
+    /// moved now or already gone; kept when it is still there or can't be told: the move failed or timed out, something
+    /// other than a file or a link (a folder that took its name) is there, which is never handed to the trash, or the
+    /// download folder itself is gone (moved, its volume ejected), so the file may come back with it.
+    ///
+    /// A file iCloud evicted may be there only as its placeholder, ".Name.flac.icloud", beside where it was. The
+    /// placeholder is what goes to Recently Deleted then, as the file would: otherwise the next scan would download the
+    /// song back. Only a placeholder that is a plain file is moved.
+    private static func moveToTrash(_ url: URL, _ trashing: TrashFolder) -> TrashOutcome {
+        switch itemType(url) {
+        case .present(let type):
+            guard type == .typeRegular || type == .typeSymbolicLink else { return .kept }
+            return move(url, trashing)
+        case .unreadable:
+            return .kept
+        case .absent:
+            break
+        }
+        let placeholder = url.deletingLastPathComponent().appending(path: ".\(url.lastPathComponent).icloud")
+        switch itemType(placeholder) {
+        case .present(let type):
+            return type == .typeRegular ? move(placeholder, trashing) : .kept
+        case .unreadable:
+            return .kept
+        case .absent:
+            var folder: ObjCBool = false
+            let present = FileManager.default.fileExists(atPath: trashing.folder.path, isDirectory: &folder)
+            return present && folder.boolValue ? .moved : .kept
+        }
+    }
+
+    /// One item handed to the trash under the coordinated write, then checked gone.
+    private static func move(_ item: URL, _ trashing: TrashFolder) -> TrashOutcome {
+        do {
+            _ = try trashing.moveToRecentlyDeleted(item)
+        } catch {
+            // The kind of failure only, never the name: a provider without a trash is Cocoa error 3328.
+            let failure = error as NSError
+            Library.logger.error(
+                "Remove: the move to Recently Deleted failed (\(failure.domain, privacy: .public) \(failure.code, privacy: .public))"
+            )
+            if case TrashFolder.Failure.timedOut = error { return .timedOut }
+            return .kept
+        }
+        // A provider that reported success but left the item has not moved it.
+        return itemType(item) == .absent ? .moved : .kept
+    }
+
+    /// What is at `url`, without following a final link.
+    private enum ItemType: Equatable {
+        case present(FileAttributeType)
+        case absent
+        /// Something that could not be looked at (no permission, an unreachable volume).
+        case unreadable
+    }
+
+    private static func itemType(_ url: URL) -> ItemType {
+        do {
+            let type = try FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+            return .present(type ?? .typeUnknown)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            return .absent
+        } catch {
+            return .unreadable
+        }
     }
 
     /// The library folder's file at `relativePath`, or nil when that path would lead out of the library folder: only

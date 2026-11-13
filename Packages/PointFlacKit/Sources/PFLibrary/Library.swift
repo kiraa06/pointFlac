@@ -12,6 +12,9 @@ public struct LibraryImportResult: Sendable {
     public var rejected: [ImportRejection]
     /// Files skipped because the library already has them.
     public var duplicates: Int
+    /// The library tracks those duplicates matched, in the order picked: what a download the library already had
+    /// became. One the library can't name (not read yet, say) is left out.
+    public var existing: [String] = []
     /// Set when the files were copied in but could not all be recorded (a database error): they are in the library
     /// folder, and the next rescan picks them up.
     public var error: String?
@@ -115,22 +118,25 @@ public final class Library: Sendable {
 
     /// Copies picked files into the library folder through the admission rule (`ImportInbox`), then reads them in.
     public func importFiles(_ urls: [URL]) async -> LibraryImportResult {
-        let result = await inbox.importFiles(urls)
+        let result = await inbox.importReporting(urls)
         let names = result.added.map(\.id)
+        let existing = result.existing
         var outcome = LibraryImportResult(
             added: [], rejected: result.rejected,
             duplicates: urls.count - result.added.count - result.rejected.count)
         do {
-            let (report, added) = try await run(.ifChanged) { store in
+            let scan = try await run(.ifChanged) { store in
                 var report = ScanReport()
                 try store.scan(folder: LibraryStore.libraryFolderID, into: &report)
                 // In the library folder a file's path relative to it is its name.
-                let ids = try names.compactMap {
-                    try store.trackID(folder: LibraryStore.libraryFolderID, relativePath: $0)
+                let ids = { (names: [String]) in
+                    try names.compactMap { try store.trackID(folder: LibraryStore.libraryFolderID, relativePath: $0) }
                 }
-                return ImportScan(report: report, added: ids)
-            }.pair
-            outcome.added = added
+                return ImportScan(report: report, added: try ids(names), existing: try ids(existing))
+            }
+            let report = scan.report
+            outcome.added = scan.added
+            outcome.existing = scan.existing
             if !report.errors.isEmpty { outcome.error = report.errors.joined(separator: "; ") }
         } catch {
             outcome.error = String(describing: error)
@@ -205,15 +211,17 @@ public final class Library: Sendable {
 
     /// Takes tracks out of the library at the user's request (Delete Album, Delete Song), and publishes the new
     /// catalog before returning. A track in the app's own library folder is deleted from the device, with any folder
-    /// that leaves empty below the library folder. A track in a folder added in place only leaves the library: its
-    /// file is the user's and is never touched, and rescans leave it out until it changes. Covers no track uses any
-    /// more are deleted. Unknown IDs are ignored.
+    /// that leaves empty below the library folder. A track whose file is inside `trashing`'s folder (the folder the
+    /// user picked for downloads) has its file moved to Recently Deleted, where the user can restore it; should that
+    /// fail, the file stays and the track is treated as below. A track in any other folder added in place only leaves
+    /// the library: its file is the user's and is never touched, and rescans leave it out until it changes. Covers no
+    /// track uses any more are deleted. Unknown IDs are ignored.
     ///
     /// Should it fail, the database rolls back but a file already deleted stays deleted, so the library rescans
     /// before throwing: its catalog, and the shelf, never list a file that is gone.
-    public func remove(trackIDs: [String]) async throws -> LibraryRemoval {
+    public func remove(trackIDs: [String], trashing: TrashFolder? = nil) async throws -> LibraryRemoval {
         do {
-            return try await run(.ifChanged) { try $0.remove(trackIDs: trackIDs) }
+            return try await run(.ifChanged) { try $0.remove(trackIDs: trackIDs, trashing: trashing) }
         } catch {
             Self.log(error, during: "remove")
             await rescan()
@@ -387,20 +395,121 @@ extension AdmitScan: ChangeReporting {
 private struct ImportScan: Sendable, ChangeReporting {
     var report: ScanReport
     var added: [String]
+    var existing: [String]
     var changedLibrary: Bool { !report.changedNothing }
-    var pair: (ScanReport, [String]) { (report, added) }
 }
 
-/// What removing tracks did (`Library.remove(trackIDs:)`).
+/// What removing tracks did (`Library.remove(trackIDs:trashing:)`).
 public struct LibraryRemoval: Sendable, Equatable {
     /// Tracks whose file was deleted from the app's library folder, or was already gone from it.
     public var deletedFiles: Int
-    /// Tracks that left the library while their file stays where it is: those in folders added in place.
+    /// Tracks that left the library while their file stays where it is: those in folders added in place, including
+    /// `trashFailures`.
     public var removedFromLibrary: Int
+    /// Tracks whose file moved to Recently Deleted (or was already gone from the folder): those in the folder picked
+    /// for downloads.
+    public var trashedFiles = 0
+    /// Tracks whose file should have moved to Recently Deleted but would not (a provider without a trash, an error):
+    /// they left the library, and their file stays in its folder. The UI says so.
+    public var trashFailures = 0
 }
 
 extension LibraryRemoval: ChangeReporting {
-    var changedLibrary: Bool { deletedFiles + removedFromLibrary > 0 }
+    var changedLibrary: Bool { deletedFiles + removedFromLibrary + trashedFiles > 0 }
+}
+
+/// Which files a removal moves to Recently Deleted instead of keeping: those inside `folder`, the folder the user
+/// picked for downloads. The app hands it in; the library knows nothing of downloads.
+public struct TrashFolder: Sendable {
+    /// The folder, as the app resolved it (its security scope is opened around the removal).
+    public var folder: URL
+    /// How long a file's provider (iCloud Drive) may take to grant the coordinated write before the move is given up.
+    public var timeout: Duration
+    /// The move itself, run inside the coordinated write: the system trash (`systemTrash`) unless a test or the
+    /// simulator's stand-in replaces it. Returns where the file went, or nil when the trash did not say.
+    public var move: @Sendable (URL) throws -> URL?
+
+    public init(
+        _ folder: URL, timeout: Duration = .seconds(30),
+        move: @escaping @Sendable (URL) throws -> URL? = TrashFolder.systemTrash
+    ) {
+        self.folder = folder
+        self.timeout = timeout
+        self.move = move
+    }
+
+    /// Why a move did not happen.
+    public enum Failure: Error, Sendable {
+        /// The file's provider did not grant the coordinated write within `timeout`; the move was called off.
+        case timedOut
+    }
+
+    /// `FileManager.trashItem`: Recently Deleted in the Files app, for iCloud Drive and On My iPhone; the Trash on a
+    /// Mac. Throws when the volume has none (the simulator's never do: Cocoa error 3328).
+    public static func systemTrash(_ file: URL) throws -> URL? {
+        var resulting: NSURL?
+        try FileManager.default.trashItem(at: file, resultingItemURL: &resulting)
+        return resulting as URL?
+    }
+
+    /// Moves `file` to Recently Deleted inside a coordinated write for deleting, so a file provider takes part and
+    /// nobody writes the file meanwhile, and returns where it went. Blocking: called on the library's queue.
+    ///
+    /// The provider gets `timeout` to grant the write; past that the move is called off and the coordinator cancelled,
+    /// so the move never runs later, and this throws `Failure.timedOut`. A move that has started is left to finish. A
+    /// refused coordination, or a move that fails, throws; the file is then left where it was.
+    public func moveToRecentlyDeleted(_ file: URL) throws -> URL? {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        let intent = NSFileAccessIntent.writingIntent(with: file, options: .forDeleting)
+        let box = MoveBox()
+        let done = DispatchSemaphore(value: 0)
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let move = move
+        coordinator.coordinate(with: [intent], queue: queue) { error in
+            let proceed = box.phase.withLock { phase -> Bool in
+                guard case .waiting = phase else { return false }
+                if let error {
+                    phase = .finished(.failure(error))
+                    return false
+                }
+                phase = .working
+                return true
+            }
+            if proceed {
+                let result = Result { try move(intent.url) }
+                box.phase.withLock { $0 = .finished(result) }
+            }
+            done.signal()
+        }
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        if done.wait(timeout: .now() + seconds) == .timedOut {
+            let gaveUp = box.phase.withLock { phase -> Bool in
+                guard case .waiting = phase else { return false }
+                phase = .abandoned
+                return true
+            }
+            if gaveUp {
+                coordinator.cancel()
+                throw Failure.timedOut
+            }
+            done.wait()
+        }
+        guard case .finished(let result) = box.phase.withLock({ $0 }) else { throw Failure.timedOut }
+        return try result.get()
+    }
+
+    /// Where a coordinated move is: waiting for the grant, running, done, or given up before it was granted.
+    private enum Phase: Sendable {
+        case waiting
+        case working
+        case finished(Result<URL?, any Error>)
+        case abandoned
+    }
+
+    private final class MoveBox: Sendable {
+        let phase = Mutex<Phase>(.waiting)
+    }
 }
 
 /// A folder the library reads: the app's own library folder (always first) or one added in place.

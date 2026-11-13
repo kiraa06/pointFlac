@@ -41,14 +41,16 @@ final class DownloadPublisher: Sendable {
                 deleteStaged: { staged in try? FileManager.default.removeItem(at: staged) }))
     }
 
-    /// Publishes `staged` (the validated download, `track`'s file), returning the row's note, or nil for "Done".
-    func publish(_ staged: URL, track: RemoteTrack) async throws -> String? {
+    /// Publishes `staged` (the validated download, `track`'s file), returning the row's note (nil for "Done") and the
+    /// library track the song became.
+    func publish(_ staged: URL, track: RemoteTrack) async throws -> Publication {
         try await publisher.publish(staged, track: track)
     }
 
     /// The import into the app's own library folder, as before download folders: the default, and the fallback. A
-    /// refusal throws, so the job shows as failed instead of done, with its staged file kept.
-    private static func importIntoApp(_ staged: URL, library: Library) async throws {
+    /// refusal throws, so the job shows as failed instead of done, with its staged file kept. Returns the track the
+    /// import added, or the one the library already had for a duplicate.
+    private static func importIntoApp(_ staged: URL, library: Library) async throws -> String? {
         let result = await library.importFiles([staged])
         if let rejection = result.rejected.first {
             throw PublishError(message: "\(rejection.fileName): \(rejection.message)")
@@ -57,6 +59,7 @@ final class DownloadPublisher: Sendable {
         guard !result.added.isEmpty || result.duplicates > 0 else {
             throw PublishError(message: "the library did not take the file")
         }
+        return result.added.first ?? result.existing.first
     }
 
     struct PublishError: LocalizedError {

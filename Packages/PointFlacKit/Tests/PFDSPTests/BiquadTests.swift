@@ -5,7 +5,7 @@ import Testing
 
 /// The matched second-order designs (Vicanek 2016) that the EQ, the tone controls and headphone correction are built
 /// from, and the transposed direct form II filter that runs them.
-@Suite("Matched biquads")
+@Suite("Matched biquads", .computeHeavy)
 struct BiquadTests {
     static let rates = [44_100.0, 48_000, 96_000, 192_000]
 
