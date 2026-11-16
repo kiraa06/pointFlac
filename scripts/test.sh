@@ -36,7 +36,15 @@ echo "== 2/7 swift format lint =="
 swift format lint --strict --recursive App AppUITests Packages
 
 echo "== 3/7 swift test (host) =="
-swift test --package-path Packages/PointFlacKit
+# The CPU-heavy suites (the ones tagged `.computeHeavy`) in a pass of their own, then everything else. Run together on
+# the 3-vCPU CI runner, they held two of its three CPUs at user-initiated QoS for the run's first ~90 s. The tests that
+# hand work to a lower-QoS queue then timed out (the trash's 30 s grant, a download's retry, a 1 s search window).
+# A suite newly tagged `.computeHeavy` belongs in this list too; one left out still runs, on the compute queue, below.
+HEAVY='PFDSPTests\.(SoundChainTests|LoudnessMatcherTests|TruePeakLimiterTests|BiquadTests)/'
+HEAVY+='|PFDSPTests\.(passbandRippleWithinTenthOfADecibel|stopbandBelowMinus100dB|delayIsConstantWithinOneSample)\('
+HEAVY+='|PFDSPTests\.fitRecoversKnownGainAndDelay\(|PFLoudnessTests\.LoudnessMeterTests/'
+swift test --package-path Packages/PointFlacKit --filter "$HEAVY"
+swift test --skip-build --package-path Packages/PointFlacKit --skip "$HEAVY"
 
 echo "== 4/7 thread sanitizer: pipeline, player, ring, scrub, sound chain, sound in the pipeline, ReplayGain, crossfade (host) =="
 # TSan cannot see the ring's memmove copies (ruling R9), so stage 5 stresses their ordering in a release build.
