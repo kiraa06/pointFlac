@@ -3,6 +3,9 @@ import Testing
 
 /// Runs a CPU-heavy suite or test on `ComputeQueue`, off the cooperative pool (see `ComputeQueue`). The same trait is
 /// declared in PFDSPTests: a trait needs `Testing`, which the shared support module does not link.
+///
+/// `scripts/test.sh` also runs the tagged suites in a host pass of their own, by name; tag a new suite and add it to
+/// the `HEAVY` list there.
 struct ComputeHeavyTrait: SuiteTrait, TestTrait, TestScoping {
     func provideScope(
         for test: Test, testCase: Test.Case?, performing function: @Sendable () async throws -> Void

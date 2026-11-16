@@ -135,7 +135,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PFSoulseekTests",
-            dependencies: ["PFSoulseek"],
+            dependencies: ["PFSoulseek", "PFTestSupport"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
@@ -171,7 +171,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PFFindTests",
-            dependencies: ["PFFind"],
+            dependencies: ["PFFind", "PFTestSupport"],
             resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

@@ -1,4 +1,5 @@
 import Foundation
+import PFTestSupport
 import Testing
 
 @testable import PFSoulseek
@@ -133,6 +134,10 @@ struct LoginTests {
 
 @Suite("Search", .timeLimit(.minutes(1)))
 struct SearchTests {
+    /// Long enough for a peer to connect and answer: a second, scaled under CI (`LatencyBudget`), where the 3-vCPU
+    /// runner once took longer and the search closed with no results.
+    static let peerWindow = LatencyBudget.scaled(.seconds(1))
+
     static let files = [
         Mock.File(
             path: "Music\\Goats\\Tallahassee\\01 First Few Desperate Hours.flac", size: 25_000_000,
@@ -167,7 +172,7 @@ struct SearchTests {
         let tokenBox = TokenBox()
         let (peer, peerTask) = try await Self.respondingPeer(
             token: 0xABCD, searchToken: { await tokenBox.value }, files: Self.files)
-        let stream = client.search("tallahassee", options: SoulseekSearchOptions(window: .seconds(1)))
+        let stream = client.search("tallahassee", options: SoulseekSearchOptions(window: Self.peerWindow))
         let search = try await link.expect(code: 26)
         var reader = WireReader(search.payload)
         await tokenBox.set(try reader.u32())
@@ -192,7 +197,7 @@ struct SearchTests {
         let files = Self.files + [Mock.File(path: "Music\\Forbidden Band\\01.flac", size: 1000)]
         let (peer, peerTask) = try await Self.respondingPeer(
             token: 1, searchToken: { await tokenBox.value }, files: files)
-        let stream = client.search("tallahassee", options: SoulseekSearchOptions(window: .seconds(1)))
+        let stream = client.search("tallahassee", options: SoulseekSearchOptions(window: Self.peerWindow))
         let search = try await link.expect(code: 26)  // the refused query never reached the server
         var reader = WireReader(search.payload)
         await tokenBox.set(try reader.u32())

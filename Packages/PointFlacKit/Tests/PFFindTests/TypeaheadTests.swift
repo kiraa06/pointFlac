@@ -1,4 +1,5 @@
 import Foundation
+import PFTestSupport
 import Synchronization
 import Testing
 
@@ -218,8 +219,11 @@ func registryRow(_ kind: Suggestion.Kind, _ title: String, artist: String, score
         let p95 = samples[Int(Double(samples.count) * 0.95)]
         print("typeahead first emission over 10k albums: median \(median), p95 \(p95)")
         // One 60 Hz frame for the median; the tail gets two, since this is a debug build sharing the machine with
-        // every other suite running in parallel.
-        #expect(median < .milliseconds(16))
-        #expect(p95 < .milliseconds(33))
+        // every other suite running in parallel. Both scale under CI, as every latency budget does (`LatencyBudget`):
+        // the 3-vCPU runner measured a p95 of 68 ms.
+        let frame = Duration.milliseconds(16)
+        let tail = Duration.milliseconds(33)
+        #expect(median < LatencyBudget.scaled(frame), "median \(median), \(LatencyBudget.describe(frame))")
+        #expect(p95 < LatencyBudget.scaled(tail), "p95 \(p95), \(LatencyBudget.describe(tail))")
     }
 }
